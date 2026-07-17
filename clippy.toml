@@ -1,0 +1,12 @@
+# Clippy configuration for agent-driven consistency.
+# See: https://rust-lang.github.io/rust-clippy/master/index.html
+
+# Be strict: warn on lints that hint at real bugs.
+# Warn-by-default is too noisy for a blank project; we'll promote the
+# correctness/performance/suspicious groups to denies via Cargo.toml.
+
+# Cognitive complexity threshold for `cognitive_complexity` lint.
+cognitive-complexity-threshold = 25
+
+# Avoid huge functions / types — keeps diffs small and reviewable.
+too-many-arguments-threshold = 7

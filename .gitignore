@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+
+# Local configuration (don't commit secrets)
+/proxy.toml
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

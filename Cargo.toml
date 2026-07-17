@@ -1,0 +1,66 @@
+[package]
+name = "openai-to-anthropic-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime + HTTP
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = { version = "3", features = ["json"] }
+
+# Byte buffers (re-exported by reqwest, but we name the type in
+# `Body::from_stream` item type)
+bytes = "1"
+
+# SSE parsing for the streaming path
+eventsource-stream = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Config + errors + logging
+toml = "0.8"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+[lints.clippy]
+# Correctness — almost always a real bug.
+correctness = { level = "deny", priority = -1 }
+
+# Suspicious — likely bugs, often type-confusion or wrong API usage.
+suspicious = { level = "deny", priority = -1 }
+
+# Complexity — simplifies code; reduces surface area the agent has to reason about.
+complexity = { level = "warn", priority = -1 }
+
+# Perf — flag accidental clones, inefficient patterns.
+perf = { level = "warn", priority = -1 }
+
+# Style — consistency, but noisy on a fresh project.
+style = { level = "warn", priority = -1 }
+
+# Nursery — opt in explicitly so we see new lints as they stabilize.
+nursery = { level = "warn", priority = -1 }
+
+# Restriction — agent guardrails: block easy-to-misuse patterns.
+# See https://rust-lang.github.io/rust-clippy/master/index.html#restriction
+restriction = { level = "allow", priority = -1 }
+
+# Specific denies that catch common agent mistakes.
+# forbid unsafe — keep the proxy safe by default.
+unsafe_derive_deserialize = "deny"
+# `missing_const_for_fn` fires on `fn main()` (which can't be const).
+# Allow it project-wide; the const-fn check still applies everywhere else
+# where it can actually do something.
+missing_const_for_fn = "allow"
+# No printing in library code (keeps stdout clean for tools).
+# We allow it inside main/examples via the lint's built-in exception
+# (clippy::print_stdout is a no-op when the calling crate is a binary's main).
