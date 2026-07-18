@@ -62,6 +62,26 @@ async fn handle_messages(
     let outbound = translate::anthropic_to_openai(&req)
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
 
+    // Serialize once, log a short summary, and stash the full body for
+    // postmortem. The body is the single most useful artifact when
+    // debugging an upstream rejection, so we also write it to a fixed
+    // file (`target/last-upstream-body.json`) on every request — that
+    // way the agent can read it after the fact without scraping logs.
+    let body_json = serde_json::to_string(&outbound)
+        .map_err(|e| AppError::Internal(format!("serialize outbound body: {e}")))?;
+
+    tracing::debug!(
+        model = %outbound.model,
+        stream = outbound.stream,
+        tools = outbound.tools.as_ref().map_or(0, Vec::len),
+        messages = outbound.messages.len(),
+        max_completion_tokens = ?outbound.max_completion_tokens,
+        "→ upstream"
+    );
+    if let Err(e) = std::fs::write("target/last-upstream-body.json", &body_json) {
+        tracing::warn!(error = %e, "failed to write target/last-upstream-body.json");
+    }
+
     let url = format!(
         "{}{}",
         state.config.upstream_base_url.trim_end_matches('/'),
@@ -89,6 +109,17 @@ async fn handle_messages(
 
     if !status.is_success() {
         let body = upstream_resp.text().await.unwrap_or_default();
+        // Log the full upstream error body at WARN. The file logger
+        // captures this even when stderr is closed (e.g. when run
+        // detached), so the agent can read it from
+        // `target/logs/proxy.log`.
+        tracing::warn!(%status, body = %body, "← upstream error");
+        // Also dump the *sent* request body alongside, since most
+        // upstream errors are "I rejected your body" and the answer
+        // is in what we sent, not what they returned.
+        if let Ok(sent) = std::fs::read_to_string("target/last-upstream-body.json") {
+            tracing::warn!(sent_body = %sent, "← upstream error: sent body");
+        }
         return Err(map_upstream_error(status, &body));
     }
 

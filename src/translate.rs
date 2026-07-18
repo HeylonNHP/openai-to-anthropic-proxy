@@ -45,7 +45,7 @@ use serde_json::Value;
 /// - `tools[]` → `tools[]` with `parameters` lifted from `input_schema`.
 /// - `tool_choice`: `Auto`→`"auto"`, `Any`→`"required"`, `Tool{name}`→structured,
 ///   `None{}`→`"none"`.
-/// - `temperature`, `top_p`, `max_tokens`, `stop_sequences` map 1:1.
+/// - `temperature`, `top_p`, `max_tokens` (→ `max_completion_tokens`), `stop_sequences`.
 /// - `stream` is preserved; when true, `stream_options.include_usage` is set
 ///   so the upstream sends a terminal usage chunk.
 /// - `metadata.user_id` → `user` field.
@@ -72,7 +72,7 @@ pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionR
                 function: FunctionDef {
                     name: t.name.clone(),
                     description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
+                    parameters: sanitize_tool_schema(t.input_schema.clone()),
                 },
             })
             .collect()
@@ -95,7 +95,7 @@ pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionR
         messages,
         temperature: req.temperature,
         top_p: req.top_p,
-        max_tokens: Some(req.max_tokens),
+        max_completion_tokens: Some(req.max_tokens),
         stop: req.stop_sequences.clone(),
         tools,
         tool_choice,
@@ -116,6 +116,25 @@ fn system_text(system: &SystemPrompt) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
     }
+}
+
+/// Make a tool's `parameters` schema acceptable to strict OpenAI-style
+/// validators. Currently only normalizes one case: an empty-object
+/// `additionalProperties: {}`, which Claude Code emits on some tools
+/// (e.g. `ExitPlanMode`) and which airia and other strict gateways
+/// reject with a generic `Invalid request body format`. An empty schema
+/// is semantically equivalent to `additionalProperties: true` (any extras
+/// are allowed, unconstrained), and the strict validator refuses to
+/// compile it. We delete the key; the validator then treats extras as
+/// unconstrained, which it accepts.
+fn sanitize_tool_schema(mut schema: Value) -> Value {
+    if let Value::Object(map) = &mut schema
+        && let Some(Value::Object(empty)) = map.get("additionalProperties")
+        && empty.is_empty()
+    {
+        map.remove("additionalProperties");
+    }
+    schema
 }
 
 fn append_message_translation(out: &mut Vec<ChatMessage>, msg: &MessageParam) -> Result<()> {
@@ -316,7 +335,7 @@ mod tests {
         let req = fixture_request();
         let out = anthropic_to_openai(&req).unwrap();
         assert_eq!(out.model, "test-model");
-        assert_eq!(out.max_tokens, Some(256));
+        assert_eq!(out.max_completion_tokens, Some(256));
         assert!(!out.stream);
 
         // System + user
@@ -592,6 +611,68 @@ mod tests {
         });
         let out = anthropic_to_openai(&req).unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn sanitize_tool_schema_strips_empty_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": {},
+        });
+        let out = sanitize_tool_schema(schema);
+        assert!(out.get("additionalProperties").is_none());
+        assert_eq!(out["type"], "object");
+        assert_eq!(out["properties"]["x"]["type"], "string");
+    }
+
+    #[test]
+    fn sanitize_tool_schema_keeps_false_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": false,
+        });
+        let out = sanitize_tool_schema(schema);
+        assert_eq!(out["additionalProperties"], Value::Bool(false));
+    }
+
+    #[test]
+    fn sanitize_tool_schema_keeps_non_empty_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": {"type": "string"},
+        });
+        let out = sanitize_tool_schema(schema);
+        assert_eq!(out["additionalProperties"]["type"], "string");
+    }
+
+    #[test]
+    fn tool_with_empty_additional_properties_is_cleaned_in_translation() {
+        // A tool with `additionalProperties: {}` — what Claude Code emits
+        // for `ExitPlanMode` and similar — must come out the other side
+        // without that key, so airia / strict OpenAI validators accept it.
+        let mut req = fixture_request();
+        req.tools = Some(vec![Tool {
+            name: "ExitPlanMode".into(),
+            description: Some("Finish planning".into()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"allowedPrompts": {"type": "array"}},
+                "additionalProperties": {},
+            }),
+        }]);
+        let out = anthropic_to_openai(&req).unwrap();
+        let tool = &out.tools.unwrap()[0];
+        assert!(
+            tool.function
+                .parameters
+                .get("additionalProperties")
+                .is_none(),
+            "expected no additionalProperties; got {:?}",
+            tool.function.parameters,
+        );
     }
 }
 

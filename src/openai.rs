@@ -26,8 +26,12 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Token cap. OpenAI renamed `max_tokens` to `max_completion_tokens`
+    /// for the gpt-5 / o-series; older models accept either. The proxy
+    /// always sends `max_completion_tokens` because the gpt-5 family
+    /// rejects the legacy field.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
