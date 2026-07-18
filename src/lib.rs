@@ -1,11 +1,10 @@
 // Library entrypoint: re-exports the modules used by `main.rs` and by tests.
 pub mod config;
 mod error;
+pub mod responses;
 pub mod stream;
 
-// Modules filled in by follow-up tasks.
 pub mod anthropic;
-pub mod openai;
 pub mod proxy;
 mod translate;
 

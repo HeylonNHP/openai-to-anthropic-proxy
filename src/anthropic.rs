@@ -213,6 +213,15 @@ pub enum ResponseContentBlock {
         name: String,
         input: Value,
     },
+    /// Thinking content block. Surfaced when the upstream (Responses API)
+    /// emits a `reasoning` output item. `thinking` carries the summary
+    /// text (concatenated from `response.reasoning_summary_text.delta`
+    /// events) and `signature` carries the upstream's `encrypted_content`
+    /// blob — opaque to the client but required by the wire format.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

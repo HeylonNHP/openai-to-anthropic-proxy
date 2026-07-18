@@ -11,7 +11,7 @@
 #   listen_addr          — e.g. "0.0.0.0:8085" (default)
 #   upstream_base_url    — required, e.g. "https://api.openai.com"
 #   upstream_api_key     — required, sent as Bearer to upstream
-#   upstream_path        — default "/v1/chat/completions"
+#   upstream_path        — default "/v1/responses"
 #   request_timeout_secs — default 600 (10 min)
 #   reasoning_effort     — global default; overridden by [reasoning]
 #                          (see the [reasoning] table below)
@@ -29,28 +29,32 @@ request_timeout_secs = 600
 # request_timeout_secs = 600
 
 # ─── Per-model reasoning effort ─────────────────────────────────────────
-# Some upstreams (notably airia-backed reasoning models) reject the
-# combination of function tools + a non-`"none"` reasoning_effort on
-# the chat-completions endpoint. The proxy picks the effort to send
-# per request using this resolution chain:
+# The proxy targets the /v1/responses endpoint, which is more lenient
+# about combining reasoning with function tools than /v1/chat/completions
+# is on some gateways (notably airia). As a result, models that used to
+# require "none" for tool use can now run with real reasoning effort.
+# The proxy picks the effort to send per request using this resolution
+# chain:
 #   1. `reasoning.models[req.model]` — exact match (highest priority)
 #   2. `reasoning.default` — fallback for any model not in the map
 #   3. The legacy top-level `reasoning_effort` field
 #   4. The built-in default ("none")
 #
-# Example: gpt-5.6-luna needs "none" for tool use, but gpt-5.4-mini
-# can do high reasoning. Without this table, swapping models in
-# Claude Code would require editing the config; with it, the proxy
-# picks the right value automatically.
+# Example: gpt-5.6-luna used to require "none" for tool use on
+# chat-completions; on /v1/responses it accepts higher effort, so
+# bumping it to "medium" lets it reason while still calling tools.
+# gpt-5.4-mini can do high reasoning.
 #
-# Valid values: "none" | "low" | "medium" | "high".
+# Valid values: "none" | "low" | "medium" | "high" | "xhigh" | "max".
+# ("xhigh" and "max" are accepted by /v1/responses but not by
+# /v1/chat/completions — use the former.)
 #
 # [reasoning]
 # default = "none"
 #
 # [reasoning.models]
 # "gpt-5.4-mini" = "high"
-# "gpt-5.6-luna"  = "none"
+# "gpt-5.6-luna"  = "medium"
 
 # ─── Model name aliases ─────────────────────────────────────────────────
 # Map inbound model names to upstream model names. Useful when the

@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8085";
-const DEFAULT_UPSTREAM_PATH: &str = "/v1/chat/completions";
+const DEFAULT_UPSTREAM_PATH: &str = "/v1/responses";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Default `reasoning_effort` for upstream chat-completions requests.
 /// Some upstreams (notably airia-backed reasoning models) reject
@@ -38,8 +38,10 @@ pub struct Config {
     pub upstream_api_key: String,
     pub upstream_path: String,
     pub request_timeout: Duration,
-    /// Outbound `reasoning_effort` for chat-completions requests. See
-    /// [`DEFAULT_REASONING_EFFORT`] for why this exists.
+    /// Outbound `reasoning_effort` for Responses requests. See
+    /// [`DEFAULT_REASONING_EFFORT`] for why this exists. Forwarded to
+    /// the upstream as `reasoning: { effort: "..." }` (the Responses
+    /// shape), not the legacy top-level `reasoning_effort` string.
     pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Used by
     /// [`Config::reasoning_for_model`] to pick the right value for each
@@ -317,6 +319,7 @@ pub(crate) struct TomlConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlReasoningConfig {
     default: Option<String>,
+    #[serde(default)]
     models: BTreeMap<String, String>,
 }
 
@@ -564,6 +567,29 @@ mod tests {
         // the proxy surfaces upstream errors unchanged.
         let cfg = Config::resolve(None, &env_with_required()).unwrap();
         assert_eq!(cfg.default_model(), None);
+    }
+
+    #[test]
+    fn reasoning_table_with_only_default_parses() {
+        // A `[reasoning]` table containing just `default` must be
+        // accepted; the `models` sub-table is optional. Without
+        // `#[serde(default)]` on `TomlReasoningConfig.models`, this
+        // shape would fail to deserialize and the proxy would refuse
+        // to start.
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            [reasoning]
+            default = "none"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(cfg.reasoning.default.as_deref(), Some("none"));
+        assert!(cfg.reasoning.models.is_empty());
+        assert_eq!(
+            cfg.reasoning_for_model("any-model").as_deref(),
+            Some("none")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! axum router and request handlers.
 //!
-//! Wires together: read Anthropic request → translate to OpenAI →
+//! Wires together: read Anthropic request → translate to Responses →
 //! forward to upstream → translate response (or stream) back → ship to
 //! Claude Code.
 
@@ -23,11 +23,12 @@ use futures_util::{Stream, StreamExt};
 use crate::anthropic::{CreateMessageRequest, StreamEvent};
 use crate::config::Config;
 use crate::error::AppError;
-use crate::openai;
+use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
+use serde_json::Value;
 
 /// Shared state passed to every handler.
 #[derive(Clone)]
@@ -78,7 +79,7 @@ async fn handle_messages(
     // through unchanged.
     let upstream_model = state.config.upstream_model_for(&req.model);
     let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
-    let mut outbound = translate::anthropic_to_openai(&req, reasoning_effort)
+    let mut outbound = translate::anthropic_to_responses(&req, reasoning_effort)
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
@@ -95,9 +96,7 @@ async fn handle_messages(
         model = %outbound.model,
         stream = outbound.stream,
         tools = outbound.tools.as_ref().map_or(0, Vec::len),
-        messages = outbound.messages.len(),
-        max_completion_tokens = ?outbound.max_completion_tokens,
-        reasoning_effort = ?outbound.reasoning_effort,
+        reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
         "→ upstream"
     );
 
@@ -113,7 +112,7 @@ async fn handle_messages_inner(
     state: AppState,
     headers: HeaderMap,
     req: CreateMessageRequest,
-    outbound: openai::ChatCompletionRequest,
+    outbound: responses::ResponsesRequest,
 ) -> Result<Response, AppError> {
     let url = format!(
         "{}{}",
@@ -157,12 +156,11 @@ async fn handle_messages_inner(
         let sent = LAST_SENT_BODY.try_with(|b| b.clone()).unwrap_or_default();
         tracing::warn!(%status, body = %body, sent_body = %sent, "← upstream error");
 
-        // Decide whether to retry with the default model. Only
-        // non-streaming requests get the retry — see TODO at end
-        // of file. Only one retry; the loop ends after attempt 2
-        // regardless.
-        let should_retry = !outbound.stream
-            && attempt == 1
+        // Decide whether to retry with the default model. The retry
+        // happens before any response bytes are written to the client
+        // (streaming or not), so it is safe for both paths. Only one
+        // retry; the loop ends after attempt 2 regardless.
+        let should_retry = attempt == 1
             && is_model_not_supported(status, &body)
             && state
                 .config
@@ -171,12 +169,17 @@ async fn handle_messages_inner(
 
         if should_retry {
             let fallback = state.config.default_model().unwrap();
+            let fallback_reasoning = state.config.reasoning_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,
                 fallback_model = %fallback,
                 "upstream rejected model; falling back to default_model"
             );
             outbound.model = fallback.to_owned();
+            outbound.reasoning = fallback_reasoning.map(|effort| responses::ReasoningConfig {
+                effort,
+                ..responses::ReasoningConfig::default()
+            });
             attempt = 2;
             continue;
         }
@@ -210,26 +213,36 @@ async fn handle_messages_inner(
         Ok(response)
     } else {
         let bytes = upstream_resp.bytes().await?;
-        let openai_resp: openai::ChatCompletionResponse =
-            serde_json::from_slice(&bytes).map_err(|e| AppError::Upstream {
+        let upstream_resp_body: responses::ResponsesResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: format!("upstream returned non-JSON body: {e}"),
             })?;
-        let anth = translate::openai_to_anthropic(&openai_resp);
+        let anth = translate::responses_to_anthropic(&upstream_resp_body);
         Ok(Json(anth).into_response())
     }
 }
 
-/// Cheap heuristic for "the upstream doesn't know this model".
-/// Matches on (a) status in `[400, 404]` and (b) body containing
-/// one of the well-known phrases from airia / OpenAI / Anthropic
-/// style error envelopes. Conservative by design: false negatives
-/// are fine (the operator sees the original error), false positives
-/// would mask unrelated 400s.
+/// Heuristic for "the upstream doesn't know this model". Matches on
+/// (a) status in `[400, 404]` and (b) either a structured error code
+/// (`code: "model_not_found"` / `model_not_supported`) or a body
+/// containing one of the well-known phrases. Conservative by design:
+/// false negatives are fine (the operator sees the original error),
+/// false positives would mask unrelated 400s.
 fn is_model_not_supported(status: StatusCode, body: &str) -> bool {
     if !matches!(status.as_u16(), 400 | 404) {
         return false;
     }
+
+    // Structured codes first: upstreams may return a generic message
+    // text while putting the real reason in `code` (flat Responses
+    // envelope) or `error.code` (Chat Completions envelope).
+    if let Some(code) = extract_model_error_code(body)
+        && matches!(code.as_str(), "model_not_found" | "model_not_supported")
+    {
+        return true;
+    }
+
     const PHRASES: &[&str] = &[
         "model_not_found",
         "model not found",
@@ -239,6 +252,27 @@ fn is_model_not_supported(status: StatusCode, body: &str) -> bool {
     ];
     let lower = body.to_ascii_lowercase();
     PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Extract the `code` field from a structured error envelope. Returns
+/// `None` if the body isn't JSON or has no recognized code shape.
+fn extract_model_error_code(body: &str) -> Option<String> {
+    // Responses API errors are flat: { "code": "...", "message": "..." }
+    if let Ok(err) = serde_json::from_str::<responses::ResponsesError>(body)
+        && let Some(Value::String(s)) = err.code
+    {
+        return Some(s);
+    }
+    // Chat Completions style errors are wrapped: { "error": { "code": "...", "message": "..." } }
+    if let Ok(v) = serde_json::from_str::<Value>(body)
+        && let Some(code) = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+    {
+        return Some(code.to_owned());
+    }
+    None
 }
 
 // ─── Streaming bridge ─────────────────────────────────────────────────────
@@ -279,12 +313,10 @@ where
         // SAFETY: we never move the inner stream out of `self`.
         let this = self.get_mut();
         loop {
-            // The translator is `None` after a clean close ([DONE], an
-            // error event, or a truncated stream). Any further event
-            // from the inner stream is a stray — drop it and end the
-            // outer stream. This used to be three separate `expect()`
-            // calls, each of which could panic and bring down the
-            // worker.
+            // The translator is `None` after a clean close (terminal
+            // event, error event, or a truncated stream). Any further
+            // event from the inner stream is a stray — drop it and end
+            // the outer stream.
             if this.translator.is_none() {
                 match this.inner.poll_next_unpin(cx) {
                     Poll::Ready(Some(_)) => continue,
@@ -294,10 +326,14 @@ where
             match this.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     if msg.data.trim() == "[DONE]" {
-                        // Flush the translator and emit the closing events.
+                        // The Responses API does not use a `[DONE]`
+                        // sentinel; its terminal event is
+                        // `response.completed` / `incomplete` / `failed`,
+                        // which the translator handles directly. If we
+                        // see `[DONE]` here, it's a stray from a
+                        // non-Responses upstream — flush the translator
+                        // and end the stream.
                         let Some(translator) = this.translator.take() else {
-                            // Already closed; should be unreachable thanks
-                            // to the guard above, but stay defensive.
                             return Poll::Ready(None);
                         };
                         let events = translator.finish();
@@ -309,26 +345,51 @@ where
                     if msg.data.is_empty() {
                         continue;
                     }
-                    let chunk: openai::ChatCompletionChunk = match serde_json::from_str(&msg.data) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "dropping malformed upstream SSE chunk");
-                            continue;
-                        }
-                    };
+                    let event: responses::ResponsesStreamEvent =
+                        match serde_json::from_str(&msg.data) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    event_kind = %msg.event,
+                                    "dropping malformed upstream SSE event"
+                                );
+                                continue;
+                            }
+                        };
                     let Some(translator) = this.translator.as_mut() else {
-                        // Translator was already taken (e.g. the
-                        // upstream sent [DONE] then a real event).
                         return Poll::Ready(None);
                     };
-                    let events = translator.feed_chunk(&chunk);
+                    // Detect `response.failed` and route to
+                    // `emit_error` so the bridge surfaces a clean
+                    // error event rather than a half-streamed message.
+                    if matches!(event, responses::ResponsesStreamEvent::Failed { .. }) {
+                        let t = this.translator.take().unwrap();
+                        // Best-effort message extraction; the
+                        // translator will read it from the response
+                        // envelope.
+                        let (kind, message) = match &event {
+                            responses::ResponsesStreamEvent::Failed { response } => {
+                                let msg = response
+                                    .error
+                                    .as_ref()
+                                    .map(|e| e.message.clone())
+                                    .unwrap_or_else(|| "upstream response failed".to_owned());
+                                ("upstream_error", msg)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let events = t.emit_error(kind, message);
+                        return Poll::Ready(Some(Ok(encode_sse_events(&events))));
+                    }
+                    let events = translator.feed_event(&event);
                     if events.is_empty() {
                         continue;
                     }
                     return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    // Surface a clean close: emit message_stop and end.
+                    // Surface a clean close: emit an error event and end.
                     tracing::warn!(error = %e, "upstream SSE error; closing stream");
                     if let Some(t) = this.translator.take() {
                         let events = t.emit_error("api_error", format!("upstream SSE error: {e}"));
@@ -337,7 +398,11 @@ where
                     return Poll::Ready(None);
                 }
                 Poll::Ready(None) => {
-                    // Upstream closed without a [DONE] — flush whatever we have.
+                    // Upstream closed without a terminal event — flush
+                    // whatever we have. (Real Responses upstreams emit
+                    // a `response.completed` / `incomplete` before
+                    // closing; this branch handles the rare truncated
+                    // case.)
                     if let Some(t) = this.translator.take() {
                         let events = t.finish();
                         if !events.is_empty() {
@@ -384,10 +449,18 @@ fn event_kind(event: &StreamEvent) -> &'static str {
 // ─── Upstream error mapping ───────────────────────────────────────────────
 
 fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
-    if let Ok(env) = serde_json::from_str::<openai::ErrorEnvelope>(body) {
+    if let Ok(env) = serde_json::from_str::<responses::ResponsesError>(body) {
+        // Responses errors are flat: `{ "message": "...", "type": "...", ... }`.
+        // The Responses API doesn't wrap in an `error: {...}` envelope like
+        // Chat Completions did, so we just read the fields directly.
+        let kind = if env.kind.is_empty() {
+            "upstream_error"
+        } else {
+            env.kind.as_str()
+        };
         AppError::Upstream {
             status,
-            body: format!("{}: {}", env.error.kind, env.error.message),
+            body: format!("{kind}: {}", env.message),
         }
     } else {
         AppError::Upstream {
@@ -410,6 +483,8 @@ fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
 /// Synthesize an Anthropic-shaped message id for streaming responses.
 /// Uses nanoseconds since the UNIX epoch, hex-encoded, plus a sanitized
 /// model fragment. Not a UUID, but unique enough for our purposes.
+/// The translator replaces this with the real `resp_...` id once
+/// `response.created` arrives.
 fn synthetic_message_id(req: &CreateMessageRequest) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -506,5 +581,44 @@ mod tests {
                 "expected false for status={status} body={body:?}",
             );
         }
+    }
+
+    #[test]
+    fn is_model_not_supported_detects_flat_responses_code() {
+        // Responses API errors are flat: { "code": "...", ... }.
+        // We must trigger fallback on model_not_supported / model_not_found
+        // even when the message text is generic.
+        let body = r#"{"message":"Bad request","type":"invalid_request_error","code":"model_not_supported"}"#;
+        assert!(is_model_not_supported(StatusCode::BAD_REQUEST, body));
+    }
+
+    #[test]
+    fn is_model_not_supported_detects_wrapped_chat_completions_code() {
+        // Chat Completions-style errors wrap the code inside `error`.
+        let body = r#"{"error":{"message":"Not found","type":"invalid_request_error","code":"model_not_found"}}"#;
+        assert!(is_model_not_supported(StatusCode::BAD_REQUEST, body));
+    }
+
+    #[test]
+    fn extract_model_error_code_returns_none_for_non_json() {
+        assert_eq!(extract_model_error_code("not json"), None);
+    }
+
+    #[test]
+    fn extract_model_error_code_prefers_flat_code() {
+        let body = r#"{"code":"model_not_supported","message":"Bad request"}"#;
+        assert_eq!(
+            extract_model_error_code(body).as_deref(),
+            Some("model_not_supported")
+        );
+    }
+
+    #[test]
+    fn extract_model_error_code_falls_back_to_wrapped_code() {
+        let body = r#"{"error":{"code":"model_not_found","message":"Not found"}}"#;
+        assert_eq!(
+            extract_model_error_code(body).as_deref(),
+            Some("model_not_found")
+        );
     }
 }
