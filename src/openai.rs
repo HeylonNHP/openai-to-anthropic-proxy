@@ -47,6 +47,14 @@ pub struct ChatCompletionRequest {
     /// client supplied `metadata.user_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Some upstreams (notably airia-backed reasoning models) reject
+    /// function tools when this is unset — they fall back to a default
+    /// reasoning effort that is incompatible with tool use. Pass
+    /// `"none"` to disable reasoning for tool-use requests. `None`
+    /// means omit the field entirely; the upstream chooses its own
+    /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

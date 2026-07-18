@@ -20,6 +20,14 @@ use serde::Deserialize;
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8085";
 const DEFAULT_UPSTREAM_PATH: &str = "/v1/chat/completions";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Default `reasoning_effort` for upstream chat-completions requests.
+/// Some upstreams (notably airia-backed reasoning models) reject
+/// function tools when `reasoning_effort` is unset — they default to a
+/// non-`"none"` value, and the resulting combination is unsupported.
+/// Pinning the default to `"none"` keeps tool-use requests working out
+/// of the box; operators who need reasoning for non-tool calls can
+/// override via env or TOML.
+const DEFAULT_REASONING_EFFORT: &str = "none";
 
 /// Resolved proxy configuration. Cheap to clone (`String`s and a `Duration`).
 #[derive(Debug, Clone)]
@@ -29,6 +37,9 @@ pub struct Config {
     pub upstream_api_key: String,
     pub upstream_path: String,
     pub request_timeout: Duration,
+    /// Outbound `reasoning_effort` for chat-completions requests. See
+    /// [`DEFAULT_REASONING_EFFORT`] for why this exists.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Config {
@@ -93,12 +104,23 @@ impl Config {
         )
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
 
+        // File > env > default. The default is what fixes the airia
+        // "function tools with reasoning_effort" 400; an operator who
+        // wants something different can set REASONING_EFFORT (or the
+        // `reasoning_effort` TOML key) to override.
+        let reasoning_effort = pick_str(
+            file.and_then(|f| f.reasoning_effort.as_deref()),
+            env.reasoning_effort.as_deref(),
+        )
+        .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_owned()));
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
             upstream_api_key,
             upstream_path,
             request_timeout: Duration::from_secs(request_timeout_secs),
+            reasoning_effort,
         })
     }
 }
@@ -113,6 +135,7 @@ pub struct EnvInputs {
     pub upstream_api_key: Option<String>,
     pub upstream_path: Option<String>,
     pub request_timeout_secs: Option<u64>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl EnvInputs {
@@ -126,6 +149,7 @@ impl EnvInputs {
             request_timeout_secs: env::var("REQUEST_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            reasoning_effort: env::var("REASONING_EFFORT").ok(),
         }
     }
 }
@@ -148,6 +172,7 @@ pub(crate) struct TomlConfig {
     upstream_api_key: Option<String>,
     upstream_path: Option<String>,
     request_timeout_secs: Option<u64>,
+    reasoning_effort: Option<String>,
 }
 
 impl TomlConfig {
@@ -195,6 +220,32 @@ mod tests {
             cfg.request_timeout,
             Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
         );
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn default_reasoning_effort_is_none() {
+        // Pins the default so a future refactor can't silently change
+        // it; airia-backed reasoning models 400 without this.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(
+            cfg.reasoning_effort.as_deref(),
+            Some(DEFAULT_REASONING_EFFORT)
+        );
+    }
+
+    #[test]
+    fn env_overrides_file_reasoning_effort() {
+        let file = TomlConfig {
+            reasoning_effort: Some("low".into()),
+            ..TomlConfig::default()
+        };
+        let env = EnvInputs {
+            reasoning_effort: Some("high".into()),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

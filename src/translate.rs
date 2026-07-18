@@ -56,7 +56,13 @@ use serde_json::Value;
 /// - `stream` is preserved; when true, `stream_options.include_usage` is set
 ///   so the upstream sends a terminal usage chunk.
 /// - `metadata.user_id` → `user` field.
-pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionRequest> {
+/// - `reasoning_effort` is passed through from config. Some upstreams
+///   (notably airia-backed reasoning models) require it to be `"none"`
+///   when tools are present, so the proxy's config defaults to that.
+pub fn anthropic_to_openai(
+    req: &CreateMessageRequest,
+    reasoning_effort: Option<String>,
+) -> Result<ChatCompletionRequest> {
     let stream = req.stream.unwrap_or(false);
     let mut messages = Vec::new();
 
@@ -122,6 +128,7 @@ pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionR
         stream,
         stream_options,
         user,
+        reasoning_effort,
     })
 }
 
@@ -353,7 +360,7 @@ mod tests {
     #[test]
     fn basic_request_translates_cleanly() {
         let req = fixture_request();
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         assert_eq!(out.model, "test-model");
         assert_eq!(out.max_completion_tokens, Some(256));
         assert!(!out.stream);
@@ -400,7 +407,7 @@ mod tests {
                 cache_control: None,
             },
         ]));
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         match &out.messages[0] {
             ChatMessage::System { content } => {
                 assert_eq!(content, "Be concise.\n\nUse examples.");
@@ -445,7 +452,7 @@ mod tests {
             },
         ];
 
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         // system + user + assistant + tool
         assert_eq!(out.messages.len(), 4);
 
@@ -509,7 +516,7 @@ mod tests {
             ]),
         }];
 
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         // system + user("Here's what I got:") + tool("first result") + user("and:") + tool("second result")
         assert_eq!(out.messages.len(), 5);
         match &out.messages[1] {
@@ -561,7 +568,7 @@ mod tests {
                 }),
             ]),
         }];
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         // system + user(text only — image dropped)
         assert_eq!(out.messages.len(), 2);
         match &out.messages[1] {
@@ -578,7 +585,7 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         match out.tool_choice.unwrap() {
             ToolChoiceValue::Simple(s) => assert_eq!(s, "auto"),
             _ => panic!("expected simple tool_choice"),
@@ -587,14 +594,14 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         match out.tool_choice.unwrap() {
             ToolChoiceValue::Simple(s) => assert_eq!(s, "required"),
             _ => panic!("expected simple 'required'"),
         }
 
         req.tool_choice = Some(ToolChoice::None {});
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         match out.tool_choice.unwrap() {
             ToolChoiceValue::Simple(s) => assert_eq!(s, "none"),
             _ => panic!("expected simple 'none'"),
@@ -604,7 +611,7 @@ mod tests {
             name: "get_weather".into(),
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         match out.tool_choice.unwrap() {
             ToolChoiceValue::Function { function, .. } => {
                 assert_eq!(function.name, "get_weather");
@@ -617,7 +624,7 @@ mod tests {
     fn stream_true_sets_include_usage() {
         let mut req = fixture_request();
         req.stream = Some(true);
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         assert!(out.stream);
         let opts = out.stream_options.unwrap();
         assert!(opts.include_usage);
@@ -629,7 +636,7 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some("user-123".into()),
         });
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
     }
 
@@ -641,11 +648,39 @@ mod tests {
         // (and a warn-level log records that loss).
         let mut req = fixture_request();
         req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         assert!(
             out.stop.is_none(),
             "expected stop to be dropped, got {:?}",
             out.stop
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passed_through() {
+        // The translator threads the config-supplied reasoning_effort
+        // through to the outbound request. This is what lets the
+        // operator disable reasoning for tool-use requests against
+        // airia-backed reasoning models.
+        let req = fixture_request();
+        let out = anthropic_to_openai(&req, Some("low".into())).unwrap();
+        assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn reasoning_effort_none_omits_field() {
+        // When config provides no reasoning_effort, the field must be
+        // absent from the serialized JSON — not present-but-null. The
+        // `skip_serializing_if` attribute on the struct field is what
+        // makes this work; this test guards against a future refactor
+        // removing it.
+        let req = fixture_request();
+        let out = anthropic_to_openai(&req, None).unwrap();
+        let body = serde_json::to_value(&out).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "expected reasoning_effort absent from wire, got {:?}",
+            body.get("reasoning_effort")
         );
     }
 
@@ -699,7 +734,7 @@ mod tests {
                 "additionalProperties": {},
             }),
         }]);
-        let out = anthropic_to_openai(&req).unwrap();
+        let out = anthropic_to_openai(&req, None).unwrap();
         let tool = &out.tools.unwrap()[0];
         assert!(
             tool.function
