@@ -70,14 +70,19 @@ async fn handle_messages(
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
-    // Per-model `reasoning_effort` lookup. The config may set a default
-    // and/or a per-model map; the per-model entry wins if present, then
-    // the default, then the legacy single field, then "none". The
-    // translator's existing `reasoning_effort: Option<String>`
-    // parameter stays unchanged.
-    let reasoning_effort = state.config.reasoning_for_model(&req.model);
-    let outbound = translate::anthropic_to_openai(&req, reasoning_effort)
+    // Resolve the inbound model name to the upstream model name BEFORE
+    // building the request — so the reasoning-effort lookup uses the
+    // *resolved* name (e.g. an aliased `claude-sonnet-5` request picks
+    // up the reasoning entry for `gpt-5.4-mini`, not the entry for
+    // `claude-sonnet-5`). If no alias is configured, the name passes
+    // through unchanged.
+    let upstream_model = state.config.upstream_model_for(&req.model);
+    let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
+    let mut outbound = translate::anthropic_to_openai(&req, reasoning_effort)
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    // The translator copies the inbound model name verbatim; rewrite
+    // it here so the upstream sees the alias-resolved name.
+    outbound.model = upstream_model;
 
     // Serialize once, log a short summary, and stash the full body for
     // the error path. The body is the single most useful artifact when

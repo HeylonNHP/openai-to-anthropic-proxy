@@ -47,6 +47,31 @@ pub struct Config {
     /// appear in `CreateMessageRequest.model`. See
     /// [`ReasoningConfig`] for resolution rules.
     pub reasoning: ReasoningConfig,
+    /// Map from inbound model name (e.g. `claude-sonnet-5`, what
+    /// Claude Code sends) to upstream model name (e.g. `gpt-5.4-mini`,
+    /// what the gateway serves). Used by [`Config::upstream_model_for`]
+    /// to rewrite the model field on the way out. If no alias is set
+    /// for a given inbound name, the proxy passes the name through
+    /// unchanged — so deployments that don't need aliases (a single
+    /// model, or model names that already match) need no config here.
+    pub model_aliases: ModelAliases,
+}
+
+/// Inbound → upstream model name aliases.
+///
+/// Lets the operator route requests for one model name to a
+/// different upstream model. The most common case: Claude Code's
+/// subagents request `claude-sonnet-5` (or another Anthropic-native
+/// name), but the gateway only serves OpenAI-family models; the
+/// operator maps each Anthropic name to the airia (or other) model
+/// they want the request to actually hit.
+///
+/// Resolution is exact-string match. No glob, no regex, no fallback
+/// chain — if a model isn't in the map, the proxy passes the name
+/// through unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct ModelAliases {
+    pub map: BTreeMap<String, String>,
 }
 
 /// Per-model `reasoning_effort` overrides. The resolution chain is
@@ -158,6 +183,13 @@ impl Config {
                 .unwrap_or_default(),
         };
 
+        let model_aliases = ModelAliases {
+            map: file
+                .and_then(|f| f.model_aliases.as_ref())
+                .map(|a| a.map.clone())
+                .unwrap_or_default(),
+        };
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -166,6 +198,7 @@ impl Config {
             request_timeout: Duration::from_secs(request_timeout_secs),
             reasoning_effort,
             reasoning,
+            model_aliases,
         })
     }
 
@@ -185,6 +218,21 @@ impl Config {
             return Some(v.clone());
         }
         Some(DEFAULT_REASONING_EFFORT.to_owned())
+    }
+
+    /// Resolve the inbound `model` to the upstream model name. If no
+    /// alias is configured, the inbound name is returned unchanged.
+    /// The caller should use the *returned* name for both the
+    /// upstream request's `model` field AND for the
+    /// `reasoning_for_model` lookup, so an aliased request picks up
+    /// the right reasoning entry too.
+    #[must_use]
+    pub fn upstream_model_for(&self, model: &str) -> String {
+        self.model_aliases
+            .map
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_owned())
     }
 }
 
@@ -240,6 +288,8 @@ pub(crate) struct TomlConfig {
     /// `deny_unknown_fields` rejects any keys we haven't declared
     /// here; the table itself is optional.
     reasoning: Option<TomlReasoningConfig>,
+    /// Inbound → upstream model name aliases. See [`ModelAliases`].
+    model_aliases: Option<TomlModelAliases>,
 }
 
 /// TOML shape of `[reasoning]`. `default` is the fallback effort for
@@ -250,6 +300,14 @@ pub(crate) struct TomlConfig {
 pub(crate) struct TomlReasoningConfig {
     default: Option<String>,
     models: BTreeMap<String, String>,
+}
+
+/// TOML shape of `[model_aliases]`. `map` is a flat string→string map:
+/// inbound model name → upstream model name.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlModelAliases {
+    map: BTreeMap<String, String>,
 }
 
 impl TomlConfig {
@@ -389,6 +447,54 @@ mod tests {
             cfg.reasoning_for_model("any-model").as_deref(),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn model_alias_hit() {
+        // The common case: Claude Code sends `claude-sonnet-5` (its
+        // subagent model), the proxy rewrites it to `gpt-5.4-mini`
+        // for the gateway.
+        let file = TomlConfig {
+            model_aliases: Some(TomlModelAliases {
+                map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
+            }),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.upstream_model_for("claude-sonnet-5"), "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn model_alias_miss_passes_through() {
+        // No alias for this model → name goes out unchanged. This is
+        // the default behavior; aliases are opt-in.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(cfg.upstream_model_for("gpt-5.6-luna"), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn alias_and_reasoning_compose() {
+        // The user aliases `claude-sonnet-5` → `gpt-5.4-mini`, and
+        // also sets a per-model reasoning entry for `gpt-5.4-mini`.
+        // The proxy should look up reasoning by the *resolved*
+        // upstream name, not the inbound one — so a subagent request
+        // for `claude-sonnet-5` lands on `gpt-5.4-mini` with
+        // `high` reasoning, exactly as if the request had arrived
+        // with `model: gpt-5.4-mini` directly.
+        let file = TomlConfig {
+            model_aliases: Some(TomlModelAliases {
+                map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
+            }),
+            reasoning: Some(TomlReasoningConfig {
+                default: Some("none".into()),
+                models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
+            }),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        let resolved = cfg.upstream_model_for("claude-sonnet-5");
+        assert_eq!(resolved, "gpt-5.4-mini");
+        assert_eq!(cfg.reasoning_for_model(&resolved).as_deref(), Some("high"));
     }
 
     #[test]

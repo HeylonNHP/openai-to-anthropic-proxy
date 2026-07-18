@@ -51,3 +51,28 @@ request_timeout_secs = 600
 # [reasoning.models]
 # "gpt-5.4-mini" = "high"
 # "gpt-5.6-luna"  = "none"
+
+# ─── Model name aliases ─────────────────────────────────────────────────
+# Map inbound model names to upstream model names. Useful when the
+# client (e.g. Claude Code subagents) requests Anthropic model names
+# like `claude-sonnet-5` or `claude-haiku-4-5` that the gateway
+# doesn't recognize, and you want those requests routed to a real
+# upstream model like `gpt-5.4-mini`.
+#
+# Without this table, requests for an unknown model go to the
+# gateway with that name verbatim and 400 with "The requested model
+# is not supported for the selected provider."
+#
+# Lookup is exact-string match; no globs or fallbacks. If a model
+# isn't in the map, the proxy passes the name through unchanged,
+# so deployments that don't need aliases need no config here.
+#
+# Note: when an alias fires, the proxy also uses the *resolved*
+# upstream name for the per-model reasoning_effort lookup. So
+# aliasing `claude-sonnet-5` → `gpt-5.4-mini` AND setting a
+# reasoning entry for `gpt-5.4-mini` means subagent requests get
+# the right effort too.
+#
+# [model_aliases.map]
+# "claude-sonnet-5"  = "gpt-5.4-mini"
+# "claude-haiku-4-5" = "gpt-4o-mini"
