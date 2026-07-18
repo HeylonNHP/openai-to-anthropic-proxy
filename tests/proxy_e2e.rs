@@ -17,7 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use openai_to_anthropic_proxy::config::{Config, ReasoningConfig};
+use openai_to_anthropic_proxy::config::{Config, ModelAliases, ReasoningConfig};
 use reqwest::Body as ReqBody;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -87,6 +87,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
+        model_aliases: Default::default(),
     })
 }
 
@@ -293,6 +294,7 @@ async fn per_model_reasoning_effort_lookup() {
             default: Some("medium".into()),
             models: std::iter::once(("gpt-5.6-luna".into(), "none".into())).collect(),
         },
+        model_aliases: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -325,4 +327,59 @@ async fn per_model_reasoning_effort_lookup() {
     let second = upstream.received.lock().await.clone().unwrap();
     let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
     assert_eq!(second["reasoning_effort"], "medium");
+}
+
+/// When the proxy's config has a `model_aliases` map, an inbound
+/// `model` field that matches an alias key is rewritten to the alias
+/// value before being sent to the upstream. This is the fix for
+/// `claude-sonnet-5` (sent by Claude Code subagents) hitting an
+/// airia gateway that only knows OpenAI-family model names.
+#[tokio::test]
+async fn model_alias_rewrites_inbound_model() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "chatcmpl-ok",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "any",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/chat/completions".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: std::iter::once(("claude-sonnet-5".into(), "gpt-5.4-mini".into())).collect(),
+        },
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let body = upstream.received.lock().await.clone().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // The upstream saw the alias-resolved name, not the inbound one.
+    assert_eq!(body["model"], "gpt-5.4-mini");
 }
