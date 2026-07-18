@@ -1,20 +1,27 @@
-# Example proxy configuration. Copy to `proxy.toml` and edit.
-# Environment variables take precedence over any value set here.
+# Example proxy config. Copy to `proxy.toml` and fill in real values.
+# Anything left unset falls back to env vars, then built-in defaults
+# (see README.md for the full resolution order).
+#
+# Env vars always win over this file, so you can keep secrets in the
+# environment and use this file for non-secret defaults:
+#
+#     UPSTREAM_API_KEY=... cargo run
+#
+# What you can set here:
+#   listen_addr          — e.g. "0.0.0.0:8085" (default)
+#   upstream_base_url    — required, e.g. "https://api.openai.com"
+#   upstream_api_key     — required, sent as Bearer to upstream
+#   upstream_path        — default "/v1/chat/completions"
+#   request_timeout_secs — default 600 (10 min)
 
-# Address the proxy listens on.
-listen_addr = "0.0.0.0:8085"
-
-# OpenAI-compatible upstream. Required.
-upstream_base_url = "https://api.openai.com"
-
-# Bearer token for the upstream. Required.
-upstream_api_key = "sk-..."
-
-# Path the proxy appends to `upstream_base_url`. Defaults to
-# `/v1/chat/completions`. Change this if your upstream exposes the
-# endpoint at a different path.
-upstream_path = "/v1/chat/completions"
-
-# Per-request timeout in seconds. Defaults to 600 (10 minutes), which
-# matches Anthropic's own `--max-time 600` for `/v1/messages`.
+# ─── Example: NVIDIA OpenAI-compatible ──────────────────────────────────
+upstream_base_url = "https://integrate.api.nvidia.com/"
+upstream_api_key  = "your-nvapi-key-here"
 request_timeout_secs = 600
+
+# ─── Example: Airia gateway (openai-compatible) ─────────────────────────
+# Uncomment and swap into the active slot to test against Airia instead.
+# The gateway picks the model server-side; do NOT set one here.
+# upstream_base_url = "https://prodaus.gateway.airia.ai"
+# upstream_api_key  = "your-airia-key-here"
+# request_timeout_secs = 600
