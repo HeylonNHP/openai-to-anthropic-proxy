@@ -1,10 +1,11 @@
 //! End-to-end test: drive the proxy with a real Anthropic-shaped
-//! request, point it at a fake in-process OpenAI-shaped upstream, and
-//! verify the proxy translates the request correctly and the response
-//! comes back in Anthropic shape.
+//! request, point it at a fake in-process OpenAI Responses-shaped
+//! upstream, and verify the proxy translates the request correctly and
+//! the response comes back in Anthropic shape.
 //!
 //! The streaming path is exercised the same way, with the fake
-//! upstream returning a server-sent event stream.
+//! upstream returning a server-sent event stream in the Responses
+//! event format.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -118,7 +119,7 @@ fn build_fake_response(resp: FakeResponse) -> Response {
 async fn start_fake_upstream() -> (SocketAddr, FakeUpstream) {
     let state = FakeUpstream::default();
     let app = Router::new()
-        .route("/v1/chat/completions", post(handle_fake))
+        .route("/v1/responses", post(handle_fake))
         .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -133,7 +134,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
@@ -160,21 +161,21 @@ async fn non_streaming_round_trip() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     *upstream.canned.lock().await = Some(
         r#"{
-            "id": "chatcmpl-abc",
-            "object": "chat.completion",
-            "created": 1,
+            "id": "resp_abc",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
             "model": "gpt-4o",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "Hello from upstream!"
-                },
-                "finish_reason": "stop"
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Hello from upstream!", "annotations": []}
+                ]
             }],
             "usage": {
-                "prompt_tokens": 5,
-                "completion_tokens": 3,
+                "input_tokens": 5,
+                "output_tokens": 3,
                 "total_tokens": 8
             }
         }"#
@@ -209,24 +210,35 @@ async fn non_streaming_round_trip() {
     assert_eq!(body["usage"]["input_tokens"], 5);
     assert_eq!(body["usage"]["output_tokens"], 3);
 
-    // Verify the upstream got a translated OpenAI request.
+    // Verify the upstream got a translated Responses request.
     let received = upstream.received.lock().await.clone().unwrap();
     let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
     assert_eq!(received["model"], "gpt-4o");
     assert_eq!(received["stream"], false);
-    assert_eq!(received["messages"][0]["role"], "user");
+    // input is a list of items; the first one is the user message.
+    let items = received["input"].as_array().expect("input is array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "message");
+    assert_eq!(items[0]["role"], "user");
 }
 
 #[tokio::test]
 async fn streaming_round_trip() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
+    // Responses API SSE event format: `event: <type>\ndata: <json>\n\n`.
+    // The terminal event is `response.completed` (not `[DONE]`).
     let sse = [
-        r#"data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}"#,
-        r#"data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
-        r#"data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}"#,
-        r#"data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
-        r#"data: [DONE]"#,
-    ].join("\n\n");
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_x","status":"in_progress","role":"assistant","content":[]}}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_x","output_index":0,"content_index":0,"delta":"Hi"}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_x","output_index":0,"content_index":0,"delta":" there"}"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+    ].join("\n\n") + "\n\n";
     *upstream.canned_stream.lock().await = Some(sse);
 
     let config = make_proxy_config(upstream_addr);
@@ -275,12 +287,14 @@ async fn streaming_round_trip() {
 }
 
 #[tokio::test]
-async fn upstream_error_returns_502_with_message() {
+async fn upstream_error_returns_error_envelope() {
+    // The Responses API uses a flat error shape (no `error: { ... }`
+    // wrapper). The proxy must still surface a usable error body to
+    // the client.
     let (upstream_addr, upstream) = start_fake_upstream().await;
     *upstream.canned_error.lock().await = Some((
         StatusCode::UNAUTHORIZED,
-        r#"{"error":{"message":"bad key","type":"authentication_error","code":"invalid_api_key"}}"#
-            .into(),
+        r#"{"message":"bad key","type":"authentication_error","code":"invalid_api_key"}"#.into(),
     ));
 
     let config = make_proxy_config(upstream_addr);
@@ -312,23 +326,24 @@ async fn upstream_error_returns_502_with_message() {
 /// When the proxy's config has a per-model `reasoning_effort` map,
 /// the request's `model` field should drive the lookup. Two requests
 /// for two different models should produce two different
-/// `reasoning_effort` values in the upstream body — proving the
+/// `reasoning.effort` values in the upstream body — proving the
 /// per-model selection happens at request time, not at proxy start.
 #[tokio::test]
 async fn per_model_reasoning_effort_lookup() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     *upstream.canned.lock().await = Some(
         r#"{
-            "id": "chatcmpl-ok",
-            "object": "chat.completion",
-            "created": 1,
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
             "model": "any",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
-                "finish_reason": "stop"
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
             }],
-            "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
         }"#
         .into(),
     );
@@ -337,7 +352,7 @@ async fn per_model_reasoning_effort_lookup() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: None,
         reasoning: ReasoningConfig {
@@ -362,7 +377,7 @@ async fn per_model_reasoning_effort_lookup() {
         .unwrap();
     let first = upstream.received.lock().await.clone().unwrap();
     let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
-    assert_eq!(first["reasoning_effort"], "none");
+    assert_eq!(first["reasoning"]["effort"], "none");
 
     // Model not in the map → falls back to default "medium".
     let _ = client
@@ -376,7 +391,7 @@ async fn per_model_reasoning_effort_lookup() {
         .unwrap();
     let second = upstream.received.lock().await.clone().unwrap();
     let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
-    assert_eq!(second["reasoning_effort"], "medium");
+    assert_eq!(second["reasoning"]["effort"], "medium");
 }
 
 /// When the proxy's config has a `model_aliases` map, an inbound
@@ -389,16 +404,17 @@ async fn model_alias_rewrites_inbound_model() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     *upstream.canned.lock().await = Some(
         r#"{
-            "id": "chatcmpl-ok",
-            "object": "chat.completion",
-            "created": 1,
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
             "model": "any",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
-                "finish_reason": "stop"
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
             }],
-            "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
         }"#
         .into(),
     );
@@ -407,7 +423,7 @@ async fn model_alias_rewrites_inbound_model() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
@@ -445,29 +461,30 @@ async fn model_alias_rewrites_inbound_model() {
 async fn model_not_supported_falls_back_to_default() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     // First call: airia-style "model not supported" rejection.
-    // Second call: a normal chat-completion response, as if the
+    // Second call: a normal Responses response, as if the
     // fallback model were valid.
     *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
         FakeResponse {
             status: StatusCode::BAD_REQUEST,
             body: Some(
-                r#"{"error":{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}}"#.into(),
+                r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
             ),
         },
         FakeResponse {
             status: StatusCode::OK,
             body: Some(
                 r#"{
-                    "id": "chatcmpl-ok",
-                    "object": "chat.completion",
-                    "created": 1,
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
                     "model": "gpt-4o-mini",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "fallback ok"},
-                        "finish_reason": "stop"
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback ok", "annotations": []}]
                     }],
-                    "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
                 }"#
                 .into(),
             ),
@@ -478,7 +495,7 @@ async fn model_not_supported_falls_back_to_default() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
@@ -524,7 +541,7 @@ async fn model_not_supported_without_default_passes_error_through() {
     *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
         status: StatusCode::BAD_REQUEST,
         body: Some(
-            r#"{"error":{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error"}}"#.into(),
+            r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error"}"#.into(),
         ),
     }]);
 
@@ -532,7 +549,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
@@ -580,7 +597,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
     *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
         status: StatusCode::BAD_REQUEST,
         body: Some(
-            r#"{"error":{"message":"max_tokens is too high for this endpoint","type":"invalid_request_error"}}"#.into(),
+            r#"{"message":"max_output_tokens is too high for this endpoint","type":"invalid_request_error"}"#.into(),
         ),
     }]);
 
@@ -588,7 +605,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
-        upstream_path: "/v1/chat/completions".into(),
+        upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
@@ -614,4 +631,231 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let sent_bodies = upstream.received_all.lock().await.clone();
     assert_eq!(sent_bodies.len(), 1, "no retry should have been attempted");
+}
+
+/// Tools in the outbound Responses request must include
+/// `strict: true` and `additionalProperties: false` on the parameters
+/// schema. Without these, the airia gateway returns 400
+/// `invalid_function_parameters`. This is the headline behavior
+/// change of the migration: the proxy bridges Claude Code's
+/// lenient tools into the strict Responses shape.
+#[tokio::test]
+async fn tools_get_strict_and_additional_properties_false() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 4,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}}
+                    }
+                }]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let body = upstream.received.lock().await.clone().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tools = body["tools"].as_array().expect("tools is array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "function");
+    assert!(tools[0]["strict"].as_bool().unwrap());
+    assert_eq!(
+        tools[0]["parameters"]["additionalProperties"],
+        serde_json::Value::Bool(false)
+    );
+    // Properties object is preserved (not overwritten) when already present.
+    assert_eq!(
+        tools[0]["parameters"]["properties"],
+        serde_json::json!({"location": {"type": "string"}})
+    );
+}
+
+/// Streaming requests are also eligible for `default_model` fallback.
+/// The retry happens before any SSE bytes are written to the client,
+/// so the client only sees the successful fallback stream.
+#[tokio::test]
+async fn streaming_model_not_supported_falls_back_to_default() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+
+    let fallback_sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_fb","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o-mini","output":[]}}"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_fb","status":"in_progress","role":"assistant","content":[]}}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_fb","output_index":0,"content_index":0,"delta":"fallback"}"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fb","object":"response","created_at":0,"status":"completed","model":"gpt-4o-mini","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+    ]
+    .join("\n\n")
+        + "\n\n";
+
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(fallback_sse),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"stream":true,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+    let events: Vec<&str> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("event: ")))
+        .collect();
+    assert!(
+        kinds.contains(&"content_block_delta"),
+        "expected fallback stream to contain a text delta, got kinds={kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"message_stop"),
+        "expected fallback stream to close cleanly, got kinds={kinds:?}"
+    );
+
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2, "expected exactly one retry");
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    assert_eq!(first["model"], "claude-sonnet-5");
+    assert_eq!(second["model"], "gpt-4o-mini");
+}
+
+/// When falling back to `default_model`, the proxy must recompute the
+/// `reasoning.effort` value for the *fallback* model, not reuse the
+/// value from the original model. This matters when the config has
+/// per-model reasoning entries.
+#[tokio::test]
+async fn fallback_recomputes_reasoning_for_default_model() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"model not supported","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o-mini",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback ok", "annotations": []}]
+                    }],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: None,
+        reasoning: ReasoningConfig {
+            default: Some("low".into()),
+            models: std::iter::once(("gpt-4o-mini".into(), "none".into())).collect(),
+        },
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    // Original model not in the reasoning map → falls back to the global default "low".
+    assert_eq!(first["reasoning"]["effort"], "low");
+    // Fallback model is in the map → gets its own per-model entry "none".
+    assert_eq!(second["reasoning"]["effort"], "none");
 }
