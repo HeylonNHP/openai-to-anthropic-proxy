@@ -85,6 +85,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/chat/completions".into(),
         request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
     })
 }
 

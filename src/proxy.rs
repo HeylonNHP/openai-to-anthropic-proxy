@@ -70,7 +70,7 @@ async fn handle_messages(
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
-    let outbound = translate::anthropic_to_openai(&req)
+    let outbound = translate::anthropic_to_openai(&req, state.config.reasoning_effort.clone())
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
 
     // Serialize once, log a short summary, and stash the full body for
