@@ -45,7 +45,14 @@ use serde_json::Value;
 /// - `tools[]` → `tools[]` with `parameters` lifted from `input_schema`.
 /// - `tool_choice`: `Auto`→`"auto"`, `Any`→`"required"`, `Tool{name}`→structured,
 ///   `None{}`→`"none"`.
-/// - `temperature`, `top_p`, `max_tokens` (→ `max_completion_tokens`), `stop_sequences`.
+/// - `temperature`, `top_p`, `max_tokens` (→ `max_completion_tokens`).
+/// - `stop_sequences` is **dropped** with a warning. Anthropic's
+///   `stop_sequences` maps 1:1 to OpenAI's `stop`, but reasoning models
+///   (gpt-5 / gpt-5-mini / o-series) reject the field outright with
+///   `400 Unsupported parameter: 'stop'`. Claude Code itself does not
+///   set `stop_sequences`, so dropping it is safe in practice; if a
+///   future client does set it, the proxy logs a warning so the
+///   configuration loss is visible.
 /// - `stream` is preserved; when true, `stream_options.include_usage` is set
 ///   so the upstream sends a terminal usage chunk.
 /// - `metadata.user_id` → `user` field.
@@ -82,6 +89,18 @@ pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionR
 
     let user = req.metadata.as_ref().and_then(|m| m.user_id.clone());
 
+    // Logged-and-dropped configuration loss: reasoning models (gpt-5 / o-series)
+    // reject OpenAI's `stop` parameter with 400, so we don't forward it.
+    // If a client does set stop_sequences, this warn makes the discard visible.
+    if let Some(stop) = req.stop_sequences.as_ref()
+        && !stop.is_empty()
+    {
+        tracing::warn!(
+            stop_sequences = ?stop,
+            "dropping stop_sequences; upstream model does not support the stop parameter",
+        );
+    }
+
     let stream_options = if stream {
         Some(StreamOptions {
             include_usage: true,
@@ -96,7 +115,8 @@ pub fn anthropic_to_openai(req: &CreateMessageRequest) -> Result<ChatCompletionR
         temperature: req.temperature,
         top_p: req.top_p,
         max_completion_tokens: Some(req.max_tokens),
-        stop: req.stop_sequences.clone(),
+        // stop deliberately omitted — see drop rationale above.
+        stop: None,
         tools,
         tool_choice,
         stream,
@@ -611,6 +631,22 @@ mod tests {
         });
         let out = anthropic_to_openai(&req).unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn stop_sequences_are_dropped() {
+        // Reasoning models (gpt-5, o-series) reject OpenAI's `stop`
+        // parameter with 400. The proxy drops stop_sequences
+        // unconditionally; if a client ever sets it, the data is lost
+        // (and a warn-level log records that loss).
+        let mut req = fixture_request();
+        req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
+        let out = anthropic_to_openai(&req).unwrap();
+        assert!(
+            out.stop.is_none(),
+            "expected stop to be dropped, got {:?}",
+            out.stop
+        );
     }
 
     #[test]
