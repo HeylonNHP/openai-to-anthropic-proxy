@@ -69,9 +69,15 @@ pub struct Config {
 /// Resolution is exact-string match. No glob, no regex, no fallback
 /// chain — if a model isn't in the map, the proxy passes the name
 /// through unchanged.
+///
+/// `default_model` is a safety net: if the upstream rejects an
+/// aliased or passed-through model with a "model not supported"
+/// error, the proxy retries the request once with this model. Every
+/// fallback is logged at WARN. `None` disables the safety net.
 #[derive(Debug, Clone, Default)]
 pub struct ModelAliases {
     pub map: BTreeMap<String, String>,
+    pub default_model: Option<String>,
 }
 
 /// Per-model `reasoning_effort` overrides. The resolution chain is
@@ -188,6 +194,9 @@ impl Config {
                 .and_then(|f| f.model_aliases.as_ref())
                 .map(|a| a.map.clone())
                 .unwrap_or_default(),
+            default_model: file
+                .and_then(|f| f.model_aliases.as_ref())
+                .and_then(|a| a.default_model.clone()),
         };
 
         Ok(Self {
@@ -233,6 +242,15 @@ impl Config {
             .get(model)
             .cloned()
             .unwrap_or_else(|| model.to_owned())
+    }
+
+    /// Fallback model to retry with when the upstream rejects a
+    /// request with a "model not supported" / "model not found" error.
+    /// `None` means the proxy surfaces the rejection to the client
+    /// without retrying.
+    #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.model_aliases.default_model.as_deref()
     }
 }
 
@@ -303,11 +321,16 @@ pub(crate) struct TomlReasoningConfig {
 }
 
 /// TOML shape of `[model_aliases]`. `map` is a flat string→string map:
-/// inbound model name → upstream model name.
+/// inbound model name → upstream model name. `default_model` is the
+/// safety-net fallback used when the upstream rejects a model.
+///
+/// `#[serde(default)]` lets either field be omitted from the TOML —
+/// a `[model_aliases]` block with only `default_model` is valid.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct TomlModelAliases {
     map: BTreeMap<String, String>,
+    default_model: Option<String>,
 }
 
 impl TomlConfig {
@@ -457,6 +480,7 @@ mod tests {
         let file = TomlConfig {
             model_aliases: Some(TomlModelAliases {
                 map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
+                default_model: None,
             }),
             ..TomlConfig::default()
         };
@@ -484,6 +508,7 @@ mod tests {
         let file = TomlConfig {
             model_aliases: Some(TomlModelAliases {
                 map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
+                default_model: None,
             }),
             reasoning: Some(TomlReasoningConfig {
                 default: Some("none".into()),
@@ -495,6 +520,50 @@ mod tests {
         let resolved = cfg.upstream_model_for("claude-sonnet-5");
         assert_eq!(resolved, "gpt-5.4-mini");
         assert_eq!(cfg.reasoning_for_model(&resolved).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn default_model_field_round_trips() {
+        // The TOML [model_aliases.default_model] value should land on
+        // Config::model_aliases.default_model verbatim. This is the
+        // round-trip half of the contract: the field gets read.
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            [model_aliases]
+            default_model = "gpt-4o-mini"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(
+            cfg.model_aliases.default_model.as_deref(),
+            Some("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn default_model_method_returns_value() {
+        // The Config::default_model() accessor must reflect whatever
+        // landed on model_aliases.default_model. The proxy call site
+        // uses this accessor; if it returns None when the field is
+        // set, the fallback path will silently never run.
+        let file = TomlConfig {
+            model_aliases: Some(TomlModelAliases {
+                map: BTreeMap::new(),
+                default_model: Some("claude-haiku-4-5".into()),
+            }),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.default_model(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn default_model_unset_returns_none() {
+        // No [model_aliases] table at all → accessor returns None,
+        // the proxy surfaces upstream errors unchanged.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(cfg.default_model(), None);
     }
 
     #[test]

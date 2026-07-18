@@ -6,6 +6,7 @@
 //! The streaming path is exercised the same way, with the fake
 //! upstream returning a server-sent event stream.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,12 +32,44 @@ struct FakeUpstream {
     canned_stream: Arc<Mutex<Option<String>>>,
     /// Canned error response (status + body) to return.
     canned_error: Arc<Mutex<Option<(StatusCode, String)>>>,
+    /// Per-attempt canned responses, served in order. When the vec is
+    /// exhausted the handler falls back to the legacy `canned` /
+    /// `canned_error` fields. Lets tests drive multi-attempt
+    /// scenarios (e.g. proxy's default_model fallback) where the
+    /// first send must fail and the second must succeed.
+    canned_per_attempt: Arc<Mutex<VecDeque<FakeResponse>>>,
     /// The most recent JSON body the proxy sent to the upstream.
     received: Arc<Mutex<Option<Bytes>>>,
+    /// Every JSON body the proxy sent to the upstream, in order.
+    /// Used to assert the proxy actually retried (vs. silently
+    /// succeeding on the first attempt).
+    received_all: Arc<Mutex<Vec<Bytes>>>,
+    /// Number of times the handler has been hit. Mirrors the
+    /// length of `received_all` but exposed for quick assertions.
+    request_count: Arc<Mutex<usize>>,
+}
+
+/// A scripted response the fake upstream returns on a given attempt.
+struct FakeResponse {
+    status: StatusCode,
+    body: Option<String>,
 }
 
 async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
+    {
+        let mut all = s.received_all.lock().await;
+        all.push(body.clone());
+        *s.request_count.lock().await = all.len();
+    }
     *s.received.lock().await = Some(body);
+    // Per-attempt responses take priority. Once exhausted, fall
+    // through to the legacy single-shot fields. The MutexGuard is
+    // bound to its own `let` so it doesn't live across the
+    // `if let` (clippy::significant_drop_in_scrutinee).
+    let next = s.canned_per_attempt.lock().await.pop_front();
+    if let Some(resp) = next {
+        return build_fake_response(resp);
+    }
     let err = s.canned_error.lock().await.clone();
     if let Some((status, body)) = err {
         return (
@@ -63,6 +96,23 @@ async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
             .unwrap();
     }
     (StatusCode::INTERNAL_SERVER_ERROR, "no canned response").into_response()
+}
+
+fn build_fake_response(resp: FakeResponse) -> Response {
+    match resp.body {
+        Some(body) => (
+            resp.status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        None => (
+            resp.status,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            String::new(),
+        )
+            .into_response(),
+    }
 }
 
 async fn start_fake_upstream() -> (SocketAddr, FakeUpstream) {
@@ -363,6 +413,7 @@ async fn model_alias_rewrites_inbound_model() {
         reasoning: Default::default(),
         model_aliases: ModelAliases {
             map: std::iter::once(("claude-sonnet-5".into(), "gpt-5.4-mini".into())).collect(),
+            default_model: None,
         },
     });
     let proxy_addr = start_proxy(config).await;
@@ -382,4 +433,185 @@ async fn model_alias_rewrites_inbound_model() {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     // The upstream saw the alias-resolved name, not the inbound one.
     assert_eq!(body["model"], "gpt-5.4-mini");
+}
+
+/// When the upstream rejects a model with a "not supported" error
+/// AND a `default_model` is configured, the proxy must retry the
+/// request once with the fallback model and surface the second
+/// response. This is the safety net that keeps a workflow moving
+/// when Claude Code subagents request a model the gateway doesn't
+/// recognize.
+#[tokio::test]
+async fn model_not_supported_falls_back_to_default() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    // First call: airia-style "model not supported" rejection.
+    // Second call: a normal chat-completion response, as if the
+    // fallback model were valid.
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"error":{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "chatcmpl-ok",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4o-mini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "fallback ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/chat/completions".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // Client sees the fallback response, not the upstream rejection.
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["content"][0]["text"], "fallback ok");
+
+    // Upstream saw exactly two requests — the original and the retry.
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2, "expected exactly one retry");
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    assert_eq!(first["model"], "claude-sonnet-5");
+    assert_eq!(second["model"], "gpt-4o-mini");
+}
+
+/// Without a `default_model` configured, an upstream "model not
+/// supported" rejection must pass through to the client unchanged.
+/// The fallback path is opt-in: silently retrying without
+/// configuration would mask the operator's misconfiguration.
+#[tokio::test]
+async fn model_not_supported_without_default_passes_error_through() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+        status: StatusCode::BAD_REQUEST,
+        body: Some(
+            r#"{"error":{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error"}}"#.into(),
+        ),
+    }]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/chat/completions".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        // Note: no default_model — fallback disabled.
+        model_aliases: Default::default(),
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // The upstream rejection passes through to the client. We
+    // don't fabricate a 502 here — the operator should see the
+    // actual upstream status and body.
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not supported for the selected provider"),
+        "expected upstream body, got {body}"
+    );
+
+    // Crucially: only one upstream call, no retry.
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 1);
+}
+
+/// If the upstream returns a 400 for *some other reason* (e.g. a
+/// bad parameter), the proxy must not silently fall back to a
+/// default model — that would mask the real error. The proxy only
+/// retries when the body specifically says the model is wrong.
+#[tokio::test]
+async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+        status: StatusCode::BAD_REQUEST,
+        body: Some(
+            r#"{"error":{"message":"max_tokens is too high for this endpoint","type":"invalid_request_error"}}"#.into(),
+        ),
+    }]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/chat/completions".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // 400 passes through; no retry.
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 1, "no retry should have been attempted");
 }
