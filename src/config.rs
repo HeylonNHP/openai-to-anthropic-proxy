@@ -8,6 +8,7 @@
 //! Environment variables always win over the TOML file. This lets a deployment
 //! override individual values without editing the config file.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -40,6 +41,33 @@ pub struct Config {
     /// Outbound `reasoning_effort` for chat-completions requests. See
     /// [`DEFAULT_REASONING_EFFORT`] for why this exists.
     pub reasoning_effort: Option<String>,
+    /// Per-model `reasoning_effort` overrides. Used by
+    /// [`Config::reasoning_for_model`] to pick the right value for each
+    /// inbound request. The map keys are model names exactly as they
+    /// appear in `CreateMessageRequest.model`. See
+    /// [`ReasoningConfig`] for resolution rules.
+    pub reasoning: ReasoningConfig,
+}
+
+/// Per-model `reasoning_effort` overrides. The resolution chain is
+/// (highest priority first):
+///   1. `models[req_model]` — exact match
+///   2. `default` — fallback for any model not in the map
+///   3. The legacy `Config::reasoning_effort` field
+///   4. The hardcoded `DEFAULT_REASONING_EFFORT` constant (`"none"`)
+///
+/// Valid values: `"none" | "low" | "medium" | "high"`. The proxy
+/// doesn't enforce the set — it forwards whatever the operator wrote —
+/// so a typo surfaces at the upstream as a 400 rather than at proxy
+/// startup. That's deliberate: it's friendlier than refusing to start.
+#[derive(Debug, Clone, Default)]
+pub struct ReasoningConfig {
+    /// Default `reasoning_effort` for models not in `models`.
+    pub default: Option<String>,
+    /// Per-model `reasoning_effort`. Keys are model names; values are
+    /// the effort string. Compared with the inbound `model` field
+    /// using exact string equality.
+    pub models: std::collections::BTreeMap<String, String>,
 }
 
 impl Config {
@@ -114,6 +142,22 @@ impl Config {
         )
         .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_owned()));
 
+        // Per-model reasoning table. `default` from the file wins over
+        // env REASONING_EFFORT only as a per-section default — the
+        // legacy field still feeds the per-request resolution chain
+        // (see `reasoning_for_model`), so the operator can use either
+        // surface area to set the global default.
+        let reasoning = ReasoningConfig {
+            default: file
+                .and_then(|f| f.reasoning.as_ref())
+                .and_then(|r| r.default.clone())
+                .or_else(|| env.reasoning_effort.clone()),
+            models: file
+                .and_then(|f| f.reasoning.as_ref())
+                .map(|r| r.models.clone())
+                .unwrap_or_default(),
+        };
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -121,7 +165,26 @@ impl Config {
             upstream_path,
             request_timeout: Duration::from_secs(request_timeout_secs),
             reasoning_effort,
+            reasoning,
         })
+    }
+
+    /// Pick the `reasoning_effort` to send to the upstream for a given
+    /// inbound `model`. See [`ReasoningConfig`] for the resolution
+    /// order. Always returns `Some(_)` because step 4 in the chain
+    /// (`DEFAULT_REASONING_EFFORT`) is a constant.
+    #[must_use]
+    pub fn reasoning_for_model(&self, model: &str) -> Option<String> {
+        if let Some(v) = self.reasoning.models.get(model) {
+            return Some(v.clone());
+        }
+        if let Some(v) = &self.reasoning.default {
+            return Some(v.clone());
+        }
+        if let Some(v) = &self.reasoning_effort {
+            return Some(v.clone());
+        }
+        Some(DEFAULT_REASONING_EFFORT.to_owned())
     }
 }
 
@@ -173,6 +236,20 @@ pub(crate) struct TomlConfig {
     upstream_path: Option<String>,
     request_timeout_secs: Option<u64>,
     reasoning_effort: Option<String>,
+    /// Per-model `reasoning_effort` overrides. Sub-table because
+    /// `deny_unknown_fields` rejects any keys we haven't declared
+    /// here; the table itself is optional.
+    reasoning: Option<TomlReasoningConfig>,
+}
+
+/// TOML shape of `[reasoning]`. `default` is the fallback effort for
+/// any model not in `models`. `models` is a flat string→string map:
+/// model name → effort (`"none" | "low" | "medium" | "high"`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlReasoningConfig {
+    default: Option<String>,
+    models: BTreeMap<String, String>,
 }
 
 impl TomlConfig {
@@ -246,6 +323,72 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env).unwrap();
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn per_model_reasoning_picks_exact_match() {
+        // [reasoning.models] entry wins over the default and the
+        // legacy reasoning_effort field.
+        let file = TomlConfig {
+            reasoning: Some(TomlReasoningConfig {
+                default: Some("medium".into()),
+                models: BTreeMap::from([
+                    ("gpt-5.4-mini".into(), "high".into()),
+                    ("gpt-5.6-luna".into(), "none".into()),
+                ]),
+            }),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(
+            cfg.reasoning_for_model("gpt-5.4-mini").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            cfg.reasoning_for_model("gpt-5.6-luna").as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn per_model_reasoning_falls_back_to_default() {
+        // Model not in the map falls back to reasoning.default.
+        let file = TomlConfig {
+            reasoning: Some(TomlReasoningConfig {
+                default: Some("low".into()),
+                models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
+            }),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.reasoning_for_model("gpt-4o").as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn per_model_reasoning_falls_back_to_hardcoded_default() {
+        // No [reasoning] table, no env, no legacy field — still gets
+        // "none" so airia doesn't 400. This is the regression guard
+        // for the bug that started this whole change.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(
+            cfg.reasoning_for_model("anything").as_deref(),
+            Some(DEFAULT_REASONING_EFFORT)
+        );
+    }
+
+    #[test]
+    fn per_model_reasoning_legacy_field_used_when_no_table() {
+        // Legacy `reasoning_effort` (file or env) still works as the
+        // global default when no [reasoning] table is present.
+        let file = TomlConfig {
+            reasoning_effort: Some("medium".into()),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(
+            cfg.reasoning_for_model("any-model").as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]

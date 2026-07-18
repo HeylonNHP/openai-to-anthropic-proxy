@@ -70,7 +70,13 @@ async fn handle_messages(
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
-    let outbound = translate::anthropic_to_openai(&req, state.config.reasoning_effort.clone())
+    // Per-model `reasoning_effort` lookup. The config may set a default
+    // and/or a per-model map; the per-model entry wins if present, then
+    // the default, then the legacy single field, then "none". The
+    // translator's existing `reasoning_effort: Option<String>`
+    // parameter stays unchanged.
+    let reasoning_effort = state.config.reasoning_for_model(&req.model);
+    let outbound = translate::anthropic_to_openai(&req, reasoning_effort)
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
 
     // Serialize once, log a short summary, and stash the full body for
@@ -86,6 +92,7 @@ async fn handle_messages(
         tools = outbound.tools.as_ref().map_or(0, Vec::len),
         messages = outbound.messages.len(),
         max_completion_tokens = ?outbound.max_completion_tokens,
+        reasoning_effort = ?outbound.reasoning_effort,
         "→ upstream"
     );
 
