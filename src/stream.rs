@@ -12,7 +12,9 @@
 //!   Anthropic content index.
 //! - `tool_blocks`: per OpenAI tool-call index, the state of the
 //!   in-flight `tool_use` Anthropic block (id, name, accumulated args,
-//!   Anthropic content index).
+//!   Anthropic content index). Stored in a `BTreeMap` so iteration in
+//!   `finalize` is in index order, giving deterministic
+//!   `content_block_stop` ordering for parallel tool calls.
 //! - `next_index`: next free Anthropic content index.
 //! - `stop_reason`: the final stop reason, set when a `finish_reason`
 //!   chunk arrives.
@@ -21,7 +23,7 @@
 //! The state is private; tests assert on the emitted events, not the
 //! internal state.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::anthropic::{
     ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload, StopReason,
@@ -37,7 +39,7 @@ pub struct StreamTranslator {
     model: String,
     started: bool,
     text_block: Option<TextBlockState>,
-    tool_blocks: HashMap<u32, ToolBlockState>,
+    tool_blocks: BTreeMap<u32, ToolBlockState>,
     next_index: u32,
     stop_reason: Option<StopReason>,
     usage: Option<AnthropicUsage>,
@@ -54,6 +56,15 @@ struct ToolBlockState {
     index: u32,
     id: String,
     name: String,
+    /// Arguments accumulated before `content_block_start` could be
+    /// emitted (because id/name were not yet both known). Flushed as
+    /// `input_json_delta` events right after the start fires.
+    pending_args: String,
+    /// True from `is_new` until id AND name are both non-empty and the
+    /// deferred `content_block_start` has been emitted. While true,
+    /// any incoming arguments are buffered in `pending_args` rather
+    /// than emitted.
+    pending_start: bool,
     arguments: String,
 }
 
@@ -68,7 +79,7 @@ impl StreamTranslator {
             model,
             started: false,
             text_block: None,
-            tool_blocks: HashMap::new(),
+            tool_blocks: BTreeMap::new(),
             next_index: 0,
             stop_reason: None,
             usage: None,
@@ -81,6 +92,15 @@ impl StreamTranslator {
     /// treated as no-ops, and a `finish_reason` chunk that arrives
     /// without a prior text/tool event is still handled correctly.
     pub fn feed_chunk(&mut self, chunk: &ChatCompletionChunk) -> Vec<StreamEvent> {
+        // Some upstreams (notably OpenAI with stream_options.include_usage)
+        // send a usage-only chunk *after* the finish_reason chunk. If
+        // we already finalized, we still need to capture that usage
+        // before dropping the chunk. Order matters: record usage first,
+        // then decide whether to keep processing.
+        if let Some(usage) = &chunk.usage {
+            self.usage = Some(map_usage(usage));
+        }
+
         if self.finished {
             return Vec::new();
         }
@@ -93,18 +113,12 @@ impl StreamTranslator {
             self.started = true;
         }
 
-        // 2. Update usage from terminal chunk (sent even after the final
-        //    finish_reason chunk when stream_options.include_usage is set).
-        if let Some(usage) = &chunk.usage {
-            self.usage = Some(map_usage(usage));
-        }
-
-        // 3. Process each choice.
+        // 2. Process each choice.
         for choice in &chunk.choices {
             self.process_choice(&mut events, choice);
         }
 
-        // 4. If any choice produced a finish_reason, finalize.
+        // 3. If any choice produced a finish_reason, finalize.
         let any_finish = chunk.choices.iter().any(|c| c.finish_reason.is_some());
         if any_finish {
             self.finalize(&mut events);
@@ -113,8 +127,9 @@ impl StreamTranslator {
         events
     }
 
-    /// Mark the stream as done. Returns the closing events: at minimum
-    /// `message_stop`, and any `content_block_stop` events for blocks
+    /// Mark the stream as done. Returns the closing events: a
+    /// `message_delta` carrying the final stop_reason + usage, then
+    /// `message_stop`, plus any `content_block_stop` events for blocks
     /// that the upstream forgot to close. Idempotent.
     pub fn finish(mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
@@ -127,6 +142,27 @@ impl StreamTranslator {
         if !self.finished {
             self.finalize(&mut events);
         }
+        // The `message_delta` is the place the client learns the
+        // final stop_reason and usage. It's built here, after any
+        // late-arriving usage chunk has been recorded, so a usage-only
+        // chunk that arrived after the finish_reason chunk is
+        // reflected correctly.
+        let usage = self.usage.clone().or(Some(AnthropicUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens_5m: 0,
+            cache_creation_input_tokens_1h: 0,
+            thinking_tokens: 0,
+        }));
+        events.push(StreamEvent::MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: self.stop_reason.take(),
+                stop_sequence: None,
+            },
+            usage,
+        });
         events.push(StreamEvent::MessageStop {});
         events
     }
@@ -198,6 +234,18 @@ impl StreamTranslator {
             return;
         }
         if self.text_block.is_none() {
+            // The Anthropic streaming spec says opening a new content
+            // block implicitly closes the previous one. If a tool_use
+            // block is still open (text → tool_use → text), close it
+            // first so the indices stay contiguous. BTreeMap iteration
+            // is in ascending index order, which matches the order the
+            // blocks were opened.
+            let open_tools: Vec<u32> = self.tool_blocks.values().map(|s| s.index).collect();
+            for idx in open_tools {
+                events.push(StreamEvent::ContentBlockStop { index: idx });
+            }
+            self.tool_blocks.clear();
+
             let index = self.allocate_index();
             self.text_block = Some(TextBlockState { index });
             events.push(StreamEvent::ContentBlockStart {
@@ -207,9 +255,15 @@ impl StreamTranslator {
                 },
             });
         }
-        let index = self.text_block.expect("just set").index;
+        // The block was just (re)opened on the line above, so it must
+        // be Some — use `let` rather than unwrap to keep the lints
+        // happy without a panic.
+        let Some(text_state) = self.text_block else {
+            tracing::error!("text block state unexpectedly None after open");
+            return;
+        };
         events.push(StreamEvent::ContentBlockDelta {
-            index,
+            index: text_state.index,
             delta: ContentDelta::TextDelta {
                 text: text.to_owned(),
             },
@@ -222,7 +276,8 @@ impl StreamTranslator {
         tc: &crate::openai::ChunkToolCall,
     ) {
         // Was this tool index already known? If not, we'll need to
-        // emit a content_block_start before any delta.
+        // emit a content_block_start before any delta — but we may
+        // not have id and name yet, so the start is deferred.
         let is_new = !self.tool_blocks.contains_key(&tc.index);
 
         if is_new {
@@ -245,15 +300,28 @@ impl StreamTranslator {
                         .as_ref()
                         .and_then(|f| f.name.clone())
                         .unwrap_or_default(),
+                    pending_args: String::new(),
+                    pending_start: true,
                     arguments: String::new(),
                 },
             );
         }
 
-        let state = self.tool_blocks.get_mut(&tc.index).expect("just inserted");
+        // From here on we need mutable access to the state. The
+        // invariant from the `is_new` branch above guarantees the
+        // entry exists; we still avoid `expect` so a future refactor
+        // can't panic the worker on a stray chunk.
+        let Some(state) = self.tool_blocks.get_mut(&tc.index) else {
+            tracing::error!(
+                index = tc.index,
+                "tool block state missing in process_tool_call_delta"
+            );
+            return;
+        };
 
-        // Update id/name if the upstream supplied them on a later delta
-        // (rare but allowed by the OpenAI spec).
+        // Update id/name if the upstream supplied them on this delta
+        // (they may arrive split across chunks — the OpenAI spec
+        // allows id on one chunk, name on a later one).
         if let Some(id) = &tc.id
             && !id.is_empty()
         {
@@ -265,30 +333,47 @@ impl StreamTranslator {
             state.name.clone_from(name);
         }
 
-        if is_new {
-            // First time we see this tool: emit content_block_start.
-            let id = state.id.clone();
-            let name = state.name.clone();
+        // If we were waiting for id/name before emitting start, and
+        // they're now both present, emit start and flush any buffered
+        // arguments as input_json_delta events.
+        if state.pending_start && !state.id.is_empty() && !state.name.is_empty() {
             events.push(StreamEvent::ContentBlockStart {
                 index: state.index,
                 content_block: ContentBlockKind::ToolUse {
-                    id,
-                    name,
+                    id: state.id.clone(),
+                    name: state.name.clone(),
                     input: Value::Object(Default::default()),
                 },
             });
+            if !state.pending_args.is_empty() {
+                let buffered = std::mem::take(&mut state.pending_args);
+                state.arguments.push_str(&buffered);
+                events.push(StreamEvent::ContentBlockDelta {
+                    index: state.index,
+                    delta: ContentDelta::InputJsonDelta {
+                        partial_json: buffered,
+                    },
+                });
+            }
+            state.pending_start = false;
         }
 
+        // Buffer or emit the arguments fragment, depending on whether
+        // the start has fired yet.
         if let Some(args) = tc.function.as_ref().and_then(|f| f.arguments.as_ref())
             && !args.is_empty()
         {
-            state.arguments.push_str(args);
-            events.push(StreamEvent::ContentBlockDelta {
-                index: state.index,
-                delta: ContentDelta::InputJsonDelta {
-                    partial_json: args.clone(),
-                },
-            });
+            if state.pending_start {
+                state.pending_args.push_str(args);
+            } else {
+                state.arguments.push_str(args);
+                events.push(StreamEvent::ContentBlockDelta {
+                    index: state.index,
+                    delta: ContentDelta::InputJsonDelta {
+                        partial_json: args.clone(),
+                    },
+                });
+            }
         }
     }
 
@@ -302,23 +387,9 @@ impl StreamTranslator {
         for idx in tool_indices {
             events.push(StreamEvent::ContentBlockStop { index: idx });
         }
-        // Emit message_delta with the final stop_reason + usage.
-        let usage = self.usage.clone().or(Some(AnthropicUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens_5m: 0,
-            cache_creation_input_tokens_1h: 0,
-            thinking_tokens: 0,
-        }));
-        events.push(StreamEvent::MessageDelta {
-            delta: MessageDeltaPayload {
-                stop_reason: self.stop_reason.take(),
-                stop_sequence: None,
-            },
-            usage,
-        });
+        // `message_delta` is emitted by `finish()` instead, so that any
+        // usage chunk that arrives AFTER `finalize` (a real OpenAI
+        // behaviour) is reflected in the final delta.
         self.finished = true;
     }
 
@@ -473,19 +544,25 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StreamEvent::ContentBlockDelta { .. }));
 
-        // Chunk 4: finish_reason + usage
+        // Chunk 4: finish_reason + usage. finalize() closes the
+        // content block; the message_delta is deferred to finish()
+        // so any late-arriving usage can update the totals.
         let events = t.feed_chunk(&chunk(
             "c4",
             vec![finish_choice("stop")],
             Some(usage_chunk()),
         ));
-        // expected: content_block_stop(0), message_delta
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             StreamEvent::ContentBlockStop { index: 0 }
         ));
-        match &events[1] {
+
+        // finish() emits message_delta (with the captured usage)
+        // followed by message_stop.
+        let closing = t.finish();
+        assert_eq!(closing.len(), 2);
+        match &closing[0] {
             StreamEvent::MessageDelta { delta, usage } => {
                 assert_eq!(delta.stop_reason, Some(StopReason::EndTurn));
                 let u = usage.as_ref().unwrap();
@@ -494,11 +571,7 @@ mod tests {
             }
             _ => panic!("expected message_delta"),
         }
-
-        // finish() emits message_stop
-        let closing = t.finish();
-        assert_eq!(closing.len(), 1);
-        assert!(matches!(closing[0], StreamEvent::MessageStop {}));
+        assert!(matches!(closing[1], StreamEvent::MessageStop {}));
     }
 
     #[test]
@@ -579,28 +652,28 @@ mod tests {
             _ => panic!("expected input_json_delta"),
         }
 
-        // Finish with tool_calls reason.
+        // Finish with tool_calls reason. feed_chunk returns just the
+        // content_block_stop; message_delta is deferred to finish().
         let events = t.feed_chunk(&chunk(
             "c5",
             vec![finish_choice("tool_calls")],
             Some(usage_chunk()),
         ));
-        // content_block_stop(0), message_delta
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
             StreamEvent::ContentBlockStop { index: 0 }
         ));
-        match &events[1] {
+
+        let closing = t.finish();
+        assert_eq!(closing.len(), 2);
+        match &closing[0] {
             StreamEvent::MessageDelta { delta, .. } => {
                 assert_eq!(delta.stop_reason, Some(StopReason::ToolUse));
             }
             _ => panic!("expected message_delta"),
         }
-
-        let closing = t.finish();
-        assert_eq!(closing.len(), 1);
-        assert!(matches!(closing[0], StreamEvent::MessageStop {}));
+        assert!(matches!(closing[1], StreamEvent::MessageStop {}));
     }
 
     #[test]
@@ -644,7 +717,9 @@ mod tests {
             Some(usage_chunk()),
         ));
         let closing = t.finish();
-        assert!(matches!(closing[0], StreamEvent::MessageStop {}));
+        // [MessageDelta, MessageStop]
+        assert!(matches!(closing[0], StreamEvent::MessageDelta { .. }));
+        assert!(matches!(closing[1], StreamEvent::MessageStop {}));
     }
 
     #[test]
@@ -683,13 +758,210 @@ mod tests {
             vec![finish_choice("length")],
             Some(usage_chunk()),
         ));
-        // content_block_stop(0) + message_delta
-        assert_eq!(events.len(), 2);
-        match &events[1] {
+        // finalize() returns just the content_block_stop; the
+        // message_delta is built in finish().
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+        let closing = t.finish();
+        match &closing[0] {
             StreamEvent::MessageDelta { delta, .. } => {
                 assert_eq!(delta.stop_reason, Some(StopReason::MaxTokens));
             }
             _ => panic!("expected message_delta"),
+        }
+    }
+
+    /// Bug 1 regression: the upstream sends a finish-reason chunk
+    /// *without* usage, then a separate usage-only chunk. The
+    /// translator must capture the late usage and surface it in the
+    /// final `message_delta` (which is emitted by the bridge on
+    /// `[DONE]`).
+    #[test]
+    fn usage_chunk_after_finish_reason_is_captured() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_chunk(&chunk("c1", vec![first_role_chunk()], None));
+        t.feed_chunk(&chunk("c2", vec![text_choice("hi")], None));
+
+        // Finish-reason chunk with NO usage. finalize() returns just
+        // the content_block_stop; message_delta is deferred to finish().
+        let events = t.feed_chunk(&chunk("c3", vec![finish_choice("stop")], None));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+
+        // Now a usage-only chunk arrives (no choices, no finish_reason).
+        // The translator must accept it and update its internal usage.
+        let late = OpenAiUsage {
+            prompt_tokens: 42,
+            completion_tokens: 7,
+            total_tokens: 49,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let events = t.feed_chunk(&chunk("c4", vec![], Some(late)));
+        // No new events (no choices, no finish) but the translator
+        // state must reflect the captured usage.
+        assert!(events.is_empty());
+
+        // finish() closes the stream with a fresh message_delta that
+        // carries the captured usage.
+        let closing = t.finish();
+        assert_eq!(closing.len(), 2);
+        assert!(matches!(closing[0], StreamEvent::MessageDelta { .. }));
+        match &closing[0] {
+            StreamEvent::MessageDelta { usage, .. } => {
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input_tokens, 42);
+                assert_eq!(u.output_tokens, 7);
+            }
+            _ => panic!("expected message_delta"),
+        }
+        assert!(matches!(closing[1], StreamEvent::MessageStop {}));
+    }
+
+    /// Bug 4 regression: when a tool call's id and name arrive in
+    /// separate chunks, the deferred `content_block_start` must
+    /// fire only once both are non-empty, and any arguments that
+    /// arrived before the start must be flushed as `input_json_delta`
+    /// right after.
+    #[test]
+    fn defer_tool_use_start_until_id_and_name_known() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_chunk(&chunk("c1", vec![first_role_chunk()], None));
+
+        // Chunk 2: id only, no name yet. With the deferred-start
+        // behaviour, this produces NO events. The arguments fragment
+        // is buffered in `pending_args`.
+        let tc1 = tool_choice(vec![ChunkToolCall {
+            index: 0,
+            id: Some("call_1".into()),
+            kind: Some("function".into()),
+            function: Some(ChunkFunction {
+                name: None,
+                arguments: Some("ignored-args".into()),
+            }),
+        }]);
+        let events = t.feed_chunk(&chunk("c2", vec![tc1], None));
+        assert!(events.is_empty(), "no events before name is known");
+
+        // Chunk 3: name only (id was already set). Start fires now,
+        // and the buffered args are flushed as an input_json_delta.
+        let tc2 = tool_choice(vec![ChunkToolCall {
+            index: 0,
+            id: None,
+            kind: None,
+            function: Some(ChunkFunction {
+                name: Some("get_weather".into()),
+                arguments: None,
+            }),
+        }]);
+        let events = t.feed_chunk(&chunk("c3", vec![tc2], None));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                assert_eq!(*index, 0);
+                match content_block {
+                    ContentBlockKind::ToolUse { id, name, .. } => {
+                        assert_eq!(id, "call_1");
+                        assert_eq!(name, "get_weather");
+                    }
+                    _ => panic!("expected tool_use"),
+                }
+            }
+            _ => panic!("expected content_block_start"),
+        }
+        match &events[1] {
+            StreamEvent::ContentBlockDelta { index, delta } => {
+                assert_eq!(*index, 0);
+                assert!(
+                    matches!(delta, ContentDelta::InputJsonDelta { partial_json } if partial_json == "ignored-args")
+                );
+            }
+            _ => panic!("expected buffered input_json_delta"),
+        }
+
+        // Chunk 4: more args after start. Emits another input_json_delta.
+        let tc3 = tool_choice(vec![ChunkToolCall {
+            index: 0,
+            id: None,
+            kind: None,
+            function: Some(ChunkFunction {
+                name: None,
+                arguments: Some(r#"{"loc":"SF"}"#.into()),
+            }),
+        }]);
+        let events = t.feed_chunk(&chunk("c4", vec![tc3], None));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ContentBlockDelta {
+                delta: ContentDelta::InputJsonDelta { .. },
+                ..
+            }
+        ));
+    }
+
+    /// Bug 9 regression: text → tool_use → text must close the tool
+    /// block before opening the new text block, otherwise the indices
+    /// skip and the client sees dangling blocks.
+    #[test]
+    fn text_after_tool_call_closes_tool_block_first() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_chunk(&chunk("c1", vec![first_role_chunk()], None));
+        t.feed_chunk(&chunk("c2", vec![text_choice("Let me check. ")], None));
+
+        // Open a tool use (single chunk: id + name + args).
+        let events = t.feed_chunk(&chunk(
+            "c3",
+            vec![tool_choice(vec![ChunkToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                kind: Some("function".into()),
+                function: Some(ChunkFunction {
+                    name: Some("get_weather".into()),
+                    arguments: Some("{}".into()),
+                }),
+            }])],
+            None,
+        ));
+        // text-stop, tool-start, tool-delta
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+        assert!(matches!(
+            events[1],
+            StreamEvent::ContentBlockStart { index: 1, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            StreamEvent::ContentBlockDelta { index: 1, .. }
+        ));
+
+        // Now a text delta follows the tool use. The tool block (index 1)
+        // must be closed before the new text block (index 2) opens.
+        let events = t.feed_chunk(&chunk("c4", vec![text_choice("Done.")], None));
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(events[0], StreamEvent::ContentBlockStop { index: 1 }),
+            "tool block must close before text reopens"
+        );
+        match &events[1] {
+            StreamEvent::ContentBlockStart { index, .. } => assert_eq!(*index, 2),
+            _ => panic!("expected content_block_start for new text block"),
+        }
+        match &events[2] {
+            StreamEvent::ContentBlockDelta { index, .. } => assert_eq!(*index, 2),
+            _ => panic!("expected content_block_delta"),
         }
     }
 }

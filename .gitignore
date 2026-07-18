@@ -6,9 +6,6 @@
 .env
 .env.local
 
-# Debug artifacts written by the proxy on every request
-/last-upstream-body.json
-
 # Editor
 .vscode/
 .idea/

@@ -82,7 +82,8 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
-/// Resolves when the user hits Ctrl-C, or (on Unix) sends SIGTERM.
+/// Resolves when the user hits Ctrl-C, sends SIGTERM (Unix), or sends
+/// a console close event (Windows).
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install ctrl-c handler");
@@ -96,11 +97,31 @@ async fn shutdown_signal() {
             .await;
     };
 
+    // Windows: `taskkill /pid <pid>` (without /f) sends a console close
+    // event to a console-attached process. Listening for it gives a
+    // graceful-shutdown path on Windows. Note this still doesn't help
+    // if the process was started detached (no console); the operator
+    // can use `taskkill /pid <pid>` (no /f) for a console-attached run
+    // or hit Ctrl-C in the terminal where it was launched. `taskkill /f`
+    // is uncatchable by design — there's no way to drain in-flight
+    // requests in that case.
+    #[cfg(windows)]
+    let close = async {
+        signal::windows::ctrl_close()
+            .expect("install ctrl_close handler")
+            .recv()
+            .await;
+    };
+
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+
+    #[cfg(not(windows))]
+    let close = std::future::pending::<()>();
 
     tokio::select! {
         _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
         _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+        _ = close => tracing::info!("received console close, shutting down"),
     }
 }
