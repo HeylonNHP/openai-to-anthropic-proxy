@@ -36,6 +36,17 @@ pub struct AppState {
     pub client: reqwest::Client,
 }
 
+// Per-request stash of the JSON body we sent upstream. Used only on
+// the error path: when the upstream rejects, we log the sent body
+// alongside the error so postmortem debugging is one log line away.
+//
+// Lives in a `task_local!` (not a file) so two concurrent requests
+// can't trample each other's bodies — `task_local!` storage is scoped
+// to the current task, and each axum request is its own task.
+tokio::task_local! {
+    static LAST_SENT_BODY: String;
+}
+
 /// Build the axum router.
 pub fn router(config: Arc<Config>, client: reqwest::Client) -> Router {
     let state = AppState { config, client };
@@ -63,10 +74,9 @@ async fn handle_messages(
         .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
 
     // Serialize once, log a short summary, and stash the full body for
-    // postmortem. The body is the single most useful artifact when
-    // debugging an upstream rejection, so we also write it to a fixed
-    // file (`target/last-upstream-body.json`) on every request — that
-    // way the agent can read it after the fact without scraping logs.
+    // the error path. The body is the single most useful artifact when
+    // debugging an upstream rejection, so we keep it in a task_local!
+    // scoped to this handler — see LAST_SENT_BODY above.
     let body_json = serde_json::to_string(&outbound)
         .map_err(|e| AppError::Internal(format!("serialize outbound body: {e}")))?;
 
@@ -78,10 +88,21 @@ async fn handle_messages(
         max_completion_tokens = ?outbound.max_completion_tokens,
         "→ upstream"
     );
-    if let Err(e) = std::fs::write("target/last-upstream-body.json", &body_json) {
-        tracing::warn!(error = %e, "failed to write target/last-upstream-body.json");
-    }
 
+    LAST_SENT_BODY
+        .scope(
+            body_json,
+            handle_messages_inner(state, headers, req, outbound),
+        )
+        .await
+}
+
+async fn handle_messages_inner(
+    state: AppState,
+    headers: HeaderMap,
+    req: CreateMessageRequest,
+    outbound: openai::ChatCompletionRequest,
+) -> Result<Response, AppError> {
     let url = format!(
         "{}{}",
         state.config.upstream_base_url.trim_end_matches('/'),
@@ -112,14 +133,11 @@ async fn handle_messages(
         // Log the full upstream error body at WARN. The file logger
         // captures this even when stderr is closed (e.g. when run
         // detached), so the agent can read it from
-        // `target/logs/proxy.log`.
-        tracing::warn!(%status, body = %body, "← upstream error");
-        // Also dump the *sent* request body alongside, since most
-        // upstream errors are "I rejected your body" and the answer
-        // is in what we sent, not what they returned.
-        if let Ok(sent) = std::fs::read_to_string("target/last-upstream-body.json") {
-            tracing::warn!(sent_body = %sent, "← upstream error: sent body");
-        }
+        // `target/logs/proxy.log`. The sent body is pulled from the
+        // task-local: it's the body *this* request sent, not
+        // whatever the previous request happened to leave on disk.
+        let sent = LAST_SENT_BODY.try_with(|b| b.clone()).unwrap_or_default();
+        tracing::warn!(%status, body = %body, sent_body = %sent, "← upstream error");
         return Err(map_upstream_error(status, &body));
     }
 
@@ -194,14 +212,27 @@ where
         // SAFETY: we never move the inner stream out of `self`.
         let this = self.get_mut();
         loop {
+            // The translator is `None` after a clean close ([DONE], an
+            // error event, or a truncated stream). Any further event
+            // from the inner stream is a stray — drop it and end the
+            // outer stream. This used to be three separate `expect()`
+            // calls, each of which could panic and bring down the
+            // worker.
+            if this.translator.is_none() {
+                match this.inner.poll_next_unpin(cx) {
+                    Poll::Ready(Some(_)) => continue,
+                    _ => return Poll::Ready(None),
+                }
+            }
             match this.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     if msg.data.trim() == "[DONE]" {
                         // Flush the translator and emit the closing events.
-                        let translator = this
-                            .translator
-                            .take()
-                            .expect("translator present until [DONE]");
+                        let Some(translator) = this.translator.take() else {
+                            // Already closed; should be unreachable thanks
+                            // to the guard above, but stay defensive.
+                            return Poll::Ready(None);
+                        };
                         let events = translator.finish();
                         if events.is_empty() {
                             return Poll::Ready(None);
@@ -218,10 +249,11 @@ where
                             continue;
                         }
                     };
-                    let translator = this
-                        .translator
-                        .as_mut()
-                        .expect("translator present until [DONE]");
+                    let Some(translator) = this.translator.as_mut() else {
+                        // Translator was already taken (e.g. the
+                        // upstream sent [DONE] then a real event).
+                        return Poll::Ready(None);
+                    };
                     let events = translator.feed_chunk(&chunk);
                     if events.is_empty() {
                         continue;
@@ -231,8 +263,7 @@ where
                 Poll::Ready(Some(Err(e))) => {
                     // Surface a clean close: emit message_stop and end.
                     tracing::warn!(error = %e, "upstream SSE error; closing stream");
-                    let translator = this.translator.take();
-                    if let Some(t) = translator {
+                    if let Some(t) = this.translator.take() {
                         let events = t.emit_error("api_error", format!("upstream SSE error: {e}"));
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
