@@ -73,6 +73,16 @@ request_timeout_secs = 600
 # reasoning entry for `gpt-5.4-mini` means subagent requests get
 # the right effort too.
 #
+# `default_model` is a safety net: if the upstream rejects an
+# aliased or passed-through model with a "not supported" / "not
+# found" error, the proxy retries the request once with this
+# model. Every fallback is logged at WARN. Leave unset (or omit
+# the key) to disable — the upstream rejection will then pass
+# through to the client unchanged.
+#
+# [model_aliases]
+# default_model = "gpt-4o-mini"
+#
 # [model_aliases.map]
 # "claude-sonnet-5"  = "gpt-5.4-mini"
 # "claude-haiku-4-5" = "gpt-4o-mini"

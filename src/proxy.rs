@@ -121,37 +121,71 @@ async fn handle_messages_inner(
         state.config.upstream_path
     );
 
-    let mut upstream_req = state
-        .client
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .bearer_auth(&state.config.upstream_api_key)
-        .json(&outbound);
+    // Send the first attempt. The non-streaming path may issue a
+    // single retry with the configured `default_model` if the
+    // upstream rejects the requested model; the streaming path
+    // can't safely retry once the response stream has started (see
+    // TODO at the end of this file).
+    let mut outbound = outbound;
+    let mut attempt = 1u8;
+    let upstream_resp = loop {
+        let mut upstream_req = state
+            .client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .bearer_auth(&state.config.upstream_api_key)
+            .json(&outbound);
 
-    // Forward a few select headers if the client set them (e.g. tracing
-    // identifiers). We don't blindly forward — that risks leaking
-    // credentials or breaking the upstream contract.
-    for key in ["x-request-id", "anthropic-version"] {
-        if let Some(v) = headers.get(key) {
-            upstream_req = upstream_req.header(key, v.clone());
+        // Forward a few select headers if the client set them (e.g. tracing
+        // identifiers). We don't blindly forward — that risks leaking
+        // credentials or breaking the upstream contract.
+        for key in ["x-request-id", "anthropic-version"] {
+            if let Some(v) = headers.get(key) {
+                upstream_req = upstream_req.header(key, v.clone());
+            }
         }
-    }
 
-    let upstream_resp = upstream_req.send().await?;
-    let status = upstream_resp.status();
-
-    if !status.is_success() {
-        let body = upstream_resp.text().await.unwrap_or_default();
-        // Log the full upstream error body at WARN. The file logger
-        // captures this even when stderr is closed (e.g. when run
-        // detached), so the agent can read it from
-        // `target/logs/proxy.log`. The sent body is pulled from the
-        // task-local: it's the body *this* request sent, not
-        // whatever the previous request happened to leave on disk.
+        let resp = upstream_req.send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            break resp;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        // The first call to the upstream for a given request, sent
+        // through this same task — pulled from the task-local, not
+        // from disk, so concurrent requests don't trample each other.
         let sent = LAST_SENT_BODY.try_with(|b| b.clone()).unwrap_or_default();
         tracing::warn!(%status, body = %body, sent_body = %sent, "← upstream error");
+
+        // Decide whether to retry with the default model. Only
+        // non-streaming requests get the retry — see TODO at end
+        // of file. Only one retry; the loop ends after attempt 2
+        // regardless.
+        let should_retry = !outbound.stream
+            && attempt == 1
+            && is_model_not_supported(status, &body)
+            && state
+                .config
+                .default_model()
+                .is_some_and(|fb| fb != outbound.model);
+
+        if should_retry {
+            let fallback = state.config.default_model().unwrap();
+            tracing::warn!(
+                inbound_model = %outbound.model,
+                fallback_model = %fallback,
+                "upstream rejected model; falling back to default_model"
+            );
+            outbound.model = fallback.to_owned();
+            attempt = 2;
+            continue;
+        }
+
         return Err(map_upstream_error(status, &body));
-    }
+    };
+
+    let status = upstream_resp.status();
+    debug_assert!(status.is_success(), "loop above only breaks on success");
 
     if outbound.stream {
         let content_type = upstream_resp
@@ -184,6 +218,27 @@ async fn handle_messages_inner(
         let anth = translate::openai_to_anthropic(&openai_resp);
         Ok(Json(anth).into_response())
     }
+}
+
+/// Cheap heuristic for "the upstream doesn't know this model".
+/// Matches on (a) status in `[400, 404]` and (b) body containing
+/// one of the well-known phrases from airia / OpenAI / Anthropic
+/// style error envelopes. Conservative by design: false negatives
+/// are fine (the operator sees the original error), false positives
+/// would mask unrelated 400s.
+fn is_model_not_supported(status: StatusCode, body: &str) -> bool {
+    if !matches!(status.as_u16(), 400 | 404) {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "model_not_found",
+        "model not found",
+        "model not supported",
+        "not supported for the selected provider",
+        "unknown model",
+    ];
+    let lower = body.to_ascii_lowercase();
+    PHRASES.iter().any(|p| lower.contains(p))
 }
 
 // ─── Streaming bridge ─────────────────────────────────────────────────────
@@ -344,6 +399,14 @@ fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
+// TODO(model-fallback-streaming): a streaming "model not supported"
+// rejection arriving after we've already shipped message_start to the
+// client is not retryable with the current design. Today the
+// streaming branch skips the fallback loop and surfaces the 4xx
+// directly. Revisit if it shows up in practice; the right fix is
+// probably "buffer the upstream body before opening our response,
+// inspect status, then start streaming the (possibly fallback) body".
+
 /// Synthesize an Anthropic-shaped message id for streaming responses.
 /// Uses nanoseconds since the UNIX epoch, hex-encoded, plus a sanitized
 /// model fragment. Not a UUID, but unique enough for our purposes.
@@ -397,5 +460,51 @@ mod tests {
     fn sanitize_model_keeps_safe_chars() {
         assert_eq!(sanitize_model("gpt-4o"), "gpt-4o");
         assert_eq!(sanitize_model("claude/opus 4.8"), "claude_opus_4_8");
+    }
+
+    #[test]
+    fn is_model_not_supported_matches_known_phrases() {
+        // Phrases the airia / OpenAI / Anthropic envelopes use when
+        // a model is unknown. The matcher is case-insensitive.
+        let cases = [
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"model_not_found","message":"..."}}"#,
+            ),
+            (StatusCode::NOT_FOUND, "Model not found"),
+            (
+                StatusCode::BAD_REQUEST,
+                "The requested model X is not supported for the selected provider.",
+            ),
+            (StatusCode::BAD_REQUEST, "Unknown model: foo"),
+            (StatusCode::BAD_REQUEST, "MODEL NOT SUPPORTED"),
+        ];
+        for (status, body) in cases {
+            assert!(
+                is_model_not_supported(status, body),
+                "expected true for status={status} body={body:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn is_model_not_supported_rejects_unrelated_errors() {
+        // 500s, 429s, and 400s about other things (rate limits,
+        // bad params, missing API key) must not be classified as
+        // model-not-supported — the fallback path would mask the
+        // real problem.
+        let cases = [
+            (StatusCode::INTERNAL_SERVER_ERROR, "upstream exploded"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded"),
+            (StatusCode::UNAUTHORIZED, "invalid api key"),
+            (StatusCode::BAD_REQUEST, "max_tokens is too high"),
+            (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
+        ];
+        for (status, body) in cases {
+            assert!(
+                !is_model_not_supported(status, body),
+                "expected false for status={status} body={body:?}",
+            );
+        }
     }
 }
