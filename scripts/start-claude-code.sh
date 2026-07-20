@@ -217,7 +217,6 @@ done
 env_args+=("ANTHROPIC_BASE_URL=$ProxyUrl")
 env_args+=("ANTHROPIC_API_KEY=any")
 
-cd "$repoRoot"
 env -i "${env_args[@]}" claude "${ClaudeArgs[@]}"
 exitCode=$?
 
