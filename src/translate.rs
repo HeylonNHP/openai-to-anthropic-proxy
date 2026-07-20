@@ -23,7 +23,7 @@ use crate::anthropic::{
     ToolResultContent, Usage as AnthropicUsage,
 };
 use crate::responses::{
-    ImageUrl, Input, InputContentPart, InputItem, ReasoningConfig, ResponsesRequest,
+    Input, InputContentPart, InputItem, ReasoningConfig, ResponsesRequest,
     ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice,
 };
 use anyhow::{Context, Result, anyhow};
@@ -591,19 +591,15 @@ fn convert_image_block(img: &ImageBlockParam) -> Option<InputContentPart> {
             let data = img.source.get("data").and_then(Value::as_str)?;
             let data_uri = format!("data:{};base64,{}", media_type, data);
             Some(InputContentPart::InputImage {
-                image_url: ImageUrl {
-                    url: data_uri,
-                    detail: None,
-                },
+                image_url: data_uri,
+                detail: None,
             })
         }
         "url" => {
             let url = img.source.get("url").and_then(Value::as_str)?;
             Some(InputContentPart::InputImage {
-                image_url: ImageUrl {
-                    url: url.to_string(),
-                    detail: None,
-                },
+                image_url: url.to_string(),
+                detail: None,
             })
         }
         other => {
@@ -991,12 +987,15 @@ mod tests {
                 }
                 // Second part: image
                 match &content[1] {
-                    InputContentPart::InputImage { image_url } => {
+                    InputContentPart::InputImage {
+                        image_url,
+                        detail,
+                    } => {
                         assert_eq!(
-                            image_url.url,
+                            image_url,
                             "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
                         );
-                        assert!(image_url.detail.is_none());
+                        assert!(detail.is_none());
                     }
                     _ => panic!("expected input_image as second content part"),
                 }
