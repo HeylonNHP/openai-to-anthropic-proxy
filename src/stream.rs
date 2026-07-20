@@ -64,6 +64,13 @@ pub struct StreamTranslator {
     next_index: u32,
     stop_reason: Option<StopReason>,
     usage: Option<AnthropicUsage>,
+    /// Input-side usage captured from the earliest `response.created` /
+    /// `response.in_progress` event so `message_start` can report real
+    /// Anthropic-shaped token counts instead of a placeholder.
+    input_tokens: u32,
+    cache_read_input_tokens: u32,
+    cache_creation_input_tokens: u32,
+    input_usage_seen: bool,
     finished: bool,
 }
 
@@ -116,6 +123,10 @@ impl StreamTranslator {
             next_index: 0,
             stop_reason: None,
             usage: None,
+            input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            input_usage_seen: false,
             finished: false,
         }
     }
@@ -136,23 +147,24 @@ impl StreamTranslator {
         match event {
             ResponsesStreamEvent::Created { response } => {
                 // First non-`Created` event opens message_start. The
-                // `response.created` event carries the real upstream id
-                // and model; we use them if they look reasonable,
-                // otherwise we keep the synthetic ones.
-                if !response.id.is_empty() && response.id.starts_with("resp_") {
-                    // Translate to Anthropic-shaped `msg_...` id.
-                    self.msg_id = ensure_msg_prefix(&response.id);
-                }
-                if !response.model.is_empty() {
-                    self.model = response.model.clone();
-                }
+                // `response.created` event carries the real upstream id,
+                // model, and (often) input-side usage; capture them so the
+                // downstream `message_start` reports accurate counts.
+                self.capture_response_metadata(response);
                 if !self.started {
                     events.push(self.build_message_start());
                     self.started = true;
                 }
             }
-            ResponsesStreamEvent::InProgress { .. } => {
-                // No-op; we already opened message_start on `created`.
+            ResponsesStreamEvent::InProgress { response } => {
+                // Capture the same metadata/usage from the in-progress
+                // snapshot. If we somehow haven't opened message_start yet,
+                // do it now.
+                self.capture_response_metadata(response);
+                if !self.started {
+                    events.push(self.build_message_start());
+                    self.started = true;
+                }
             }
             ResponsesStreamEvent::OutputItemAdded { output_index, item } => {
                 self.handle_output_item_added(&mut events, *output_index, item);
@@ -339,7 +351,52 @@ impl StreamTranslator {
 
     // ─── internal helpers ─────────────────────────────────────────────
 
+    fn capture_response_metadata(&mut self, response: &ResponsesResponse) {
+        if !response.id.is_empty() && response.id.starts_with("resp_") {
+            // Translate to Anthropic-shaped `msg_...` id.
+            self.msg_id = ensure_msg_prefix(&response.id);
+        }
+        if !response.model.is_empty() {
+            self.model = response.model.clone();
+        }
+        if let Some(u) = &response.usage {
+            self.input_tokens = u.input_tokens;
+            self.cache_read_input_tokens = u
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens);
+            self.cache_creation_input_tokens = u
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cache_write_tokens);
+            self.input_usage_seen = true;
+        }
+    }
+
     fn build_message_start(&self) -> StreamEvent {
+        let usage = if self.input_usage_seen {
+            AnthropicUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: 0,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_read_input_tokens: self.cache_read_input_tokens,
+                cache_creation_input_tokens_5m: 0,
+                cache_creation_input_tokens_1h: 0,
+                thinking_tokens: 0,
+            }
+        } else {
+            // Legacy placeholder: downstream expects a message_start before
+            // any upstream usage is available.
+            AnthropicUsage {
+                input_tokens: 0,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens_5m: 0,
+                cache_creation_input_tokens_1h: 0,
+                thinking_tokens: 0,
+            }
+        };
         StreamEvent::MessageStart {
             message: Message {
                 id: self.msg_id.clone(),
@@ -349,15 +406,7 @@ impl StreamTranslator {
                 model: self.model.clone(),
                 stop_reason: None,
                 stop_sequence: None,
-                usage: AnthropicUsage {
-                    input_tokens: 0,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation_input_tokens_5m: 0,
-                    cache_creation_input_tokens_1h: 0,
-                    thinking_tokens: 0,
-                },
+                usage,
             },
         }
     }
@@ -697,8 +746,14 @@ fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
     AnthropicUsage {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: u
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.cache_write_tokens),
+        cache_read_input_tokens: u
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.cached_tokens),
         cache_creation_input_tokens_5m: 0,
         cache_creation_input_tokens_1h: 0,
         thinking_tokens: u
@@ -737,7 +792,9 @@ fn ensure_msg_prefix(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::responses::{IncompleteDetails, OutputItem, ResponsesResponse, ResponsesUsage};
+    use crate::responses::{
+        IncompleteDetails, InputTokensDetails, OutputItem, ResponsesResponse, ResponsesUsage,
+    };
 
     fn msg_id() -> String {
         "msg_test".into()
@@ -1157,6 +1214,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_event_usage_includes_cache_fields() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+        t.feed_event(&message_item_added(0));
+        t.feed_event(&output_text_delta(0, "x"));
+
+        let mut r = base_response("completed");
+        r.usage = Some(ResponsesUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 20,
+                cache_write_tokens: 7,
+            }),
+            output_tokens_details: None,
+        });
+        let _ = t.feed_event(&ResponsesStreamEvent::Completed { response: r });
+
+        let closing = t.finish();
+        match &closing[0] {
+            StreamEvent::MessageDelta { usage, .. } => {
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.output_tokens, 50);
+                assert_eq!(u.cache_read_input_tokens, 20);
+                assert_eq!(u.cache_creation_input_tokens, 7);
+            }
+            _ => panic!("expected message_delta"),
+        }
+    }
+
+    #[test]
     fn finish_without_start_emits_message_start_first() {
         let t = StreamTranslator::new(msg_id(), model());
         let evs = t.finish();
@@ -1199,6 +1289,44 @@ mod tests {
             StreamEvent::MessageStart { message } => {
                 assert_eq!(message.id, "msg_resp_real");
                 assert_eq!(message.model, "gpt-5.6-luna");
+            }
+            _ => panic!("expected message_start"),
+        }
+    }
+
+    #[test]
+    fn created_event_usage_surfaces_in_message_start() {
+        let mut t = StreamTranslator::new("synthetic".into(), "inbound".into());
+        let ev = ResponsesStreamEvent::Created {
+            response: ResponsesResponse {
+                id: "resp_real".into(),
+                object: "response".into(),
+                created_at: 0,
+                status: "in_progress".into(),
+                model: "gpt-5.6-luna".into(),
+                output: vec![],
+                usage: Some(ResponsesUsage {
+                    input_tokens: 42,
+                    output_tokens: 5,
+                    total_tokens: 47,
+                    input_tokens_details: Some(InputTokensDetails {
+                        cached_tokens: 30,
+                        cache_write_tokens: 12,
+                    }),
+                    output_tokens_details: None,
+                }),
+                error: None,
+                incomplete_details: None,
+            },
+        };
+        let evs = t.feed_event(&ev);
+        match &evs[0] {
+            StreamEvent::MessageStart { message } => {
+                assert_eq!(message.usage.input_tokens, 42);
+                assert_eq!(message.usage.cache_read_input_tokens, 30);
+                assert_eq!(message.usage.cache_creation_input_tokens, 12);
+                assert_eq!(message.usage.output_tokens, 0);
+                assert_eq!(message.usage.thinking_tokens, 0);
             }
             _ => panic!("expected message_start"),
         }

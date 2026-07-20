@@ -1967,8 +1967,14 @@ pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
         .map(|u| AnthropicUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: u
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cache_write_tokens),
+            cache_read_input_tokens: u
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
             cache_creation_input_tokens_5m: 0,
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: u
@@ -2313,13 +2319,36 @@ mod response_tests {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
-            input_tokens_details: Some(InputTokensDetails { cached_tokens: 10 }),
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 10,
+                cache_write_tokens: 0,
+            }),
             output_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 14,
             }),
         });
         let out = responses_to_anthropic(&resp);
         assert_eq!(out.usage.thinking_tokens, 14);
+    }
+
+    #[test]
+    fn cache_usage_fields_map_from_input_details() {
+        let mut resp = fixture_response();
+        resp.usage = Some(ResponsesUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 20,
+                cache_write_tokens: 7,
+            }),
+            output_tokens_details: None,
+        });
+        let out = responses_to_anthropic(&resp);
+        assert_eq!(out.usage.input_tokens, 100);
+        assert_eq!(out.usage.output_tokens, 50);
+        assert_eq!(out.usage.cache_read_input_tokens, 20);
+        assert_eq!(out.usage.cache_creation_input_tokens, 7);
     }
 
     #[test]
