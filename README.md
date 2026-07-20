@@ -5,6 +5,7 @@ A small Rust proxy that lets Claude Code talk to OpenAI-compatible upstreams by 
 ## Quick start
 
 1. Set `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY`, or copy `proxy.toml.example` to `proxy.toml` and fill them in.
+   - For a fuller walkthrough of `proxy.toml`, see [proxy.toml guide](./proxy-toml-guide.md).
 2. Start the proxy:
 
    ```bash
