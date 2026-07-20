@@ -66,7 +66,6 @@ if (-not [Uri]::IsWellFormedUriString($ProxyUrl, [UriKind]::Absolute)) {
 $ClaudeArgs = $newClaudeArgs
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$previousLocation = (Get-Location).Path
 
 # ─── Capture/restore helpers ───────────────────────────────────────────
 # Like the bash version: record each var's prior value (or absence) so
@@ -96,8 +95,6 @@ foreach ($name in $scrubbedVars) {
 $exitCode = 0
 
 try {
-    Set-Location -LiteralPath $repoRoot
-
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
         throw "Claude Code CLI 'claude' was not found on PATH. Install Claude Code or open a shell where it is available."
     }
@@ -150,8 +147,6 @@ proxy not reachable on $ProxyUrl (preflight failed: $($_.Exception.Message)).
     $exitCode = $LASTEXITCODE
 }
 finally {
-    Set-Location -LiteralPath $previousLocation
-
     foreach ($name in $scrubbedVars) {
         $entry = $prior[$name]
         if ($entry.Set) {
