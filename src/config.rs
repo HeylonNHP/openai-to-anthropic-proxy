@@ -21,6 +21,10 @@ use serde::Deserialize;
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8085";
 const DEFAULT_UPSTREAM_PATH: &str = "/v1/responses";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Prompt caching is opt-in and off by default. When disabled, the
+/// proxy does not emit any OpenAI prompt-cache fields, so the feature
+/// has zero impact on upstreams that don't understand it.
+const DEFAULT_PROMPT_CACHING_ENABLED: bool = false;
 /// Default `reasoning_effort` for upstream chat-completions requests.
 /// Some upstreams (notably airia-backed reasoning models) reject
 /// function tools when `reasoning_effort` is unset — they default to a
@@ -57,6 +61,12 @@ pub struct Config {
     /// unchanged — so deployments that don't need aliases (a single
     /// model, or model names that already match) need no config here.
     pub model_aliases: ModelAliases,
+    /// Prompt-caching settings. Disabled by default; enabling it
+    /// translates Anthropic `cache_control: {type: "ephemeral"}` on
+    /// user/system text and image blocks into OpenAI
+    /// `prompt_cache_breakpoint` markers. Upstreams that don't
+    /// support the field silently ignore it.
+    pub prompt_caching: PromptCachingConfig,
 }
 
 /// Inbound → upstream model name aliases.
@@ -101,6 +111,23 @@ pub struct ReasoningConfig {
     /// the effort string. Compared with the inbound `model` field
     /// using exact string equality.
     pub models: std::collections::BTreeMap<String, String>,
+}
+
+/// Prompt-caching configuration.
+///
+/// `enabled` is the master switch. When `false` (the default), the
+/// proxy does not emit `prompt_cache_key`, `prompt_cache_options`, or
+/// `prompt_cache_breakpoint` fields, so deployments pointing at Ollama,
+/// OpenRouter, vLLM, or other non-OpenAI upstreams are unaffected.
+/// When `true`, Anthropic `cache_control: {type: "ephemeral"}` hints
+/// from the client are translated into explicit OpenAI breakpoints.
+///
+/// `cache_key` is optional; if set it is forwarded verbatim as
+/// `prompt_cache_key`.
+#[derive(Debug, Clone, Default)]
+pub struct PromptCachingConfig {
+    pub enabled: bool,
+    pub cache_key: Option<String>,
 }
 
 impl Config {
@@ -201,6 +228,24 @@ impl Config {
                 .and_then(|a| a.default_model.clone()),
         };
 
+        let prompt_caching_enabled = pick_bool(
+            file.and_then(|f| f.prompt_caching.as_ref())
+                .and_then(|p| p.enabled),
+            env.prompt_caching_enabled,
+        )
+        .unwrap_or(DEFAULT_PROMPT_CACHING_ENABLED);
+
+        let prompt_cache_key = pick_str(
+            file.and_then(|f| f.prompt_caching.as_ref())
+                .and_then(|p| p.cache_key.as_deref()),
+            env.prompt_cache_key.as_deref(),
+        );
+
+        let prompt_caching = PromptCachingConfig {
+            enabled: prompt_caching_enabled,
+            cache_key: prompt_cache_key,
+        };
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -210,6 +255,7 @@ impl Config {
             reasoning_effort,
             reasoning,
             model_aliases,
+            prompt_caching,
         })
     }
 
@@ -254,6 +300,14 @@ impl Config {
     pub fn default_model(&self) -> Option<&str> {
         self.model_aliases.default_model.as_deref()
     }
+
+    /// Prompt-caching settings to use for a given inbound model.
+    /// Currently returns the global config; a per-model table can be
+    /// added here later without changing call sites.
+    #[must_use]
+    pub fn prompt_caching_for_model(&self, _model: &str) -> PromptCachingConfig {
+        self.prompt_caching.clone()
+    }
 }
 
 /// Environment-variable values relevant to the proxy. Captured once at load
@@ -267,6 +321,8 @@ pub struct EnvInputs {
     pub upstream_path: Option<String>,
     pub request_timeout_secs: Option<u64>,
     pub reasoning_effort: Option<String>,
+    pub prompt_caching_enabled: Option<bool>,
+    pub prompt_cache_key: Option<String>,
 }
 
 impl EnvInputs {
@@ -281,6 +337,10 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
+            prompt_caching_enabled: env::var("PROMPT_CACHING_ENABLED")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
         }
     }
 }
@@ -290,6 +350,10 @@ fn pick_str(file_value: Option<&str>, env_value: Option<&str>) -> Option<String>
 }
 
 fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
+    env_value.or(file_value)
+}
+
+fn pick_bool(file_value: Option<bool>, env_value: Option<bool>) -> Option<bool> {
     env_value.or(file_value)
 }
 
@@ -310,6 +374,8 @@ pub(crate) struct TomlConfig {
     reasoning: Option<TomlReasoningConfig>,
     /// Inbound → upstream model name aliases. See [`ModelAliases`].
     model_aliases: Option<TomlModelAliases>,
+    /// Prompt-caching settings. See [`PromptCachingConfig`].
+    prompt_caching: Option<TomlPromptCachingConfig>,
 }
 
 /// TOML shape of `[reasoning]`. `default` is the fallback effort for
@@ -334,6 +400,14 @@ pub(crate) struct TomlReasoningConfig {
 pub(crate) struct TomlModelAliases {
     map: BTreeMap<String, String>,
     default_model: Option<String>,
+}
+
+/// TOML shape of `[prompt_caching]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TomlPromptCachingConfig {
+    enabled: Option<bool>,
+    cache_key: Option<String>,
 }
 
 impl TomlConfig {
@@ -559,6 +633,48 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.default_model(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn prompt_caching_defaults_to_disabled() {
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert!(!cfg.prompt_caching.enabled);
+        assert!(cfg.prompt_caching.cache_key.is_none());
+    }
+
+    #[test]
+    fn prompt_caching_toml_enables_and_sets_key() {
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            [prompt_caching]
+            enabled = true
+            cache_key = "my-app"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert!(cfg.prompt_caching.enabled);
+        assert_eq!(cfg.prompt_caching.cache_key.as_deref(), Some("my-app"));
+    }
+
+    #[test]
+    fn prompt_caching_env_overrides_toml() {
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            [prompt_caching]
+            enabled = true
+            cache_key = "from-file"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let env = EnvInputs {
+            prompt_caching_enabled: Some(false),
+            prompt_cache_key: Some("from-env".into()),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&parsed), &env).unwrap();
+        assert!(!cfg.prompt_caching.enabled);
+        assert_eq!(cfg.prompt_caching.cache_key.as_deref(), Some("from-env"));
     }
 
     #[test]

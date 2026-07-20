@@ -18,12 +18,13 @@
 //! `thinking_tokens`; cache fields are 0.
 
 use crate::anthropic::{
-    ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message, MessageContent,
-    MessageParam, MessageRole, ResponseContentBlock, StopReason, SystemPrompt, ToolChoice,
-    ToolResultContent, Usage as AnthropicUsage,
+    CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
+    MessageContent, MessageParam, MessageRole, ResponseContentBlock, StopReason, SystemPrompt,
+    ToolChoice, ToolResultContent, Usage as AnthropicUsage,
 };
+use crate::config::PromptCachingConfig;
 use crate::responses::{
-    Input, InputContentPart, InputItem, ReasoningConfig, ResponsesRequest,
+    Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig, ResponsesRequest,
     ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice,
 };
 use anyhow::{Context, Result, anyhow};
@@ -130,6 +131,7 @@ fn truncate_user_id(s: String) -> String {
 pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
     reasoning_effort: Option<String>,
+    prompt_caching: &PromptCachingConfig,
 ) -> Result<ResponsesRequest> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
@@ -139,7 +141,7 @@ pub fn anthropic_to_responses(
     let mut instructions = req.system.as_ref().map(system_text).unwrap_or_default();
 
     for msg in &req.messages {
-        append_message_translation(&mut items, &mut instructions, msg)?;
+        append_message_translation(&mut items, &mut instructions, msg, prompt_caching)?;
     }
 
     if instructions.is_empty() {
@@ -197,6 +199,9 @@ pub fn anthropic_to_responses(
         temperature: req.temperature,
         top_p: req.top_p,
         max_output_tokens: Some(req.max_tokens),
+        // Prompt-caching fields are set later by the caller if enabled.
+        prompt_cache_key: None,
+        prompt_cache_options: None,
         parallel_tool_calls: None,
         store: None,
         previous_response_id: None,
@@ -504,20 +509,28 @@ fn append_message_translation(
     out: &mut Vec<InputItem>,
     instructions: &mut String,
     msg: &MessageParam,
+    prompt_caching: &PromptCachingConfig,
 ) -> Result<()> {
     match msg.role {
-        MessageRole::User => append_user_message(out, &msg.content),
+        MessageRole::User => append_user_message(out, &msg.content, prompt_caching),
         MessageRole::Assistant => append_assistant_message(out, &msg.content),
         MessageRole::System => append_system_message(instructions, &msg.content),
     }
 }
 
-fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Result<()> {
+fn append_user_message(
+    out: &mut Vec<InputItem>,
+    content: &MessageContent,
+    prompt_caching: &PromptCachingConfig,
+) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
             out.push(InputItem::Message {
                 role: "user".into(),
-                content: vec![InputContentPart::InputText { text: s.clone() }],
+                content: vec![InputContentPart::InputText {
+                    text: s.clone(),
+                    prompt_cache_breakpoint: None,
+                }],
             });
             Ok(())
         }
@@ -526,18 +539,36 @@ fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Re
             // content parts into a single `Message` item. When we hit a
             // `ToolResult`, flush the accumulated parts as a user message
             // and emit a `FunctionCallOutput` item.
-            let mut parts: Vec<InputContentPart> = Vec::new();
+            //
+            // We also track which accumulated part ends an Anthropic
+            // `cache_control: {type: "ephemeral"}` block, so we can emit
+            // an OpenAI `prompt_cache_breakpoint` marker on it.
+            let mut parts: Vec<(InputContentPart, bool)> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
-                        // Append text to the last part if it's also text,
-                        // or start a new text part.
-                        if let Some(InputContentPart::InputText { text }) = parts.last_mut() {
+                        let ephemeral = prompt_caching.enabled && is_ephemeral(&t.cache_control);
+                        // Append text to the last part if it's also text
+                        // and extending it won't move a cache breakpoint
+                        // past the end of a non-ephemeral block. Otherwise
+                        // start a new text part so the breakpoint can sit
+                        // on the right content.
+                        if let Some((InputContentPart::InputText { text, .. }, last_ephemeral)) =
+                            parts.last_mut()
+                            && (!*last_ephemeral || ephemeral)
+                        {
                             text.push('\n');
                             text.push_str(&t.text);
-                        } else {
-                            parts.push(InputContentPart::InputText { text: t.text.clone() });
+                            *last_ephemeral = ephemeral;
+                            continue;
                         }
+                        parts.push((
+                            InputContentPart::InputText {
+                                text: t.text.clone(),
+                                prompt_cache_breakpoint: None,
+                            },
+                            ephemeral,
+                        ));
                     }
                     ContentBlockParam::ToolResult(tr) => {
                         flush_user_parts(out, &mut parts);
@@ -548,7 +579,9 @@ fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Re
                     }
                     ContentBlockParam::Image(img) => {
                         if let Some(image_part) = convert_image_block(img) {
-                            parts.push(image_part);
+                            let ephemeral =
+                                prompt_caching.enabled && is_ephemeral(&img.cache_control);
+                            parts.push((image_part, ephemeral));
                         }
                     }
                     ContentBlockParam::ToolUse(_) => {
@@ -567,16 +600,42 @@ fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Re
     }
 }
 
-fn flush_user_parts(out: &mut Vec<InputItem>, parts: &mut Vec<InputContentPart>) {
+fn flush_user_parts(out: &mut Vec<InputItem>, parts: &mut Vec<(InputContentPart, bool)>) {
     if !parts.is_empty() {
+        let taken = std::mem::take(parts);
+        let content = taken
+            .into_iter()
+            .map(|(mut part, breakpoint)| {
+                if breakpoint
+                    && let InputContentPart::InputText {
+                        prompt_cache_breakpoint,
+                        ..
+                    }
+                    | InputContentPart::InputImage {
+                        prompt_cache_breakpoint,
+                        ..
+                    } = &mut part
+                {
+                    *prompt_cache_breakpoint = Some(PromptCacheBreakpoint {
+                        mode: "explicit".into(),
+                    });
+                }
+                part
+            })
+            .collect();
         out.push(InputItem::Message {
             role: "user".into(),
-            content: std::mem::take(parts),
+            content,
         });
     }
 }
 
-/// Convert an Anthropic image content block to an OpenAI `InputContentPart::InputImage`.
+/// True if the Anthropic block asks for an ephemeral cache checkpoint.
+fn is_ephemeral(cache_control: &Option<CacheControl>) -> bool {
+    cache_control
+        .as_ref()
+        .is_some_and(|c| c.r#type.as_deref() == Some("ephemeral"))
+}
 ///
 /// Supports both `base64` and `url` source types:
 /// - `base64`: constructs a data URI `data:{media_type};base64,{data}`
@@ -593,6 +652,7 @@ fn convert_image_block(img: &ImageBlockParam) -> Option<InputContentPart> {
             Some(InputContentPart::InputImage {
                 image_url: data_uri,
                 detail: None,
+                prompt_cache_breakpoint: None,
             })
         }
         "url" => {
@@ -600,6 +660,7 @@ fn convert_image_block(img: &ImageBlockParam) -> Option<InputContentPart> {
             Some(InputContentPart::InputImage {
                 image_url: url.to_string(),
                 detail: None,
+                prompt_cache_breakpoint: None,
             })
         }
         other => {
@@ -718,9 +779,10 @@ fn map_tool_choice(choice: &ToolChoice) -> ResponsesToolChoice {
 mod tests {
     use super::*;
     use crate::anthropic::{
-        ImageBlockParam, MessageParam, TextBlockParam, Tool, ToolResultBlockParam,
+        CacheControl, ImageBlockParam, MessageParam, TextBlockParam, Tool, ToolResultBlockParam,
         ToolUseBlockParam,
     };
+    use crate::config::PromptCachingConfig;
     use serde_json::json;
 
     /// Build a minimal request with a system prompt, one user message, and
@@ -763,7 +825,7 @@ mod tests {
     #[test]
     fn basic_request_translates_cleanly() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.model, "test-model");
         assert_eq!(out.max_output_tokens, Some(256));
         assert!(!out.stream);
@@ -779,7 +841,7 @@ mod tests {
             InputItem::Message { role, content } => {
                 assert_eq!(role, "user");
                 match &content[0] {
-                    InputContentPart::InputText { text } => assert_eq!(text, "Hello"),
+                    InputContentPart::InputText { text, .. } => assert_eq!(text, "Hello"),
                     _ => panic!("expected input_text part"),
                 }
             }
@@ -812,7 +874,7 @@ mod tests {
                 cache_control: None,
             },
         ]));
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(
             out.instructions.as_deref(),
             Some("Be concise.\n\nUse examples.")
@@ -853,7 +915,7 @@ mod tests {
             },
         ];
 
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         // user, assistant(message+text), assistant(function_call), user(function_call_output)
         let items = unwrap_items(out);
         assert_eq!(items.len(), 4);
@@ -917,13 +979,13 @@ mod tests {
             ]),
         }];
 
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let items = unwrap_items(out);
         // user("Here's what I got:") + function_call_output(first) + user("and:") + function_call_output(second)
         assert_eq!(items.len(), 4);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
-                InputContentPart::InputText { text } => assert_eq!(text, "Here's what I got:"),
+                InputContentPart::InputText { text, .. } => assert_eq!(text, "Here's what I got:"),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -937,7 +999,7 @@ mod tests {
         }
         match &items[2] {
             InputItem::Message { content, .. } => match &content[0] {
-                InputContentPart::InputText { text } => assert_eq!(text, "and:"),
+                InputContentPart::InputText { text, .. } => assert_eq!(text, "and:"),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -967,10 +1029,11 @@ mod tests {
                         "media_type": "image/jpeg",
                         "data": "/9j/4AAQSkZJRg=="
                     }),
+                    cache_control: None,
                 }),
             ]),
         }];
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let items = unwrap_items(out);
         // user(text + image) — both in one message
         assert_eq!(items.len(), 1);
@@ -980,7 +1043,7 @@ mod tests {
                 assert_eq!(content.len(), 2);
                 // First part: text
                 match &content[0] {
-                    InputContentPart::InputText { text } => {
+                    InputContentPart::InputText { text, .. } => {
                         assert_eq!(text, "What is this?");
                     }
                     _ => panic!("expected input_text as first content part"),
@@ -988,13 +1051,9 @@ mod tests {
                 // Second part: image
                 match &content[1] {
                     InputContentPart::InputImage {
-                        image_url,
-                        detail,
+                        image_url, detail, ..
                     } => {
-                        assert_eq!(
-                            image_url,
-                            "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
-                        );
+                        assert_eq!(image_url, "data:image/jpeg;base64,/9j/4AAQSkZJRg==");
                         assert!(detail.is_none());
                     }
                     _ => panic!("expected input_image as second content part"),
@@ -1010,7 +1069,7 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
             _ => panic!("expected simple tool_choice"),
@@ -1019,14 +1078,14 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "required"),
             _ => panic!("expected simple 'required'"),
         }
 
         req.tool_choice = Some(ToolChoice::None {});
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "none"),
             _ => panic!("expected simple 'none'"),
@@ -1036,7 +1095,7 @@ mod tests {
             name: "get_weather".into(),
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Function { kind, name } => {
                 assert_eq!(kind, "function");
@@ -1050,7 +1109,7 @@ mod tests {
     fn stream_true_sets_flag() {
         let mut req = fixture_request();
         req.stream = Some(true);
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert!(out.stream);
     }
 
@@ -1060,7 +1119,7 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some("user-123".into()),
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
     }
 
@@ -1074,7 +1133,7 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.user.as_deref(), Some(user_id.as_str()));
         assert_eq!(out.user.as_ref().map(String::len), Some(USER_ID_MAX_LEN));
     }
@@ -1090,7 +1149,7 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         // The leading prefix (the most operationally meaningful part
@@ -1110,7 +1169,7 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         assert_eq!(out_user, &user_id[..USER_ID_MAX_LEN]);
@@ -1122,7 +1181,7 @@ mod tests {
     #[test]
     fn user_id_absent_stays_none() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert!(out.user.is_none());
     }
 
@@ -1148,7 +1207,7 @@ mod tests {
     fn stop_sequences_are_dropped() {
         let mut req = fixture_request();
         req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         // stop_sequences has no Responses equivalent; just don't error.
         // (We can't assert against an absent field easily here, but the
         // function completing without error is the contract.)
@@ -1158,7 +1217,9 @@ mod tests {
     #[test]
     fn reasoning_effort_passes_through_to_nested_reasoning() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, Some("medium".into())).unwrap();
+        let out =
+            anthropic_to_responses(&req, Some("medium".into()), &PromptCachingConfig::default())
+                .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
         assert_eq!(reasoning.effort, "medium");
     }
@@ -1166,7 +1227,7 @@ mod tests {
     #[test]
     fn reasoning_effort_none_omits_field() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None).unwrap();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let body = serde_json::to_value(&out).unwrap();
         assert!(
             body.get("reasoning").is_none(),
@@ -1883,21 +1944,169 @@ mod tests {
     }
 
     #[test]
-    fn tool_with_empty_additional_properties_is_cleaned_in_translation() {
+    fn prompt_caching_disabled_ignores_cache_control() {
         let mut req = fixture_request();
-        req.tools = Some(vec![Tool {
-            name: "ExitPlanMode".into(),
-            description: Some("Finish planning".into()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"allowedPrompts": {"type": "array"}},
-                "additionalProperties": {},
-            }),
-        }]);
-        let out = anthropic_to_responses(&req, None).unwrap();
-        let tool = &out.tools.unwrap()[0];
-        assert!(tool.strict);
-        assert_eq!(tool.parameters["additionalProperties"], false);
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::Text(TextBlockParam {
+                text: "Hello".into(),
+                cache_control: Some(CacheControl {
+                    r#type: Some("ephemeral".into()),
+                }),
+            })]),
+        }];
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::Message { content, .. } => match &content[0] {
+                InputContentPart::InputText {
+                    prompt_cache_breakpoint,
+                    ..
+                } => assert!(prompt_cache_breakpoint.is_none()),
+                _ => panic!("expected input_text"),
+            },
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn prompt_caching_translates_ephemeral_text_to_breakpoint() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::Text(TextBlockParam {
+                text: "Hello".into(),
+                cache_control: Some(CacheControl {
+                    r#type: Some("ephemeral".into()),
+                }),
+            })]),
+        }];
+        let caching = PromptCachingConfig {
+            enabled: true,
+            ..PromptCachingConfig::default()
+        };
+        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::Message { content, .. } => match &content[0] {
+                InputContentPart::InputText {
+                    prompt_cache_breakpoint,
+                    ..
+                } => {
+                    assert_eq!(
+                        prompt_cache_breakpoint.as_ref().map(|b| b.mode.as_str()),
+                        Some("explicit")
+                    );
+                }
+                _ => panic!("expected input_text"),
+            },
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn prompt_caching_flushes_ephemeral_before_non_ephemeral_text() {
+        // If an ephemeral text block is followed by a non-ephemeral
+        // text block, they must not be merged into a single content part
+        // with a trailing breakpoint — the breakpoint belongs at the
+        // end of the first block's content.
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "cached".into(),
+                    cache_control: Some(CacheControl {
+                        r#type: Some("ephemeral".into()),
+                    }),
+                }),
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "fresh".into(),
+                    cache_control: None,
+                }),
+            ]),
+        }];
+        let caching = PromptCachingConfig {
+            enabled: true,
+            ..PromptCachingConfig::default()
+        };
+        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content.len(), 2, "expected two separate content parts");
+                // First part ends at the cache breakpoint.
+                match &content[0] {
+                    InputContentPart::InputText {
+                        text,
+                        prompt_cache_breakpoint,
+                        ..
+                    } => {
+                        assert_eq!(text, "cached");
+                        assert!(prompt_cache_breakpoint.is_some());
+                    }
+                    _ => panic!("expected input_text"),
+                }
+                // Second part is fresh, no breakpoint.
+                match &content[1] {
+                    InputContentPart::InputText {
+                        text,
+                        prompt_cache_breakpoint,
+                        ..
+                    } => {
+                        assert_eq!(text, "fresh");
+                        assert!(prompt_cache_breakpoint.is_none());
+                    }
+                    _ => panic!("expected input_text"),
+                }
+            }
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn prompt_caching_non_ephemeral_followed_by_ephemeral_merges() {
+        // A non-ephemeral block followed by an ephemeral block can be
+        // merged; the breakpoint just moves to the end of the part.
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "prefix".into(),
+                    cache_control: None,
+                }),
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "cached".into(),
+                    cache_control: Some(CacheControl {
+                        r#type: Some("ephemeral".into()),
+                    }),
+                }),
+            ]),
+        }];
+        let caching = PromptCachingConfig {
+            enabled: true,
+            ..PromptCachingConfig::default()
+        };
+        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    InputContentPart::InputText {
+                        text,
+                        prompt_cache_breakpoint,
+                        ..
+                    } => {
+                        assert_eq!(text, "prefix\ncached");
+                        assert!(prompt_cache_breakpoint.is_some());
+                    }
+                    _ => panic!("expected input_text"),
+                }
+            }
+            _ => panic!("expected message"),
+        }
     }
 }
 

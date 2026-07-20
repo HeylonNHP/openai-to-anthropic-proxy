@@ -10,6 +10,7 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 - Stop reason mapping: `stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`, `content_filter` → `end_turn`.
 - Error translation from OpenAI `{error: {...}}` envelopes and HTTP statuses into Anthropic-shaped errors.
 - Usage translation from OpenAI `usage` into Anthropic `usage`.
+- Optional prompt-caching translation from Anthropic `cache_control` to OpenAI `prompt_cache_breakpoint`.
 - `GET /healthz` for liveness checks.
 
 ## Configuration
@@ -23,6 +24,8 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 | `LISTEN_ADDR` | `0.0.0.0:8085` | no | socket address to bind |
 | `UPSTREAM_PATH` | `/v1/responses` | no | appended to the base URL |
 | `REQUEST_TIMEOUT_SECS` | `600` | no | per-request timeout |
+| `PROMPT_CACHING_ENABLED` | `false` | no | set `true` to forward OpenAI prompt-cache hints |
+| `PROMPT_CACHE_KEY` | - | no | optional stable key for `prompt_cache_key` |
 
 `proxy.toml` uses the same field names in snake_case. See `proxy.toml.example` for a starter.
 
@@ -32,6 +35,9 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 - The `[reasoning]` table lets you set a default effort plus per-model overrides.
 - The `[model_aliases]` table maps inbound model names to upstream model names.
 - `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model.
+- The `[prompt_caching]` table lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
+- `prompt_caching.enabled` defaults to `false`; when disabled, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
+- `prompt_caching.cache_key` is optional and forwarded as `prompt_cache_key`.
 
 ## Launching Claude Code
 
@@ -58,6 +64,8 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 - `tools[]` is mapped through with JSON Schema parameters preserved.
 - `tool_choice`, `temperature`, `top_p`, `max_tokens`, and `stop_sequences` are forwarded.
 - `stream: true` also enables usage reporting from the upstream.
+- `cache_control` on user/system text and image blocks is translated to OpenAI `prompt_cache_breakpoint` when `[prompt_caching]` is enabled.
+- `cache_control` on system prompts, tools, and assistant content is currently not translated; OpenAI caches eligible prefixes automatically.
 
 ### Response: OpenAI Responses → Anthropic
 
@@ -82,7 +90,7 @@ upstream SSE/response -> translate::response or ::stream (OpenAI -> Anthropic) -
 
 - Vision / image inputs
 - Extended thinking blocks
-- Prompt caching
+- Tool-level and assistant-level prompt-cache control markers
 - Server-side tools (`web_search`, `web_fetch`, `code_execution`)
 - `/v1/models` listing
 - TLS termination
