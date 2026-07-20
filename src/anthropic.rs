@@ -125,6 +125,8 @@ pub struct TextBlockParam {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageBlockParam {
     pub source: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

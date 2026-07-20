@@ -61,6 +61,15 @@ A useful rule: if a model gets renamed by `[model_aliases.map]`, key the reasoni
 
 In the current local file, `claude-opus-4-8` and `claude-sonnet-5` both route to models with explicit `reasoning.models` entries. `claude-haiku-4-5` routes to `gpt-5.4-nano`, which falls back to `reasoning.default = "none"` because there is no dedicated entry for that model.
 
+### Prompt caching
+
+`[prompt_caching]` is opt-in and defaults to disabled.
+
+- `enabled = true` turns Anthropic `cache_control: {type: "ephemeral"}` markers into OpenAI `prompt_cache_breakpoint` markers for user/system text and image blocks.
+- `cache_key` is optional; if set, it is forwarded as `prompt_cache_key`.
+
+Because unknown JSON fields are silently ignored by most OpenAI-compatible endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM upstreams. Those endpoints will simply ignore the extra fields.
+
 ### Model aliases
 
 This table rewrites the model name Claude Code asks for into the model your upstream actually serves.

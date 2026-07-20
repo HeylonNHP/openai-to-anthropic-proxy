@@ -139,6 +139,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: Default::default(),
+        prompt_caching: Default::default(),
     })
 }
 
@@ -360,6 +361,7 @@ async fn per_model_reasoning_effort_lookup() {
             models: std::iter::once(("gpt-5.6-luna".into(), "none".into())).collect(),
         },
         model_aliases: Default::default(),
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -431,6 +433,7 @@ async fn model_alias_rewrites_inbound_model() {
             map: std::iter::once(("claude-sonnet-5".into(), "gpt-5.4-mini".into())).collect(),
             default_model: None,
         },
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -503,6 +506,7 @@ async fn model_not_supported_falls_back_to_default() {
             map: BTreeMap::new(),
             default_model: Some("gpt-4o-mini".into()),
         },
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -555,6 +559,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         reasoning: Default::default(),
         // Note: no default_model — fallback disabled.
         model_aliases: Default::default(),
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -613,6 +618,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
             map: BTreeMap::new(),
             default_model: Some("gpt-4o-mini".into()),
         },
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -746,6 +752,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
             map: BTreeMap::new(),
             default_model: Some("gpt-4o-mini".into()),
         },
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -834,6 +841,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
             map: BTreeMap::new(),
             default_model: Some("gpt-4o-mini".into()),
         },
+        prompt_caching: Default::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
