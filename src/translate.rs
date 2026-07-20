@@ -18,13 +18,13 @@
 //! `thinking_tokens`; cache fields are 0.
 
 use crate::anthropic::{
-    ContentBlockParam, CreateMessageRequest, Message, MessageContent, MessageParam, MessageRole,
-    ResponseContentBlock, StopReason, SystemPrompt, ToolChoice, ToolResultContent,
-    Usage as AnthropicUsage,
+    ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message, MessageContent,
+    MessageParam, MessageRole, ResponseContentBlock, StopReason, SystemPrompt, ToolChoice,
+    ToolResultContent, Usage as AnthropicUsage,
 };
 use crate::responses::{
-    Input, InputContentPart, InputItem, ReasoningConfig, ResponsesRequest, ResponsesResponse,
-    ResponsesTool, ToolChoice as ResponsesToolChoice,
+    ImageUrl, Input, InputContentPart, InputItem, ReasoningConfig, ResponsesRequest,
+    ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice,
 };
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -522,28 +522,34 @@ fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Re
             Ok(())
         }
         MessageContent::Blocks(blocks) => {
-            // Walk the block list in order, emitting one `user` message
-            // per run of text blocks and one `FunctionCallOutput` per
-            // `ToolResult`. Anything else is dropped (with a tracing
-            // warning in production; tests just skip).
-            let mut text_buf = String::new();
+            // Walk the block list in order, accumulating text and image
+            // content parts into a single `Message` item. When we hit a
+            // `ToolResult`, flush the accumulated parts as a user message
+            // and emit a `FunctionCallOutput` item.
+            let mut parts: Vec<InputContentPart> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
-                        if !text_buf.is_empty() {
-                            text_buf.push('\n');
+                        // Append text to the last part if it's also text,
+                        // or start a new text part.
+                        if let Some(InputContentPart::InputText { text }) = parts.last_mut() {
+                            text.push('\n');
+                            text.push_str(&t.text);
+                        } else {
+                            parts.push(InputContentPart::InputText { text: t.text.clone() });
                         }
-                        text_buf.push_str(&t.text);
                     }
                     ContentBlockParam::ToolResult(tr) => {
-                        flush_user_text(out, &mut text_buf);
+                        flush_user_parts(out, &mut parts);
                         out.push(InputItem::FunctionCallOutput {
                             call_id: tr.tool_use_id.clone(),
                             output: tool_result_text(&tr.content),
                         });
                     }
-                    ContentBlockParam::Image(_) => {
-                        tracing::warn!("dropping image block — not supported in MVP");
+                    ContentBlockParam::Image(img) => {
+                        if let Some(image_part) = convert_image_block(img) {
+                            parts.push(image_part);
+                        }
                     }
                     ContentBlockParam::ToolUse(_) => {
                         return Err(anyhow!(
@@ -555,20 +561,58 @@ fn append_user_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Re
                     }
                 }
             }
-            flush_user_text(out, &mut text_buf);
+            flush_user_parts(out, &mut parts);
             Ok(())
         }
     }
 }
 
-fn flush_user_text(out: &mut Vec<InputItem>, buf: &mut String) {
-    if !buf.is_empty() {
+fn flush_user_parts(out: &mut Vec<InputItem>, parts: &mut Vec<InputContentPart>) {
+    if !parts.is_empty() {
         out.push(InputItem::Message {
             role: "user".into(),
-            content: vec![InputContentPart::InputText {
-                text: std::mem::take(buf),
-            }],
+            content: std::mem::take(parts),
         });
+    }
+}
+
+/// Convert an Anthropic image content block to an OpenAI `InputContentPart::InputImage`.
+///
+/// Supports both `base64` and `url` source types:
+/// - `base64`: constructs a data URI `data:{media_type};base64,{data}`
+/// - `url`: passes the URL through directly
+///
+/// Returns `None` if the source type is unknown or required fields are missing.
+fn convert_image_block(img: &ImageBlockParam) -> Option<InputContentPart> {
+    let source_type = img.source.get("type").and_then(Value::as_str)?;
+    match source_type {
+        "base64" => {
+            let media_type = img.source.get("media_type").and_then(Value::as_str)?;
+            let data = img.source.get("data").and_then(Value::as_str)?;
+            let data_uri = format!("data:{};base64,{}", media_type, data);
+            Some(InputContentPart::InputImage {
+                image_url: ImageUrl {
+                    url: data_uri,
+                    detail: None,
+                },
+            })
+        }
+        "url" => {
+            let url = img.source.get("url").and_then(Value::as_str)?;
+            Some(InputContentPart::InputImage {
+                image_url: ImageUrl {
+                    url: url.to_string(),
+                    detail: None,
+                },
+            })
+        }
+        other => {
+            tracing::warn!(
+                source_type = %other,
+                "dropping image block with unknown source type"
+            );
+            None
+        }
     }
 }
 
@@ -912,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn user_with_image_block_drops_with_warning() {
+    fn user_with_image_block_is_forwarded() {
         let mut req = fixture_request();
         req.messages = vec![MessageParam {
             role: MessageRole::User,
@@ -922,19 +966,42 @@ mod tests {
                     cache_control: None,
                 }),
                 ContentBlockParam::Image(ImageBlockParam {
-                    source: json!({"type": "base64", "data": "..."}),
+                    source: json!({
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": "/9j/4AAQSkZJRg=="
+                    }),
                 }),
             ]),
         }];
         let out = anthropic_to_responses(&req, None).unwrap();
         let items = unwrap_items(out);
-        // user(text only — image dropped)
+        // user(text + image) — both in one message
         assert_eq!(items.len(), 1);
         match &items[0] {
-            InputItem::Message { content, .. } => {
-                assert_eq!(content.len(), 1);
+            InputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 2);
+                // First part: text
+                match &content[0] {
+                    InputContentPart::InputText { text } => {
+                        assert_eq!(text, "What is this?");
+                    }
+                    _ => panic!("expected input_text as first content part"),
+                }
+                // Second part: image
+                match &content[1] {
+                    InputContentPart::InputImage { image_url } => {
+                        assert_eq!(
+                            image_url.url,
+                            "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+                        );
+                        assert!(image_url.detail.is_none());
+                    }
+                    _ => panic!("expected input_image as second content part"),
+                }
             }
-            _ => panic!(),
+            _ => panic!("expected message item"),
         }
     }
 
