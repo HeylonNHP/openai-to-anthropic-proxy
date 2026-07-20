@@ -1,6 +1,6 @@
 # Example proxy config. Copy to `proxy.toml` and fill in real values.
 # Anything left unset falls back to env vars, then built-in defaults
-# (see README.md for the full resolution order).
+# (see REFERENCE.md for the full resolution order).
 #
 # Env vars always win over this file, so you can keep secrets in the
 # environment and use this file for non-secret defaults:
