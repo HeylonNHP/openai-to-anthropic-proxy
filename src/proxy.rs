@@ -92,8 +92,9 @@ async fn handle_messages(
     let body_json = serde_json::to_string(&outbound)
         .map_err(|e| AppError::Internal(format!("serialize outbound body: {e}")))?;
 
-    tracing::debug!(
-        model = %outbound.model,
+    tracing::info!(
+        inbound_model = %req.model,
+        upstream_model = %outbound.model,
         stream = outbound.stream,
         tools = outbound.tools.as_ref().map_or(0, Vec::len),
         reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
