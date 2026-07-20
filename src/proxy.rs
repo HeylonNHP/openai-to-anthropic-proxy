@@ -154,7 +154,13 @@ async fn handle_messages_inner(
         // through this same task — pulled from the task-local, not
         // from disk, so concurrent requests don't trample each other.
         let sent = LAST_SENT_BODY.try_with(|b| b.clone()).unwrap_or_default();
-        tracing::warn!(%status, body = %body, sent_body = %sent, "← upstream error");
+        tracing::warn!(%status, body = %body, "← upstream error");
+        tracing::warn!(
+            target: "upstream_payload",
+            %status,
+            sent_body = %sent,
+            "← upstream error (full payload)"
+        );
 
         // Decide whether to retry with the default model. The retry
         // happens before any response bytes are written to the client

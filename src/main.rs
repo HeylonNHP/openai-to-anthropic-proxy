@@ -61,10 +61,16 @@ fn init_tracing() -> WorkerGuard {
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
     // Stderr layer — colored, human-readable, what you see in the terminal.
+    // Filters out the `upstream_payload` target so the full request body
+    // (which can contain the user's prompt) is never printed to the terminal.
+    // That target still reaches the file layer for postmortem debugging.
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(true)
-        .with_ansi(true);
+        .with_ansi(true)
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target() != "upstream_payload"
+        }));
 
     // File layer — plain text, no colors (easier to grep). One line per record.
     let file_layer = fmt::layer()
