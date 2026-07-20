@@ -74,6 +74,18 @@ pub struct StreamTranslator {
     finished: bool,
 }
 
+/// Summary stats extracted from a `StreamTranslator` after the stream ends.
+/// Used by the proxy to print a user-readable response summary line.
+#[derive(Debug, Clone)]
+pub struct StreamStats {
+    pub usage: Option<AnthropicUsage>,
+    pub stop_reason: Option<StopReason>,
+    pub model: String,
+    pub input_tokens: u32,
+    pub cache_read_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TextBlockState {
     index: u32,
@@ -347,6 +359,20 @@ impl StreamTranslator {
         });
         events.push(StreamEvent::MessageStop {});
         events
+    }
+
+    /// Return the final stats from this translator: usage, stop_reason, and model.
+    /// Useful for the proxy to print a summary line after a streaming response completes.
+    #[must_use]
+    pub fn stats(&self) -> StreamStats {
+        StreamStats {
+            usage: self.usage.clone(),
+            stop_reason: self.stop_reason,
+            model: self.model.clone(),
+            input_tokens: self.input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+        }
     }
 
     // ─── internal helpers ─────────────────────────────────────────────
