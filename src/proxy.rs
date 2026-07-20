@@ -7,7 +7,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
@@ -101,10 +101,30 @@ async fn handle_messages(
         "→ upstream"
     );
 
+    let start = Instant::now();
+
+    // Print a user-readable request summary to the terminal.
+    let tool_count = outbound.tools.as_ref().map_or(0, Vec::len);
+    let msg_count = req.messages.len();
+    let stream_label = if outbound.stream {
+        "  |  stream"
+    } else {
+        ""
+    };
+    let reasoning = outbound
+        .reasoning
+        .as_ref()
+        .map(|r| format!("  |  reasoning: {}", r.effort))
+        .unwrap_or_default();
+    println!(
+        "  → {} → {}  |  {} tools  |  {} messages{}{}",
+        req.model, outbound.model, tool_count, msg_count, stream_label, reasoning
+    );
+
     LAST_SENT_BODY
         .scope(
             body_json,
-            handle_messages_inner(state, headers, req, outbound),
+            handle_messages_inner(state, headers, req, outbound, start),
         )
         .await
 }
@@ -114,6 +134,7 @@ async fn handle_messages_inner(
     headers: HeaderMap,
     req: CreateMessageRequest,
     outbound: responses::ResponsesRequest,
+    start: Instant,
 ) -> Result<Response, AppError> {
     let url = format!(
         "{}{}",
@@ -208,7 +229,12 @@ async fn handle_messages_inner(
 
         let msg_id = synthetic_message_id(&req);
         let model = outbound.model.clone();
-        let translator_stream = TranslatorStream::new(sse, msg_id, model);
+        let translator_stream = TranslatorStream::new(
+            sse,
+            msg_id,
+            model,
+            start,
+        );
 
         let body = Body::from_stream(translator_stream);
         let response = Response::builder()
@@ -226,8 +252,75 @@ async fn handle_messages_inner(
                 body: format!("upstream returned non-JSON body: {e}"),
             })?;
         let anth = translate::responses_to_anthropic(&upstream_resp_body);
+        let elapsed = start.elapsed();
+        let usage = &upstream_resp_body.usage;
+        let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
+        let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
+        let thinking = usage
+            .as_ref()
+            .and_then(|u| u.output_tokens_details.as_ref())
+            .map_or(0, |d| d.reasoning_tokens);
+        let cache_read = usage
+            .as_ref()
+            .and_then(|u| u.input_tokens_details.as_ref())
+            .map_or(0, |d| d.cached_tokens);
+        let cache_write = usage
+            .as_ref()
+            .and_then(|u| u.input_tokens_details.as_ref())
+            .map_or(0, |d| d.cache_write_tokens);
+        let thinking_str = if thinking > 0 {
+            format!("  |  {} thinking", thinking)
+        } else {
+            String::new()
+        };
+        println!(
+            "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
+            upstream_resp_body.status,
+            elapsed.as_secs_f64(),
+            in_tokens,
+            out_tokens,
+            thinking_str,
+            cache_read,
+            cache_write,
+        );
         Ok(Json(anth).into_response())
     }
+}
+
+/// Print a response stats line from a `StreamStats` (used by the streaming path).
+fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Duration) {
+    let usage = &stats.usage;
+    let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
+    let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
+    let thinking = usage.as_ref().map_or(0, |u| u.thinking_tokens);
+    let cache_read = stats.cache_read_input_tokens;
+    let cache_write = stats.cache_creation_input_tokens;
+    let stop_reason = stats
+        .stop_reason
+        .as_ref()
+        .map_or("completed", |s| match s {
+            crate::anthropic::StopReason::EndTurn => "completed",
+            crate::anthropic::StopReason::MaxTokens => "max_tokens",
+            crate::anthropic::StopReason::StopSequence => "stop_sequence",
+            crate::anthropic::StopReason::ToolUse => "tool_use",
+            crate::anthropic::StopReason::Refusal => "refusal",
+            crate::anthropic::StopReason::PauseTurn => "paused",
+        });
+    let thinking_str = if thinking > 0 {
+        format!("  |  {} thinking", thinking)
+    } else {
+        String::new()
+    };
+    println!(
+        "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
+        stop_reason,
+        elapsed.as_secs_f64(),
+        in_tokens,
+        out_tokens,
+        thinking_str,
+        cache_read,
+        cache_write,
+    );
 }
 
 /// Heuristic for "the upstream doesn't know this model". Matches on
@@ -296,16 +389,58 @@ where
 {
     inner: S,
     translator: Option<StreamTranslator>,
+    /// When the request started, for computing elapsed time.
+    start: Instant,
+    /// Captured stats after the translator is consumed, so `Drop` can print them.
+    stats: Option<crate::stream::StreamStats>,
 }
 
 impl<S> TranslatorStream<S>
 where
     S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
 {
-    fn new(inner: S, msg_id: String, model: String) -> Self {
+    fn new(
+        inner: S,
+        msg_id: String,
+        model: String,
+        start: Instant,
+    ) -> Self {
         Self {
             inner,
             translator: Some(StreamTranslator::new(msg_id, model)),
+            start,
+            stats: None,
+        }
+    }
+
+    /// Take the translator, capture its stats, and return the events.
+    fn take_and_report(&mut self) -> Option<Vec<StreamEvent>> {
+        let t = self.translator.take()?;
+        self.stats = Some(t.stats());
+        let events = t.finish();
+        if events.is_empty() { None } else { Some(events) }
+    }
+
+    /// Take the translator for an error path, capture stats, return events.
+    fn take_and_report_error(
+        &mut self,
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Vec<StreamEvent> {
+        let t = self.translator.take().expect("translator already taken");
+        self.stats = Some(t.stats());
+        t.emit_error(kind, message)
+    }
+}
+
+impl<S> Drop for TranslatorStream<S>
+where
+    S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
+{
+    fn drop(&mut self) {
+        if let Some(stats) = self.stats.as_ref() {
+            let elapsed = self.start.elapsed();
+            print_stream_stats(stats, elapsed);
         }
     }
 }
@@ -340,10 +475,7 @@ where
                         // see `[DONE]` here, it's a stray from a
                         // non-Responses upstream — flush the translator
                         // and end the stream.
-                        let Some(translator) = this.translator.take() else {
-                            return Poll::Ready(None);
-                        };
-                        let events = translator.finish();
+                        let events = this.take_and_report().unwrap_or_default();
                         if events.is_empty() {
                             return Poll::Ready(None);
                         }
@@ -371,7 +503,6 @@ where
                     // `emit_error` so the bridge surfaces a clean
                     // error event rather than a half-streamed message.
                     if matches!(event, responses::ResponsesStreamEvent::Failed { .. }) {
-                        let t = this.translator.take().unwrap();
                         // Best-effort message extraction; the
                         // translator will read it from the response
                         // envelope.
@@ -386,7 +517,7 @@ where
                             }
                             _ => unreachable!(),
                         };
-                        let events = t.emit_error(kind, message);
+                        let events = this.take_and_report_error(kind, message);
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
                     let events = translator.feed_event(&event);
@@ -398,11 +529,8 @@ where
                 Poll::Ready(Some(Err(e))) => {
                     // Surface a clean close: emit an error event and end.
                     tracing::warn!(error = %e, "upstream SSE error; closing stream");
-                    if let Some(t) = this.translator.take() {
-                        let events = t.emit_error("api_error", format!("upstream SSE error: {e}"));
-                        return Poll::Ready(Some(Ok(encode_sse_events(&events))));
-                    }
-                    return Poll::Ready(None);
+                    let events = this.take_and_report_error("api_error", format!("upstream SSE error: {e}"));
+                    return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                 }
                 Poll::Ready(None) => {
                     // Upstream closed without a terminal event — flush
@@ -410,11 +538,8 @@ where
                     // a `response.completed` / `incomplete` before
                     // closing; this branch handles the rare truncated
                     // case.)
-                    if let Some(t) = this.translator.take() {
-                        let events = t.finish();
-                        if !events.is_empty() {
-                            return Poll::Ready(Some(Ok(encode_sse_events(&events))));
-                        }
+                    if let Some(events) = this.take_and_report() {
+                        return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
                     return Poll::Ready(None);
                 }
