@@ -284,6 +284,8 @@ pub struct ResponsesUsage {
 pub struct InputTokensDetails {
     #[serde(default)]
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
