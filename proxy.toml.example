@@ -35,6 +35,17 @@
 #
 # Environment variable: `PROMPT_CACHING_MODELS` — comma-separated list
 # (e.g. "gpt-5.6-luna,gpt-5.6-terra"). Overrides the TOML value.
+#
+# ─── Web search ────────────────────────────────────────────────────────
+# Claude Code's built-in WebSearch tool (Anthropic server-side
+# `web_search_20250305`) is automatically translated to OpenAI's native
+# `web_search` built-in tool. No configuration needed — the proxy
+# detects the tool by name and emits the equivalent OpenAI tool
+# definition. The upstream handles the search and returns results with
+# citations, which the proxy translates back to Anthropic format.
+#
+# Upstreams that don't support OpenAI's native web_search will return
+# a 400 error, which the proxy surfaces to the client unchanged.
 
 # ─── Example: NVIDIA OpenAI-compatible ──────────────────────────────────
 upstream_base_url = "https://integrate.api.nvidia.com/"
