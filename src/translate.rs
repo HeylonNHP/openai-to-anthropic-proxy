@@ -151,12 +151,15 @@ pub fn anthropic_to_responses(
     let tools = req.tools.as_ref().map(|tools| {
         tools
             .iter()
-            .map(|t| ResponsesTool {
-                kind: "function".to_string(),
-                name: t.name.clone(),
-                description: t.description.clone(),
-                strict: true,
-                parameters: sanitize_tool_schema(t.input_schema.clone()),
+            .filter_map(|t| {
+                let input_schema = t.input_schema.clone()?;
+                Some(ResponsesTool {
+                    kind: "function".to_string(),
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    strict: true,
+                    parameters: sanitize_tool_schema(input_schema),
+                })
             })
             .collect()
     });
@@ -799,11 +802,11 @@ mod tests {
             tools: Some(vec![Tool {
                 name: "get_weather".into(),
                 description: Some("Get the weather".into()),
-                input_schema: json!({
+                input_schema: Some(json!({
                     "type": "object",
                     "properties": {"location": {"type": "string"}},
                     "required": ["location"],
-                }),
+                })),
             }]),
             tool_choice: None,
             temperature: Some(0.5),
