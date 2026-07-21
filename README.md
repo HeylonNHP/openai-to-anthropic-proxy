@@ -29,10 +29,13 @@ If your file already has an `env` block, merge these values into it:
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8085",
-    "ANTHROPIC_API_KEY": "any"
+    "ANTHROPIC_API_KEY": "any",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"
   }
 }
 ```
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells Claude Code the context window of the upstream model. Without it, Claude Code assumes the default Anthropic 200K window and auto-compacts conversations too early when the upstream actually supports more (for example, GPT-5.4-mini and GPT-5.6-luna both support 1M tokens). Set this to whatever your upstream model really supports.
 
 After that, you can run `claude` directly and it will use the proxy without the start scripts.
 
