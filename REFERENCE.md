@@ -46,6 +46,18 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 - Both scripts set `ANTHROPIC_BASE_URL` to the proxy, set `ANTHROPIC_API_KEY=any`, and scrub leaked Anthropic/Claude Code env vars so the child stays routed through the proxy.
 - Both default to `http://localhost:8085` and pass `--setting-sources=project,local` unless you override it.
 
+## Context-window workaround
+
+Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, not from API responses. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to a hardcoded 200K. That causes premature auto-compaction for 1M-context models.
+
+Set the upstream model's real context window explicitly:
+
+- Windows PowerShell: `$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = 1000000`
+- Linux/macOS shell: `export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`
+- Claude Code `~/.claude/settings.json`: add `"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"` inside the `env` object.
+
+Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
+
 ## Development
 
 - `cargo test` runs unit and e2e tests.

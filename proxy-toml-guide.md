@@ -94,6 +94,7 @@ This table rewrites the model name Claude Code asks for into the model your upst
 - Matching is exact. There are no wildcards.
 - If a model is not listed, the proxy passes it through unchanged.
 - `default_model` is a safety net. If the upstream rejects a model, the proxy retries once with this fallback.
+- **Important:** renaming a model can confuse Claude Code's context-window detection. Claude Code estimates when to auto-compact from the model name, not from the API response, and an unknown name falls back to 200K. If your upstream supports a larger window, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in your environment or `~/.claude/settings.json` (see [REFERENCE.md](./REFERENCE.md#context-window-workaround)).
 
 In the current local file:
 
