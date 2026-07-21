@@ -217,6 +217,19 @@ done
 env_args+=("ANTHROPIC_BASE_URL=$ProxyUrl")
 env_args+=("ANTHROPIC_API_KEY=any")
 
+# ─── Layer 3: proxy_key → X-Proxy-Key header ────────────────────────────
+# If the proxy is configured with `proxy_key` (env PROXY_KEY or
+# proxy.toml), every request must include a matching `X-Proxy-Key`
+# header or the proxy returns 401. The Anthropic SDK reads custom
+# headers from the `ANTHROPIC_CUSTOM_HEADERS` env var, which takes
+# a `Name: Value` string. We forward `PROXY_KEY` from the calling
+# shell if it's set, and strip the var from the allowlist so it
+# doesn't get passed twice or leak into the child unintended.
+if [[ -n "${PROXY_KEY-}" ]]; then
+    env_args+=("ANTHROPIC_CUSTOM_HEADERS=X-Proxy-Key: $PROXY_KEY")
+    echo "note: forwarding PROXY_KEY to the child as X-Proxy-Key." >&2
+fi
+
 env -i "${env_args[@]}" claude "${ClaudeArgs[@]}"
 exitCode=$?
 

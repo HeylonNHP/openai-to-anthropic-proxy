@@ -140,6 +140,8 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         reasoning: Default::default(),
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     })
 }
 
@@ -362,6 +364,8 @@ async fn per_model_reasoning_effort_lookup() {
         },
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -434,6 +438,8 @@ async fn model_alias_rewrites_inbound_model() {
             default_model: None,
         },
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -507,6 +513,8 @@ async fn model_not_supported_falls_back_to_default() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -560,6 +568,8 @@ async fn model_not_supported_without_default_passes_error_through() {
         // Note: no default_model — fallback disabled.
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -619,6 +629,8 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -753,6 +765,8 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -842,6 +856,8 @@ async fn fallback_recomputes_reasoning_for_default_model() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
     });
     let proxy_addr = start_proxy(config).await;
 

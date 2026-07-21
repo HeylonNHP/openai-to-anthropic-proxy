@@ -18,9 +18,25 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _log_guard = init_tracing();
-
     let config = Config::load().context("load configuration")?;
+
+    // Initialize tracing after we know whether file logging is
+    // enabled. When `log_to_disk` is off (the default), tracing
+    // events go to stdout — no `target/logs/proxy.log` is created.
+    let _log_guard = init_tracing(config.log_to_disk);
+
+    // Warn loudly if the proxy is reachable but unauthenticated.
+    // The `println!` ensures the warning is visible even when
+    // `log_to_disk` is off (the new default).
+    if config.proxy_key.is_none() {
+        eprintln!(
+            "WARNING: proxy_key is not set; /v1/messages accepts requests from any client. \
+             Set `proxy_key` in proxy.toml or PROXY_KEY env to require authentication."
+        );
+        tracing::warn!(
+            "proxy_key is not set; /v1/messages accepts requests from any client"
+        );
+    }
 
     let client = build_upstream_client(&config)?;
     let app = openai_to_anthropic_proxy::proxy::router(Arc::new(config.clone()), client);
@@ -51,35 +67,58 @@ fn build_upstream_client(config: &Config) -> Result<reqwest::Client> {
         .context("build reqwest client")
 }
 
-/// Initialize tracing with a single sink: the rotating file at
-/// `target/logs/proxy.log`. Terminal output is handled separately via
-/// `println!` / `eprintln!` so the user sees clean, readable stats
-/// instead of structured log lines.
+/// Initialize tracing. When `log_to_disk` is `true` (opt-in),
+/// structured events go to a rotating file at
+/// `target/logs/proxy.log`. When `false` (the default), events go to
+/// stdout — the `println!` / `eprintln!` lines in the rest of the
+/// binary remain the user-visible terminal output.
 ///
-/// Returns a `WorkerGuard` that must be kept alive for the lifetime of
-/// the program; dropping it flushes and stops the background log writer.
-fn init_tracing() -> WorkerGuard {
+/// Returns a `WorkerGuard` that must be kept alive for the lifetime
+/// of the program; dropping it flushes and stops the background log
+/// writer. The guard is meaningful only for the file path; the
+/// stdout path drops it harmlessly.
+fn init_tracing(log_to_disk: bool) -> WorkerGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,openai_to_anthropic_proxy=debug"));
 
-    let log_dir = std::path::Path::new("target").join("logs");
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "proxy.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    if log_to_disk {
+        let log_dir = std::path::Path::new("target").join("logs");
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "proxy.log");
+        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    // File layer — plain text, no colors (easier to grep). One line per record.
-    // This is the only tracing sink; terminal output uses direct printing.
-    let file_layer = fmt::layer()
-        .with_writer(file_writer)
-        .with_target(true)
-        .with_ansi(false)
-        .with_level(true);
+        // File layer — plain text, no colors (easier to grep). One
+        // line per record.
+        let file_layer = fmt::layer()
+            .with_writer(file_writer)
+            .with_target(true)
+            .with_ansi(false)
+            .with_level(true);
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
-        .init();
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .init();
 
-    guard
+        guard
+    } else {
+        // Default: stdout, with colors. Operators who want grep-able
+        // file logs set `log_to_disk = true` in proxy.toml or
+        // `LOG_TO_DISK=1` in the env.
+        let (stdout_writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+
+        let stdout_layer = fmt::layer()
+            .with_writer(stdout_writer)
+            .with_target(true)
+            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+            .with_level(true);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .init();
+
+        guard
+    }
 }
 
 /// Resolves when the user hits Ctrl-C, sends SIGTERM (Unix), or sends

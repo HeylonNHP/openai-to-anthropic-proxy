@@ -68,6 +68,12 @@ async fn handle_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    // Auth check: if `proxy_key` is set, the client must include a
+    // matching `X-Proxy-Key` header. The check happens before any
+    // body parsing so an unauthorized client can't even probe for
+    // valid request shapes.
+    check_proxy_key(&state.config, &headers)?;
+
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
@@ -638,6 +644,45 @@ fn sanitize_model(model: &str) -> String {
         .collect()
 }
 
+/// Name of the HTTP header clients must set when `proxy_key` is
+/// configured. Case-insensitive (HTTP headers are).
+const PROXY_KEY_HEADER: &str = "x-proxy-key";
+
+/// Constant-time string equality. Avoids leaking the key's length or
+/// position-of-first-mismatch through response timing. Marked
+/// `#[inline(never)]` so the compiler can't partially inline it
+/// back into a per-byte branchy form.
+#[inline(never)]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Check the inbound `X-Proxy-Key` header against the configured
+/// `proxy_key`. Returns `Ok(())` if auth is disabled (no key
+/// configured) or the header matches; `Err(401)` otherwise. The
+/// comparison is constant-time over the equal-length case.
+fn check_proxy_key(config: &Config, headers: &HeaderMap) -> Result<(), AppError> {
+    let Some(expected) = config.proxy_key.as_deref() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(PROXY_KEY_HEADER)
+        .map(|v| v.as_bytes())
+        .unwrap_or(&[]);
+    if ct_eq(provided, expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +797,105 @@ mod tests {
             extract_model_error_code(body).as_deref(),
             Some("model_not_found")
         );
+    }
+
+    fn test_config_with_key(key: Option<&str>) -> Arc<Config> {
+        // Build a minimal config that satisfies the fields
+        // `check_proxy_key` reads. The other fields don't matter.
+        Arc::new(Config {
+            proxy_key: key.map(String::from),
+            ..test_config_minimal()
+        })
+    }
+
+    fn test_config_minimal() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream_base_url: "https://example.com".into(),
+            upstream_api_key: "test".into(),
+            upstream_path: "/v1/responses".into(),
+            request_timeout: std::time::Duration::from_secs(60),
+            reasoning_effort: None,
+            reasoning: crate::config::ReasoningConfig::default(),
+            model_aliases: crate::config::ModelAliases::default(),
+            prompt_caching: crate::config::PromptCachingConfig::default(),
+            log_to_disk: false,
+            proxy_key: None,
+        }
+    }
+
+    #[test]
+    fn ct_eq_matches_identical_strings() {
+        assert!(ct_eq(b"hello", b"hello"));
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"a-longer-key-12345", b"a-longer-key-12345"));
+    }
+
+    #[test]
+    fn ct_eq_rejects_different_strings() {
+        assert!(!ct_eq(b"hello", b"world"));
+        assert!(!ct_eq(b"hello", b"hell"));
+        assert!(!ct_eq(b"hell", b"hello"));
+        // Empty vs non-empty.
+        assert!(!ct_eq(b"", b"x"));
+        assert!(!ct_eq(b"x", b""));
+    }
+
+    #[test]
+    fn check_proxy_key_no_key_configured_allows_all() {
+        // No `proxy_key` set → no auth, no header required. Current
+        // behavior: any reachable client can use the proxy.
+        let config = test_config_with_key(None);
+        let headers = HeaderMap::new();
+        assert!(check_proxy_key(&config, &headers).is_ok());
+    }
+
+    #[test]
+    fn check_proxy_key_correct_header_passes() {
+        let config = test_config_with_key(Some("shared-secret-1234"));
+        let mut headers = HeaderMap::new();
+        headers.insert(PROXY_KEY_HEADER, "shared-secret-1234".parse().unwrap());
+        assert!(check_proxy_key(&config, &headers).is_ok());
+    }
+
+    #[test]
+    fn check_proxy_key_missing_header_rejects() {
+        let config = test_config_with_key(Some("shared-secret-1234"));
+        let headers = HeaderMap::new();
+        let err = check_proxy_key(&config, &headers).unwrap_err();
+        // Should be Unauthorized, not BadRequest or Internal.
+        assert!(matches!(err, AppError::Unauthorized));
+    }
+
+    #[test]
+    fn check_proxy_key_wrong_header_rejects() {
+        let config = test_config_with_key(Some("shared-secret-1234"));
+        let mut headers = HeaderMap::new();
+        headers.insert(PROXY_KEY_HEADER, "wrong".parse().unwrap());
+        let err = check_proxy_key(&config, &headers).unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized));
+    }
+
+    #[test]
+    fn check_proxy_key_header_is_case_insensitive() {
+        // HTTP header names are case-insensitive. Verify the lookup
+        // works regardless of how the client capitalized the header.
+        let config = test_config_with_key(Some("k"));
+        for variant in ["X-Proxy-Key", "x-proxy-key", "X-PROXY-KEY", "x-Proxy-Key"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(variant, "k".parse().unwrap());
+            assert!(
+                check_proxy_key(&config, &headers).is_ok(),
+                "{variant:?} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn unauthorized_response_returns_401() {
+        // Pin the wire shape of an unauthorized response so a future
+        // refactor can't accidentally downgrade it to 400 or 500.
+        let resp = AppError::Unauthorized.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

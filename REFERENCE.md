@@ -26,8 +26,43 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 | `REQUEST_TIMEOUT_SECS` | `600` | no | per-request timeout |
 | `PROMPT_CACHING_ENABLED` | `false` | no | set `true` to forward OpenAI prompt-cache hints |
 | `PROMPT_CACHE_KEY` | - | no | optional stable key for `prompt_cache_key` |
+| `PROXY_KEY` | - | no | shared secret for `X-Proxy-Key` auth (see "Client auth" below) |
+| `LOG_TO_DISK` | `false` | no | set `1`/`true`/`yes` to write `target/logs/proxy.log` |
 
 `proxy.toml` uses the same field names in snake_case. See `proxy.toml.example` for a starter.
+
+### Client auth (`proxy_key` / `PROXY_KEY`)
+
+The proxy binds `0.0.0.0:8085` by default, which means anyone on the network can reach it. If you don't set `proxy_key`, every reachable client can use your upstream API key. To lock it down, set a shared secret:
+
+```toml
+# proxy.toml
+proxy_key = "any-shared-secret-string"
+```
+
+or via env:
+
+```bash
+export PROXY_KEY="any-shared-secret-string"
+```
+
+When `proxy_key` is set, every `/v1/messages` request must include a matching `X-Proxy-Key` header. Without it, the proxy returns `401 Unauthorized` with an Anthropic-shaped error envelope. The `/healthz` endpoint is always open for liveness checks. The header value is compared in constant time to avoid timing leaks. The startup output prints a warning when `proxy_key` is unset.
+
+**Wiring it into Claude Code.** Claude Code and the Anthropic SDK inject custom HTTP headers via the `ANTHROPIC_CUSTOM_HEADERS` env var, in `Name: Value` format. Add it to your `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8085",
+    "ANTHROPIC_API_KEY": "any",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Proxy-Key: your-shared-secret"
+  }
+}
+```
+
+For multiple custom headers, separate them with newlines (a single line is enough for `X-Proxy-Key`).
+
+**Wiring it into the helper scripts.** The `scripts/start-claude-code.sh` and `scripts/start-claude-code.ps1` launchers detect `PROXY_KEY` in the calling shell and forward it to the child as `ANTHROPIC_CUSTOM_HEADERS=X-Proxy-Key: ...` automatically. If you launch through the helper, you don't need to edit `settings.json`.
 
 ### Advanced config
 

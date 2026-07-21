@@ -17,6 +17,31 @@
 #                          (see the [reasoning] table below)
 #   prompt_caching       — opt-in OpenAI prompt-caching controls
 #                          (see the [prompt_caching] table below)
+#   proxy_key            — optional shared secret. When set, clients
+#                          must include an `X-Proxy-Key: <value>`
+#                          header on every /v1/messages request, or
+#                          the proxy returns 401. When unset, the
+#                          proxy accepts all requests and prints a
+#                          startup warning. See "Client auth" below.
+#   log_to_disk          — when true, structured logs are written
+#                          to `target/logs/proxy.log` in addition to
+#                          stdout. Default false (logs go to stdout
+#                          only — no PII persisted to disk).
+
+# ─── Client auth ────────────────────────────────────────────────────────
+# The proxy listens on `0.0.0.0:8085` by default, which means anyone
+# on the network can reach it. If you don't set `proxy_key`, every
+# reachable client can spend your upstream API key. To require auth:
+#
+#   proxy_key = "any-shared-secret-string"
+#
+# Then clients must send:
+#
+#   curl -H "X-Proxy-Key: any-shared-secret-string" ...
+#
+# Without the matching header, the proxy returns 401. The
+# /healthz endpoint is always open (for liveness checks).
+# Environment variable: `PROXY_KEY`. Env wins over TOML.
 
 # [prompt_caching]
 # models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]

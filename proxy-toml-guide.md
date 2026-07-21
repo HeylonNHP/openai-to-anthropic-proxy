@@ -48,6 +48,38 @@ default_model = "gpt-5.4-mini"
 - `listen_addr` is the local address the proxy binds to. The default is `0.0.0.0:8085`, so you only need to set it when you want a different host or port.
 - `upstream_path` is the upstream route. The default is `/v1/responses`.
 
+### Client auth (`proxy_key`)
+
+The proxy binds `0.0.0.0:8085` by default, which means anyone on the network can reach it. If you don't set `proxy_key`, every reachable client can use your upstream API key — the proxy prints a startup warning but otherwise allows all traffic. To require auth, set `proxy_key` to any shared secret string:
+
+```toml
+proxy_key = "any-shared-secret-string"
+```
+
+Clients must then send an `X-Proxy-Key: any-shared-secret-string` header on every `/v1/messages` request, or the proxy returns 401. The `/healthz` endpoint is always open for liveness checks. The header value is compared in constant time to avoid timing leaks. Environment variable: `PROXY_KEY` — wins over the TOML value.
+
+**Wiring `X-Proxy-Key` into Claude Code.** Add an `ANTHROPIC_CUSTOM_HEADERS` entry to the `env` block in `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8085",
+    "ANTHROPIC_API_KEY": "any",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Proxy-Key: any-shared-secret-string"
+  }
+}
+```
+
+`ANTHROPIC_CUSTOM_HEADERS` is the Anthropic SDK's standard way to inject arbitrary HTTP headers on every request. The value is in `Name: Value` format (one header per line for multiple). The `scripts/start-claude-code.sh` and `.ps1` helper scripts do this forwarding automatically when `PROXY_KEY` is set in the calling shell.
+
+### Logging (`log_to_disk`)
+
+By default the proxy writes structured logs to stdout (and only stdout). Set `log_to_disk = true` in TOML, or `LOG_TO_DISK=1` in the env, to additionally write a rotating file at `target/logs/proxy.log`. The file path is unchanged from earlier versions. Off-by-default avoids persisting request and response bodies to disk on every upstream error.
+
+```toml
+log_to_disk = true
+```
+
 ### Reasoning
 
 The proxy chooses reasoning in this order for each request:

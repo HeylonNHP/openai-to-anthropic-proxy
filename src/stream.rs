@@ -260,7 +260,11 @@ impl StreamTranslator {
                 // Surface the upstream error. The translator doesn't
                 // own the bridge's terminal-error path (the bridge
                 // does), but if for some reason it gets here we still
-                // emit a clean error event + message_stop.
+                // emit a clean error event + message_stop. We MUST
+                // call `finalize` first so any open text/tool/thinking
+                // block is closed with a matching `content_block_stop`
+                // before the terminal `MessageStop` — otherwise the
+                // Anthropic client sees a half-streamed response.
                 let msg = response
                     .error
                     .as_ref()
@@ -270,6 +274,7 @@ impl StreamTranslator {
                     events.push(self.build_message_start());
                     self.started = true;
                 }
+                self.finalize(&mut events);
                 events.push(StreamEvent::Error {
                     error: ApiErrorBody {
                         r#type: "upstream_error".to_string(),
@@ -277,14 +282,16 @@ impl StreamTranslator {
                     },
                 });
                 events.push(StreamEvent::MessageStop {});
-                self.finished = true;
             }
             ResponsesStreamEvent::Error { message, .. } => {
-                // Top-level error event: same path.
+                // Top-level error event: same path — close any open
+                // blocks before the terminal `MessageStop` so the
+                // client sees a well-formed sequence.
                 if !self.started {
                     events.push(self.build_message_start());
                     self.started = true;
                 }
+                self.finalize(&mut events);
                 events.push(StreamEvent::Error {
                     error: ApiErrorBody {
                         r#type: "upstream_error".to_string(),
@@ -292,7 +299,6 @@ impl StreamTranslator {
                     },
                 });
                 events.push(StreamEvent::MessageStop {});
-                self.finished = true;
             }
             ResponsesStreamEvent::Unknown => {
                 // Round-trip only.
@@ -801,9 +807,25 @@ impl StreamTranslator {
         if self.thinking_blocks.is_empty() {
             return;
         }
-        let indices: Vec<u32> = self.thinking_blocks.values().map(|s| s.index).collect();
-        for idx in indices {
-            events.push(StreamEvent::ContentBlockStop { index: idx });
+        // Snapshot the entries so we can mutate `self.thinking_blocks`
+        // while iterating. Each block is closed by emitting the
+        // captured `signature` as a `SignatureDelta` (when non-empty)
+        // followed by `ContentBlockStop`. Anthropic's wire format
+        // requires the signature delta before the stop, otherwise the
+        // client can't verify the thinking block on the next turn.
+        let snapshot: Vec<(u32, String)> = self
+            .thinking_blocks
+            .values()
+            .map(|state| (state.index, state.signature.clone()))
+            .collect();
+        for (block_index, signature) in snapshot {
+            if !signature.is_empty() {
+                events.push(StreamEvent::ContentBlockDelta {
+                    index: block_index,
+                    delta: ContentDelta::SignatureDelta { signature },
+                });
+            }
+            events.push(StreamEvent::ContentBlockStop { index: block_index });
         }
         self.thinking_blocks.clear();
     }
@@ -1267,16 +1289,75 @@ mod tests {
         assert!(matches!(evs[0], StreamEvent::ContentBlockDelta { .. }));
 
         // Reasoning item done carries the signature; the translator
-        // records it but does not emit a delta (no signature-delta on
-        // the wire).
+        // records it but does not emit an immediate delta. The
+        // signature is emitted later, when the block is closed (by a
+        // `Completed` event, a downstream item, or the stream end).
         let evs = t.feed_event(&reasoning_item_done(0, "opaque-sig"));
         assert!(evs.is_empty(), "no events for reasoning done");
 
-        let _ = t.feed_event(&completed_event("completed"));
-        let closing = t.finish();
+        // When the stream ends with a Completed event, the open
+        // thinking block is closed via `capture_terminal` →
+        // `finalize` → `close_open_thinking_blocks`. The close emits
+        // a `SignatureDelta` carrying the captured signature,
+        // followed by a `ContentBlockStop`. Without the signature on
+        // the wire, the Anthropic client can't verify the thinking
+        // block on the next turn. `finish()` then emits the
+        // MessageDelta + MessageStop that close the message.
+        let mut closing = t.feed_event(&completed_event("completed"));
+        closing.extend(t.finish());
+        assert!(
+            matches!(
+                closing[0],
+                StreamEvent::ContentBlockDelta {
+                    delta: ContentDelta::SignatureDelta { .. },
+                    ..
+                }
+            ),
+            "expected SignatureDelta first, got {:?}",
+            closing[0]
+        );
+        assert!(matches!(closing[1], StreamEvent::ContentBlockStop { index: 0 }));
         // MessageDelta + MessageStop
-        assert!(matches!(closing[0], StreamEvent::MessageDelta { .. }));
-        assert!(matches!(closing[1], StreamEvent::MessageStop {}));
+        assert!(matches!(closing[2], StreamEvent::MessageDelta { .. }));
+        assert!(matches!(closing[3], StreamEvent::MessageStop {}));
+    }
+
+    #[test]
+    fn empty_signature_skips_signature_delta() {
+        // Some upstreams send a `done` event with an empty
+        // `encrypted_content`. The translator must close the block
+        // with a plain `ContentBlockStop` and no SignatureDelta —
+        // emitting an empty `SignatureDelta { signature: "" }` would
+        // be a confusing no-op on the wire.
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+        let evs = t.feed_event(&reasoning_item_added(0));
+        assert!(matches!(evs[0], StreamEvent::ContentBlockStart { .. }));
+
+        let evs = t.feed_event(&reasoning_item_done(0, ""));
+        assert!(evs.is_empty());
+
+        // The block closes on Completed. With an empty signature,
+        // the close sequence is just `ContentBlockStop` — no
+        // `SignatureDelta` should precede it.
+        let closing = t.feed_event(&completed_event("completed"));
+        let stop_pos = closing
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }))
+            .expect("expected ContentBlockStop");
+        assert_eq!(stop_pos, 0, "expected ContentBlockStop to be first, got {closing:?}");
+        if stop_pos > 0 {
+            assert!(
+                !matches!(
+                    closing[stop_pos - 1],
+                    StreamEvent::ContentBlockDelta {
+                        delta: ContentDelta::SignatureDelta { .. },
+                        ..
+                    }
+                ),
+                "expected no SignatureDelta when signature is empty, got {closing:?}"
+            );
+        }
     }
 
     #[test]
@@ -1339,6 +1420,101 @@ mod tests {
         // fired — it has, so just the error + stop.
         assert!(evs.iter().any(|e| matches!(e, StreamEvent::Error { .. })));
         assert!(evs.iter().any(|e| matches!(e, StreamEvent::MessageStop {})));
+    }
+
+    #[test]
+    fn failed_response_closes_open_text_block_before_error() {
+        // Regression: a Failed event arriving while a text block is
+        // open used to push `Error` + `MessageStop` without a
+        // matching `content_block_stop`, leaving the Anthropic client
+        // with a half-streamed response. The translator must now
+        // close the block first.
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+        t.feed_event(&message_item_added(0));
+        t.feed_event(&output_text_delta(0, "partial output"));
+
+        let mut r = base_response("failed");
+        r.error = Some(crate::responses::ResponsesError {
+            message: "context overflow".into(),
+            kind: "server_error".into(),
+            code: None,
+            param: None,
+        });
+        let evs = t.feed_event(&ResponsesStreamEvent::Failed { response: r });
+
+        // Find the indices of content_block_stop, error, and message_stop.
+        let stop_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { .. }));
+        let err_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Error { .. }));
+        let msg_stop_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::MessageStop {}));
+        let stop_idx = stop_idx.expect("expected a ContentBlockStop");
+        let err_idx = err_idx.expect("expected an Error event");
+        let msg_stop_idx = msg_stop_idx.expect("expected a MessageStop");
+        assert!(
+            stop_idx < err_idx,
+            "ContentBlockStop must precede Error, got events={evs:?}"
+        );
+        assert!(
+            err_idx < msg_stop_idx,
+            "Error must precede MessageStop, got events={evs:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_error_closes_open_tool_block_before_error() {
+        // Same regression as above, but via a FunctionCall instead of
+        // a text block, and triggered by the top-level `Error` SSE
+        // event (not `Failed`).
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+        // Open a tool_use block.
+        let tool_added = ResponsesStreamEvent::OutputItemAdded {
+            output_index: 0,
+            item: OutputItem::FunctionCall {
+                id: Some("call_x".into()),
+                call_id: "call_x".into(),
+                name: "do_thing".into(),
+                arguments: String::new(),
+                status: None,
+            },
+        };
+        t.feed_event(&tool_added);
+        t.feed_event(&ResponsesStreamEvent::Error {
+            message: "upstream closed".into(),
+            code: None,
+            param: None,
+        });
+
+        // Walk the events returned by the error feed (the bridge
+        // calls `take_and_report_error`, which uses `emit_error`
+        // under the hood). The order must be:
+        //   1. content_block_stop (closing the open tool block)
+        //   2. error
+        //   3. message_stop
+        let evs = t.emit_error("upstream_error", "upstream closed");
+        let stop_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { .. }));
+        let err_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Error { .. }));
+        let msg_stop_idx = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::MessageStop {}));
+        assert!(
+            stop_idx < err_idx,
+            "ContentBlockStop must precede Error in emit_error, got events={evs:?}"
+        );
+        assert!(
+            err_idx < msg_stop_idx,
+            "Error must precede MessageStop in emit_error, got events={evs:?}"
+        );
     }
 
     #[test]
