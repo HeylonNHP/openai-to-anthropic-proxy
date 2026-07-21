@@ -245,6 +245,10 @@ async fn handle_messages_inner(
         Ok(response)
     } else {
         let bytes = upstream_resp.bytes().await?;
+        tracing::debug!(
+            raw_body = %String::from_utf8_lossy(&bytes),
+            "raw upstream response (non-streaming)"
+        );
         let upstream_resp_body: responses::ResponsesResponse = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Upstream {
                 status: StatusCode::BAD_GATEWAY,

@@ -225,6 +225,41 @@ pub enum ResponseContentBlock {
         thinking: String,
         signature: String,
     },
+    /// Server-side tool use (e.g. web_search). Injected when the
+    /// upstream used a built-in web_search tool so Claude Code's
+    /// search counter works.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Web search results block. Follows a `ServerToolUse` block.
+    WebSearchToolResult {
+        #[serde(flatten)]
+        block: WebSearchToolResultBlock,
+    },
+}
+
+/// A single web search result within a `WebSearchToolResult` block.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSearchResult {
+    pub uri: String,
+    pub title: String,
+    /// Opaque encrypted content. We don't have the upstream's
+    /// encrypted blob, so this is empty — the citation URL and
+    /// title are what Claude Code uses for display.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub encrypted_content: String,
+}
+
+/// A `web_search_tool_result` content block. Returned by Anthropic's
+/// server-side web search after a `server_tool_use` block. We inject
+/// a synthetic one when the upstream (OpenAI) used its built-in
+/// `web_search` tool so Claude Code's search counter works.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSearchToolResultBlock {
+    pub tool_use_id: String,
+    pub content: Vec<WebSearchResult>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +273,13 @@ pub enum StopReason {
     Refusal,
     /// Streaming-only: the model paused mid-turn (rare, round-trip only).
     PauseTurn,
+}
+
+/// Server tool usage tracking. `web_search_requests` counts how many
+/// web searches were performed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerToolUseUsage {
+    pub web_search_requests: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +296,10 @@ pub struct Usage {
     pub cache_creation_input_tokens_1h: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub thinking_tokens: u32,
+    /// Server tool usage (e.g. web search request count).
+    /// Only present when a server tool was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUseUsage>,
 }
 
 const fn is_zero_u32(n: &u32) -> bool {
@@ -344,6 +390,17 @@ pub enum ContentBlockKind {
     Thinking {
         thinking: String,
         signature: String,
+    },
+    /// Server-side tool use (e.g. web_search).
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Web search results block.
+    WebSearchToolResult {
+        #[serde(flatten)]
+        block: WebSearchToolResultBlock,
     },
 }
 

@@ -43,10 +43,13 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::anthropic::{
-    ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload, StopReason,
-    StreamEvent, Usage as AnthropicUsage,
+    ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload,
+    ServerToolUseUsage, StopReason, StreamEvent, Usage as AnthropicUsage, WebSearchResult,
+    WebSearchToolResultBlock,
 };
-use crate::responses::{IncompleteDetails, OutputItem, ResponsesResponse, ResponsesStreamEvent};
+use crate::responses::{
+    IncompleteDetails, OutputItem, ResponsesResponse, ResponsesStreamEvent,
+};
 
 /// Stateful translator for one streaming request.
 #[derive(Debug)]
@@ -64,6 +67,11 @@ pub struct StreamTranslator {
     next_index: u32,
     stop_reason: Option<StopReason>,
     usage: Option<AnthropicUsage>,
+    /// Set to true when the upstream used its built-in web_search tool
+    /// (detected via `url_citation` annotations). Used to populate
+    /// `server_tool_use` in the final `message_delta` usage so Claude
+    /// Code's search counter works.
+    web_search_used: bool,
     /// Input-side usage captured from the earliest `response.created` /
     /// `response.in_progress` event so `message_start` can report real
     /// Anthropic-shaped token counts instead of a placeholder.
@@ -135,6 +143,7 @@ impl StreamTranslator {
             next_index: 0,
             stop_reason: None,
             usage: None,
+            web_search_used: false,
             input_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -318,6 +327,11 @@ impl StreamTranslator {
             cache_creation_input_tokens_5m: 0,
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: 0,
+            server_tool_use: if self.web_search_used {
+                Some(ServerToolUseUsage { web_search_requests: 1 })
+            } else {
+                None
+            },
         }));
         events.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
@@ -409,6 +423,7 @@ impl StreamTranslator {
                 cache_creation_input_tokens_5m: 0,
                 cache_creation_input_tokens_1h: 0,
                 thinking_tokens: 0,
+                server_tool_use: None,
             }
         } else {
             // Legacy placeholder: downstream expects a message_start before
@@ -421,6 +436,7 @@ impl StreamTranslator {
                 cache_creation_input_tokens_5m: 0,
                 cache_creation_input_tokens_1h: 0,
                 thinking_tokens: 0,
+                server_tool_use: None,
             }
         };
         StreamEvent::MessageStart {
@@ -443,6 +459,7 @@ impl StreamTranslator {
         output_index: u32,
         item: &OutputItem,
     ) {
+        tracing::debug!(output_index, ?item, "handle_output_item_added");
         if !self.started {
             events.push(self.build_message_start());
             self.started = true;
@@ -455,6 +472,20 @@ impl StreamTranslator {
                 // contiguous.
                 self.close_open_tool_blocks(events);
                 self.close_open_thinking_blocks(events);
+
+                // NOTE: We deliberately do NOT scan the message's
+                // `content` for `url_citation` annotations here. In the
+                // streaming path, `content` arrives empty at
+                // `output_item.added` time — the text and annotations
+                // come later via `output_text.delta` /
+                // `output_text.annotation.added` events. Scanning here
+                // never fires, so we rely on the upstream
+                // `WebSearchCall` / `FunctionCall { name: "WebSearch" }`
+                // detection (handled in their own match arms) to inject
+                // the `server_tool_use` + `web_search_tool_result`
+                // blocks. The non-streaming path (`build_content_blocks`
+                // in translate.rs) still scans annotations as a
+                // fallback for fully-populated responses.
                 if self.text_block.is_none() {
                     let index = self.allocate_index();
                     self.text_block = Some(TextBlockState { index });
@@ -466,7 +497,31 @@ impl StreamTranslator {
                     });
                 }
             }
+            OutputItem::WebSearchCall { .. } => {
+                // The upstream used its built-in `web_search` tool.
+                // Inject a `server_tool_use` + `web_search_tool_result`
+                // block pair so Claude Code's search counter works. The
+                // actual search results aren't available here (they come
+                // back as `url_citation` annotations on the text later,
+                // which the client renders inline); we use an empty
+                // result list and the placeholder is enough for the
+                // counter.
+                //
+                // `web_search_call` items arrive BEFORE the `Message`
+                // items in the stream, so injecting here puts the blocks
+                // in the right position (before the text).
+                self.emit_web_search_blocks(events, None);
+            }
             OutputItem::FunctionCall { call_id, name, .. } => {
+                // The model may invoke web search as a function tool
+                // (name == "WebSearch" or "web_search") instead of via
+                // a `web_search_call` output item. Detect that here and
+                // inject the same web search blocks FIRST, then fall
+                // through to the normal tool_use handling.
+                if name == "WebSearch" || name == "web_search" {
+                    self.emit_web_search_blocks(events, None);
+                }
+
                 // Close any open text block.
                 if let Some(text) = self.text_block.take() {
                     events.push(StreamEvent::ContentBlockStop { index: text.index });
@@ -579,7 +634,7 @@ impl StreamTranslator {
                     }
                 }
             }
-            OutputItem::Message { .. } | OutputItem::Unknown => {
+            OutputItem::Message { .. } | OutputItem::Unknown | OutputItem::WebSearchCall { .. } => {
                 // Nothing to do; the next item or stream close will
                 // close the text block.
             }
@@ -705,7 +760,12 @@ impl StreamTranslator {
     fn capture_terminal(&mut self, events: &mut Vec<StreamEvent>, response: &ResponsesResponse) {
         // Capture usage first so `finish()` includes it in message_delta.
         if let Some(usage) = &response.usage {
-            self.usage = Some(map_usage(usage));
+            let mut u = map_usage(usage);
+            if self.web_search_used {
+                u.server_tool_use =
+                    Some(ServerToolUseUsage { web_search_requests: 1 });
+            }
+            self.usage = Some(u);
         }
         // Map the response's status to a stop reason.
         let has_tool_use = response
@@ -766,6 +826,65 @@ impl StreamTranslator {
         self.next_index += 1;
         idx
     }
+
+    /// Inject a `server_tool_use` (start+stop) and `web_search_tool_result`
+    /// (start+stop) content block pair into the Anthropic event stream.
+    /// Called when the upstream signals a web search via a
+    /// `web_search_call` output item or a `FunctionCall` whose name is
+    /// `WebSearch`/`web_search`. Sets `web_search_used` so the terminal
+    /// `message_delta` includes `server_tool_use` usage.
+    ///
+    /// `citations` is an optional list of (url, title) pairs to populate
+    /// the result block with. When `None`, an empty result list is used —
+    /// sufficient for Claude Code's search counter to register the
+    /// search, even without the actual URLs/titles (those arrive later
+    /// as `url_citation` annotations on the text, which the client
+    /// renders inline rather than from this block).
+    fn emit_web_search_blocks(
+        &mut self,
+        events: &mut Vec<StreamEvent>,
+        citations: Option<&[(String, String)]>,
+    ) {
+        self.web_search_used = true;
+        let tool_use_id = "stoolu_web_search_01".to_string();
+
+        let result_content: Vec<WebSearchResult> = match citations {
+            Some(cits) => cits
+                .iter()
+                .map(|(url, title)| WebSearchResult {
+                    uri: url.clone(),
+                    title: title.clone(),
+                    encrypted_content: String::new(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // server_tool_use: start + stop.
+        let index = self.allocate_index();
+        events.push(StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockKind::ServerToolUse {
+                id: tool_use_id.clone(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({"query": "Web search"}),
+            },
+        });
+        events.push(StreamEvent::ContentBlockStop { index });
+
+        // web_search_tool_result: start + stop.
+        let index = self.allocate_index();
+        events.push(StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockKind::WebSearchToolResult {
+                block: WebSearchToolResultBlock {
+                    tool_use_id,
+                    content: result_content,
+                },
+            },
+        });
+        events.push(StreamEvent::ContentBlockStop { index });
+    }
 }
 
 fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
@@ -786,6 +905,7 @@ fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
             .output_tokens_details
             .as_ref()
             .map_or(0, |d| d.reasoning_tokens),
+        server_tool_use: None,
     }
 }
 
@@ -1465,5 +1585,148 @@ mod tests {
             "content_block_stop must precede error, got {:?}",
             evs
         );
+    }
+
+    /// Helper: build a `response.output_item.added` event carrying a
+    /// `WebSearchCall` output item.
+    fn web_search_call_added(output_index: u32) -> ResponsesStreamEvent {
+        ResponsesStreamEvent::OutputItemAdded {
+            output_index,
+            item: OutputItem::WebSearchCall {
+                id: Some(format!("ws_{output_index}")),
+                status: Some("in_progress".into()),
+            },
+        }
+    }
+
+    /// Regression: a `web_search_call` output item in the stream must
+    /// emit a `server_tool_use` (start+stop) + `web_search_tool_result`
+    /// (start+stop) block pair so Claude Code's search counter works.
+    /// Previously these items deserialized as `Unknown` and were dropped,
+    /// producing "Did 0 searches".
+    #[test]
+    fn web_search_call_emits_server_tool_use_and_result_blocks() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+
+        let evs = t.feed_event(&web_search_call_added(0));
+        // 4 events: server_tool_use start, stop, web_search_tool_result start, stop.
+        assert_eq!(evs.len(), 4, "expected 4 events for web search blocks");
+        assert!(matches!(
+            &evs[0],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ServerToolUse { .. },
+                ..
+            }
+        ));
+        assert!(matches!(&evs[1], StreamEvent::ContentBlockStop { .. }));
+        assert!(matches!(
+            &evs[2],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::WebSearchToolResult { .. },
+                ..
+            }
+        ));
+        assert!(matches!(&evs[3], StreamEvent::ContentBlockStop { .. }));
+
+        // The web_search_used flag must be set so the terminal
+        // message_delta carries server_tool_use usage.
+        let _ = t.feed_event(&completed_event("completed"));
+        let closing = t.finish();
+        match &closing[0] {
+            StreamEvent::MessageDelta { usage, .. } => {
+                let u = usage.as_ref().expect("usage present");
+                let stu = u
+                    .server_tool_use
+                    .as_ref()
+                    .expect("server_tool_use usage should be set");
+                assert_eq!(stu.web_search_requests, 1);
+            }
+            other => panic!("expected message_delta, got {other:?}"),
+        }
+    }
+
+    /// Regression: a `FunctionCall` whose name is `WebSearch` must emit
+    /// the web search blocks FIRST, then the normal `tool_use` block for
+    /// the function call. This covers the case where the model invokes
+    /// web search as a function tool rather than via a `web_search_call`.
+    #[test]
+    fn web_search_function_call_emits_blocks_then_tool_use() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+
+        let evs = t.feed_event(&function_call_added(0, "call_ws", "WebSearch"));
+        // web search blocks: server_tool_use start+stop, web_search_tool_result start+stop (4)
+        // then tool_use start (1) = 5 events.
+        assert_eq!(evs.len(), 5, "expected 5 events");
+        assert!(matches!(
+            &evs[0],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ServerToolUse { .. },
+                ..
+            }
+        ));
+        assert!(matches!(&evs[1], StreamEvent::ContentBlockStop { .. }));
+        assert!(matches!(
+            &evs[2],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::WebSearchToolResult { .. },
+                ..
+            }
+        ));
+        assert!(matches!(&evs[3], StreamEvent::ContentBlockStop { .. }));
+        assert!(matches!(
+            &evs[4],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ToolUse { name, .. },
+                ..
+            } if name == "WebSearch"
+        ));
+
+        // web_search_used must be set.
+        let _ = t.feed_event(&completed_event("completed"));
+        let closing = t.finish();
+        match &closing[0] {
+            StreamEvent::MessageDelta { usage, .. } => {
+                assert!(usage
+                    .as_ref()
+                    .and_then(|u| u.server_tool_use.as_ref())
+                    .is_some());
+            }
+            other => panic!("expected message_delta, got {other:?}"),
+        }
+    }
+
+    /// A non-web-search function call (e.g. `get_weather`) must NOT emit
+    /// the web search blocks — only the normal `tool_use` block. Pin this
+    /// so the name-based detection doesn't over-trigger.
+    #[test]
+    fn non_web_search_function_call_does_not_emit_search_blocks() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+
+        let evs = t.feed_event(&function_call_added(0, "call_1", "get_weather"));
+        // Only the tool_use start block; no web search blocks.
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(
+            &evs[0],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ToolUse { .. },
+                ..
+            }
+        ));
+
+        let _ = t.feed_event(&completed_event("completed"));
+        let closing = t.finish();
+        match &closing[0] {
+            StreamEvent::MessageDelta { usage, .. } => {
+                // No server_tool_use usage for a plain function call.
+                assert!(usage
+                    .as_ref()
+                    .and_then(|u| u.server_tool_use.as_ref())
+                    .is_none());
+            }
+            other => panic!("expected message_delta, got {other:?}"),
+        }
     }
 }
