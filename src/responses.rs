@@ -302,6 +302,19 @@ pub enum OutputItem {
         #[serde(default)]
         encrypted_content: String,
     },
+    /// A built-in `web_search` tool invocation. The upstream emits
+    /// these as output items with `type: "web_search_call"` when the
+    /// model uses OpenAI's native web search. We use this as the
+    /// signal to inject `server_tool_use` + `web_search_tool_result`
+    /// blocks into the Anthropic response so Claude Code's search
+    /// counter works. The `id` and `status` fields are forwarded but
+    /// not load-bearing for the proxy's translation.
+    WebSearchCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
     /// Round-trip only; we don't currently generate this.
     #[serde(other)]
     Unknown,

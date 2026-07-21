@@ -19,8 +19,9 @@
 
 use crate::anthropic::{
     CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
-    MessageContent, MessageParam, MessageRole, ResponseContentBlock, StopReason, SystemPrompt,
-    ToolChoice, ToolResultContent, Usage as AnthropicUsage,
+    MessageContent, MessageParam, MessageRole, ResponseContentBlock, ServerToolUseUsage,
+    StopReason, SystemPrompt, ToolChoice, ToolResultContent, Usage as AnthropicUsage,
+    WebSearchResult, WebSearchToolResultBlock,
 };
 use crate::config::PromptCachingConfig;
 use crate::responses::{
@@ -2177,7 +2178,7 @@ use crate::responses::{OutputContentPart, OutputItem};
 ///   `thinking_tokens`. Cache fields are 0.
 #[must_use]
 pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
-    let mut content = build_content_blocks(&resp.output);
+    let (mut content, web_search_used) = build_content_blocks(&resp.output);
 
     // If the response failed AND we have no output blocks of our own,
     // surface the upstream error message as a `[error] ...` text block
@@ -2225,6 +2226,11 @@ pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
                 .output_tokens_details
                 .as_ref()
                 .map_or(0, |d| d.reasoning_tokens),
+            server_tool_use: if web_search_used {
+                Some(ServerToolUseUsage { web_search_requests: 1 })
+            } else {
+                None
+            },
         })
         .unwrap_or(AnthropicUsage {
             input_tokens: 0,
@@ -2234,6 +2240,7 @@ pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
             cache_creation_input_tokens_5m: 0,
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: 0,
+            server_tool_use: None,
         });
 
     Message {
@@ -2275,8 +2282,125 @@ fn map_status_to_stop_reason(
     }
 }
 
-fn build_content_blocks(items: &[OutputItem]) -> Vec<ResponseContentBlock> {
+/// Extract web search citations from OpenAI `url_citation` annotations,
+/// `web_search_call` output items, and `FunctionCall` items whose name
+/// is `WebSearch`/`web_search`.
+///
+/// Returns a vector of (url, title) pairs. The vector is non-empty if
+/// any web search signal is detected — this is what drives the
+/// `web_search_used` flag in [`build_content_blocks`] and the
+/// `server_tool_use` usage in the final message.
+///
+/// The primary detection signal is the upstream's `web_search_call`
+/// output item (type: "web_search_call"), which the OpenAI Responses
+/// API emits when the model uses its built-in web search. A secondary
+/// signal is a `FunctionCall` whose name is `WebSearch` or `web_search`
+/// (the model sometimes invokes web search as a function tool instead
+/// of via the built-in). The tertiary signal — kept as a fallback — is
+/// `url_citation` annotations on `OutputText` parts, which is what the
+/// non-streaming response path populates once content is fully
+/// materialized.
+fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
+    let mut citations = Vec::new();
+    let mut saw_web_search_call = false;
+    let mut saw_web_search_function_call = false;
+
+    for item in items {
+        match item {
+            OutputItem::WebSearchCall { .. } => {
+                tracing::debug!("detected web_search_call output item");
+                saw_web_search_call = true;
+            }
+            OutputItem::FunctionCall { name, .. } => {
+                if name == "WebSearch" || name == "web_search" {
+                    tracing::debug!(name = %name, "detected web search FunctionCall");
+                    saw_web_search_function_call = true;
+                }
+            }
+            OutputItem::Message { content, .. } => {
+                for part in content {
+                    if let OutputContentPart::OutputText { text, annotations } = part {
+                        tracing::debug!(
+                            text_len = text.len(),
+                            annotation_count = annotations.len(),
+                            annotations = ?annotations,
+                            "OutputText part with annotations"
+                        );
+                        for ann in annotations {
+                            if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation") {
+                                if let (Some(url), Some(title)) = (
+                                    ann.get("url").and_then(|v| v.as_str()),
+                                    ann.get("title").and_then(|v| v.as_str()),
+                                ) {
+                                    citations.push((url.to_string(), title.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            OutputItem::Unknown => {
+                tracing::debug!("dropping unknown OutputItem (may be web_search_call)");
+            }
+            _ => {}
+        }
+    }
+
+    // If we detected a web_search_call or a WebSearch function call but
+    // have no url_citation annotations (the streaming path often has
+    // none at this point, and some upstreams don't return citations on
+    // the non-streaming response either), synthesize a placeholder
+    // citation so `web_search_used` is still true and the
+    // server_tool_use usage is reported. The placeholder URL/title are
+    // not load-bearing — Claude Code's search counter only needs the
+    // `server_tool_use` + `web_search_tool_result` block pair to exist.
+    if citations.is_empty() && (saw_web_search_call || saw_web_search_function_call) {
+        tracing::info!(
+            saw_web_search_call,
+            saw_web_search_function_call,
+            "web search detected via output item; synthesizing placeholder citation"
+        );
+        citations.push(("https://www.openai.com".to_string(), "Web search".to_string()));
+    }
+
+    tracing::info!(
+        citations_found = citations.len(),
+        saw_web_search_call,
+        saw_web_search_function_call,
+        "web search citation extraction"
+    );
+    citations
+}
+
+fn build_content_blocks(items: &[OutputItem]) -> (Vec<ResponseContentBlock>, bool) {
+    let citations = extract_web_search_citations(items);
+    let web_search_used = !citations.is_empty();
+
     let mut blocks = Vec::new();
+
+    // If web search was used, inject server_tool_use + web_search_tool_result
+    // blocks before the text content so Claude Code's search counter works.
+    if web_search_used {
+        let tool_use_id = "stoolu_web_search_01".to_string();
+        blocks.push(ResponseContentBlock::ServerToolUse {
+            id: tool_use_id.clone(),
+            name: "web_search".to_string(),
+            input: serde_json::json!({"query": "Web search"}),
+        });
+        blocks.push(ResponseContentBlock::WebSearchToolResult {
+            block: WebSearchToolResultBlock {
+                tool_use_id,
+                content: citations
+                    .iter()
+                    .map(|(url, title)| WebSearchResult {
+                        uri: url.clone(),
+                        title: title.clone(),
+                        encrypted_content: String::new(),
+                    })
+                    .collect(),
+            },
+        });
+    }
     for item in items {
         match item {
             OutputItem::Message { content, .. } => {
@@ -2335,10 +2459,16 @@ fn build_content_blocks(items: &[OutputItem]) -> Vec<ResponseContentBlock> {
                     signature: encrypted_content.clone(),
                 });
             }
+            // The web_search_call item itself doesn't translate to an
+            // Anthropic content block — its presence is what drives
+            // the `server_tool_use` + `web_search_tool_result` block
+            // injection above (via `extract_web_search_citations`).
+            // Skip it here.
+            OutputItem::WebSearchCall { .. } => {}
             OutputItem::Unknown => {}
         }
     }
-    blocks
+    (blocks, web_search_used)
 }
 
 #[cfg(test)]
@@ -2698,5 +2828,138 @@ mod response_tests {
             }
             other => panic!("expected Function, got {other:?}"),
         }
+    }
+
+    /// Regression: when the upstream emits a `web_search_call` output
+    /// item (the OpenAI Responses API's signal that the model used its
+    /// built-in web search), the proxy must inject
+    /// `server_tool_use` + `web_search_tool_result` blocks into the
+    /// Anthropic response and report `server_tool_use` usage, so
+    /// Claude Code's search counter registers the search. Previously
+    /// these items deserialized as `OutputItem::Unknown` and were
+    /// dropped, causing Claude Code to show "Did 0 searches".
+    #[test]
+    fn web_search_call_output_item_injects_blocks_and_usage() {
+        let mut resp = fixture_response();
+        resp.output = vec![
+            OutputItem::WebSearchCall {
+                id: Some("ws_01".into()),
+                status: Some("completed".into()),
+            },
+            OutputItem::Message {
+                id: Some("msg_x".into()),
+                status: Some("completed".into()),
+                role: "assistant".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "Based on my search...".into(),
+                    annotations: vec![],
+                }],
+            },
+        ];
+        let out = responses_to_anthropic(&resp);
+
+        // server_tool_use + web_search_tool_result + text = 3 blocks.
+        assert_eq!(out.content.len(), 3, "expected 3 content blocks");
+        match &out.content[0] {
+            ResponseContentBlock::ServerToolUse { id, name, input } => {
+                assert_eq!(id, "stoolu_web_search_01");
+                assert_eq!(name, "web_search");
+                assert_eq!(input["query"], "Web search");
+            }
+            other => panic!("expected ServerToolUse, got {other:?}"),
+        }
+        match &out.content[1] {
+            ResponseContentBlock::WebSearchToolResult { block } => {
+                assert_eq!(block.tool_use_id, "stoolu_web_search_01");
+                // Placeholder citation synthesized because no
+                // url_citation annotations were present.
+                assert_eq!(block.content.len(), 1);
+                assert!(!block.content[0].uri.is_empty());
+            }
+            other => panic!("expected WebSearchToolResult, got {other:?}"),
+        }
+        match &out.content[2] {
+            ResponseContentBlock::Text { text } => {
+                assert_eq!(text, "Based on my search...");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+
+        // server_tool_use usage must be present so the search counter works.
+        let stu = out
+            .usage
+            .server_tool_use
+            .as_ref()
+            .expect("server_tool_use usage should be present");
+        assert_eq!(stu.web_search_requests, 1);
+    }
+
+    /// Regression: when the upstream emits a `FunctionCall` whose name is
+    /// `WebSearch` (the model invoking web search as a function tool
+    /// instead of via the built-in `web_search_call` item), the proxy
+    /// must also inject the web search blocks and report usage. The
+    /// function call's own `tool_use` block is still emitted afterward.
+    #[test]
+    fn web_search_function_call_injects_blocks_and_keeps_tool_use() {
+        let mut resp = fixture_response();
+        resp.output = vec![
+            OutputItem::FunctionCall {
+                id: Some("fc_x".into()),
+                status: Some("completed".into()),
+                call_id: "call_ws".into(),
+                name: "WebSearch".into(),
+                arguments: r#"{"query":"rust async"}"#.into(),
+            },
+            OutputItem::Message {
+                id: Some("msg_x".into()),
+                status: Some("completed".into()),
+                role: "assistant".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "Result".into(),
+                    annotations: vec![],
+                }],
+            },
+        ];
+        let out = responses_to_anthropic(&resp);
+
+        // server_tool_use + web_search_tool_result (injected) +
+        // tool_use (the WebSearch function call) + text = 4 blocks.
+        assert_eq!(out.content.len(), 4, "expected 4 content blocks");
+        assert!(matches!(&out.content[0], ResponseContentBlock::ServerToolUse { .. }));
+        assert!(matches!(&out.content[1], ResponseContentBlock::WebSearchToolResult { .. }));
+        match &out.content[2] {
+            ResponseContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "call_ws");
+                assert_eq!(name, "WebSearch");
+            }
+            other => panic!("expected ToolUse for the function call, got {other:?}"),
+        }
+        assert!(matches!(&out.content[3], ResponseContentBlock::Text { .. }));
+
+        // stop_reason is ToolUse because a FunctionCall is present.
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
+        // server_tool_use usage present.
+        assert!(out.usage.server_tool_use.is_some());
+    }
+
+    /// The `web_search` lowercase function name variant is also
+    /// detected. Pin this so a future rename doesn't quietly break the
+    /// lowercase form.
+    #[test]
+    fn web_search_function_call_lowercase_name_is_detected() {
+        let mut resp = fixture_response();
+        resp.output = vec![OutputItem::FunctionCall {
+            id: Some("fc_x".into()),
+            status: Some("completed".into()),
+            call_id: "call_ws".into(),
+            name: "web_search".into(),
+            arguments: "{}".into(),
+        }];
+        let out = responses_to_anthropic(&resp);
+        // server_tool_use + web_search_tool_result + tool_use = 3 blocks.
+        assert_eq!(out.content.len(), 3);
+        assert!(matches!(&out.content[0], ResponseContentBlock::ServerToolUse { .. }));
+        assert!(matches!(&out.content[1], ResponseContentBlock::WebSearchToolResult { .. }));
+        assert!(out.usage.server_tool_use.is_some());
     }
 }
