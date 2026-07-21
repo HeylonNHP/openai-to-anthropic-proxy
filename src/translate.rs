@@ -550,7 +550,7 @@ fn append_user_message(
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
-                        let ephemeral = prompt_caching.enabled && is_ephemeral(&t.cache_control);
+                        let ephemeral = !prompt_caching.models.is_empty() && is_ephemeral(&t.cache_control);
                         // Append text to the last part if it's also text
                         // and extending it won't move a cache breakpoint
                         // past the end of a non-ephemeral block. Otherwise
@@ -583,7 +583,7 @@ fn append_user_message(
                     ContentBlockParam::Image(img) => {
                         if let Some(image_part) = convert_image_block(img) {
                             let ephemeral =
-                                prompt_caching.enabled && is_ephemeral(&img.cache_control);
+                                !prompt_caching.models.is_empty() && is_ephemeral(&img.cache_control);
                             parts.push((image_part, ephemeral));
                         }
                     }
@@ -1985,7 +1985,7 @@ mod tests {
             })]),
         }];
         let caching = PromptCachingConfig {
-            enabled: true,
+            models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
         let out = anthropic_to_responses(&req, None, &caching).unwrap();
@@ -2030,7 +2030,7 @@ mod tests {
             ]),
         }];
         let caching = PromptCachingConfig {
-            enabled: true,
+            models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
         let out = anthropic_to_responses(&req, None, &caching).unwrap();
@@ -2088,7 +2088,7 @@ mod tests {
             ]),
         }];
         let caching = PromptCachingConfig {
-            enabled: true,
+            models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
         let out = anthropic_to_responses(&req, None, &caching).unwrap();

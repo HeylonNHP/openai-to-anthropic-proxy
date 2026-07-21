@@ -24,7 +24,6 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Prompt caching is opt-in and off by default. When disabled, the
 /// proxy does not emit any OpenAI prompt-cache fields, so the feature
 /// has zero impact on upstreams that don't understand it.
-const DEFAULT_PROMPT_CACHING_ENABLED: bool = false;
 /// Default `reasoning_effort` for upstream chat-completions requests.
 /// Some upstreams (notably airia-backed reasoning models) reject
 /// function tools when `reasoning_effort` is unset — they default to a
@@ -61,11 +60,11 @@ pub struct Config {
     /// unchanged — so deployments that don't need aliases (a single
     /// model, or model names that already match) need no config here.
     pub model_aliases: ModelAliases,
-    /// Prompt-caching settings. Disabled by default; enabling it
-    /// translates Anthropic `cache_control: {type: "ephemeral"}` on
-    /// user/system text and image blocks into OpenAI
-    /// `prompt_cache_breakpoint` markers. Upstreams that don't
-    /// support the field silently ignore it.
+    /// Prompt-caching settings. Disabled by default. When a model is listed
+    /// in `models`, the proxy translates Anthropic `cache_control: {type: "ephemeral"}`
+    /// on user/system text and image blocks into OpenAI `prompt_cache_breakpoint`
+    /// markers and sets the top-level `prompt_cache_key`. Models not in the list
+    /// get no prompt-caching fields.
     pub prompt_caching: PromptCachingConfig,
 }
 
@@ -126,7 +125,7 @@ pub struct ReasoningConfig {
 /// `prompt_cache_key`.
 #[derive(Debug, Clone, Default)]
 pub struct PromptCachingConfig {
-    pub enabled: bool,
+    pub models: Vec<String>,
     pub cache_key: Option<String>,
 }
 
@@ -228,12 +227,20 @@ impl Config {
                 .and_then(|a| a.default_model.clone()),
         };
 
-        let prompt_caching_enabled = pick_bool(
-            file.and_then(|f| f.prompt_caching.as_ref())
-                .and_then(|p| p.enabled),
-            env.prompt_caching_enabled,
-        )
-        .unwrap_or(DEFAULT_PROMPT_CACHING_ENABLED);
+        let prompt_caching_models: Vec<String> = env
+            .prompt_caching_models
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .collect()
+            })
+            .or_else(|| {
+                file.and_then(|f| f.prompt_caching.as_ref())
+                    .and_then(|p| p.models.clone())
+            })
+            .unwrap_or_default();
 
         let prompt_cache_key = pick_str(
             file.and_then(|f| f.prompt_caching.as_ref())
@@ -242,7 +249,7 @@ impl Config {
         );
 
         let prompt_caching = PromptCachingConfig {
-            enabled: prompt_caching_enabled,
+            models: prompt_caching_models,
             cache_key: prompt_cache_key,
         };
 
@@ -301,12 +308,21 @@ impl Config {
         self.model_aliases.default_model.as_deref()
     }
 
-    /// Prompt-caching settings to use for a given inbound model.
-    /// Currently returns the global config; a per-model table can be
-    /// added here later without changing call sites.
+    /// Prompt-caching settings to use for a given upstream model.
+    /// Returns a config with `models` populated only if the model is
+    /// in the configured list, so callers can check `!models.is_empty()`
+    /// to decide whether to emit prompt-caching fields.
     #[must_use]
-    pub fn prompt_caching_for_model(&self, _model: &str) -> PromptCachingConfig {
-        self.prompt_caching.clone()
+    pub fn prompt_caching_for_model(&self, model: &str) -> PromptCachingConfig {
+        let enabled = self.prompt_caching.models.iter().any(|m| m == model);
+        PromptCachingConfig {
+            models: if enabled {
+                self.prompt_caching.models.clone()
+            } else {
+                Vec::new()
+            },
+            cache_key: self.prompt_caching.cache_key.clone(),
+        }
     }
 }
 
@@ -321,7 +337,7 @@ pub struct EnvInputs {
     pub upstream_path: Option<String>,
     pub request_timeout_secs: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub prompt_caching_enabled: Option<bool>,
+    pub prompt_caching_models: Option<String>,
     pub prompt_cache_key: Option<String>,
 }
 
@@ -337,9 +353,7 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
-            prompt_caching_enabled: env::var("PROMPT_CACHING_ENABLED")
-                .ok()
-                .and_then(|s| s.parse().ok()),
+            prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
         }
     }
@@ -350,10 +364,6 @@ fn pick_str(file_value: Option<&str>, env_value: Option<&str>) -> Option<String>
 }
 
 fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
-    env_value.or(file_value)
-}
-
-fn pick_bool(file_value: Option<bool>, env_value: Option<bool>) -> Option<bool> {
     env_value.or(file_value)
 }
 
@@ -406,7 +416,8 @@ pub(crate) struct TomlModelAliases {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TomlPromptCachingConfig {
-    enabled: Option<bool>,
+    #[serde(default)]
+    models: Option<Vec<String>>,
     cache_key: Option<String>,
 }
 
@@ -638,23 +649,46 @@ mod tests {
     #[test]
     fn prompt_caching_defaults_to_disabled() {
         let cfg = Config::resolve(None, &env_with_required()).unwrap();
-        assert!(!cfg.prompt_caching.enabled);
+        assert!(cfg.prompt_caching.models.is_empty());
         assert!(cfg.prompt_caching.cache_key.is_none());
     }
 
     #[test]
-    fn prompt_caching_toml_enables_and_sets_key() {
+    fn prompt_caching_toml_sets_models_and_key() {
         let toml_raw = r#"
             upstream_base_url = "https://api.example.com"
             upstream_api_key  = "sk-test"
             [prompt_caching]
-            enabled = true
+            models = ["gpt-5.6-luna", "gpt-5.6-terra"]
             cache_key = "my-app"
         "#;
         let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
-        assert!(cfg.prompt_caching.enabled);
+        assert_eq!(cfg.prompt_caching.models.len(), 2);
+        assert!(cfg.prompt_caching.models.contains(&"gpt-5.6-luna".to_string()));
+        assert!(cfg.prompt_caching.models.contains(&"gpt-5.6-terra".to_string()));
         assert_eq!(cfg.prompt_caching.cache_key.as_deref(), Some("my-app"));
+    }
+
+    #[test]
+    fn prompt_caching_for_model_filters_by_model() {
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            [prompt_caching]
+            models = ["gpt-5.6-luna", "gpt-5.6-terra"]
+            cache_key = "my-app"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        // Model in the list gets caching
+        let for_luna = cfg.prompt_caching_for_model("gpt-5.6-luna");
+        assert!(!for_luna.models.is_empty());
+        assert_eq!(for_luna.cache_key.as_deref(), Some("my-app"));
+        // Model NOT in the list gets no caching
+        let for_other = cfg.prompt_caching_for_model("gpt-5.4-mini");
+        assert!(for_other.models.is_empty());
+        assert_eq!(for_other.cache_key.as_deref(), Some("my-app"));
     }
 
     #[test]
@@ -663,17 +697,17 @@ mod tests {
             upstream_base_url = "https://api.example.com"
             upstream_api_key  = "sk-test"
             [prompt_caching]
-            enabled = true
+            models = ["gpt-5.6-luna"]
             cache_key = "from-file"
         "#;
         let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
         let env = EnvInputs {
-            prompt_caching_enabled: Some(false),
+            prompt_caching_models: Some("".into()),
             prompt_cache_key: Some("from-env".into()),
             ..env_with_required()
         };
         let cfg = Config::resolve(Some(&parsed), &env).unwrap();
-        assert!(!cfg.prompt_caching.enabled);
+        assert!(cfg.prompt_caching.models.is_empty());
         assert_eq!(cfg.prompt_caching.cache_key.as_deref(), Some("from-env"));
     }
 
