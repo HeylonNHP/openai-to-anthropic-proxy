@@ -74,6 +74,7 @@ $scrubbedVars = @(
     'ANTHROPIC_BASE_URL',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_CUSTOM_HEADERS',
     'CLAUDE_CODE_CHILD_SESSION',
     'CLAUDE_CODE_ENTRYPOINT',
     'CLAUDE_CODE_SESSION_ID',
@@ -132,6 +133,18 @@ proxy not reachable on $ProxyUrl (preflight failed: $($_.Exception.Message)).
         if (Test-Path "Env:$v") {
             Remove-Item "Env:$v" -ErrorAction SilentlyContinue
         }
+    }
+
+    # ─── Layer 3: proxy_key → X-Proxy-Key header ──────────────────
+    # If the proxy is configured with `proxy_key` (env PROXY_KEY or
+    # proxy.toml), every request must include a matching `X-Proxy-Key`
+    # header or the proxy returns 401. The Anthropic SDK reads custom
+    # headers from the `ANTHROPIC_CUSTOM_HEADERS` env var, which takes
+    # a `Name: Value` string. We forward `PROXY_KEY` from the calling
+    # shell if it's set.
+    if (Test-Path 'Env:PROXY_KEY') {
+        $env:ANTHROPIC_CUSTOM_HEADERS = "X-Proxy-Key: $env:PROXY_KEY"
+        Write-Host 'note: forwarding PROXY_KEY to the child as X-Proxy-Key.' -ForegroundColor Yellow
     }
 
     # ─── Layer 1: --setting-sources=project,local ──────────────────

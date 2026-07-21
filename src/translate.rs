@@ -20,8 +20,8 @@
 use crate::anthropic::{
     CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
     MessageContent, MessageParam, MessageRole, ResponseContentBlock, ServerToolUseUsage,
-    StopReason, SystemPrompt, ToolChoice, ToolResultContent, Usage as AnthropicUsage,
-    WebSearchResult, WebSearchToolResultBlock,
+    StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
+    Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
 use crate::config::PromptCachingConfig;
 use crate::responses::{
@@ -179,7 +179,23 @@ pub fn anthropic_to_responses(
             .collect()
     });
 
-    let tool_choice = req.tool_choice.as_ref().map(map_tool_choice);
+    let (tool_choice, parallel_tool_calls) = match req.tool_choice.as_ref() {
+        // No `tool_choice` on the inbound request → leave both fields
+        // `None`. The Responses API default is `"auto"` and we don't
+        // want to override `parallel_tool_calls` unless the client
+        // asked us to.
+        None => (None, None),
+        Some(c) => {
+            let (tc, disable) = map_tool_choice(c);
+            // Anthropic's `disable_parallel_tool_use: true` means "the
+            // model may call at most one tool per turn." On Responses,
+            // that's `parallel_tool_calls: false`. We only forward the
+            // field when the client explicitly set the Anthropic side
+            // — `None` leaves it to the upstream's default.
+            let parallel = disable.map(|d| !d);
+            (Some(tc), parallel)
+        }
+    };
 
     let user = req
         .metadata
@@ -220,7 +236,7 @@ pub fn anthropic_to_responses(
         // Prompt-caching fields are set later by the caller if enabled.
         prompt_cache_key: None,
         prompt_cache_options: None,
-        parallel_tool_calls: None,
+        parallel_tool_calls,
         store: None,
         previous_response_id: None,
         user,
@@ -590,9 +606,10 @@ fn append_user_message(
                     }
                     ContentBlockParam::ToolResult(tr) => {
                         flush_user_parts(out, &mut parts);
+                        let output = tool_result_output(&tr);
                         out.push(InputItem::FunctionCallOutput {
                             call_id: tr.tool_use_id.clone(),
-                            output: tool_result_text(&tr.content),
+                            output,
                         });
                     }
                     ContentBlockParam::Image(img) => {
@@ -703,6 +720,22 @@ fn tool_result_text(content: &Option<ToolResultContent>) -> String {
     }
 }
 
+/// Render a `ToolResultBlockParam` as the `output` string for a
+/// Responses `FunctionCallOutput`. When `is_error: true` is set, the
+/// OpenAI Responses API has no first-class error field, so we prefix
+/// the output with `[TOOL_ERROR]` so the model can distinguish a
+/// tool failure from a successful result. Without the prefix the
+/// model treats the exception as a successful return value and may
+/// build further calls on top of it.
+fn tool_result_output(tr: &ToolResultBlockParam) -> String {
+    let text = tool_result_text(&tr.content);
+    if tr.is_error == Some(true) {
+        format!("[TOOL_ERROR]\n{text}")
+    } else {
+        text
+    }
+}
+
 fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
@@ -781,12 +814,29 @@ fn append_system_message(instructions: &mut String, content: &MessageContent) ->
     Ok(())
 }
 
-fn map_tool_choice(choice: &ToolChoice) -> ResponsesToolChoice {
+/// Map Anthropic's `ToolChoice` to a Responses-API `ToolChoice` and
+/// capture the `disable_parallel_tool_use` flag separately so the
+/// caller can set `parallel_tool_calls` on the outbound request.
+/// Returns `(tool_choice, disable_parallel_tool_use)`.
+fn map_tool_choice(choice: &ToolChoice) -> (ResponsesToolChoice, Option<bool>) {
     match choice {
-        ToolChoice::Auto { .. } => ResponsesToolChoice::Simple("auto".to_string()),
-        ToolChoice::Any { .. } => ResponsesToolChoice::Simple("required".to_string()),
-        ToolChoice::None {} => ResponsesToolChoice::Simple("none".to_string()),
-        ToolChoice::Tool { name, .. } => {
+        ToolChoice::Auto {
+            disable_parallel_tool_use,
+        } => (
+            ResponsesToolChoice::Simple("auto".to_string()),
+            *disable_parallel_tool_use,
+        ),
+        ToolChoice::Any {
+            disable_parallel_tool_use,
+        } => (
+            ResponsesToolChoice::Simple("required".to_string()),
+            *disable_parallel_tool_use,
+        ),
+        ToolChoice::None {} => (ResponsesToolChoice::Simple("none".to_string()), None),
+        ToolChoice::Tool {
+            name,
+            disable_parallel_tool_use,
+        } => {
             // The Responses API distinguishes function tools (with
             // `{type: "function", name: "..."}`) from built-in tools like
             // `web_search` (which use `{type: "web_search"}` with no name).
@@ -795,14 +845,15 @@ fn map_tool_choice(choice: &ToolChoice) -> ResponsesToolChoice {
             // upstream rejects with: Tool choice 'function' not found in
             // 'tools' parameter. For built-in server tools, fall back to
             // `"auto"` so the model can decide when to invoke them.
-            if name == "web_search" {
+            let tc = if name == "web_search" {
                 ResponsesToolChoice::Simple("auto".to_string())
             } else {
                 ResponsesToolChoice::Function {
                     kind: "function".to_string(),
                     name: name.clone(),
                 }
-            }
+            };
+            (tc, *disable_parallel_tool_use)
         }
     }
 }
@@ -1140,6 +1191,104 @@ mod tests {
             }
             _ => panic!("expected function tool_choice"),
         }
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_true_forces_parallel_off() {
+        // Anthropic's `disable_parallel_tool_use: true` is the client's
+        // way of asking the model to make at most one tool call per
+        // turn. On Responses that's `parallel_tool_calls: false`. The
+        // proxy must forward it; the upstream is otherwise free to
+        // batch tool calls in a single turn, breaking serial-only
+        // tool flows (interactive prompts, lock files, etc).
+        let mut req = fixture_request();
+        req.tool_choice = Some(ToolChoice::Auto {
+            disable_parallel_tool_use: Some(true),
+        });
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        assert_eq!(out.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_false_sets_parallel_true() {
+        // `disable_parallel_tool_use: false` is an explicit "you may
+        // emit parallel tool calls" — forward as `parallel_tool_calls:
+        // true` so the upstream's own default doesn't get in the way.
+        let mut req = fixture_request();
+        req.tool_choice = Some(ToolChoice::Any {
+            disable_parallel_tool_use: Some(false),
+        });
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        assert_eq!(out.parallel_tool_calls, Some(true));
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_none_leaves_field_none() {
+        // When the client doesn't ask either way, we don't override
+        // the upstream's default. Pinning `parallel_tool_calls` to
+        // Some(false) here would silently turn every multi-tool model
+        // into a single-tool model.
+        let mut req = fixture_request();
+        req.tool_choice = Some(ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        });
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        assert_eq!(out.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn no_tool_choice_leaves_parallel_tool_calls_none() {
+        // No `tool_choice` on the inbound request at all — leave both
+        // fields `None` so the upstream's defaults apply.
+        let req = fixture_request();
+        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        assert!(out.tool_choice.is_none());
+        assert_eq!(out.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn tool_result_is_error_true_prefixes_output() {
+        // A tool that returned `is_error: true` must surface as an
+        // error to the model. Responses has no native is_error field,
+        // so we prefix the output with `[TOOL_ERROR]`. Without this
+        // the model treats the exception as a successful result.
+        let tr = ToolResultBlockParam {
+            tool_use_id: "call_1".into(),
+            content: Some(ToolResultContent::Text("division by zero".into())),
+            is_error: Some(true),
+        };
+        let out = tool_result_output(&tr);
+        assert!(
+            out.starts_with("[TOOL_ERROR]\n"),
+            "expected [TOOL_ERROR] prefix, got {out:?}"
+        );
+        assert!(out.contains("division by zero"));
+    }
+
+    #[test]
+    fn tool_result_is_error_false_passes_output_through() {
+        // `is_error: false` is an explicit "this was a successful
+        // result" — same as `None`, no prefix.
+        let tr = ToolResultBlockParam {
+            tool_use_id: "call_1".into(),
+            content: Some(ToolResultContent::Text("ok".into())),
+            is_error: Some(false),
+        };
+        let out = tool_result_output(&tr);
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn tool_result_is_error_none_passes_output_through() {
+        // Most callers omit `is_error` entirely. Preserve current
+        // behavior — output as-is, no prefix.
+        let tr = ToolResultBlockParam {
+            tool_use_id: "call_1".into(),
+            content: Some(ToolResultContent::Text("72F sunny".into())),
+            is_error: None,
+        };
+        let out = tool_result_output(&tr);
+        assert_eq!(out, "72F sunny");
     }
 
     #[test]
@@ -2804,7 +2953,7 @@ mod response_tests {
             name: "web_search".into(),
             disable_parallel_tool_use: None,
         };
-        let mapped = map_tool_choice(&choice);
+        let (mapped, _) = map_tool_choice(&choice);
         match mapped {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
             other => panic!("expected Simple(\"auto\"), got {other:?}"),
@@ -2820,7 +2969,7 @@ mod response_tests {
             name: "get_weather".into(),
             disable_parallel_tool_use: None,
         };
-        let mapped = map_tool_choice(&choice);
+        let (mapped, _) = map_tool_choice(&choice);
         match mapped {
             ResponsesToolChoice::Function { kind, name } => {
                 assert_eq!(kind, "function");

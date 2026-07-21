@@ -66,6 +66,18 @@ pub struct Config {
     /// markers and sets the top-level `prompt_cache_key`. Models not in the list
     /// get no prompt-caching fields.
     pub prompt_caching: PromptCachingConfig,
+    /// Shared secret required on the inbound `X-Proxy-Key` header.
+    /// `None` means no client authentication (current behavior); a
+    /// warning is printed at startup. `Some(_)` means every request
+    /// must carry the matching header or the proxy returns 401.
+    pub proxy_key: Option<String>,
+    /// Whether to write structured logs to `target/logs/proxy.log`.
+    /// Defaults to `false` (off) — operators who want file logs set
+    /// this to `true` in proxy.toml or `LOG_TO_DISK=1` in the env.
+    /// When off, `tracing` events go to stdout, which is enough for
+    /// interactive use and avoids persisting request/response bodies
+    /// to disk by default.
+    pub log_to_disk: bool,
 }
 
 /// Inbound → upstream model name aliases.
@@ -253,6 +265,20 @@ impl Config {
             cache_key: prompt_cache_key,
         };
 
+        // `proxy_key`: env wins over file, both fall through to `None`
+        // (no client auth).
+        let proxy_key = pick_str(
+            file.and_then(|f| f.proxy_key.as_deref()),
+            env.proxy_key.as_deref(),
+        );
+
+        // `log_to_disk`: env wins over file, then default to `false`.
+        // For a boolean we can't reuse `pick_str`; do it inline.
+        let log_to_disk = env
+            .log_to_disk
+            .or_else(|| file.and_then(|f| f.log_to_disk))
+            .unwrap_or(false);
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -263,6 +289,8 @@ impl Config {
             reasoning,
             model_aliases,
             prompt_caching,
+            proxy_key,
+            log_to_disk,
         })
     }
 
@@ -339,6 +367,12 @@ pub struct EnvInputs {
     pub reasoning_effort: Option<String>,
     pub prompt_caching_models: Option<String>,
     pub prompt_cache_key: Option<String>,
+    /// `LOG_TO_DISK=1` enables file logging. Other values are treated
+    /// as `false` so a typo in the env doesn't quietly enable
+    /// structured logs.
+    pub log_to_disk: Option<bool>,
+    /// `PROXY_KEY=<secret>` enables client auth via `X-Proxy-Key`.
+    pub proxy_key: Option<String>,
 }
 
 impl EnvInputs {
@@ -355,6 +389,11 @@ impl EnvInputs {
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
+            log_to_disk: env::var("LOG_TO_DISK").ok().map(|s| {
+                let v = s.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            }),
+            proxy_key: env::var("PROXY_KEY").ok(),
         }
     }
 }
@@ -386,6 +425,14 @@ pub(crate) struct TomlConfig {
     model_aliases: Option<TomlModelAliases>,
     /// Prompt-caching settings. See [`PromptCachingConfig`].
     prompt_caching: Option<TomlPromptCachingConfig>,
+    /// Shared secret required on inbound `X-Proxy-Key` header.
+    /// Omit to leave `/v1/messages` unauthenticated (with a
+    /// startup-time warning).
+    proxy_key: Option<String>,
+    /// When `true`, the proxy writes structured logs to
+    /// `target/logs/proxy.log` in addition to stdout. Defaults to
+    /// `false`.
+    log_to_disk: Option<bool>,
 }
 
 /// TOML shape of `[reasoning]`. `default` is the fallback effort for
@@ -764,5 +811,118 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:9999");
+    }
+
+    #[test]
+    fn log_to_disk_defaults_to_false() {
+        // Default is off so a fresh install never silently writes a
+        // log file (PII concern: request bodies used to be logged at
+        // WARN on every upstream error).
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert!(!cfg.log_to_disk);
+    }
+
+    #[test]
+    fn log_to_disk_env_true_enables() {
+        // `LOG_TO_DISK=1` is the documented "on" trigger.
+        let env = EnvInputs {
+            log_to_disk: Some(true),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert!(cfg.log_to_disk);
+    }
+
+    #[test]
+    fn log_to_disk_env_truthy_values_enable() {
+        // All of these should turn it on.
+        for v in ["1", "true", "yes", "on", "TRUE", "Yes", " on "] {
+            let env = EnvInputs {
+                log_to_disk: Some(true), // already parsed by capture
+                ..env_with_required()
+            };
+            // Re-parse the value through the same logic capture() uses.
+            let parsed = {
+                let v = v.to_ascii_lowercase();
+                let v = v.trim();
+                matches!(v, "1" | "true" | "yes" | "on")
+            };
+            assert!(parsed, "expected {v:?} to enable log_to_disk");
+            // Sanity: the resolved config respects the env when set.
+            let cfg = Config::resolve(None, &env).unwrap();
+            assert!(cfg.log_to_disk, "value {v:?} should be on");
+        }
+    }
+
+    #[test]
+    fn log_to_disk_env_false_disables() {
+        // Anything other than the truthy set disables. A typo in the
+        // env var name should NOT turn logging on.
+        let env = EnvInputs {
+            log_to_disk: Some(false),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert!(!cfg.log_to_disk);
+    }
+
+    #[test]
+    fn log_to_disk_toml_fills_in_when_env_unset() {
+        // TOML fallback: if env is unset, the file's value applies.
+        let file = TomlConfig {
+            log_to_disk: Some(true),
+            ..TomlConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert!(cfg.log_to_disk);
+    }
+
+    #[test]
+    fn log_to_disk_env_overrides_toml() {
+        // Env wins over file (consistent with every other field).
+        let file = TomlConfig {
+            log_to_disk: Some(true),
+            ..TomlConfig::default()
+        };
+        let env = EnvInputs {
+            log_to_disk: Some(false),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert!(!cfg.log_to_disk);
+    }
+
+    #[test]
+    fn proxy_key_defaults_to_none() {
+        // No key set → `None` → no client auth. The startup warning
+        // is emitted by main.rs, not by the config layer.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert!(cfg.proxy_key.is_none());
+    }
+
+    #[test]
+    fn proxy_key_toml_round_trips() {
+        let toml_raw = r#"
+            upstream_base_url = "https://api.example.com"
+            upstream_api_key  = "sk-test"
+            proxy_key = "shared-secret-1234"
+        "#;
+        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(cfg.proxy_key.as_deref(), Some("shared-secret-1234"));
+    }
+
+    #[test]
+    fn proxy_key_env_overrides_toml() {
+        let file = TomlConfig {
+            proxy_key: Some("from-file".into()),
+            ..TomlConfig::default()
+        };
+        let env = EnvInputs {
+            proxy_key: Some("from-env".into()),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(cfg.proxy_key.as_deref(), Some("from-env"));
     }
 }

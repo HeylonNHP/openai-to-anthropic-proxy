@@ -19,6 +19,12 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    /// The client did not provide a valid `X-Proxy-Key` header (or
+    /// the configured `proxy_key` is unset and we're being defensive
+    /// elsewhere). 401 with an Anthropic-shaped body.
+    #[error("unauthorized")]
+    Unauthorized,
+
     /// The upstream returned a non-success status. The status is preserved
     /// so the client sees the same code Anthropic would have returned.
     #[error("upstream returned {status}: {body}")]
@@ -33,6 +39,10 @@ impl AppError {
     fn anthropic_error_body(&self) -> serde_json::Value {
         let (kind, message) = match self {
             Self::BadRequest(msg) => ("invalid_request_error", msg.clone()),
+            Self::Unauthorized => (
+                "authentication_error",
+                "missing or invalid X-Proxy-Key header".to_owned(),
+            ),
             Self::Upstream { status, body } => {
                 let kind = match status.as_u16() {
                     401 | 403 => "authentication_error",
@@ -60,6 +70,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             // 4xx and 5xx upstream statuses are passed through, but if the
             // status itself is informational (1xx) or a success code (2xx/3xx)
             // we collapse to 502 — something is wrong if we got here.
