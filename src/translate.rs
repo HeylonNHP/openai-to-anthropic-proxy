@@ -25,7 +25,8 @@ use crate::anthropic::{
 use crate::config::PromptCachingConfig;
 use crate::responses::{
     Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig, ResponsesRequest,
-    ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice,
+    ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition,
+    WebSearchTool,
 };
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -152,14 +153,27 @@ pub fn anthropic_to_responses(
         tools
             .iter()
             .filter_map(|t| {
+                // Anthropic server-side web_search tool → OpenAI native web_search.
+                // Server tools have no input_schema; we detect them by name.
+                if t.name == "web_search" {
+                    return Some(ToolDefinition::WebSearch(WebSearchTool {
+                        kind: "web_search".to_string(),
+                        max_uses: None,
+                        search_context_size: Some("medium".to_string()),
+                        user_location: None,
+                        allowed_domains: None,
+                        blocked_domains: None,
+                    }));
+                }
+
                 let input_schema = t.input_schema.clone()?;
-                Some(ResponsesTool {
+                Some(ToolDefinition::Function(ResponsesTool {
                     kind: "function".to_string(),
                     name: t.name.clone(),
                     description: t.description.clone(),
                     strict: true,
                     parameters: sanitize_tool_schema(input_schema),
-                })
+                }))
             })
             .collect()
     });
@@ -771,10 +785,24 @@ fn map_tool_choice(choice: &ToolChoice) -> ResponsesToolChoice {
         ToolChoice::Auto { .. } => ResponsesToolChoice::Simple("auto".to_string()),
         ToolChoice::Any { .. } => ResponsesToolChoice::Simple("required".to_string()),
         ToolChoice::None {} => ResponsesToolChoice::Simple("none".to_string()),
-        ToolChoice::Tool { name, .. } => ResponsesToolChoice::Function {
-            kind: "function".to_string(),
-            name: name.clone(),
-        },
+        ToolChoice::Tool { name, .. } => {
+            // The Responses API distinguishes function tools (with
+            // `{type: "function", name: "..."}`) from built-in tools like
+            // `web_search` (which use `{type: "web_search"}` with no name).
+            // If we forward `{type: "function", name: "web_search"}` while
+            // the tools array contains a `web_search` built-in, the
+            // upstream rejects with: Tool choice 'function' not found in
+            // 'tools' parameter. For built-in server tools, fall back to
+            // `"auto"` so the model can decide when to invoke them.
+            if name == "web_search" {
+                ResponsesToolChoice::Simple("auto".to_string())
+            } else {
+                ResponsesToolChoice::Function {
+                    kind: "function".to_string(),
+                    name: name.clone(),
+                }
+            }
+        }
     }
 }
 
@@ -854,11 +882,16 @@ mod tests {
         // Tools lifted, input_schema → parameters + strict: true
         let tools = tools.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].kind, "function");
-        assert_eq!(tools[0].name, "get_weather");
-        assert!(tools[0].strict);
-        assert_eq!(tools[0].parameters["type"], "object");
-        assert_eq!(tools[0].parameters["additionalProperties"], false);
+        match &tools[0] {
+            ToolDefinition::Function(t) => {
+                assert_eq!(t.kind, "function");
+                assert_eq!(t.name, "get_weather");
+                assert!(t.strict);
+                assert_eq!(t.parameters["type"], "object");
+                assert_eq!(t.parameters["additionalProperties"], false);
+            }
+            _ => panic!("expected function tool"),
+        }
 
         // temperature passed through
         assert_eq!(temperature, Some(0.5));
@@ -2625,6 +2658,45 @@ mod response_tests {
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(out.content.len(), 1);
         assert!(matches!(out.content[0], ResponseContentBlock::Text { .. }));
-        let _ = json!({}); // silence unused-import warning under no_features
+    }
+
+    #[test]
+    fn web_search_tool_choice_translates_to_auto() {
+        // Claude Code's WebSearch tool is sent as a built-in server
+        // tool (no input_schema). The proxy translates it to OpenAI's
+        // native `{type: "web_search"}` tool. If the inbound
+        // `tool_choice` is `{type: "tool", name: "web_search"}`, the
+        // Responses API would reject `{type: "function", name:
+        // "web_search"}` because the tools array contains a web_search
+        // built-in, not a function. Verify the proxy falls back to
+        // `"auto"` for this case.
+        let choice = ToolChoice::Tool {
+            name: "web_search".into(),
+            disable_parallel_tool_use: None,
+        };
+        let mapped = map_tool_choice(&choice);
+        match mapped {
+            ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
+            other => panic!("expected Simple(\"auto\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_tool_choice_keeps_function_form() {
+        // Regular function tools (with input_schema) must still be
+        // translated to `{type: "function", name: "..."}` so the
+        // Responses API routes the choice to the right function.
+        let choice = ToolChoice::Tool {
+            name: "get_weather".into(),
+            disable_parallel_tool_use: None,
+        };
+        let mapped = map_tool_choice(&choice);
+        match mapped {
+            ResponsesToolChoice::Function { kind, name } => {
+                assert_eq!(kind, "function");
+                assert_eq!(name, "get_weather");
+            }
+            other => panic!("expected Function, got {other:?}"),
+        }
     }
 }
