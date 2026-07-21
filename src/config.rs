@@ -71,12 +71,15 @@ pub struct Config {
     /// warning is printed at startup. `Some(_)` means every request
     /// must carry the matching header or the proxy returns 401.
     pub proxy_key: Option<String>,
-    /// Whether to write structured logs to `target/logs/proxy.log`.
-    /// Defaults to `false` (off) — operators who want file logs set
-    /// this to `true` in proxy.toml or `LOG_TO_DISK=1` in the env.
-    /// When off, `tracing` events go to stdout, which is enough for
-    /// interactive use and avoids persisting request/response bodies
-    /// to disk by default.
+    /// Whether to write structured `tracing` events to
+    /// `target/logs/proxy.log`. Defaults to `false` (off). When
+    /// `false`, tracing events are **dropped** — they reach neither
+    /// the terminal nor a file, so the operator's terminal shows
+    /// only the explicit `println!` / `eprintln!` user-facing lines.
+    /// This is the safe default: no PII is persisted and the
+    /// terminal stays uncluttered. Operators who want logs for
+    /// postmortem inspection set this to `true` in `proxy.toml` or
+    /// `LOG_TO_DISK=1` in the env.
     pub log_to_disk: bool,
 }
 
@@ -367,8 +370,9 @@ pub struct EnvInputs {
     pub reasoning_effort: Option<String>,
     pub prompt_caching_models: Option<String>,
     pub prompt_cache_key: Option<String>,
-    /// `LOG_TO_DISK=1` enables file logging. Other values are treated
-    /// as `false` so a typo in the env doesn't quietly enable
+    /// `LOG_TO_DISK=1` enables file logging (and silences the
+    /// default drop-everything mode). Other values are treated as
+    /// `false` so a typo in the env doesn't quietly enable
     /// structured logs.
     pub log_to_disk: Option<bool>,
     /// `PROXY_KEY=<secret>` enables client auth via `X-Proxy-Key`.
@@ -429,9 +433,11 @@ pub(crate) struct TomlConfig {
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).
     proxy_key: Option<String>,
-    /// When `true`, the proxy writes structured logs to
-    /// `target/logs/proxy.log` in addition to stdout. Defaults to
-    /// `false`.
+    /// When `true`, the proxy writes structured `tracing` events to
+    /// `target/logs/proxy.log`. When `false` (the default), tracing
+    /// events are dropped — nothing reaches the terminal or a file.
+    /// Set to `true` when you want postmortem logs; leave unset (or
+    /// `false`) for a clean terminal in interactive use.
     log_to_disk: Option<bool>,
 }
 
