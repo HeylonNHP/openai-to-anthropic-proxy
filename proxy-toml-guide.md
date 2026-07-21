@@ -74,7 +74,7 @@ Clients must then send an `X-Proxy-Key: any-shared-secret-string` header on ever
 
 ### Logging (`log_to_disk`)
 
-By default the proxy writes structured logs to stdout (and only stdout). Set `log_to_disk = true` in TOML, or `LOG_TO_DISK=1` in the env, to additionally write a rotating file at `target/logs/proxy.log`. The file path is unchanged from earlier versions. Off-by-default avoids persisting request and response bodies to disk on every upstream error.
+By default the proxy **drops** every `tracing` event — nothing reaches the terminal or a file. The terminal shows only the explicit `println!` / `eprintln!` lines (startup banner, per-request `→` / `←` summary, shutdown notice). Set `log_to_disk = true` in TOML, or `LOG_TO_DISK=1` in the env, to write a rotating file at `target/logs/proxy.log` for postmortem inspection. The file path is unchanged from earlier versions. Off-by-default keeps request and response bodies off the terminal and off disk on every upstream error.
 
 ```toml
 log_to_disk = true

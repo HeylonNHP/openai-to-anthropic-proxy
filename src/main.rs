@@ -3,8 +3,11 @@
 //! Loads configuration, builds a shared reqwest client and an axum router,
 //! then binds the configured listen address. Shuts down on `Ctrl-C`.
 //!
-//! Terminal output shows startup info and per-request stats. Full structured
-//! logs (including warnings and debug) go to a rotating file under
+//! The terminal shows only the explicit `println!` / `eprintln!` lines
+//! in this binary (startup banner, per-request summary, shutdown notice).
+//! `tracing` events are **silent by default** — they reach neither the
+//! terminal nor a file. Set `log_to_disk = true` in `proxy.toml` (or
+//! `LOG_TO_DISK=1` in the env) to capture them in a rotating file at
 //! `target/logs/proxy.log` for postmortem inspection.
 
 use std::sync::Arc;
@@ -22,12 +25,14 @@ async fn main() -> Result<()> {
 
     // Initialize tracing after we know whether file logging is
     // enabled. When `log_to_disk` is off (the default), tracing
-    // events go to stdout — no `target/logs/proxy.log` is created.
+    // events are dropped — no output, no file. When on, they go
+    // to `target/logs/proxy.log`.
     let _log_guard = init_tracing(config.log_to_disk);
 
     // Warn loudly if the proxy is reachable but unauthenticated.
-    // The `println!` ensures the warning is visible even when
-    // `log_to_disk` is off (the new default).
+    // The `eprintln!` is the only way this surfaces to the operator
+    // under the default (`log_to_disk = false`), since the matching
+    // `tracing::warn!` below is dropped.
     if config.proxy_key.is_none() {
         eprintln!(
             "WARNING: proxy_key is not set; /v1/messages accepts requests from any client. \
@@ -69,14 +74,15 @@ fn build_upstream_client(config: &Config) -> Result<reqwest::Client> {
 
 /// Initialize tracing. When `log_to_disk` is `true` (opt-in),
 /// structured events go to a rotating file at
-/// `target/logs/proxy.log`. When `false` (the default), events go to
-/// stdout — the `println!` / `eprintln!` lines in the rest of the
-/// binary remain the user-visible terminal output.
+/// `target/logs/proxy.log`. When `false` (the default), events are
+/// dropped — they reach neither the terminal nor a file, and only
+/// the explicit `println!` / `eprintln!` lines in this binary are
+/// visible to the operator.
 ///
 /// Returns a `WorkerGuard` that must be kept alive for the lifetime
 /// of the program; dropping it flushes and stops the background log
 /// writer. The guard is meaningful only for the file path; the
-/// stdout path drops it harmlessly.
+/// silent path drops it harmlessly.
 fn init_tracing(log_to_disk: bool) -> WorkerGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,openai_to_anthropic_proxy=debug"));
@@ -101,20 +107,23 @@ fn init_tracing(log_to_disk: bool) -> WorkerGuard {
 
         guard
     } else {
-        // Default: stdout, with colors. Operators who want grep-able
-        // file logs set `log_to_disk = true` in proxy.toml or
-        // `LOG_TO_DISK=1` in the env.
-        let (stdout_writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+        // Default: silent. The terminal shows only the explicit
+        // `println!` / `eprintln!` lines in this binary. We still
+        // pipe through `tracing_appender::non_blocking(io::sink())`
+        // (rather than a custom `MakeWriter`) so the return type
+        // stays `WorkerGuard` with no signature change at the call
+        // site — the writes are dropped at the kernel pipe.
+        let (sink_writer, guard) = tracing_appender::non_blocking(std::io::sink());
 
-        let stdout_layer = fmt::layer()
-            .with_writer(stdout_writer)
+        let sink_layer = fmt::layer()
+            .with_writer(sink_writer)
             .with_target(true)
-            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+            .with_ansi(false)
             .with_level(true);
 
         tracing_subscriber::registry()
             .with(filter)
-            .with(stdout_layer)
+            .with(sink_layer)
             .init();
 
         guard

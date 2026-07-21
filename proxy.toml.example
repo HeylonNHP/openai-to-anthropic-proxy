@@ -23,10 +23,13 @@
 #                          the proxy returns 401. When unset, the
 #                          proxy accepts all requests and prints a
 #                          startup warning. See "Client auth" below.
-#   log_to_disk          — when true, structured logs are written
-#                          to `target/logs/proxy.log` in addition to
-#                          stdout. Default false (logs go to stdout
-#                          only — no PII persisted to disk).
+#   log_to_disk          — when true, structured tracing events are
+#                          written to `target/logs/proxy.log`. When
+#                          false (default), tracing events are
+#                          dropped — the terminal shows only the
+#                          intentional `println!` banners and the
+#                          per-request summary lines. Set true when
+#                          you want postmortem logs.
 
 # ─── Client auth ────────────────────────────────────────────────────────
 # The proxy listens on `0.0.0.0:8085` by default, which means anyone
