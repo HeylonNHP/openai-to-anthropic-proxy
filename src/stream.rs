@@ -121,10 +121,10 @@ struct ToolBlockState {
 #[derive(Debug, Clone)]
 struct ThinkingBlockState {
     index: u32,
-    /// Concatenated summary text from `reasoning_summary_text.delta`
-    /// events. Set on the block's `signature` field at `output_item.done`
-    /// from `encrypted_content`.
-    thinking: String,
+    /// Encrypted content blob from the upstream's `Reasoning` output
+    /// item. Carried on the wire as the `signature` field of the
+    /// Anthropic Thinking block so the client can verify the block
+    /// on the next turn.
     signature: String,
 }
 
@@ -577,7 +577,6 @@ impl StreamTranslator {
                     output_index,
                     ThinkingBlockState {
                         index,
-                        thinking: String::new(),
                         signature: String::new(),
                     },
                 );
@@ -750,11 +749,6 @@ impl StreamTranslator {
             return;
         };
         let index = state.index;
-        self.thinking_blocks
-            .get_mut(&output_index)
-            .unwrap()
-            .thinking
-            .push_str(text);
         events.push(StreamEvent::ContentBlockDelta {
             index,
             delta: ContentDelta::ThinkingDelta {
