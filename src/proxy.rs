@@ -89,7 +89,7 @@ async fn handle_messages(
     // If the operator configured a prompt-cache key, forward it. This
     // is done after translation so the key is independent of the
     // alias-resolved model name.
-    if prompt_caching.enabled {
+    if !prompt_caching.models.is_empty() {
         outbound.prompt_cache_key = prompt_caching.cache_key.clone();
     }
 

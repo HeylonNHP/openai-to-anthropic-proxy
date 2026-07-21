@@ -63,12 +63,29 @@ In the current local file, `claude-opus-4-8` and `claude-sonnet-5` both route to
 
 ### Prompt caching
 
-`[prompt_caching]` is opt-in and defaults to disabled.
+`[prompt_caching]` is opt-in and defaults to disabled (empty model list).
 
-- `enabled = true` turns Anthropic `cache_control: {type: "ephemeral"}` markers into OpenAI `prompt_cache_breakpoint` markers for user/system text and image blocks.
-- `cache_key` is optional; if set, it is forwarded as `prompt_cache_key`.
+- `models` is a list of upstream model names that support prompt caching.
+  Only requests sent to these models will get `prompt_cache_breakpoint` markers
+  and the `prompt_cache_key` field. Models not in the list get no
+  prompt-caching fields at all.
+- `cache_key` is optional; if set, it is forwarded as `prompt_cache_key`
+  to help the upstream route similar prompt prefixes to the same cache bucket.
 
-Because unknown JSON fields are silently ignored by most OpenAI-compatible endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM upstreams. Those endpoints will simply ignore the extra fields.
+Example — enable caching only for the GPT 5.6 series:
+
+```toml
+[prompt_caching]
+models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+cache_key = "my-app"
+```
+
+Environment variable: `PROMPT_CACHING_MODELS` — a comma-separated list
+(e.g. `gpt-5.6-luna,gpt-5.6-terra`). Overrides the TOML value.
+
+Because unknown JSON fields are silently ignored by most OpenAI-compatible
+endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM
+upstreams. Those endpoints will simply ignore the extra fields.
 
 ### Model aliases
 

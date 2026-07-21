@@ -19,20 +19,22 @@
 #                          (see the [prompt_caching] table below)
 
 # [prompt_caching]
-# enabled = false
+# models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 # cache_key = "my-app"
 #
-# When `enabled = true`, Anthropic `cache_control: {type: "ephemeral"}`
+# When a model is listed in `models`, Anthropic `cache_control: {type: "ephemeral"}`
 # markers on user/system text and image blocks are translated into
 # OpenAI `prompt_cache_breakpoint` markers on the outbound
-# `/v1/responses` request. Endpoints that don't understand these fields
-# (Ollama, OpenRouter, vLLM, etc.) silently ignore them, so the change
-# is safe for non-OpenAI upstreams. Leave `enabled = false` (the
-# default) if your upstream does not support OpenAI prompt caching.
+# `/v1/responses` request. Models not in the list get no prompt-caching
+# fields. Leave `models` empty (or omit the table entirely) to disable
+# prompt caching for all models.
 #
 # `cache_key` is optional. If set, it is forwarded as
 # `prompt_cache_key` to help the upstream route similar prompt prefixes
-# to the same cache.
+# to the same cache bucket.
+#
+# Environment variable: `PROMPT_CACHING_MODELS` — comma-separated list
+# (e.g. "gpt-5.6-luna,gpt-5.6-terra"). Overrides the TOML value.
 
 # ─── Example: NVIDIA OpenAI-compatible ──────────────────────────────────
 upstream_base_url = "https://integrate.api.nvidia.com/"
