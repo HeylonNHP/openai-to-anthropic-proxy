@@ -4,8 +4,8 @@ A small Rust proxy that lets Claude Code talk to OpenAI-compatible upstreams by 
 
 ## Quick start
 
-1. Set `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY`, or copy `proxy.toml.example` to `proxy.toml` and fill them in.
-   - For a fuller walkthrough of `proxy.toml`, see [proxy.toml guide](./proxy-toml-guide.md).
+1. Set `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY`, or copy `proxy.json.example` to `proxy.json` and fill them in.
+   - For a fuller walkthrough of `proxy.json`, see [proxy.json guide](./proxy.json-guide.md).
 2. Start the proxy:
 
    ```bash
@@ -43,7 +43,7 @@ For config details, launch-script behavior, and protocol notes, see [`REFERENCE.
 
 ### If the proxy is configured with `proxy_key`
 
-The proxy accepts a `proxy_key` setting in `proxy.toml` (or a `PROXY_KEY` env var) that, when set, requires every `/v1/messages` request to carry a matching `X-Proxy-Key` header. Without it, the proxy returns 401 before doing any other work. Add the secret to your `~/.claude/settings.json` so Claude Code sends it on every request:
+The proxy accepts a `proxy_key` setting in `proxy.json` (or a `PROXY_KEY` env var) that, when set, requires every `/v1/messages` request to carry a matching `X-Proxy-Key` header. Without it, the proxy returns 401 before doing any other work. Add the secret to your `~/.claude/settings.json` so Claude Code sends it on every request:
 
 ```json
 {

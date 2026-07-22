@@ -2,7 +2,7 @@
 /target/
 
 # Local configuration (don't commit secrets)
-/proxy.toml
+/proxy.json
 .env
 .env.local
 
