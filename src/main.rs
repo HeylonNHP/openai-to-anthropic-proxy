@@ -6,7 +6,7 @@
 //! The terminal shows only the explicit `println!` / `eprintln!` lines
 //! in this binary (startup banner, per-request summary, shutdown notice).
 //! `tracing` events are **silent by default** — they reach neither the
-//! terminal nor a file. Set `log_to_disk = true` in `proxy.toml` (or
+//! terminal nor a file. Set `log_to_disk = true` in `proxy.json` (or
 //! `LOG_TO_DISK=1` in the env) to capture them in a rotating file at
 //! `target/logs/proxy.log` for postmortem inspection.
 
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     if config.proxy_key.is_none() {
         eprintln!(
             "WARNING: proxy_key is not set; /v1/messages accepts requests from any client. \
-             Set `proxy_key` in proxy.toml or PROXY_KEY env to require authentication."
+             Set `proxy_key` in proxy.json or PROXY_KEY env to require authentication."
         );
         tracing::warn!(
             "proxy_key is not set; /v1/messages accepts requests from any client"

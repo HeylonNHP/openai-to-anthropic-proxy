@@ -15,7 +15,7 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 
 ## Configuration
 
-The proxy reads environment variables first, then an optional `proxy.toml`, then built-in defaults. Environment variables win on conflict.
+The proxy reads environment variables first, then an optional `proxy.json`, then built-in defaults. Environment variables win on conflict.
 
 | Variable | Default | Required? | Notes |
 |---|---|---|---|
@@ -29,15 +29,16 @@ The proxy reads environment variables first, then an optional `proxy.toml`, then
 | `PROXY_KEY` | - | no | shared secret for `X-Proxy-Key` auth (see "Client auth" below) |
 | `LOG_TO_DISK` | `false` | no | set `1`/`true`/`yes` to write `target/logs/proxy.log` |
 
-`proxy.toml` uses the same field names in snake_case. See `proxy.toml.example` for a starter.
+`proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
 
 ### Client auth (`proxy_key` / `PROXY_KEY`)
 
-The proxy binds `0.0.0.0:8085` by default, which means anyone on the network can reach it. If you don't set `proxy_key`, every reachable client can use your upstream API key. To lock it down, set a shared secret:
+The proxy binds `0.0.0.0:8085` by default, which means anyone on the network can reach it. If you don't set `proxy_key`, every reachable client can use your upstream API key. To lock it down, set a shared secret in `proxy.json`:
 
-```toml
-# proxy.toml
-proxy_key = "any-shared-secret-string"
+```json
+{
+  "proxy_key": "any-shared-secret-string"
+}
 ```
 
 or via env:
@@ -67,12 +68,38 @@ For multiple custom headers, separate them with newlines (a single line is enoug
 ### Advanced config
 
 - `REASONING_EFFORT` sets the legacy default effort when no per-model override applies.
-- The `[reasoning]` table lets you set a default effort plus per-model overrides.
-- The `[model_aliases]` table maps inbound model names to upstream model names.
+- The `reasoning` object lets you set a default effort plus per-model overrides.
+- The `model_aliases` object maps inbound model names to upstream model names.
 - `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model.
-- The `[prompt_caching]` table lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
-- `prompt_caching.enabled` defaults to `false`; when disabled, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
+- The `prompt_caching` object lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
+- `prompt_caching.models` defaults to `[]`; when empty, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
 - `prompt_caching.cache_key` is optional and forwarded as `prompt_cache_key`.
+
+A small example of these in `proxy.json`:
+
+```json
+{
+  "upstream_base_url": "https://api.example.com",
+  "upstream_api_key":  "sk-...",
+  "reasoning": {
+    "default": "none",
+    "models": {
+      "gpt-5.4-mini": "high",
+      "gpt-5.6-luna":  "medium"
+    }
+  },
+  "model_aliases": {
+    "default_model": "gpt-4o-mini",
+    "map": {
+      "claude-sonnet-5": "gpt-5.4-mini"
+    }
+  },
+  "prompt_caching": {
+    "models": ["gpt-5.6-luna", "gpt-5.6-terra"],
+    "cache_key": "my-app"
+  }
+}
+```
 
 ## Launching Claude Code
 

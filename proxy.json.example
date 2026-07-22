@@ -1,0 +1,27 @@
+{
+  "upstream_base_url": "https://integrate.api.nvidia.com/",
+  "upstream_api_key":  "your-nvapi-key-here",
+  "request_timeout_secs": 600,
+
+  "reasoning": {
+    "default": "none",
+    "models": {
+      "gpt-5.4-mini": "high",
+      "gpt-5.6-luna":  "medium"
+    }
+  },
+
+  "model_aliases": {
+    "default_model": "gpt-4o-mini",
+    "map": {
+      "claude-opus-4-8":  "gpt-5.6-luna",
+      "claude-sonnet-5":  "gpt-5.4-mini",
+      "claude-haiku-4-5": "gpt-4o-mini"
+    }
+  },
+
+  "prompt_caching": {
+    "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+    "cache_key": "my-app"
+  }
+}

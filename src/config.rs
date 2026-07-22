@@ -2,10 +2,10 @@
 //!
 //! Resolution order (highest priority first):
 //!   1. Environment variables (`LISTEN_ADDR`, `UPSTREAM_BASE_URL`, ...).
-//!   2. `proxy.toml` in the working directory, if present.
+//!   2. `proxy.json` in the working directory, if present.
 //!   3. Built-in defaults.
 //!
-//! Environment variables always win over the TOML file. This lets a deployment
+//! Environment variables always win over the JSON file. This lets a deployment
 //! override individual values without editing the config file.
 
 use std::collections::BTreeMap;
@@ -30,7 +30,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// non-`"none"` value, and the resulting combination is unsupported.
 /// Pinning the default to `"none"` keeps tool-use requests working out
 /// of the box; operators who need reasoning for non-tool calls can
-/// override via env or TOML.
+/// override via env or JSON.
 const DEFAULT_REASONING_EFFORT: &str = "none";
 
 /// Resolved proxy configuration. Cheap to clone (`String`s and a `Duration`).
@@ -78,7 +78,7 @@ pub struct Config {
     /// only the explicit `println!` / `eprintln!` user-facing lines.
     /// This is the safe default: no PII is persisted and the
     /// terminal stays uncluttered. Operators who want logs for
-    /// postmortem inspection set this to `true` in `proxy.toml` or
+    /// postmortem inspection set this to `true` in `proxy.json` or
     /// `LOG_TO_DISK=1` in the env.
     pub log_to_disk: bool,
 }
@@ -145,19 +145,19 @@ pub struct PromptCachingConfig {
 }
 
 impl Config {
-    /// Load configuration from the environment and optional `proxy.toml`.
+    /// Load configuration from the environment and optional `proxy.json`.
     pub fn load() -> Result<Self> {
-        Self::load_from(Path::new("proxy.toml"))
+        Self::load_from(Path::new("proxy.json"))
     }
 
-    /// Load configuration, looking for the TOML file at `toml_path`.
+    /// Load configuration, looking for the JSON file at `json_path`.
     ///
     /// Exposed for tests; production code should call [`Config::load`].
-    pub fn load_from(toml_path: &Path) -> Result<Self> {
-        let from_file = if toml_path.exists() {
-            let raw = fs::read_to_string(toml_path)
-                .with_context(|| format!("read config file at {}", toml_path.display()))?;
-            Some(TomlConfig::parse(&raw).with_context(|| "parse proxy.toml")?)
+    pub fn load_from(json_path: &Path) -> Result<Self> {
+        let from_file = if json_path.exists() {
+            let raw = fs::read_to_string(json_path)
+                .with_context(|| format!("read config file at {}", json_path.display()))?;
+            Some(JsonConfig::parse(&raw).with_context(|| "parse proxy.json")?)
         } else {
             None
         };
@@ -169,7 +169,7 @@ impl Config {
     /// Resolve from explicit inputs. `pub(crate)` so integration tests in
     /// `tests/` can't reach in and bypass the env-loading entry point, but
     /// unit tests inside this module can.
-    pub(crate) fn resolve(file: Option<&TomlConfig>, env: &EnvInputs) -> Result<Self> {
+    pub(crate) fn resolve(file: Option<&JsonConfig>, env: &EnvInputs) -> Result<Self> {
         let listen_addr = pick_str(
             file.and_then(|f| f.listen_addr.as_deref()),
             env.listen_addr.as_deref(),
@@ -182,7 +182,7 @@ impl Config {
             file.and_then(|f| f.upstream_base_url.as_deref()),
             env.upstream_base_url.as_deref(),
         )
-        .context("UPSTREAM_BASE_URL is required (set env var or set in proxy.toml)")?;
+        .context("UPSTREAM_BASE_URL is required (set env var or set in proxy.json)")?;
 
         // Validate that the URL parses. We don't keep the parsed form because
         // reqwest will re-parse it at request time, and storing both is noise.
@@ -192,7 +192,7 @@ impl Config {
             file.and_then(|f| f.upstream_api_key.as_deref()),
             env.upstream_api_key.as_deref(),
         )
-        .context("UPSTREAM_API_KEY is required (set env var or set in proxy.toml)")?;
+        .context("UPSTREAM_API_KEY is required (set env var or set in proxy.json)")?;
 
         let upstream_path = pick_str(
             file.and_then(|f| f.upstream_path.as_deref()),
@@ -209,7 +209,7 @@ impl Config {
         // File > env > default. The default is what fixes the airia
         // "function tools with reasoning_effort" 400; an operator who
         // wants something different can set REASONING_EFFORT (or the
-        // `reasoning_effort` TOML key) to override.
+        // `reasoning_effort` JSON key) to override.
         let reasoning_effort = pick_str(
             file.and_then(|f| f.reasoning_effort.as_deref()),
             env.reasoning_effort.as_deref(),
@@ -410,25 +410,25 @@ fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
     env_value.or(file_value)
 }
 
-/// TOML representation of `proxy.toml`. Every field is optional; missing
+/// JSON representation of `proxy.json`. Every field is optional; missing
 /// fields fall through to env vars and then to defaults.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TomlConfig {
+pub(crate) struct JsonConfig {
     listen_addr: Option<String>,
     upstream_base_url: Option<String>,
     upstream_api_key: Option<String>,
     upstream_path: Option<String>,
     request_timeout_secs: Option<u64>,
     reasoning_effort: Option<String>,
-    /// Per-model `reasoning_effort` overrides. Sub-table because
+    /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared
-    /// here; the table itself is optional.
-    reasoning: Option<TomlReasoningConfig>,
+    /// here; the object itself is optional.
+    reasoning: Option<JsonReasoningConfig>,
     /// Inbound → upstream model name aliases. See [`ModelAliases`].
-    model_aliases: Option<TomlModelAliases>,
+    model_aliases: Option<JsonModelAliases>,
     /// Prompt-caching settings. See [`PromptCachingConfig`].
-    prompt_caching: Option<TomlPromptCachingConfig>,
+    prompt_caching: Option<JsonPromptCachingConfig>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).
@@ -441,42 +441,42 @@ pub(crate) struct TomlConfig {
     log_to_disk: Option<bool>,
 }
 
-/// TOML shape of `[reasoning]`. `default` is the fallback effort for
-/// any model not in `models`. `models` is a flat string→string map:
+/// JSON shape of `reasoning`. `default` is the fallback effort for
+/// any model not in `models`. `models` is a flat string→string object:
 /// model name → effort (`"none" | "low" | "medium" | "high"`).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TomlReasoningConfig {
+pub(crate) struct JsonReasoningConfig {
     default: Option<String>,
     #[serde(default)]
     models: BTreeMap<String, String>,
 }
 
-/// TOML shape of `[model_aliases]`. `map` is a flat string→string map:
+/// JSON shape of `model_aliases`. `map` is a flat string→string object:
 /// inbound model name → upstream model name. `default_model` is the
 /// safety-net fallback used when the upstream rejects a model.
 ///
-/// `#[serde(default)]` lets either field be omitted from the TOML —
-/// a `[model_aliases]` block with only `default_model` is valid.
+/// `#[serde(default)]` lets either field be omitted from the JSON —
+/// a `model_aliases` object with only `default_model` is valid.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct TomlModelAliases {
+pub(crate) struct JsonModelAliases {
     map: BTreeMap<String, String>,
     default_model: Option<String>,
 }
 
-/// TOML shape of `[prompt_caching]`.
+/// JSON shape of `prompt_caching`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct TomlPromptCachingConfig {
+pub(crate) struct JsonPromptCachingConfig {
     #[serde(default)]
     models: Option<Vec<String>>,
     cache_key: Option<String>,
 }
 
-impl TomlConfig {
+impl JsonConfig {
     fn parse(raw: &str) -> Result<Self> {
-        toml::from_str(raw).context("invalid TOML")
+        serde_json::from_str(raw).context("invalid JSON (check syntax and field names)")
     }
 }
 
@@ -535,9 +535,9 @@ mod tests {
 
     #[test]
     fn env_overrides_file_reasoning_effort() {
-        let file = TomlConfig {
+        let file = JsonConfig {
             reasoning_effort: Some("low".into()),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let env = EnvInputs {
             reasoning_effort: Some("high".into()),
@@ -549,17 +549,17 @@ mod tests {
 
     #[test]
     fn per_model_reasoning_picks_exact_match() {
-        // [reasoning.models] entry wins over the default and the
+        // `reasoning.models` entry wins over the default and the
         // legacy reasoning_effort field.
-        let file = TomlConfig {
-            reasoning: Some(TomlReasoningConfig {
+        let file = JsonConfig {
+            reasoning: Some(JsonReasoningConfig {
                 default: Some("medium".into()),
                 models: BTreeMap::from([
                     ("gpt-5.4-mini".into(), "high".into()),
                     ("gpt-5.6-luna".into(), "none".into()),
                 ]),
             }),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(
@@ -575,12 +575,12 @@ mod tests {
     #[test]
     fn per_model_reasoning_falls_back_to_default() {
         // Model not in the map falls back to reasoning.default.
-        let file = TomlConfig {
-            reasoning: Some(TomlReasoningConfig {
+        let file = JsonConfig {
+            reasoning: Some(JsonReasoningConfig {
                 default: Some("low".into()),
                 models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
             }),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.reasoning_for_model("gpt-4o").as_deref(), Some("low"));
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn per_model_reasoning_falls_back_to_hardcoded_default() {
-        // No [reasoning] table, no env, no legacy field — still gets
+        // No `reasoning` object, no env, no legacy field — still gets
         // "none" so airia doesn't 400. This is the regression guard
         // for the bug that started this whole change.
         let cfg = Config::resolve(None, &env_with_required()).unwrap();
@@ -601,10 +601,10 @@ mod tests {
     #[test]
     fn per_model_reasoning_legacy_field_used_when_no_table() {
         // Legacy `reasoning_effort` (file or env) still works as the
-        // global default when no [reasoning] table is present.
-        let file = TomlConfig {
+        // global default when no `reasoning` object is present.
+        let file = JsonConfig {
             reasoning_effort: Some("medium".into()),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(
@@ -618,12 +618,12 @@ mod tests {
         // The common case: Claude Code sends `claude-sonnet-5` (its
         // subagent model), the proxy rewrites it to `gpt-5.4-mini`
         // for the gateway.
-        let file = TomlConfig {
-            model_aliases: Some(TomlModelAliases {
+        let file = JsonConfig {
+            model_aliases: Some(JsonModelAliases {
                 map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
                 default_model: None,
             }),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.upstream_model_for("claude-sonnet-5"), "gpt-5.4-mini");
@@ -646,16 +646,16 @@ mod tests {
         // for `claude-sonnet-5` lands on `gpt-5.4-mini` with
         // `high` reasoning, exactly as if the request had arrived
         // with `model: gpt-5.4-mini` directly.
-        let file = TomlConfig {
-            model_aliases: Some(TomlModelAliases {
+        let file = JsonConfig {
+            model_aliases: Some(JsonModelAliases {
                 map: BTreeMap::from([("claude-sonnet-5".into(), "gpt-5.4-mini".into())]),
                 default_model: None,
             }),
-            reasoning: Some(TomlReasoningConfig {
+            reasoning: Some(JsonReasoningConfig {
                 default: Some("none".into()),
                 models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
             }),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         let resolved = cfg.upstream_model_for("claude-sonnet-5");
@@ -665,16 +665,17 @@ mod tests {
 
     #[test]
     fn default_model_field_round_trips() {
-        // The TOML [model_aliases.default_model] value should land on
+        // The JSON `model_aliases.default_model` value should land on
         // Config::model_aliases.default_model verbatim. This is the
         // round-trip half of the contract: the field gets read.
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            [model_aliases]
-            default_model = "gpt-4o-mini"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "model_aliases": {
+                "default_model": "gpt-4o-mini"
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         assert_eq!(
             cfg.model_aliases.default_model.as_deref(),
@@ -688,12 +689,12 @@ mod tests {
         // landed on model_aliases.default_model. The proxy call site
         // uses this accessor; if it returns None when the field is
         // set, the fallback path will silently never run.
-        let file = TomlConfig {
-            model_aliases: Some(TomlModelAliases {
+        let file = JsonConfig {
+            model_aliases: Some(JsonModelAliases {
                 map: BTreeMap::new(),
                 default_model: Some("claude-haiku-4-5".into()),
             }),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.default_model(), Some("claude-haiku-4-5"));
@@ -707,15 +708,16 @@ mod tests {
     }
 
     #[test]
-    fn prompt_caching_toml_sets_models_and_key() {
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            [prompt_caching]
-            models = ["gpt-5.6-luna", "gpt-5.6-terra"]
-            cache_key = "my-app"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+    fn prompt_caching_json_sets_models_and_key() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "prompt_caching": {
+                "models": ["gpt-5.6-luna", "gpt-5.6-terra"],
+                "cache_key": "my-app"
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         assert_eq!(cfg.prompt_caching.models.len(), 2);
         assert!(cfg.prompt_caching.models.contains(&"gpt-5.6-luna".to_string()));
@@ -725,14 +727,15 @@ mod tests {
 
     #[test]
     fn prompt_caching_for_model_filters_by_model() {
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            [prompt_caching]
-            models = ["gpt-5.6-luna", "gpt-5.6-terra"]
-            cache_key = "my-app"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "prompt_caching": {
+                "models": ["gpt-5.6-luna", "gpt-5.6-terra"],
+                "cache_key": "my-app"
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         // Model in the list gets caching
         let for_luna = cfg.prompt_caching_for_model("gpt-5.6-luna");
@@ -745,15 +748,16 @@ mod tests {
     }
 
     #[test]
-    fn prompt_caching_env_overrides_toml() {
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            [prompt_caching]
-            models = ["gpt-5.6-luna"]
-            cache_key = "from-file"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+    fn prompt_caching_env_overrides_json() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "prompt_caching": {
+                "models": ["gpt-5.6-luna"],
+                "cache_key": "from-file"
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let env = EnvInputs {
             prompt_caching_models: Some("".into()),
             prompt_cache_key: Some("from-env".into()),
@@ -766,26 +770,27 @@ mod tests {
 
     #[test]
     fn default_model_unset_returns_none() {
-        // No [model_aliases] table at all → accessor returns None,
+        // No `model_aliases` object at all → accessor returns None,
         // the proxy surfaces upstream errors unchanged.
         let cfg = Config::resolve(None, &env_with_required()).unwrap();
         assert_eq!(cfg.default_model(), None);
     }
 
     #[test]
-    fn reasoning_table_with_only_default_parses() {
-        // A `[reasoning]` table containing just `default` must be
-        // accepted; the `models` sub-table is optional. Without
-        // `#[serde(default)]` on `TomlReasoningConfig.models`, this
+    fn reasoning_object_with_only_default_parses() {
+        // A `reasoning` object containing just `default` must be
+        // accepted; the `models` sub-object is optional. Without
+        // `#[serde(default)]` on `JsonReasoningConfig.models`, this
         // shape would fail to deserialize and the proxy would refuse
         // to start.
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            [reasoning]
-            default = "none"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "reasoning": {
+                "default": "none"
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         assert_eq!(cfg.reasoning.default.as_deref(), Some("none"));
         assert!(cfg.reasoning.models.is_empty());
@@ -797,9 +802,9 @@ mod tests {
 
     #[test]
     fn env_overrides_file() {
-        let file = TomlConfig {
+        let file = JsonConfig {
             listen_addr: Some("0.0.0.0:9999".into()),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let env = EnvInputs {
             listen_addr: Some("0.0.0.0:1234".into()),
@@ -811,9 +816,9 @@ mod tests {
 
     #[test]
     fn file_fills_in_when_env_unset() {
-        let file = TomlConfig {
+        let file = JsonConfig {
             listen_addr: Some("0.0.0.0:9999".into()),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:9999");
@@ -873,22 +878,22 @@ mod tests {
     }
 
     #[test]
-    fn log_to_disk_toml_fills_in_when_env_unset() {
-        // TOML fallback: if env is unset, the file's value applies.
-        let file = TomlConfig {
+    fn log_to_disk_json_fills_in_when_env_unset() {
+        // JSON fallback: if env is unset, the file's value applies.
+        let file = JsonConfig {
             log_to_disk: Some(true),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert!(cfg.log_to_disk);
     }
 
     #[test]
-    fn log_to_disk_env_overrides_toml() {
+    fn log_to_disk_env_overrides_json() {
         // Env wins over file (consistent with every other field).
-        let file = TomlConfig {
+        let file = JsonConfig {
             log_to_disk: Some(true),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let env = EnvInputs {
             log_to_disk: Some(false),
@@ -907,22 +912,22 @@ mod tests {
     }
 
     #[test]
-    fn proxy_key_toml_round_trips() {
-        let toml_raw = r#"
-            upstream_base_url = "https://api.example.com"
-            upstream_api_key  = "sk-test"
-            proxy_key = "shared-secret-1234"
-        "#;
-        let parsed = TomlConfig::parse(toml_raw).expect("parse toml");
+    fn proxy_key_json_round_trips() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "proxy_key": "shared-secret-1234"
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         assert_eq!(cfg.proxy_key.as_deref(), Some("shared-secret-1234"));
     }
 
     #[test]
-    fn proxy_key_env_overrides_toml() {
-        let file = TomlConfig {
+    fn proxy_key_env_overrides_json() {
+        let file = JsonConfig {
             proxy_key: Some("from-file".into()),
-            ..TomlConfig::default()
+            ..JsonConfig::default()
         };
         let env = EnvInputs {
             proxy_key: Some("from-env".into()),
