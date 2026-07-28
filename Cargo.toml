@@ -24,6 +24,12 @@ bytes = "1"
 eventsource-stream = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# TUI (runtime model-routing console)
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+arc-swap = "1"
+unicode-width = "0.1"
+
 # Config + errors + logging
 url = "2"
 tracing = "0.1"
