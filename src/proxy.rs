@@ -26,15 +26,25 @@ use crate::error::AppError;
 use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
+use crate::tui::MappingsStore;
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
 use serde_json::Value;
 
 /// Shared state passed to every handler.
+///
+/// `config` holds the static, startup-only settings (listen address,
+/// upstream URL, API key, ...). `mappings` is the runtime, hot-editable
+/// alias store; handlers take a snapshot from it at the start of each
+/// request so an in-flight request finishes with the mapping it began
+/// with. `output` is the per-process log sink that routes request
+/// lines into the TUI log pane or, with `--no-tui`, to stdout.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub mappings: Arc<MappingsStore>,
     pub client: reqwest::Client,
+    pub output: crate::tui::OutputSink,
 }
 
 // Per-request stash of the JSON body we sent upstream. Used only on
@@ -49,8 +59,18 @@ tokio::task_local! {
 }
 
 /// Build the axum router.
-pub fn router(config: Arc<Config>, client: reqwest::Client) -> Router {
-    let state = AppState { config, client };
+pub fn router(
+    config: Arc<Config>,
+    mappings: Arc<MappingsStore>,
+    client: reqwest::Client,
+    output: crate::tui::OutputSink,
+) -> Router {
+    let state = AppState {
+        config,
+        mappings,
+        client,
+        output,
+    };
     Router::new()
         .route("/v1/messages", post(handle_messages))
         .route("/healthz", get(handle_health))
@@ -126,10 +146,13 @@ async fn handle_messages(
         .as_ref()
         .map(|r| format!("  |  reasoning: {}", r.effort))
         .unwrap_or_default();
-    println!(
-        "  → {} → {}  |  {} tools  |  {} messages{}{}",
-        req.model, outbound.model, tool_count, msg_count, stream_label, reasoning
-    );
+    state.output.emit(crate::tui::LogLine {
+        kind: crate::tui::LogKind::Inbound,
+        text: format!(
+            "  → {} → {}  |  {} tools  |  {} messages{}{}",
+            req.model, outbound.model, tool_count, msg_count, stream_label, reasoning
+        ),
+    });
 
     LAST_SENT_BODY
         .scope(
@@ -239,7 +262,8 @@ async fn handle_messages_inner(
 
         let msg_id = synthetic_message_id(&req);
         let model = outbound.model.clone();
-        let translator_stream = TranslatorStream::new(sse, msg_id, model, start);
+        let translator_stream =
+            TranslatorStream::new(sse, msg_id, model, start, state.output.clone());
 
         let body = Body::from_stream(translator_stream);
         let response = Response::builder()
@@ -282,7 +306,7 @@ async fn handle_messages_inner(
         } else {
             String::new()
         };
-        println!(
+        let line = format!(
             "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
             upstream_resp_body.status,
             elapsed.as_secs_f64(),
@@ -292,12 +316,16 @@ async fn handle_messages_inner(
             cache_read,
             cache_write,
         );
+        state.output.emit(crate::tui::LogLine {
+            kind: crate::tui::LogKind::Response,
+            text: line,
+        });
         Ok(Json(anth).into_response())
     }
 }
 
 /// Print a response stats line from a `StreamStats` (used by the streaming path).
-fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Duration) {
+fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Duration, sink: &crate::tui::OutputSink) {
     let usage = &stats.usage;
     let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
     let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
@@ -317,7 +345,7 @@ fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Du
     } else {
         String::new()
     };
-    println!(
+    let line = format!(
         "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
         stop_reason,
         elapsed.as_secs_f64(),
@@ -327,6 +355,10 @@ fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Du
         cache_read,
         cache_write,
     );
+    sink.emit(crate::tui::LogLine {
+        kind: crate::tui::LogKind::Response,
+        text: line,
+    });
 }
 
 /// Heuristic for "the upstream doesn't know this model". Matches on
@@ -399,18 +431,27 @@ where
     start: Instant,
     /// Captured stats after the translator is consumed, so `Drop` can print them.
     stats: Option<crate::stream::StreamStats>,
+    /// Output sink for the response log line. Cloned cheaply (Arc inside).
+    sink: crate::tui::OutputSink,
 }
 
 impl<S> TranslatorStream<S>
 where
     S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
 {
-    fn new(inner: S, msg_id: String, model: String, start: Instant) -> Self {
+    fn new(
+        inner: S,
+        msg_id: String,
+        model: String,
+        start: Instant,
+        sink: crate::tui::OutputSink,
+    ) -> Self {
         Self {
             inner,
             translator: Some(StreamTranslator::new(msg_id, model)),
             start,
             stats: None,
+            sink,
         }
     }
 
@@ -445,7 +486,7 @@ where
     fn drop(&mut self) {
         if let Some(stats) = self.stats.as_ref() {
             let elapsed = self.start.elapsed();
-            print_stream_stats(stats, elapsed);
+            print_stream_stats(stats, elapsed, &self.sink);
         }
     }
 }

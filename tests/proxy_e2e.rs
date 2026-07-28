@@ -150,7 +150,16 @@ async fn start_proxy(config: Arc<Config>) -> SocketAddr {
         .timeout(config.request_timeout)
         .build()
         .unwrap();
-    let app = openai_to_anthropic_proxy::proxy::router(config, client);
+    use openai_to_anthropic_proxy::{MappingsStore, OutputSink, RuntimeMappings};
+    let store = Arc::new(MappingsStore::seeded(Arc::new(
+        RuntimeMappings::from_config(&config),
+    )));
+    let app = openai_to_anthropic_proxy::proxy::router(
+        config,
+        store,
+        client,
+        OutputSink::plain(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

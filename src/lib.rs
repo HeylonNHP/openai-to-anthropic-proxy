@@ -6,7 +6,9 @@ pub mod stream;
 
 pub mod anthropic;
 pub mod proxy;
+pub mod tui;
 mod translate;
 
 pub use config::Config;
 pub use error::AppError;
+pub use tui::{MappingsStore, OutputSink, RuntimeMappings};
