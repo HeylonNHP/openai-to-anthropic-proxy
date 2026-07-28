@@ -466,8 +466,16 @@ const RECURSE_KEYWORDS: &[&str] = &[
 /// Used to decide whether to inject `additionalProperties: false`
 /// and `properties: {}` (those rules only apply to object schemas;
 /// injecting them into a `string` schema would be a wire-level bug).
+///
+/// A schema is treated as an object if either it carries the
+/// conventional `"type": "object"` tag, **or** it carries a
+/// `properties` map without an explicit type. The latter form is
+/// valid JSON Schema but the OpenAI Responses API strict validator
+/// rejects any nested object that does not declare either of those
+/// or `additionalProperties`, so we must reconcile it here.
 fn is_object_schema(map: &serde_json::Map<String, Value>) -> bool {
     matches!(map.get("type"), Some(Value::String(s)) if s == "object")
+        || (map.get("type").is_none() && map.contains_key("properties"))
 }
 
 /// Reconcile the `required` array of an object schema against the
@@ -3110,5 +3118,86 @@ mod response_tests {
         assert!(matches!(&out.content[0], ResponseContentBlock::ServerToolUse { .. }));
         assert!(matches!(&out.content[1], ResponseContentBlock::WebSearchToolResult { .. }));
         assert!(out.usage.server_tool_use.is_some());
+    }
+
+    // ─── untyped object schemas inside `anyOf` / `oneOf` ──────────
+    //
+    // Live regression from a claude-code → atlassian MCP tool:
+    //   "Invalid schema for function 'mcp__atlassian__createJiraIssue':
+    //    In context=('properties', 'description', 'anyOf', '1'),
+    //    'additionalProperties' is required to be supplied and to be false."
+    //
+    // Root cause: that branch of `anyOf` is an object schema with
+    // `properties` but no explicit `"type": "object"` and no
+    // `additionalProperties`. The Responses strict validator infers
+    // "object" from the `properties` key, then requires
+    // `additionalProperties: false`. `is_object_schema` previously
+    // only recognised schemas with `"type": "object"`, so the
+    // injection step silently skipped the branch and the upstream
+    // returned 400. The fix is to also treat any map carrying
+    // `properties` as an object schema.
+
+    #[test]
+    fn sanitize_tool_schema_reconciles_untyped_object_in_any_of_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            // No "type": "object"; only `properties`.
+                            "properties": {
+                                "type": {"type": "string"},
+                                "text": {"type": "string"},
+                            },
+                        },
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema);
+        let branch = &out["properties"]["description"]["anyOf"][1];
+        assert_eq!(
+            branch.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "expected additionalProperties: false injected into untyped anyOf branch, got {:?}",
+            branch
+        );
+        // `required` should also have been populated from
+        // `properties` keys, so this is also a regression guard for
+        // the prior required-reconciler running here too.
+        let required = branch.get("required").and_then(|v| v.as_array());
+        let names: Vec<&str> = required
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for expected in ["type", "text"] {
+            assert!(
+                names.contains(&expected),
+                "required {:?} should contain {:?}",
+                names,
+                expected
+            );
+        }
+    }
+
+    /// A schema that *only* declares `properties` (no `type` and no
+    /// `additionalProperties`) is treated as an object and gets
+    /// `additionalProperties: false` injected. This is what
+    /// `is_object_schema`'s new branch enables.
+    #[test]
+    fn sanitize_tool_schema_untyped_object_receives_additional_properties_false() {
+        let schema = json!({
+            "properties": {
+                "x": {"type": "string"},
+            },
+        });
+        let out = sanitize_tool_schema(schema);
+        assert_eq!(out["additionalProperties"], Value::Bool(false));
+        let required = out["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(required.contains(&"x"), "required {:?} should contain x", required);
     }
 }
