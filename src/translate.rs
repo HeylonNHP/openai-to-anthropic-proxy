@@ -367,6 +367,37 @@ fn sanitize_tool_schema(mut schema: Value) -> Value {
 /// `v` is expected to have been pre-cleaned of `propertyNames` by
 /// [`strip_property_names`] before this is called.
 fn reconcile_strict(v: &mut Value) {
+    reconcile_strict_inner(v, false);
+}
+
+/// Internal worker for [`reconcile_strict`]. `force_object` is true when
+/// the caller is recursing into a combinator branch (`anyOf`, `oneOf`,
+/// `allOf`, `not`, etc.). The OpenAI Responses strict validator treats
+/// every such branch as an object schema, so a typeless or
+/// `properties`-less branch must be coerced into an object schema with
+/// `additionalProperties: false`. Without this, a branch like
+/// `{ "description": "An ADF document..." }` would fall through to
+/// `type: "string"` and the validator rejects the request with
+/// `additionalProperties is required to be supplied and to be false`
+/// pointing at that branch.
+fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
+    if force_object && let Value::Object(map) = v {
+        // Coerce a typeless or otherwise un-typed combinator branch
+        // into an object schema. We don't strip existing keys (the
+        // client may carry semantic info like `description`,
+        // `markdownDescription`, `enum`, etc.) - we just ensure the
+        // object-keyword requirements are satisfied.
+        if !map.contains_key("additionalProperties") {
+            map.insert("additionalProperties".to_owned(), Value::Bool(false));
+        }
+        if !map.contains_key("properties") {
+            map.insert("properties".to_owned(), Value::Object(Default::default()));
+        }
+        if !map.contains_key("type") {
+            map.insert("type".to_owned(), Value::String("object".into()));
+        }
+    }
+
     match v {
         Value::Object(map) => {
             // Reconcile this object schema FIRST for the
@@ -402,12 +433,21 @@ fn reconcile_strict(v: &mut Value) {
                 );
             }
             if !map.contains_key("type") {
-                tracing::warn!(
-                    "schema node missing `type` key; defaulting to `string`. The \
-                     Responses strict validator rejects type-less schemas. See \
-                     sanitize_tool_schema doc comment in src/translate.rs."
-                );
-                map.insert("type".to_owned(), Value::String("string".into()));
+                if is_object_schema(map) {
+                    tracing::warn!(
+                        "schema node missing `type` key but has `properties`; defaulting to `object`. The \
+                         Responses strict validator rejects type-less object schemas. See \
+                         sanitize_tool_schema doc comment in src/translate.rs."
+                    );
+                    map.insert("type".to_owned(), Value::String("object".into()));
+                } else {
+                    tracing::warn!(
+                        "schema node missing `type` key; defaulting to `string`. The \
+                         Responses strict validator rejects type-less schemas. See \
+                         sanitize_tool_schema doc comment in src/translate.rs."
+                    );
+                    map.insert("type".to_owned(), Value::String("string".into()));
+                }
             }
 
             // Now recurse into child schemas. We do this AFTER the
@@ -418,26 +458,51 @@ fn reconcile_strict(v: &mut Value) {
             // reconciliation runs last, on the post-recurse
             // properties, so the parent's required array is built
             // from the (now-typed) child keys.
+            //
+            // `force_object` is set for combinator-array elements so
+            // OpenAI's strict validator gets `additionalProperties:
+            // false` even on branches that lack `properties`.
+            for keyword in COMBINATOR_KEYWORDS {
+                if let Some(Value::Array(arr)) = map.get_mut(*keyword) {
+                    for child in arr.iter_mut() {
+                        reconcile_strict_inner(child, true);
+                    }
+                }
+            }
             for keyword in RECURSE_KEYWORDS {
                 if let Some(child) = map.get_mut(*keyword) {
-                    reconcile_strict(child);
+                    // `additionalProperties` may carry a sub-schema;
+                    // recurse into it but do NOT force-object it -
+                    // that field really can be a string/array schema.
+                    let force = false;
+                    reconcile_strict_inner(child, force);
                 }
             }
             if let Some(Value::Object(props)) = map.get_mut("properties") {
                 for (_, child) in props.iter_mut() {
-                    reconcile_strict(child);
+                    reconcile_strict_inner(child, false);
                 }
             }
             reconcile_required(map);
         }
         Value::Array(arr) => {
+            // Top-level array reached via the bare `reconcile_strict`
+            // wrapper (e.g. `anyOf` at the schema root). Force-object
+            // each element so the strict validator sees
+            // `additionalProperties: false` on every branch.
             for child in arr.iter_mut() {
-                reconcile_strict(child);
+                reconcile_strict_inner(child, true);
             }
         }
         _ => {}
     }
 }
+
+/// Combinators whose branches the OpenAI Responses strict validator
+/// treats as object schemas, requiring `additionalProperties: false`.
+/// These are walked separately so each branch is force-typed as an
+/// object before the ordinary [`RECURSE_KEYWORDS`] walk runs.
+const COMBINATOR_KEYWORDS: &[&str] = &["anyOf", "oneOf", "allOf"];
 
 /// JSON Schema keywords whose value is (or contains) a sub-schema
 /// that the strict Responses validator will recursively validate.
@@ -3158,6 +3223,7 @@ mod response_tests {
         });
         let out = sanitize_tool_schema(schema);
         let branch = &out["properties"]["description"]["anyOf"][1];
+        assert_eq!(branch["type"], "object");
         assert_eq!(
             branch.get("additionalProperties"),
             Some(&Value::Bool(false)),
@@ -3181,6 +3247,85 @@ mod response_tests {
         }
     }
 
+    /// Live regression from `mcp__atlassian__createJiraIssue`:
+    /// `properties.description.anyOf[1]` is a description-only object
+    /// schema with no `properties`, no `type`, and no
+    /// `additionalProperties`. The OpenAI Responses strict validator
+    /// still treats the branch as an object schema and demands
+    /// `additionalProperties: false`. Combinator branches are
+    /// force-coerced to objects.
+    #[test]
+    fn sanitize_tool_schema_reconciles_description_only_any_of_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            // No `type`, no `properties`, no
+                            // `additionalProperties`. OpenAI's strict
+                            // validator treats this as an object.
+                            "description": "An ADF document."
+                        },
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema);
+        let branch = &out["properties"]["description"]["anyOf"][1];
+        assert_eq!(branch["type"], "object");
+        assert_eq!(
+            branch.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "expected additionalProperties: false on description-only anyOf branch, got {:?}",
+            branch
+        );
+        assert!(
+            branch.get("properties").is_some(),
+            "expected empty `properties` map injected on description-only anyOf branch, got {:?}",
+            branch
+        );
+    }
+
+    /// Same regression but for `oneOf` and `allOf` branches.
+    #[test]
+    fn sanitize_tool_schema_force_objects_all_combinator_branches() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "oneOf": [
+                        {"description": "a oneOf branch"},
+                    ],
+                },
+                "y": {
+                    "allOf": [
+                        {"description": "an allOf branch"},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema);
+        for path in ["properties/x/oneOf/0", "properties/y/allOf/0"] {
+            let node = out
+                .pointer(&format!("/{}", path))
+                .unwrap_or_else(|| panic!("missing path /{}", path));
+            assert_eq!(node["type"], "object", "path {}", path);
+            assert_eq!(
+                node.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "path {}: expected additionalProperties: false",
+                path
+            );
+            assert!(
+                node.get("properties").is_some(),
+                "path {}: expected properties map",
+                path
+            );
+        }
+    }
+
     /// A schema that *only* declares `properties` (no `type` and no
     /// `additionalProperties`) is treated as an object and gets
     /// `additionalProperties: false` injected. This is what
@@ -3193,6 +3338,7 @@ mod response_tests {
             },
         });
         let out = sanitize_tool_schema(schema);
+        assert_eq!(out["type"], "object");
         assert_eq!(out["additionalProperties"], Value::Bool(false));
         let required = out["required"]
             .as_array()
