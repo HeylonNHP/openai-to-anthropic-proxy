@@ -419,6 +419,15 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
             if !map.contains_key("additionalProperties") && is_object_schema(map) {
                 map.insert("additionalProperties".to_owned(), Value::Bool(false));
             }
+            // OpenAI's strict validator rejects schemas that say
+            // `additionalProperties: true` for object-like schemas; it
+            // wants the literal `false`. Coerce it.
+            if let Some(Value::Bool(b)) = map.get("additionalProperties")
+                && *b
+                && is_object_schema(map)
+            {
+                map.insert("additionalProperties".to_owned(), Value::Bool(false));
+            }
             if !map.contains_key("properties") && is_object_schema(map) {
                 map.insert("properties".to_owned(), Value::Object(Default::default()));
             }
@@ -3345,5 +3354,63 @@ mod response_tests {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
         assert!(required.contains(&"x"), "required {:?} should contain x", required);
+    }
+
+    /// Live regression: the Atlassian MCP `createJiraIssue` tool's
+    /// `properties.description.anyOf[1]` branch arrived with
+    /// `additionalProperties: true` on an object-shaped schema. The
+    /// OpenAI strict validator rejected that and demanded the literal
+    /// `additionalProperties: false`. `sanitize_tool_schema` must
+    /// coerce `true` to `false` on object-like schemas.
+    ///
+    /// The branch shape is replayed from the captured dump file at
+    /// `tests/fixtures/atlassian_create_jira_issue_description_any_of_1.json`
+    /// rather than re-synthesized here, so the test tracks the actual
+    /// payload that triggered the live 400.
+    #[test]
+    fn sanitize_tool_schema_coerces_additional_properties_true_to_false_on_object() {
+        // 1. Load the captured branch from the test fixture.
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("atlassian_create_jira_issue_description_any_of_1.json");
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture");
+
+        // Sanity-check the fixture matches the originally captured
+        // shape (additionalProperties: true + type: object). If a
+        // future Atlassian MCP release changes the schema, this guard
+        // makes it obvious the fixture needs updating, not the
+        // sanitizer.
+        assert_eq!(captured["type"], "object");
+        assert_eq!(captured["additionalProperties"], Value::Bool(true));
+
+        // 2. Build the surrounding `properties.description` wrapper
+        //    that contained the branch in the live request, so the
+        //    sanitizer walks the same recursion path it walks for
+        //    real traffic.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "anyOf": [
+                        {"type": "string", "maxLength": 32000},
+                        captured,
+                    ],
+                },
+            },
+        });
+
+        // 3. Sanitize and assert the offender branch now has
+        //    `additionalProperties: false`.
+        let out = sanitize_tool_schema(schema);
+        let branch = &out["properties"]["description"]["anyOf"][1];
+        assert_eq!(
+            branch["additionalProperties"],
+            Value::Bool(false),
+            "expected additionalProperties: false on object branch, got {}",
+            branch["additionalProperties"]
+        );
     }
 }

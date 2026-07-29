@@ -1,0 +1,13 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "const": "doc",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type"
+  ],
+  "type": "object"
+}
