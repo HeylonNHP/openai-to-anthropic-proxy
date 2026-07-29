@@ -13,15 +13,22 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
-use super::output::LogLine;
+use super::output::{LogKind, LogLine};
 use super::panels::Panel;
 use super::runtime::MappingsStore;
 
 /// Maximum number of log lines retained for the on-screen tail.
-const LOG_TAIL: usize = 32;
+///
+/// Raised from 32 to 1000 so the tail is useful in practice. With
+/// the scrollable `List` widget the entire buffer is reachable via
+/// `PageUp`/`PageDown`/`Home`/`End`.
+const LOG_TAIL: usize = 1000;
 
 /// Stable, ordered list of inbound models for display. We sort the live
 /// map's keys for stability; the `default_model` is rendered as its
@@ -59,6 +66,18 @@ pub struct TuiApp {
     config_path: Option<PathBuf>,
     /// Recent log lines, newest at the back.
     log: VecDeque<LogLine>,
+    /// Scroll position inside the log `List`. `offset` is the index
+    /// of the first visible item (0 = newest, `log.len() - 1` = oldest).
+    /// We display the log newest-first, so the "tail" position is
+    /// `offset == 0`.
+    log_list_state: ListState,
+    /// Last rendered log area height. Used by `PageUp`/`PageDown` to
+    /// jump by a full screen. Refreshed every render frame.
+    log_viewport_h: u16,
+    /// When `true`, newly-pushed log lines auto-scroll the view to the
+    /// newest entry. Set to `false` when the user scrolls up, restored
+    /// to `true` when they hit `End`/`G`.
+    log_follow_tail: bool,
     /// Last time the dashboard was rendered. Used for the uptime clock.
     started_at: Instant,
     /// Current input mode.
@@ -78,10 +97,16 @@ pub struct TuiApp {
 impl TuiApp {
     /// Construct a new app.
     pub fn new(store: std::sync::Arc<MappingsStore>, config_path: Option<PathBuf>) -> Self {
+        let mut log_list_state = ListState::default();
+        // Show the newest entry at the top by default (offset 0).
+        log_list_state.select(Some(0));
         Self {
             store,
             config_path,
             log: VecDeque::with_capacity(LOG_TAIL),
+            log_list_state,
+            log_viewport_h: 0,
+            log_follow_tail: true,
             started_at: Instant::now(),
             mode: Mode::Normal,
             edit_inbound: String::new(),
@@ -98,6 +123,15 @@ impl TuiApp {
             self.log.pop_front();
         }
         self.log.push_back(line);
+        // If the user is tail-following, keep them on the newest entry.
+        // We display newest-first, so "newest" is index 0.
+        if self.log_follow_tail {
+            *self.log_list_state.offset_mut() = 0;
+            self.log_list_state.select(Some(0));
+        }
+        // If the user has scrolled away, leave their position alone.
+        // When new lines arrive the offset stays put so the relative
+        // view of the older history is preserved.
     }
 
     /// Display rows in the same order each frame (sorted by inbound).
@@ -144,6 +178,7 @@ impl TuiApp {
     fn on_key_normal(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => true,
+            // Mapping-list navigation (existing behavior).
             KeyCode::Char('j') | KeyCode::Down => {
                 let n = self.rows().len();
                 if n > 0 && self.selected + 1 < n {
@@ -153,6 +188,25 @@ impl TuiApp {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
+                false
+            }
+            // Log scrolling. These keys are not used by the mapping
+            // list, so there's no collision with the `j`/`k`/`Up`/`Down`
+            // bindings above.
+            KeyCode::PageDown => {
+                self.log_scroll_down(self.log_viewport_h.max(1));
+                false
+            }
+            KeyCode::PageUp => {
+                self.log_scroll_up(self.log_viewport_h.max(1));
+                false
+            }
+            KeyCode::Home => {
+                self.log_jump_to_oldest();
+                false
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.log_jump_to_newest();
                 false
             }
             KeyCode::Char('a') => {
@@ -182,6 +236,61 @@ impl TuiApp {
             }
             _ => false,
         }
+    }
+
+    /// Move the log scroll offset down by `n` cells (toward newer
+    /// entries; i.e. decreases the offset since newest is at index 0).
+    /// Clamps to the valid range.
+    fn log_scroll_down(&mut self, n: u16) {
+        if self.log.is_empty() {
+            return;
+        }
+        let max_offset = self.log.len().saturating_sub(1);
+        let cur = self.log_list_state.offset();
+        let new = cur.saturating_sub(n as usize);
+        let clamped = new.min(max_offset);
+        *self.log_list_state.offset_mut() = clamped;
+        self.log_list_state.select(Some(clamped));
+        // Reaching the newest entry re-enables tail-following.
+        self.log_follow_tail = clamped == 0;
+    }
+
+    /// Move the log scroll offset up by `n` cells (toward older
+    /// entries; i.e. increases the offset since newest is at index 0).
+    /// Clamps to the valid range.
+    fn log_scroll_up(&mut self, n: u16) {
+        if self.log.is_empty() {
+            return;
+        }
+        let max_offset = self.log.len().saturating_sub(1);
+        let cur = self.log_list_state.offset();
+        let new = cur.saturating_add(n as usize);
+        let clamped = new.min(max_offset);
+        *self.log_list_state.offset_mut() = clamped;
+        self.log_list_state.select(Some(clamped));
+        // Moving away from the newest entry disables tail-following.
+        self.log_follow_tail = clamped == 0;
+    }
+
+    /// Jump to the oldest log entry (largest valid offset).
+    fn log_jump_to_oldest(&mut self) {
+        if self.log.is_empty() {
+            return;
+        }
+        let max_offset = self.log.len().saturating_sub(1);
+        *self.log_list_state.offset_mut() = max_offset;
+        self.log_list_state.select(Some(max_offset));
+        self.log_follow_tail = false;
+    }
+
+    /// Jump to the newest log entry (offset 0). Re-enables tail-follow.
+    fn log_jump_to_newest(&mut self) {
+        if self.log.is_empty() {
+            return;
+        }
+        *self.log_list_state.offset_mut() = 0;
+        self.log_list_state.select(Some(0));
+        self.log_follow_tail = true;
     }
 
     fn on_key_editing(&mut self, key: KeyEvent, field: EditField) -> bool {
@@ -353,7 +462,20 @@ impl TuiApp {
     }
 
     /// Render the TUI. `area` is the full terminal area.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    ///
+    /// The layout is **content-size-safe**: the dashboard panel's
+    /// height is capped at the available vertical space, and the log
+    /// panel uses a `List` widget that scrolls internally. This makes
+    /// a `buffer::index out of bounds` panic structurally impossible
+    /// regardless of how many log lines or mappings exist.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // Defence in depth: clamp the render area to the frame's
+        // actual buffer area. If a future caller passes a stale
+        // `Rect` (e.g. from a Resize event that races with a draw),
+        // this prevents the inner widgets from overflowing the
+        // underlying buffer.
+        let area = area.intersection(frame.area());
+
         // Width budget. We use 4 cells of margin so panels don't
         // press against the terminal edge, and cap at the terminal
         // width minus the margin.
@@ -361,17 +483,21 @@ impl TuiApp {
         let max_w = area.width.saturating_sub(margin * 2);
         let inner_w = max_w.saturating_sub(2).max(20);
 
-        // ---- Dashboard panel ----
+        // ---- Dashboard panel (log-free) ----
         let snap = self.store.snapshot();
+        // The title is widened to fit even the narrowest panel we
+        // expect to see (inner_w == 20 in pathological cases). The
+        // long-form status strings go into body rows instead so the
+        // panel border never overflows its measured width.
         let mut dash = Panel::new(
             format!(
-                "openai-to-anthropic proxy  |  v0.1.0  |  model routing console  |  uptime {}s",
+                "proxy  v0.1.0  uptime {}s",
                 self.started_at.elapsed().as_secs()
             ),
             inner_w,
         );
         dash.row(&format!(
-            "STATUS  ONLINE       LISTEN  127.0.0.1:8080       UPSTREAM  CONNECTED       CONFIG  {}",
+            "STATUS  ONLINE   LISTEN  127.0.0.1:8080   UPSTREAM  CONNECTED   CONFIG  {}",
             self.config_path
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -413,47 +539,118 @@ impl TuiApp {
 
         // ---- Footer hint ----
         dash.row("[a] add  [e/Enter] edit  [d] delete  [f] default  [s] save  [q] quit");
-
-        // ---- Log panel ----
-        let mut log_panel = Panel::new("RECENT REQUESTS  (oldest first)", inner_w);
-        if self.log.is_empty() {
-            log_panel.row("  (no requests yet)");
-        } else {
-            for line in self.log.iter() {
-                log_panel.row(&format!("  {}", line.text));
-            }
-        }
+        dash.row("[PgUp/PgDn] scroll log  [Home/End] jump log top/bottom");
 
         // ---- Layout ----
-        // We render two stacked panels using ratatui's Layout: the
-        // dashboard on top, the log below. Each panel's height equals
-        // its own line count, so they always fit.
-        let dash_h = dash.len() as u16;
-        let log_h = log_panel.len() as u16;
+        // The dashboard height is its own line count, **capped** at
+        // the available terminal height minus what the log and footer
+        // need. The log is then given at least 3 rows, and the footer
+        // gets 1 row. This guarantees every widget fits inside the
+        // frame buffer no matter how many mappings or log lines
+        // there are.
+        let dash_h_raw = dash.len() as u16;
+        // Reserve at least 3 rows for the log + 1 row for the
+        // footer hint strip.
+        let reserved: u16 = 3 + 1;
+        let max_dash = area.height.saturating_sub(reserved);
+        let dash_h = dash_h_raw.min(max_dash);
+        // Footer sits in the line immediately below the dashboard.
+        // The log occupies the rest.
+        let footer_h: u16 = 1;
         let vchunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(dash_h),
-                Constraint::Length(1), // gap
-                Constraint::Length(log_h),
+                Constraint::Min(3),            // log: at least 3 rows
+                Constraint::Length(footer_h), // footer
             ])
             .split(area);
+        let dash_area = vchunks[0];
+        let log_area = vchunks[1];
+        let footer_area = vchunks[2];
 
-        // Center each panel horizontally.
-        let centered = |h: u16, parent: Rect| -> Rect {
-            let x = parent.x + (parent.width.saturating_sub(h)) / 2;
-            Rect::new(x, parent.y, h, parent.width)
-        };
+        // Track the log viewport height so `PageUp`/`PageDown` can
+        // jump by a screen.
+        self.log_viewport_h = log_area.height;
 
+        // ---- Dashboard ----
+        // `centered` was a free function in the previous version; it
+        // was passed the panel's `width` but accidentally reused
+        // `parent.width` as the height argument. With a 120-col x
+        // 30-row terminal the dashboard was given a 120-row-tall
+        // area, which caused the log to overflow the buffer. Use a
+        // free function (see below) that always uses `parent.height`.
         frame.render_widget(
             Paragraph::new(dash.lines.join("\n"))
                 .style(Style::default().fg(Color::White)),
-            centered(dash.width, vchunks[0]),
+            centered(dash.width, dash_area),
+        );
+
+        // ---- Log (scrollable List + Scrollbar) ----
+        // Build items newest-first. The `List` widget's `offset`
+        // refers to the first visible item; with newest at index 0
+        // and offset 0 the newest line is at the top.
+        let items: Vec<ListItem> = self
+            .log
+            .iter()
+            .rev()
+            .map(|line| ListItem::new(format!("{}  {}", kind_glyph(line.kind), line.text)))
+            .collect();
+        let title = if self.log.is_empty() {
+            "RECENT REQUESTS  (no requests yet)  [PgUp/PgDn to scroll]"
+        } else {
+            "RECENT REQUESTS  (newest first)  [PgUp/PgDn, Home/End to scroll]"
+        };
+        let list = List::new(items)
+            .block(Block::bordered().title(title))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .scroll_padding(1);
+        // `List` mutates the state we hand it (it clamps the offset
+        // to the visible range). We hand it a clone so the on-disk
+        // `self.log_list_state` reflects the post-render reality.
+        let mut state = self.log_list_state.clone();
+        frame.render_stateful_widget(list, log_area, &mut state);
+        self.log_list_state = state;
+
+        // Scrollbar. We only render it when there's enough content
+        // to warrant one (>= viewport height). The state is freshly
+        // built each frame so the position reflects the post-render
+        // `ListState`.
+        if self.log.len() > log_area.height as usize {
+            let mut sb_state = ScrollbarState::new(self.log.len())
+                .position(self.log_list_state.offset());
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("^"))
+                    .end_symbol(Some("v")),
+                log_area,
+                &mut sb_state,
+            );
+        }
+
+        // ---- Footer hint ----
+        // A single-line status strip under the log. We re-use the
+        // existing dash.panel footer text but render it in a small
+        // paragraph so it doesn't depend on Panel line art.
+        // The long form lives in the dashboard; the footer just
+        // summarises the current key bindings. We truncate the
+        // string with `truncate` so it never overflows narrow
+        // terminals.
+        let tail_note = if self.log_follow_tail {
+            "tail-follow"
+        } else {
+            "scroll (End/G = tail)"
+        };
+        let footer_text = truncate(
+            &format!(
+                "[a] add  [e] edit  [d] delete  [f] default  [s] save  [q] quit   |   log: {tail_note}   |   PgUp/PgDn scroll"
+            ),
+            area.width.saturating_sub(2) as usize,
         );
         frame.render_widget(
-            Paragraph::new(log_panel.lines.join("\n"))
-                .style(Style::default().fg(Color::Gray)),
-            centered(log_panel.width, vchunks[2]),
+            Paragraph::new(footer_text.as_str())
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect::new(area.x, footer_area.y, area.width, footer_area.height),
         );
 
         // ---- Edit overlay ----
@@ -585,6 +782,32 @@ impl TuiApp {
     }
 }
 
+/// Build a `Rect` for a panel of width `w` centered horizontally
+/// inside `parent`. The resulting `Rect` keeps `parent`'s full
+/// height and clamps `w` to `parent.width` (so a too-wide panel
+/// never overflows the parent buffer). The previous version
+/// accidentally used `parent.width` for the height, which on a
+/// 120x30 terminal produced a 120-row dashboard that immediately
+/// overflowed the 30-row buffer.
+fn centered(w: u16, parent: Rect) -> Rect {
+    let w = w.min(parent.width);
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    Rect::new(x, parent.y, w, parent.height)
+}
+
+/// Single-character category glyph for a log line. Used as a
+/// leading column in the scrollable log so the operator can spot
+/// errors and warnings at a glance.
+fn kind_glyph(kind: LogKind) -> &'static str {
+    match kind {
+        LogKind::Inbound => ">",
+        LogKind::Response => "<",
+        LogKind::Warning => "!",
+        LogKind::Error => "X",
+        LogKind::Info => ".",
+    }
+}
+
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_owned()
@@ -620,6 +843,8 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn make_store() -> std::sync::Arc<MappingsStore> {
         std::sync::Arc::new(MappingsStore::from_parts(
@@ -634,6 +859,13 @@ mod tests {
             },
             super::super::runtime::RuntimeMappings::default(),
         ))
+    }
+
+    fn make_log_line(text: &str) -> LogLine {
+        LogLine {
+            text: text.to_owned(),
+            kind: LogKind::Info,
+        }
     }
 
     #[test]
@@ -671,4 +903,186 @@ mod tests {
         assert!(app.toast.is_some());
     }
 
+    /// REGRESSION TEST for the ratatui panic
+    /// `index outside of buffer: the area is Rect { x: 0, y: 0,
+    /// width: 120, height: 30 } but index is (2, 30)`.
+    ///
+    /// On the pre-fix code, the `centered` closure passed
+    /// `parent.width` as the last argument to `Rect::new`, so the
+    /// dashboard Paragraph was given a 120-row area on a 30-row
+    /// terminal. As soon as the log Paragraph was rendered below
+    /// it, the cursor ran off the bottom of the buffer and the
+    /// rendering thread panicked.
+    ///
+    /// On the fixed code, the layout is content-size-safe: the
+    /// dashboard height is capped at `area.height - reserved`, and
+    /// the log is rendered as a scrollable `List` that can never
+    /// overflow. This test fills the log to its `LOG_TAIL` cap and
+    /// renders into a 120x30 `TestBackend`. Pre-fix, this would
+    /// panic. Post-fix, it returns `Ok`.
+    #[test]
+    fn render_does_not_overflow_buffer_when_log_is_full() {
+        let mut app = TuiApp::new(make_store(), None);
+        // Fill the log well past what a 30-row terminal can show.
+        for i in 0..(LOG_TAIL + 50) {
+            app.push_log(make_log_line(&format!("request #{i} inbound foo -> bar")));
+        }
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        // The panic happens inside the draw closure, so we wrap
+        // the closure body in `catch_unwind` and return the result
+        // out via a `Cell`.
+        let outcome = std::cell::Cell::new(None::<std::thread::Result<()>>);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                outcome.set(Some(std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        app.render(frame, area);
+                    }),
+                )));
+            })
+            .expect("draw failed");
+        let result = outcome
+            .take()
+            .expect("draw closure did not run");
+        // The draw must complete without panicking.
+        assert!(
+            result.is_ok(),
+            "render panicked with full log: {result:?}"
+        );
+    }
+
+    /// At a minimum terminal height (5 rows) the layout must still
+    /// fit. The dashboard is capped and the log is given its
+    /// reserved 3-row minimum.
+    #[test]
+    fn render_does_not_overflow_buffer_at_minimum_height() {
+        let mut app = TuiApp::new(make_store(), None);
+        for i in 0..200 {
+            app.push_log(make_log_line(&format!("req {i}")));
+        }
+        let backend = TestBackend::new(80, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let outcome = std::cell::Cell::new(None::<std::thread::Result<()>>);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                outcome.set(Some(std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        app.render(frame, area);
+                    }),
+                )));
+            })
+            .expect("draw failed");
+        let result = outcome.take().expect("draw closure did not run");
+        assert!(result.is_ok(), "render panicked at 80x5: {result:?}");
+    }
+
+    /// Even with no log lines, a fat mappings list must not
+    /// overflow. This exercises the dashboard-cap path.
+    #[test]
+    fn render_does_not_overflow_buffer_with_many_mappings() {
+        let store = MappingsStore::from_parts(
+            super::super::runtime::RuntimeMappings::default(),
+            super::super::runtime::RuntimeMappings::default(),
+        );
+        {
+            let mut m: super::super::runtime::RuntimeMappings =
+                (*store.load_live()).as_ref().clone();
+            for i in 0..50 {
+                m.map.insert(format!("claude-in-{i}"), format!("gpt-out-{i}"));
+            }
+            store.set_live(m);
+        }
+        let mut app = TuiApp::new(std::sync::Arc::new(store), None);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let outcome = std::cell::Cell::new(None::<std::thread::Result<()>>);
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                outcome.set(Some(std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
+                        app.render(frame, area);
+                    }),
+                )));
+            })
+            .expect("draw failed");
+        let result = outcome.take().expect("draw closure did not run");
+        assert!(
+            result.is_ok(),
+            "render panicked with 50 mappings: {result:?}"
+        );
+    }
+
+    /// The `LOG_TAIL` cap is enforced: pushing more than `LOG_TAIL`
+    /// lines keeps the deque at exactly `LOG_TAIL` entries.
+    #[test]
+    fn log_cap_respected() {
+        let mut app = TuiApp::new(make_store(), None);
+        for i in 0..(LOG_TAIL * 2) {
+            app.push_log(make_log_line(&format!("line {i}")));
+        }
+        assert_eq!(app.log.len(), LOG_TAIL);
+    }
+
+    /// The log scroll handlers must keep `ListState.offset` in
+    /// the valid range `[0, log.len().saturating_sub(1)]`, no
+    /// matter what direction the user scrolls.
+    #[test]
+    fn scroll_offset_clamps_to_valid_range() {
+        let mut app = TuiApp::new(make_store(), None);
+        // Push enough lines to make the offset non-trivial.
+        for i in 0..200 {
+            app.push_log(make_log_line(&format!("line {i}")));
+        }
+        // Scroll up well past the top.
+        for _ in 0..1000 {
+            app.log_scroll_up(10);
+        }
+        let max_offset = app.log.len().saturating_sub(1);
+        assert_eq!(app.log_list_state.offset(), max_offset);
+
+        // Scroll down well past the bottom.
+        for _ in 0..1000 {
+            app.log_scroll_down(10);
+        }
+        assert_eq!(app.log_list_state.offset(), 0);
+        assert!(app.log_follow_tail, "scroll to top re-enables tail-follow");
+
+        // Jump to oldest, then to newest.
+        app.log_jump_to_oldest();
+        assert_eq!(app.log_list_state.offset(), max_offset);
+        assert!(!app.log_follow_tail);
+        app.log_jump_to_newest();
+        assert_eq!(app.log_list_state.offset(), 0);
+        assert!(app.log_follow_tail);
+    }
+
+    /// `centered` must produce a `Rect` whose height equals
+    /// `parent.height`. Pre-fix, the height was `parent.width`,
+    /// which is what caused the original panic.
+    #[test]
+    fn centered_preserves_height() {
+        let parent = Rect::new(0, 0, 120, 30);
+        let r = centered(80, parent);
+        assert_eq!(r.height, 30, "height must be parent.height");
+        assert_eq!(r.width, 80);
+        // Centred horizontally: x is at the midpoint of the slack.
+        assert_eq!(r.x, (120 - 80) / 2);
+    }
+
+    /// `centered` must clamp the panel width to `parent.width` so a
+    /// too-wide request never overflows the parent buffer.
+    #[test]
+    fn centered_handles_wider_than_parent() {
+        let parent = Rect::new(0, 0, 40, 20);
+        let r = centered(80, parent);
+        // Saturating arithmetic clamps x to parent.x.
+        assert_eq!(r.x, 0);
+        assert_eq!(r.height, 20);
+        // Width is clamped to parent.width.
+        assert_eq!(r.width, 40);
+    }
 }
