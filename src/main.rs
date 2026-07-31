@@ -26,7 +26,7 @@ use openai_to_anthropic_proxy::proxy::router;
 use openai_to_anthropic_proxy::{Config, MappingsStore, OutputSink, RuntimeMappings};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -71,7 +71,15 @@ async fn main() -> Result<()> {
 
     // The server runs until either the graceful-shutdown signal fires
     // (Ctrl-C / SIGTERM / console close) or the TUI asks to quit.
-    let server_shutdown = shutdown_signal();
+    //
+    // We use a `watch::channel` as the "TUI asked to quit" signal.
+    // After the TUI returns, `main()` drops `shutdown_tx`; the
+    // `watch::Receiver` then resolves its `changed()` future, which
+    // `shutdown_signal` races against the OS signals. This makes
+    // `q` in the TUI shut the server down without requiring the
+    // user to press Ctrl-C a second time.
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let server_shutdown = shutdown_signal(shutdown_rx);
 
     if no_tui {
         // No TUI: build a plain router that writes request lines to
@@ -118,9 +126,12 @@ async fn main() -> Result<()> {
 
     // TUI exited: signal shutdown and wait for the server to drain.
     drop(tui_tx);
-    // `axum::serve(...).with_graceful_shutdown` is already wired to
-    // `shutdown_signal()`, so we trigger that.
-    let _ = signal::ctrl_c().await;
+    // Dropping `shutdown_tx` causes `shutdown_signal`'s
+    // `watch::Receiver::changed()` future to resolve with
+    // `Err(RecvError)`, which fires the `select!` branch that
+    // `axum::serve(...).with_graceful_shutdown` is waiting on.
+    // The server then drains in-flight requests and returns.
+    drop(shutdown_tx);
     let _ = server_task.await;
 
     tui_result.context("TUI runtime error")?;
@@ -221,11 +232,20 @@ fn init_tracing(log_to_disk: bool) -> WorkerGuard {
     }
 }
 
-/// Resolves when the user hits Ctrl-C, sends SIGTERM (Unix), or
-/// sends a console close event (Windows). The TUI installs its own
-/// Ctrl-C handler; calling `signal::ctrl_c` here is harmless because
-/// the TUI's exit path also triggers it.
-async fn shutdown_signal() {
+/// Resolves when **any** of:
+///   - the user hits Ctrl-C, sends SIGTERM (Unix), or sends a
+///     console-close event (Windows);
+///   - the `watch::Sender` held by `main()` is dropped, which
+///     happens immediately after the TUI's `run()` returns.
+///
+/// The TUI installs its own Ctrl-C handler because raw mode
+/// suppresses delivery of SIGINT to the process; Ctrl-C is delivered
+/// to the TUI as a `KeyEvent` instead. Pressing `q` (or Ctrl-C)
+/// inside the TUI causes the TUI loop to exit, which in turn causes
+/// `main()` to drop `shutdown_tx`, which causes this future to
+/// resolve — so the server shuts down without the operator having
+/// to press Ctrl-C a second time.
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<()>) {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install ctrl-c handler");
     };
@@ -252,8 +272,64 @@ async fn shutdown_signal() {
     let close = std::future::pending::<()>();
 
     tokio::select! {
+        // Fires when `main()` drops `shutdown_tx` after the TUI exits.
+        // `_` matches both `Ok(())` (sender sent a value) and
+        // `Err(_)` (sender dropped without sending).
+        _ = shutdown_rx.changed() => {},
         _ = ctrl_c => {},
         _ = terminate => {},
         _ = close => {},
+    }
+}
+
+#[cfg(test)]
+mod shutdown_signal_tests {
+    //! Regression tests for the TUI-exit-triggered shutdown mechanism.
+    //!
+    //! The bug: pressing `q` in the TUI exited the TUI but left the
+    //! axum server running, because the only thing that resolved
+    //! `shutdown_signal()` was `signal::ctrl_c()`. The user had to
+    //! press Ctrl-C a *second* time to actually stop the server.
+    //!
+    //! The fix wires `shutdown_signal()` to a `watch::Receiver`
+    //! alongside the OS signal handlers; dropping the sender (which
+    //! we do immediately after the TUI's `run()` returns) resolves
+    //! the receiver and triggers the graceful-shutdown path.
+
+    use std::time::Duration;
+
+    /// Dropping the sender must cause `shutdown_signal`'s
+    /// `watch::Receiver::changed()` branch to resolve. This pins
+    /// the primitive we chose: a `watch::channel` whose sender we
+    /// hold in `main()` and drop after the TUI exits. Tokio's
+    /// `watch::Receiver::changed()` returns `Err(RecvError)` when
+    /// the sender is dropped — the `_` pattern in `select!`
+    /// matches both `Ok` and `Err`, so the branch fires and
+    /// triggers graceful shutdown.
+    #[tokio::test]
+    async fn watch_changed_resolves_when_sender_dropped() {
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        drop(tx);
+        let result = tokio::time::timeout(Duration::from_millis(200), rx.changed()).await;
+        match result {
+            Ok(Err(_)) => {} // expected: Err when sender is dropped
+            Ok(Ok(())) => panic!("watch::changed() resolved to Ok(()) without a value change"),
+            Err(_) => panic!("watch::changed() did not resolve within 200ms — sender drop did not wake receiver"),
+        }
+    }
+
+    /// The actual mechanism: a `tokio::select!` racing a
+    /// `watch::Receiver::changed()` against `tokio::time::sleep`
+    /// must pick the receiver branch when the sender is dropped.
+    /// This is the shape used in `shutdown_signal`.
+    #[tokio::test]
+    async fn select_picks_watch_branch_when_sender_dropped() {
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        drop(tx);
+        let picked = tokio::select! {
+            _ = rx.changed() => "watch",
+            _ = tokio::time::sleep(Duration::from_secs(10)) => "sleep",
+        };
+        assert_eq!(picked, "watch", "select! must pick the dropped-watch branch");
     }
 }
