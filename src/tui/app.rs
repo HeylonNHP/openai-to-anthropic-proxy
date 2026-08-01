@@ -21,7 +21,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::output::{LogKind, LogLine};
 use super::panels::Panel;
-use super::runtime::MappingsStore;
+use super::runtime::{MappingsStore, RuntimeMappings};
+use crate::config::JsonConfig;
 
 /// Maximum number of log lines retained for the on-screen tail.
 ///
@@ -431,28 +432,56 @@ impl TuiApp {
             self.mode = Mode::SavedToast;
             return;
         };
-        let live: super::runtime::RuntimeMappings =
-            (*self.store.load_live()).as_ref().clone();
-        let json = match serde_json::to_string_pretty(&live) {
+        
+        // Read the existing full config to preserve all non-mappings fields
+        let mut json_config: JsonConfig = if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => match JsonConfig::parse(&content) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        self.toast = Some(format!("save failed: parse error: {e}"));
+                        self.mode = Mode::SavedToast;
+                        return;
+                    }
+                },
+                Err(e) => {
+                    self.toast = Some(format!("save failed: read error: {e}"));
+                    self.mode = Mode::SavedToast;
+                    return;
+                }
+            }
+        } else {
+            JsonConfig::default()
+        };
+        
+        // Update only the model_aliases from live mappings
+        let live: RuntimeMappings = (*self.store.load_live()).as_ref().clone();
+        json_config.model_aliases = Some(crate::config::JsonModelAliases {
+            map: live.map,
+            default_model: live.default_model,
+        });
+        
+        let json = match serde_json::to_string_pretty(&json_config) {
             Ok(j) => j,
             Err(e) => {
-                self.toast = Some(format!("save failed: {e}"));
+                self.toast = Some(format!("save failed: serialize error: {e}"));
                 self.mode = Mode::SavedToast;
                 return;
             }
         };
+        
         // Write to a temp file, then atomic-rename. This avoids leaving
         // a half-written proxy.json if the process is killed mid-write.
         let tmp = path.with_extension("json.tmp");
         if let Err(e) = std::fs::write(&tmp, &json) {
-            self.toast = Some(format!("save failed: {e}"));
+            self.toast = Some(format!("save failed: write error: {e}"));
             self.mode = Mode::SavedToast;
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             // Best-effort: try to clean up the temp file.
             let _ = std::fs::remove_file(&tmp);
-            self.toast = Some(format!("save failed: {e}"));
+            self.toast = Some(format!("save failed: rename error: {e}"));
             self.mode = Mode::SavedToast;
             return;
         }

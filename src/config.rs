@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8085";
 const DEFAULT_UPSTREAM_PATH: &str = "/v1/responses";
@@ -412,44 +412,44 @@ fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
 
 /// JSON representation of `proxy.json`. Every field is optional; missing
 /// fields fall through to env vars and then to defaults.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct JsonConfig {
-    listen_addr: Option<String>,
-    upstream_base_url: Option<String>,
-    upstream_api_key: Option<String>,
-    upstream_path: Option<String>,
-    request_timeout_secs: Option<u64>,
-    reasoning_effort: Option<String>,
+pub struct JsonConfig {
+    pub listen_addr: Option<String>,
+    pub upstream_base_url: Option<String>,
+    pub upstream_api_key: Option<String>,
+    pub upstream_path: Option<String>,
+    pub request_timeout_secs: Option<u64>,
+    pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared
     /// here; the object itself is optional.
-    reasoning: Option<JsonReasoningConfig>,
+    pub reasoning: Option<JsonReasoningConfig>,
     /// Inbound → upstream model name aliases. See [`ModelAliases`].
-    model_aliases: Option<JsonModelAliases>,
+    pub model_aliases: Option<JsonModelAliases>,
     /// Prompt-caching settings. See [`PromptCachingConfig`].
-    prompt_caching: Option<JsonPromptCachingConfig>,
+    pub prompt_caching: Option<JsonPromptCachingConfig>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).
-    proxy_key: Option<String>,
+    pub proxy_key: Option<String>,
     /// When `true`, the proxy writes structured `tracing` events to
     /// `target/logs/proxy.log`. When `false` (the default), tracing
     /// events are dropped — nothing reaches the terminal or a file.
     /// Set to `true` when you want postmortem logs; leave unset (or
     /// `false`) for a clean terminal in interactive use.
-    log_to_disk: Option<bool>,
+    pub log_to_disk: Option<bool>,
 }
 
 /// JSON shape of `reasoning`. `default` is the fallback effort for
 /// any model not in `models`. `models` is a flat string→string object:
 /// model name → effort (`"none" | "low" | "medium" | "high"`).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct JsonReasoningConfig {
-    default: Option<String>,
+pub struct JsonReasoningConfig {
+    pub default: Option<String>,
     #[serde(default)]
-    models: BTreeMap<String, String>,
+    pub models: BTreeMap<String, String>,
 }
 
 /// JSON shape of `model_aliases`. `map` is a flat string→string object:
@@ -458,24 +458,26 @@ pub(crate) struct JsonReasoningConfig {
 ///
 /// `#[serde(default)]` lets either field be omitted from the JSON —
 /// a `model_aliases` object with only `default_model` is valid.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct JsonModelAliases {
-    map: BTreeMap<String, String>,
-    default_model: Option<String>,
+pub struct JsonModelAliases {
+    pub map: BTreeMap<String, String>,
+    pub default_model: Option<String>,
 }
 
 /// JSON shape of `prompt_caching`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct JsonPromptCachingConfig {
+pub struct JsonPromptCachingConfig {
     #[serde(default)]
-    models: Option<Vec<String>>,
-    cache_key: Option<String>,
+    pub models: Option<Vec<String>>,
+    pub cache_key: Option<String>,
 }
 
 impl JsonConfig {
-    fn parse(raw: &str) -> Result<Self> {
+    /// Parse JSON into a `JsonConfig`. Public so the TUI can read
+    /// the existing config before updating and saving just the mappings.
+    pub fn parse(raw: &str) -> Result<Self> {
         serde_json::from_str(raw).context("invalid JSON (check syntax and field names)")
     }
 }
