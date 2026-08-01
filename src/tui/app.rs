@@ -65,6 +65,13 @@ pub struct TuiApp {
     /// Path to `proxy.json` for save operations. `None` disables saving
     /// (the TUI still works for in-memory changes).
     config_path: Option<PathBuf>,
+    /// Configured listen address (e.g. `0.0.0.0:8085`) shown in the
+    /// status bar. Cached here so we don't have to plumb a `Config`
+    /// reference through the render path.
+    listen_addr: String,
+    /// Configured upstream base URL (e.g. `http://192.168.1.15:11434`)
+    /// shown in the status bar.
+    upstream_base_url: String,
     /// Recent log lines, newest at the back.
     log: VecDeque<LogLine>,
     /// Scroll position inside the log `List`. `offset` is the index
@@ -97,13 +104,20 @@ pub struct TuiApp {
 
 impl TuiApp {
     /// Construct a new app.
-    pub fn new(store: std::sync::Arc<MappingsStore>, config_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        store: std::sync::Arc<MappingsStore>,
+        config_path: Option<PathBuf>,
+        listen_addr: String,
+        upstream_base_url: String,
+    ) -> Self {
         let mut log_list_state = ListState::default();
         // Show the newest entry at the top by default (offset 0).
         log_list_state.select(Some(0));
         Self {
             store,
             config_path,
+            listen_addr,
+            upstream_base_url,
             log: VecDeque::with_capacity(LOG_TAIL),
             log_list_state,
             log_viewport_h: 0,
@@ -526,7 +540,9 @@ impl TuiApp {
             inner_w,
         );
         dash.row(&format!(
-            "STATUS  ONLINE   LISTEN  127.0.0.1:8080   UPSTREAM  CONNECTED   CONFIG  {}",
+            "STATUS  ONLINE   LISTEN  {:<21}   UPSTREAM  {}   CONFIG  {}",
+            self.listen_addr,
+            self.upstream_base_url,
             self.config_path
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -899,7 +915,7 @@ mod tests {
 
     #[test]
     fn rows_are_sorted() {
-        let app = TuiApp::new(make_store(), None);
+        let app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         let rows = app.rows();
         assert_eq!(rows[0].inbound, "claude-opus-4-8");
         assert_eq!(rows[1].inbound, "claude-sonnet-5");
@@ -907,7 +923,7 @@ mod tests {
 
     #[test]
     fn add_then_dirty() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         app.apply_mutation(|m| {
             m.map
                 .insert("claude-haiku-4-5".into(), "gpt-4o-mini".into());
@@ -917,7 +933,7 @@ mod tests {
 
     #[test]
     fn delete_clears_mapping() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         app.selected = 0; // claude-opus-4-8
         app.delete_selected();
         let rows = app.rows();
@@ -927,7 +943,7 @@ mod tests {
 
     #[test]
     fn save_disabled_when_no_path() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         app.save_to_disk();
         assert!(app.toast.is_some());
     }
@@ -951,7 +967,7 @@ mod tests {
     /// panic. Post-fix, it returns `Ok`.
     #[test]
     fn render_does_not_overflow_buffer_when_log_is_full() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         // Fill the log well past what a 30-row terminal can show.
         for i in 0..(LOG_TAIL + 50) {
             app.push_log(make_log_line(&format!("request #{i} inbound foo -> bar")));
@@ -987,7 +1003,7 @@ mod tests {
     /// reserved 3-row minimum.
     #[test]
     fn render_does_not_overflow_buffer_at_minimum_height() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         for i in 0..200 {
             app.push_log(make_log_line(&format!("req {i}")));
         }
@@ -1024,7 +1040,7 @@ mod tests {
             }
             store.set_live(m);
         }
-        let mut app = TuiApp::new(std::sync::Arc::new(store), None);
+        let mut app = TuiApp::new(std::sync::Arc::new(store), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let outcome = std::cell::Cell::new(None::<std::thread::Result<()>>);
@@ -1049,7 +1065,7 @@ mod tests {
     /// lines keeps the deque at exactly `LOG_TAIL` entries.
     #[test]
     fn log_cap_respected() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         for i in 0..(LOG_TAIL * 2) {
             app.push_log(make_log_line(&format!("line {i}")));
         }
@@ -1061,7 +1077,7 @@ mod tests {
     /// matter what direction the user scrolls.
     #[test]
     fn scroll_offset_clamps_to_valid_range() {
-        let mut app = TuiApp::new(make_store(), None);
+        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
         // Push enough lines to make the offset non-trivial.
         for i in 0..200 {
             app.push_log(make_log_line(&format!("line {i}")));
