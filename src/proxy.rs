@@ -97,13 +97,23 @@ async fn handle_messages(
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
+    // Snapshot the runtime mappings at handler entry. A change
+    // applied mid-request never tears the snapshot — the request
+    // finishes with the mappings it started with. This matches the
+    // design contract on `MappingsStore` (see `tui/runtime.rs`):
+    // readers vastly outnumber writers, so we take a cheap atomic
+    // refcount bump and release the snapshot when the handler ends.
+    let mappings_snapshot = state.mappings.load_live().clone();
+
     // Resolve the inbound model name to the upstream model name BEFORE
     // building the request — so the reasoning-effort lookup uses the
     // *resolved* name (e.g. an aliased `claude-sonnet-5` request picks
     // up the reasoning entry for `gpt-5.4-mini`, not the entry for
-    // `claude-sonnet-5`). If no alias is configured, the name passes
-    // through unchanged.
-    let upstream_model = state.config.upstream_model_for(&req.model);
+    // `claude-sonnet-5`). The snapshot is what makes TUI edits take
+    // effect: the static `Config::model_aliases` is the startup-only
+    // seed, while `mappings_snapshot` is what the operator sees when
+    // they hit `e` in the TUI.
+    let upstream_model = mappings_snapshot.resolve(&req.model);
     let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
     let mut outbound = translate::anthropic_to_responses(&req, reasoning_effort, &prompt_caching)
@@ -157,7 +167,7 @@ async fn handle_messages(
     LAST_SENT_BODY
         .scope(
             body_json,
-            handle_messages_inner(state, headers, req, outbound, start),
+            handle_messages_inner(state, headers, req, outbound, start, mappings_snapshot),
         )
         .await
 }
@@ -168,6 +178,11 @@ async fn handle_messages_inner(
     req: CreateMessageRequest,
     outbound: responses::ResponsesRequest,
     start: Instant,
+    // Snapshot of the runtime mappings taken at handler entry. Used
+    // for the `default_model` fallback so an edit made mid-request
+    // doesn't tear the response — the same contract the alias
+    // resolution above honours.
+    mappings_snapshot: Arc<crate::tui::RuntimeMappings>,
 ) -> Result<Response, AppError> {
     let url = format!(
         "{}{}",
@@ -220,16 +235,17 @@ async fn handle_messages_inner(
         // Decide whether to retry with the default model. The retry
         // happens before any response bytes are written to the client
         // (streaming or not), so it is safe for both paths. Only one
-        // retry; the loop ends after attempt 2 regardless.
+        // retry; the loop ends after attempt 2 regardless. The
+        // fallback name comes from the runtime snapshot, so an edit
+        // made via the TUI is honoured just like an alias edit is.
         let should_retry = attempt == 1
             && is_model_not_supported(status, &body)
-            && state
-                .config
+            && mappings_snapshot
                 .default_model()
                 .is_some_and(|fb| fb != outbound.model);
 
         if should_retry {
-            let fallback = state.config.default_model().unwrap();
+            let fallback = mappings_snapshot.default_model().unwrap();
             let fallback_reasoning = state.config.reasoning_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,

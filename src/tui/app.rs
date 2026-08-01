@@ -20,7 +20,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::output::{LogKind, LogLine};
-use super::panels::Panel;
+use super::panels::{truncate_to_width, Panel};
 use super::runtime::{MappingsStore, RuntimeMappings};
 use crate::config::JsonConfig;
 
@@ -635,11 +635,17 @@ impl TuiApp {
         // Build items newest-first. The `List` widget's `offset`
         // refers to the first visible item; with newest at index 0
         // and offset 0 the newest line is at the top.
-        let items: Vec<ListItem> = self
-            .log
-            .iter()
-            .rev()
-            .map(|line| ListItem::new(format!("{}  {}", kind_glyph(line.kind), line.text)))
+        let recent_log: Vec<&LogLine> = self.log.iter().rev().collect();
+        let recent_widths = recent_request_column_widths(recent_log.iter().copied());
+        let items: Vec<ListItem> = recent_log
+            .into_iter()
+            .map(|line| {
+                let text = normalize_recent_request_text(
+                    &line.text,
+                    &recent_widths[log_kind_index(line.kind)],
+                );
+                ListItem::new(format!("{}  {}", kind_glyph(line.kind), text))
+            })
             .collect();
         let title = if self.log.is_empty() {
             "RECENT REQUESTS  (no requests yet)  [PgUp/PgDn to scroll]"
@@ -853,6 +859,53 @@ fn kind_glyph(kind: LogKind) -> &'static str {
     }
 }
 
+fn recent_request_column_widths<'a>(lines: impl IntoIterator<Item = &'a LogLine>) -> [Vec<usize>; 5] {
+    let mut widths = std::array::from_fn(|_| Vec::new());
+    for line in lines {
+        let slot = &mut widths[log_kind_index(line.kind)];
+        for (idx, col) in recent_request_columns(&line.text).into_iter().enumerate() {
+            let width = col.width();
+            if idx >= slot.len() {
+                slot.push(width);
+            } else {
+                slot[idx] = slot[idx].max(width);
+            }
+        }
+    }
+    widths
+}
+
+fn normalize_recent_request_text(text: &str, widths: &[usize]) -> String {
+    let cols = recent_request_columns(text);
+    if cols.len() <= 1 {
+        return text.to_owned();
+    }
+
+    let mut out = String::new();
+    for (idx, col) in cols.into_iter().enumerate() {
+        if idx > 0 {
+            out.push_str("  |  ");
+        }
+        let width = widths.get(idx).copied().unwrap_or_else(|| col.width());
+        out.push_str(&truncate_to_width(col, width));
+    }
+    out
+}
+
+fn recent_request_columns(text: &str) -> Vec<&str> {
+    text.split("  |  ").collect()
+}
+
+fn log_kind_index(kind: LogKind) -> usize {
+    match kind {
+        LogKind::Inbound => 0,
+        LogKind::Response => 1,
+        LogKind::Warning => 2,
+        LogKind::Error => 3,
+        LogKind::Info => 4,
+    }
+}
+
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_owned()
@@ -911,6 +964,42 @@ mod tests {
             text: text.to_owned(),
             kind: LogKind::Info,
         }
+    }
+
+    #[test]
+    fn recent_request_columns_are_width_normalized() {
+        let lines = vec![
+            LogLine {
+                text: "  → claude-sonnet-5 → gpt-5.4-mini  |  2 tools  |  12 messages  |  stream  |  reasoning: high".into(),
+                kind: LogKind::Inbound,
+            },
+            LogLine {
+                text: "  → claude-opus-4-8 → gpt-5.6-luna  |  12 tools  |  2 messages  |  stream  |  reasoning: high".into(),
+                kind: LogKind::Inbound,
+            },
+        ];
+        let widths = recent_request_column_widths(lines.iter());
+        let normalized = normalize_recent_request_text(
+            "  → claude-sonnet-5 → gpt-5.4-mini  |  2 tools  |  12 messages  |  stream  |  reasoning: high",
+            &widths[log_kind_index(LogKind::Inbound)],
+        );
+        assert!(normalized.contains("|  12 messages"));
+        assert!(normalized.contains("|  reasoning: high"));
+    }
+
+    #[test]
+    fn recent_request_columns_handle_wide_text() {
+        let lines = vec![LogLine {
+            text: "  → haiku → 繁體中文  |  12 tools  |  9 messages".into(),
+            kind: LogKind::Inbound,
+        }];
+        let widths = recent_request_column_widths(lines.iter());
+        let normalized = normalize_recent_request_text(
+            "  → haiku → 繁體中文  |  12 tools  |  9 messages",
+            &widths[log_kind_index(LogKind::Inbound)],
+        );
+        assert!(normalized.contains("繁體中文"));
+        assert!(normalized.width() >= normalized.chars().count());
     }
 
     #[test]

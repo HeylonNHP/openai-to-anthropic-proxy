@@ -126,7 +126,7 @@ impl Panel {
 
 /// Truncate `s` so its measured width does not exceed `max_width`.
 /// If the string is already narrow enough, returns it unchanged.
-fn truncate_to_width(s: &str, max_width: usize) -> String {
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> String {
     if s.width() <= max_width {
         return s.to_owned();
     }
