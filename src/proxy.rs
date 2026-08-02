@@ -45,6 +45,8 @@ pub struct AppState {
     pub mappings: Arc<MappingsStore>,
     pub client: reqwest::Client,
     pub output: crate::tui::OutputSink,
+    /// Process-lifetime token totals shared with the TUI.
+    pub stats: Arc<crate::tui::SessionStatsStore>,
 }
 
 // Per-request stash of the JSON body we sent upstream. Used only on
@@ -65,11 +67,29 @@ pub fn router(
     client: reqwest::Client,
     output: crate::tui::OutputSink,
 ) -> Router {
+    router_with_stats(
+        config,
+        mappings,
+        client,
+        output,
+        Arc::new(crate::tui::SessionStatsStore::new()),
+    )
+}
+
+/// Build a router using the process-lifetime stats store shared by the TUI.
+pub fn router_with_stats(
+    config: Arc<Config>,
+    mappings: Arc<MappingsStore>,
+    client: reqwest::Client,
+    output: crate::tui::OutputSink,
+    stats: Arc<crate::tui::SessionStatsStore>,
+) -> Router {
     let state = AppState {
         config,
         mappings,
         client,
         output,
+        stats,
     };
     Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -196,6 +216,7 @@ async fn handle_messages_inner(
     // can't safely retry once the response stream has started (see
     // TODO at the end of this file).
     let mut outbound = outbound;
+    let mut fallback_used = false;
     let mut attempt = 1u8;
     let upstream_resp = loop {
         let mut upstream_req = state
@@ -253,6 +274,7 @@ async fn handle_messages_inner(
                 "upstream rejected model; falling back to default_model"
             );
             outbound.model = fallback.to_owned();
+            fallback_used = true;
             outbound.reasoning = fallback_reasoning.map(|effort| responses::ReasoningConfig {
                 effort,
                 ..responses::ReasoningConfig::default()
@@ -278,8 +300,16 @@ async fn handle_messages_inner(
 
         let msg_id = synthetic_message_id(&req);
         let model = outbound.model.clone();
-        let translator_stream =
-            TranslatorStream::new(sse, msg_id, model, start, state.output.clone());
+        let translator_stream = TranslatorStream::new(
+            sse,
+            msg_id,
+            model,
+            start,
+            state.output.clone(),
+            state.stats.clone(),
+            stats_model(&req.model, &outbound.model, fallback_used),
+            fallback_used,
+        );
 
         let body = Body::from_stream(translator_stream);
         let response = Response::builder()
@@ -301,6 +331,16 @@ async fn handle_messages_inner(
                 body: format!("upstream returned non-JSON body: {e}"),
             })?;
         let anth = translate::responses_to_anthropic(&upstream_resp_body);
+        if is_countable_response_status(&upstream_resp_body.status)
+            && let Some(usage) = upstream_resp_body.usage.as_ref()
+        {
+            let usage = token_usage(usage);
+            if fallback_used {
+                state.stats.record_actual(outbound.model.clone(), usage);
+            } else {
+                state.stats.record(req.model.clone(), usage);
+            }
+        }
         let elapsed = start.elapsed();
         let usage = &upstream_resp_body.usage;
         let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
@@ -341,7 +381,46 @@ async fn handle_messages_inner(
 }
 
 /// Print a response stats line from a `StreamStats` (used by the streaming path).
-fn print_stream_stats(stats: &crate::stream::StreamStats, elapsed: std::time::Duration, sink: &crate::tui::OutputSink) {
+fn token_usage(usage: &responses::ResponsesUsage) -> crate::tui::TokenUsage {
+    crate::tui::TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.cached_tokens),
+        cache_creation_input_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.cache_write_tokens),
+        reasoning_tokens: usage
+            .output_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.reasoning_tokens),
+    }
+}
+
+/// Use the inbound name for ordinary requests, but attribute a retry to the
+/// fallback model that actually produced the successful response.
+fn is_countable_response_status(status: &str) -> bool {
+    // `incomplete` is a terminal upstream response with authoritative usage,
+    // unlike a stream interrupted before it emitted a terminal event.
+    matches!(status, "completed" | "incomplete")
+}
+
+fn stats_model(inbound: &str, actual_model: &str, fallback_used: bool) -> String {
+    if fallback_used {
+        actual_model.to_owned()
+    } else {
+        inbound.to_owned()
+    }
+}
+
+fn print_stream_stats(
+    stats: &crate::stream::StreamStats,
+    elapsed: std::time::Duration,
+    sink: &crate::tui::OutputSink,
+) {
     let usage = &stats.usage;
     let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
     let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
@@ -447,6 +526,12 @@ where
     start: Instant,
     /// Captured stats after the translator is consumed, so `Drop` can print them.
     stats: Option<crate::stream::StreamStats>,
+    /// Shared process-lifetime token totals.
+    session_stats: Arc<crate::tui::SessionStatsStore>,
+    /// Inbound or actual model bucket for this request.
+    stats_model: String,
+    /// Whether this response was produced by a fallback retry.
+    fallback_used: bool,
     /// Output sink for the response log line. Cloned cheaply (Arc inside).
     sink: crate::tui::OutputSink,
 }
@@ -461,12 +546,18 @@ where
         model: String,
         start: Instant,
         sink: crate::tui::OutputSink,
+        session_stats: Arc<crate::tui::SessionStatsStore>,
+        stats_model: String,
+        fallback_used: bool,
     ) -> Self {
         Self {
             inner,
             translator: Some(StreamTranslator::new(msg_id, model)),
             start,
             stats: None,
+            session_stats,
+            stats_model,
+            fallback_used,
             sink,
         }
     }
@@ -503,6 +594,21 @@ where
         if let Some(stats) = self.stats.as_ref() {
             let elapsed = self.start.elapsed();
             print_stream_stats(stats, elapsed, &self.sink);
+            if stats.completed && stats.usage.is_some() {
+                let usage = crate::tui::TokenUsage {
+                    input_tokens: stats.input_tokens,
+                    output_tokens: stats.usage.as_ref().map_or(0, |u| u.output_tokens),
+                    cache_read_input_tokens: stats.cache_read_input_tokens,
+                    cache_creation_input_tokens: stats.cache_creation_input_tokens,
+                    reasoning_tokens: stats.usage.as_ref().map_or(0, |u| u.thinking_tokens),
+                };
+                if self.fallback_used {
+                    self.session_stats
+                        .record_actual(self.stats_model.clone(), usage);
+                } else {
+                    self.session_stats.record(self.stats_model.clone(), usage);
+                }
+            }
         }
     }
 }
@@ -582,7 +688,19 @@ where
                         let events = this.take_and_report_error(kind, message);
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
+                    let terminal = matches!(
+                        event,
+                        responses::ResponsesStreamEvent::Completed { .. }
+                            | responses::ResponsesStreamEvent::Incomplete { .. }
+                    );
                     let events = translator.feed_event(&event);
+                    // Capture terminal usage before yielding its events. If
+                    // the downstream disconnects immediately after receiving
+                    // the terminal event, Drop still has enough information
+                    // to count this completed response exactly once.
+                    if terminal {
+                        this.stats = Some(translator.stats());
+                    }
                     if events.is_empty() {
                         continue;
                     }
@@ -836,6 +954,30 @@ mod tests {
     #[test]
     fn extract_model_error_code_returns_none_for_non_json() {
         assert_eq!(extract_model_error_code("not json"), None);
+    }
+
+    #[test]
+    fn stats_model_groups_mapped_requests_by_inbound_name() {
+        assert_eq!(
+            stats_model("claude-sonnet", "gpt-sonnet", false),
+            "claude-sonnet"
+        );
+    }
+
+    #[test]
+    fn stats_model_attributes_fallback_to_actual_model() {
+        assert_eq!(
+            stats_model("claude-sonnet", "gpt-fallback", true),
+            "gpt-fallback"
+        );
+    }
+
+    #[test]
+    fn stats_model_keeps_unmapped_inbound_name_separate() {
+        assert_eq!(
+            stats_model("claude-unknown", "claude-unknown", false),
+            "claude-unknown"
+        );
     }
 
     #[test]

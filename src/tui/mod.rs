@@ -16,6 +16,8 @@ pub mod output;
 pub mod panels;
 pub mod runner;
 pub mod runtime;
+pub mod stats;
 
 pub use output::{LogKind, LogLine, OutputSink};
 pub use runtime::{MappingsSnapshot, MappingsStore, RuntimeMappings};
+pub use stats::{SessionStatsSnapshot, SessionStatsStore, TokenTotals, TokenUsage};

@@ -43,13 +43,10 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::anthropic::{
-    ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload,
-    ServerToolUseUsage, StopReason, StreamEvent, Usage as AnthropicUsage, WebSearchResult,
-    WebSearchToolResultBlock,
+    ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload, ServerToolUseUsage,
+    StopReason, StreamEvent, Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::responses::{
-    IncompleteDetails, OutputItem, ResponsesResponse, ResponsesStreamEvent,
-};
+use crate::responses::{IncompleteDetails, OutputItem, ResponsesResponse, ResponsesStreamEvent};
 
 /// Stateful translator for one streaming request.
 #[derive(Debug)]
@@ -80,6 +77,9 @@ pub struct StreamTranslator {
     cache_creation_input_tokens: u32,
     input_usage_seen: bool,
     finished: bool,
+    /// True only when a terminal completed/incomplete response event arrived.
+    /// A stream that merely closes or errors is not countable.
+    completed: bool,
 }
 
 /// Summary stats extracted from a `StreamTranslator` after the stream ends.
@@ -92,6 +92,7 @@ pub struct StreamStats {
     pub input_tokens: u32,
     pub cache_read_input_tokens: u32,
     pub cache_creation_input_tokens: u32,
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +150,7 @@ impl StreamTranslator {
             cache_creation_input_tokens: 0,
             input_usage_seen: false,
             finished: false,
+            completed: false,
         }
     }
 
@@ -254,6 +256,7 @@ impl StreamTranslator {
             }
             ResponsesStreamEvent::Completed { response }
             | ResponsesStreamEvent::Incomplete { response } => {
+                self.completed = true;
                 self.capture_terminal(&mut events, response);
             }
             ResponsesStreamEvent::Failed { response } => {
@@ -334,7 +337,9 @@ impl StreamTranslator {
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: 0,
             server_tool_use: if self.web_search_used {
-                Some(ServerToolUseUsage { web_search_requests: 1 })
+                Some(ServerToolUseUsage {
+                    web_search_requests: 1,
+                })
             } else {
                 None
             },
@@ -392,6 +397,7 @@ impl StreamTranslator {
             input_tokens: self.input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
+            completed: self.completed,
         }
     }
 
@@ -759,11 +765,24 @@ impl StreamTranslator {
 
     fn capture_terminal(&mut self, events: &mut Vec<StreamEvent>, response: &ResponsesResponse) {
         // Capture usage first so `finish()` includes it in message_delta.
+        // The terminal snapshot is authoritative: created/in-progress
+        // snapshots may omit usage or contain only provisional counts.
         if let Some(usage) = &response.usage {
+            self.input_tokens = usage.input_tokens;
+            self.cache_read_input_tokens = usage
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens);
+            self.cache_creation_input_tokens = usage
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cache_write_tokens);
+            self.input_usage_seen = true;
             let mut u = map_usage(usage);
             if self.web_search_used {
-                u.server_tool_use =
-                    Some(ServerToolUseUsage { web_search_requests: 1 });
+                u.server_tool_use = Some(ServerToolUseUsage {
+                    web_search_requests: 1,
+                });
             }
             self.usage = Some(u);
         }
@@ -1310,7 +1329,10 @@ mod tests {
             "expected SignatureDelta first, got {:?}",
             closing[0]
         );
-        assert!(matches!(closing[1], StreamEvent::ContentBlockStop { index: 0 }));
+        assert!(matches!(
+            closing[1],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
         // MessageDelta + MessageStop
         assert!(matches!(closing[2], StreamEvent::MessageDelta { .. }));
         assert!(matches!(closing[3], StreamEvent::MessageStop {}));
@@ -1339,7 +1361,10 @@ mod tests {
             .iter()
             .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }))
             .expect("expected ContentBlockStop");
-        assert_eq!(stop_pos, 0, "expected ContentBlockStop to be first, got {closing:?}");
+        assert_eq!(
+            stop_pos, 0,
+            "expected ContentBlockStop to be first, got {closing:?}"
+        );
         if stop_pos > 0 {
             assert!(
                 !matches!(
@@ -1858,10 +1883,12 @@ mod tests {
         let closing = t.finish();
         match &closing[0] {
             StreamEvent::MessageDelta { usage, .. } => {
-                assert!(usage
-                    .as_ref()
-                    .and_then(|u| u.server_tool_use.as_ref())
-                    .is_some());
+                assert!(
+                    usage
+                        .as_ref()
+                        .and_then(|u| u.server_tool_use.as_ref())
+                        .is_some()
+                );
             }
             other => panic!("expected message_delta, got {other:?}"),
         }
@@ -1891,10 +1918,12 @@ mod tests {
         match &closing[0] {
             StreamEvent::MessageDelta { usage, .. } => {
                 // No server_tool_use usage for a plain function call.
-                assert!(usage
-                    .as_ref()
-                    .and_then(|u| u.server_tool_use.as_ref())
-                    .is_none());
+                assert!(
+                    usage
+                        .as_ref()
+                        .and_then(|u| u.server_tool_use.as_ref())
+                        .is_none()
+                );
             }
             other => panic!("expected message_delta, got {other:?}"),
         }

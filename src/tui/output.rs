@@ -43,9 +43,7 @@ pub struct OutputSink {
 
 enum OutputInner {
     /// TUI is active. Lines are queued and rendered by the TUI loop.
-    Tui {
-        tx: mpsc::Sender<LogLine>,
-    },
+    Tui { tx: mpsc::Sender<LogLine> },
     /// TUI is off. Lines go to stdout, exactly as they did before.
     Plain {
         /// Serialize stdout writes so two requests can't interleave.

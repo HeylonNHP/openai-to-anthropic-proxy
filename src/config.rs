@@ -722,8 +722,16 @@ mod tests {
         let parsed = JsonConfig::parse(json_raw).expect("parse json");
         let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
         assert_eq!(cfg.prompt_caching.models.len(), 2);
-        assert!(cfg.prompt_caching.models.contains(&"gpt-5.6-luna".to_string()));
-        assert!(cfg.prompt_caching.models.contains(&"gpt-5.6-terra".to_string()));
+        assert!(
+            cfg.prompt_caching
+                .models
+                .contains(&"gpt-5.6-luna".to_string())
+        );
+        assert!(
+            cfg.prompt_caching
+                .models
+                .contains(&"gpt-5.6-terra".to_string())
+        );
         assert_eq!(cfg.prompt_caching.cache_key.as_deref(), Some("my-app"));
     }
 

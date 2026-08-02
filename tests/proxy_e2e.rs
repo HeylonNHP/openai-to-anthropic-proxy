@@ -900,7 +900,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
     // Original model not in the reasoning map → falls back to the global default "low".
     assert_eq!(first["reasoning"]["effort"], "low");
     // Fallback model is in the map → gets its own per-model entry "none".
-assert_eq!(second["reasoning"]["effort"], "none");
+    assert_eq!(second["reasoning"]["effort"], "none");
 }
 /// Regression test for the bug where the runtime `MappingsStore` was
 /// disconnected from request handling: TUI edits to model aliases

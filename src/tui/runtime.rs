@@ -84,8 +84,7 @@ pub struct MappingsSnapshot {
 impl MappingsSnapshot {
     /// True when the live mappings differ from the on-disk mappings.
     pub fn is_dirty(&self) -> bool {
-        self.live.map != self.on_disk.map
-            || self.live.default_model != self.on_disk.default_model
+        self.live.map != self.on_disk.map || self.live.default_model != self.on_disk.default_model
     }
 
     /// True when the given inbound model's *value* in `live` differs
@@ -205,10 +204,7 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_marks_unsaved_changes() {
-        let store = MappingsStore::from_parts(
-            rm(&[("a", "x")], Some("fallback")),
-            rm(&[], None),
-        );
+        let store = MappingsStore::from_parts(rm(&[("a", "x")], Some("fallback")), rm(&[], None));
         let s = store.snapshot();
         assert!(s.is_dirty());
         assert!(s.inbound_is_dirty("a"));
