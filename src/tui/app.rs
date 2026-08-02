@@ -20,8 +20,9 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::output::{LogKind, LogLine};
-use super::panels::{truncate_to_width, Panel};
+use super::panels::{Panel, truncate_to_width};
 use super::runtime::{MappingsStore, RuntimeMappings};
+use super::stats::{SessionStatsStore, TokenTotals};
 use crate::config::JsonConfig;
 
 /// Maximum number of log lines retained for the on-screen tail.
@@ -62,6 +63,8 @@ enum EditField {
 pub struct TuiApp {
     /// Shared store. Read on every render, written by edit actions.
     store: std::sync::Arc<MappingsStore>,
+    /// Session-only token totals shared with request handlers.
+    stats: std::sync::Arc<SessionStatsStore>,
     /// Path to `proxy.json` for save operations. `None` disables saving
     /// (the TUI still works for in-memory changes).
     config_path: Option<PathBuf>,
@@ -110,11 +113,29 @@ impl TuiApp {
         listen_addr: String,
         upstream_base_url: String,
     ) -> Self {
+        Self::new_with_stats(
+            store,
+            std::sync::Arc::new(SessionStatsStore::new()),
+            config_path,
+            listen_addr,
+            upstream_base_url,
+        )
+    }
+
+    /// Construct an app using the request handlers' shared session stats.
+    pub fn new_with_stats(
+        store: std::sync::Arc<MappingsStore>,
+        stats: std::sync::Arc<SessionStatsStore>,
+        config_path: Option<PathBuf>,
+        listen_addr: String,
+        upstream_base_url: String,
+    ) -> Self {
         let mut log_list_state = ListState::default();
         // Show the newest entry at the top by default (offset 0).
         log_list_state.select(Some(0));
         Self {
             store,
+            stats,
             config_path,
             listen_addr,
             upstream_base_url,
@@ -398,11 +419,7 @@ impl TuiApp {
     fn edit_default_model(&mut self) {
         let snap = self.store.snapshot();
         self.edit_inbound = "<default fallback>".into();
-        self.edit_outbound = snap
-            .live
-            .default_model
-            .clone()
-            .unwrap_or_default();
+        self.edit_outbound = snap.live.default_model.clone().unwrap_or_default();
         self.edit_cursor = self.edit_outbound.len();
         self.mode = Mode::Editing(EditField::Outbound);
         // Pressing Enter on this pseudo-row should set default_model,
@@ -434,8 +451,7 @@ impl TuiApp {
 
     fn apply_mutation(&self, f: impl FnOnce(&mut super::runtime::RuntimeMappings)) {
         // Read the current live snapshot, mutate a clone, and swap.
-        let mut next: super::runtime::RuntimeMappings =
-            (*self.store.load_live()).as_ref().clone();
+        let mut next: super::runtime::RuntimeMappings = (*self.store.load_live()).as_ref().clone();
         f(&mut next);
         self.store.set_live(next);
     }
@@ -446,7 +462,7 @@ impl TuiApp {
             self.mode = Mode::SavedToast;
             return;
         };
-        
+
         // Read the existing full config to preserve all non-mappings fields
         let mut json_config: JsonConfig = if path.exists() {
             match std::fs::read_to_string(path) {
@@ -467,14 +483,14 @@ impl TuiApp {
         } else {
             JsonConfig::default()
         };
-        
+
         // Update only the model_aliases from live mappings
         let live: RuntimeMappings = (*self.store.load_live()).as_ref().clone();
         json_config.model_aliases = Some(crate::config::JsonModelAliases {
             map: live.map,
             default_model: live.default_model,
         });
-        
+
         let json = match serde_json::to_string_pretty(&json_config) {
             Ok(j) => j,
             Err(e) => {
@@ -483,7 +499,7 @@ impl TuiApp {
                 return;
             }
         };
-        
+
         // Write to a temp file, then atomic-rename. This avoids leaving
         // a half-written proxy.json if the process is killed mid-write.
         let tmp = path.with_extension("json.tmp");
@@ -572,15 +588,68 @@ impl TuiApp {
             dash.row(&line);
         }
         dash.rule();
-        let fb = snap
-            .live
-            .default_model
-            .as_deref()
-            .unwrap_or("<none>");
+        let fb = snap.live.default_model.as_deref().unwrap_or("<none>");
         dash.row(&format!(
             "DEFAULT FALLBACK  {fb}        SAVE STATUS  {}",
-            if snap.is_dirty() { "UNSAVED  (press S to save)" } else { "SAVED" }
+            if snap.is_dirty() {
+                "UNSAVED  (press S to save)"
+            } else {
+                "SAVED"
+            }
         ));
+
+        // ---- Session token totals ----
+        // These are process-lifetime values in a separate in-memory store.
+        // Cap rows so a busy process cannot crowd out the request log.
+        let totals = self.stats.snapshot_sections();
+        dash.row("SESSION TOKENS  (process lifetime; input/output/cache/reasoning)");
+        let mut shown = 0usize;
+        let mut configured: Vec<_> = totals
+            .inbound
+            .iter()
+            .filter(|(model, _)| snap.live.map.contains_key(*model))
+            .collect();
+        configured.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (model, total) in configured {
+            if shown >= 24 {
+                break;
+            }
+            dash.row(&format_token_total(model, total));
+            shown += 1;
+        }
+        let mut unmapped_inbound: Vec<_> = totals
+            .inbound
+            .iter()
+            .filter(|(model, _)| !snap.live.map.contains_key(*model))
+            .collect();
+        unmapped_inbound.sort_by(|(a, _), (b, _)| a.cmp(b));
+        if !unmapped_inbound.is_empty() {
+            dash.row("UNMAPPED INBOUND MODEL TOTALS");
+            for (model, total) in unmapped_inbound {
+                if shown >= 24 {
+                    break;
+                }
+                dash.row(&format_token_total(model, total));
+                shown += 1;
+            }
+        }
+        if !totals.actual.is_empty() {
+            dash.row("ACTUAL FALLBACK MODEL TOTALS");
+            for (model, total) in &totals.actual {
+                if shown >= 24 {
+                    break;
+                }
+                dash.row(&format_token_total(model, total));
+                shown += 1;
+            }
+        }
+        let total_rows = totals.inbound.len() + totals.actual.len();
+        if total_rows > shown {
+            dash.row(&format!(
+                "  … {} additional model totals hidden",
+                total_rows - shown
+            ));
+        }
 
         // ---- Footer hint ----
         dash.row("[a] add  [e/Enter] edit  [d] delete  [f] default  [s] save  [q] quit");
@@ -606,7 +675,7 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(dash_h),
-                Constraint::Min(3),            // log: at least 3 rows
+                Constraint::Min(3),           // log: at least 3 rows
                 Constraint::Length(footer_h), // footer
             ])
             .split(area);
@@ -626,8 +695,7 @@ impl TuiApp {
         // area, which caused the log to overflow the buffer. Use a
         // free function (see below) that always uses `parent.height`.
         frame.render_widget(
-            Paragraph::new(dash.lines.join("\n"))
-                .style(Style::default().fg(Color::White)),
+            Paragraph::new(dash.lines.join("\n")).style(Style::default().fg(Color::White)),
             centered(dash.width, dash_area),
         );
 
@@ -668,8 +736,8 @@ impl TuiApp {
         // built each frame so the position reflects the post-render
         // `ListState`.
         if self.log.len() > log_area.height as usize {
-            let mut sb_state = ScrollbarState::new(self.log.len())
-                .position(self.log_list_state.offset());
+            let mut sb_state =
+                ScrollbarState::new(self.log.len()).position(self.log_list_state.offset());
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(Some("^"))
@@ -699,8 +767,7 @@ impl TuiApp {
             area.width.saturating_sub(2) as usize,
         );
         frame.render_widget(
-            Paragraph::new(footer_text.as_str())
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(footer_text.as_str()).style(Style::default().fg(Color::DarkGray)),
             Rect::new(area.x, footer_area.y, area.width, footer_area.height),
         );
 
@@ -741,12 +808,16 @@ impl TuiApp {
         frame.render_widget(block, popup);
 
         let inbound_style = if field == EditField::Inbound {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
         let outbound_style = if field == EditField::Outbound {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -859,7 +930,9 @@ fn kind_glyph(kind: LogKind) -> &'static str {
     }
 }
 
-fn recent_request_column_widths<'a>(lines: impl IntoIterator<Item = &'a LogLine>) -> [Vec<usize>; 5] {
+fn recent_request_column_widths<'a>(
+    lines: impl IntoIterator<Item = &'a LogLine>,
+) -> [Vec<usize>; 5] {
     let mut widths = std::array::from_fn(|_| Vec::new());
     for line in lines {
         let slot = &mut widths[log_kind_index(line.kind)];
@@ -904,6 +977,19 @@ fn log_kind_index(kind: LogKind) -> usize {
         LogKind::Error => 3,
         LogKind::Info => 4,
     }
+}
+
+fn format_token_total(model: &str, total: &TokenTotals) -> String {
+    format!(
+        "  {:<26} {:>6} req  in {:>10}  out {:>10}  cache {:>10}/{:<10}  reason {:>10}",
+        truncate(model, 26),
+        total.requests,
+        total.input_tokens,
+        total.output_tokens,
+        total.cache_read_input_tokens,
+        total.cache_creation_input_tokens,
+        total.reasoning_tokens,
+    )
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -1004,7 +1090,12 @@ mod tests {
 
     #[test]
     fn rows_are_sorted() {
-        let app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         let rows = app.rows();
         assert_eq!(rows[0].inbound, "claude-opus-4-8");
         assert_eq!(rows[1].inbound, "claude-sonnet-5");
@@ -1012,7 +1103,12 @@ mod tests {
 
     #[test]
     fn add_then_dirty() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         app.apply_mutation(|m| {
             m.map
                 .insert("claude-haiku-4-5".into(), "gpt-4o-mini".into());
@@ -1022,7 +1118,12 @@ mod tests {
 
     #[test]
     fn delete_clears_mapping() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         app.selected = 0; // claude-opus-4-8
         app.delete_selected();
         let rows = app.rows();
@@ -1032,7 +1133,12 @@ mod tests {
 
     #[test]
     fn save_disabled_when_no_path() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         app.save_to_disk();
         assert!(app.toast.is_some());
     }
@@ -1056,7 +1162,12 @@ mod tests {
     /// panic. Post-fix, it returns `Ok`.
     #[test]
     fn render_does_not_overflow_buffer_when_log_is_full() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         // Fill the log well past what a 30-row terminal can show.
         for i in 0..(LOG_TAIL + 50) {
             app.push_log(make_log_line(&format!("request #{i} inbound foo -> bar")));
@@ -1077,14 +1188,9 @@ mod tests {
                 )));
             })
             .expect("draw failed");
-        let result = outcome
-            .take()
-            .expect("draw closure did not run");
+        let result = outcome.take().expect("draw closure did not run");
         // The draw must complete without panicking.
-        assert!(
-            result.is_ok(),
-            "render panicked with full log: {result:?}"
-        );
+        assert!(result.is_ok(), "render panicked with full log: {result:?}");
     }
 
     /// At a minimum terminal height (5 rows) the layout must still
@@ -1092,7 +1198,12 @@ mod tests {
     /// reserved 3-row minimum.
     #[test]
     fn render_does_not_overflow_buffer_at_minimum_height() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         for i in 0..200 {
             app.push_log(make_log_line(&format!("req {i}")));
         }
@@ -1125,11 +1236,17 @@ mod tests {
             let mut m: super::super::runtime::RuntimeMappings =
                 (*store.load_live()).as_ref().clone();
             for i in 0..50 {
-                m.map.insert(format!("claude-in-{i}"), format!("gpt-out-{i}"));
+                m.map
+                    .insert(format!("claude-in-{i}"), format!("gpt-out-{i}"));
             }
             store.set_live(m);
         }
-        let mut app = TuiApp::new(std::sync::Arc::new(store), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            std::sync::Arc::new(store),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let outcome = std::cell::Cell::new(None::<std::thread::Result<()>>);
@@ -1154,7 +1271,12 @@ mod tests {
     /// lines keeps the deque at exactly `LOG_TAIL` entries.
     #[test]
     fn log_cap_respected() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         for i in 0..(LOG_TAIL * 2) {
             app.push_log(make_log_line(&format!("line {i}")));
         }
@@ -1166,7 +1288,12 @@ mod tests {
     /// matter what direction the user scrolls.
     #[test]
     fn scroll_offset_clamps_to_valid_range() {
-        let mut app = TuiApp::new(make_store(), None, "0.0.0.0:8085".into(), "http://localhost/v1".into());
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
         // Push enough lines to make the offset non-trivial.
         for i in 0..200 {
             app.push_log(make_log_line(&format!("line {i}")));

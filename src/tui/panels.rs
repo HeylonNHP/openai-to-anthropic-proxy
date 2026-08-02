@@ -175,8 +175,15 @@ mod tests {
         p.row("a long string that overflows the panel width");
         for line in &p.lines {
             assert_eq!(line.width(), p.width as usize, "misaligned: {line:?}");
-            assert!(line.starts_with(V) || line.starts_with(TL) || line.starts_with(ML) || line.starts_with(BL));
-            assert!(line.ends_with(V) || line.ends_with(TR) || line.ends_with(MR) || line.ends_with(BR));
+            assert!(
+                line.starts_with(V)
+                    || line.starts_with(TL)
+                    || line.starts_with(ML)
+                    || line.starts_with(BL)
+            );
+            assert!(
+                line.ends_with(V) || line.ends_with(TR) || line.ends_with(MR) || line.ends_with(BR)
+            );
         }
     }
 

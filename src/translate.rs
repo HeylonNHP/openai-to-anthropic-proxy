@@ -663,7 +663,8 @@ fn append_user_message(
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
-                        let ephemeral = !prompt_caching.models.is_empty() && is_ephemeral(&t.cache_control);
+                        let ephemeral =
+                            !prompt_caching.models.is_empty() && is_ephemeral(&t.cache_control);
                         // Append text to the last part if it's also text
                         // and extending it won't move a cache breakpoint
                         // past the end of a non-ephemeral block. Otherwise
@@ -696,8 +697,8 @@ fn append_user_message(
                     }
                     ContentBlockParam::Image(img) => {
                         if let Some(image_part) = convert_image_block(img) {
-                            let ephemeral =
-                                !prompt_caching.models.is_empty() && is_ephemeral(&img.cache_control);
+                            let ephemeral = !prompt_caching.models.is_empty()
+                                && is_ephemeral(&img.cache_control);
                             parts.push((image_part, ephemeral));
                         }
                     }
@@ -2458,7 +2459,9 @@ pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
                 .as_ref()
                 .map_or(0, |d| d.reasoning_tokens),
             server_tool_use: if web_search_used {
-                Some(ServerToolUseUsage { web_search_requests: 1 })
+                Some(ServerToolUseUsage {
+                    web_search_requests: 1,
+                })
             } else {
                 None
             },
@@ -2591,7 +2594,10 @@ fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
             saw_web_search_function_call,
             "web search detected via output item; synthesizing placeholder citation"
         );
-        citations.push(("https://www.openai.com".to_string(), "Web search".to_string()));
+        citations.push((
+            "https://www.openai.com".to_string(),
+            "Web search".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -3156,8 +3162,14 @@ mod response_tests {
         // server_tool_use + web_search_tool_result (injected) +
         // tool_use (the WebSearch function call) + text = 4 blocks.
         assert_eq!(out.content.len(), 4, "expected 4 content blocks");
-        assert!(matches!(&out.content[0], ResponseContentBlock::ServerToolUse { .. }));
-        assert!(matches!(&out.content[1], ResponseContentBlock::WebSearchToolResult { .. }));
+        assert!(matches!(
+            &out.content[0],
+            ResponseContentBlock::ServerToolUse { .. }
+        ));
+        assert!(matches!(
+            &out.content[1],
+            ResponseContentBlock::WebSearchToolResult { .. }
+        ));
         match &out.content[2] {
             ResponseContentBlock::ToolUse { id, name, .. } => {
                 assert_eq!(id, "call_ws");
@@ -3189,8 +3201,14 @@ mod response_tests {
         let out = responses_to_anthropic(&resp);
         // server_tool_use + web_search_tool_result + tool_use = 3 blocks.
         assert_eq!(out.content.len(), 3);
-        assert!(matches!(&out.content[0], ResponseContentBlock::ServerToolUse { .. }));
-        assert!(matches!(&out.content[1], ResponseContentBlock::WebSearchToolResult { .. }));
+        assert!(matches!(
+            &out.content[0],
+            ResponseContentBlock::ServerToolUse { .. }
+        ));
+        assert!(matches!(
+            &out.content[1],
+            ResponseContentBlock::WebSearchToolResult { .. }
+        ));
         assert!(out.usage.server_tool_use.is_some());
     }
 
@@ -3353,7 +3371,11 @@ mod response_tests {
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
-        assert!(required.contains(&"x"), "required {:?} should contain x", required);
+        assert!(
+            required.contains(&"x"),
+            "required {:?} should contain x",
+            required
+        );
     }
 
     /// Live regression: the Atlassian MCP `createJiraIssue` tool's
