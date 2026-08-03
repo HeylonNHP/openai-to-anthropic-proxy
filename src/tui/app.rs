@@ -936,7 +936,8 @@ fn recent_request_column_widths<'a>(
     let mut widths = std::array::from_fn(|_| Vec::new());
     for line in lines {
         let slot = &mut widths[log_kind_index(line.kind)];
-        for (idx, col) in recent_request_columns(&line.text).into_iter().enumerate() {
+        let text = format_recent_request_token_counts(&line.text);
+        for (idx, col) in recent_request_columns(&text).into_iter().enumerate() {
             let width = col.width();
             if idx >= slot.len() {
                 slot.push(width);
@@ -949,9 +950,10 @@ fn recent_request_column_widths<'a>(
 }
 
 fn normalize_recent_request_text(text: &str, widths: &[usize]) -> String {
-    let cols = recent_request_columns(text);
+    let text = format_recent_request_token_counts(text);
+    let cols = recent_request_columns(&text);
     if cols.len() <= 1 {
-        return text.to_owned();
+        return text;
     }
 
     let mut out = String::new();
@@ -960,8 +962,82 @@ fn normalize_recent_request_text(text: &str, widths: &[usize]) -> String {
             out.push_str("  |  ");
         }
         let width = widths.get(idx).copied().unwrap_or_else(|| col.width());
-        out.push_str(&truncate_to_width(col, width));
+        let normalized = truncate_to_width(col, width);
+        out.push_str(&normalized);
+        for _ in normalized.width()..width {
+            out.push(' ');
+        }
     }
+    out
+}
+
+/// Format token counts in the response lines shown in Recent Requests.
+///
+/// Request metadata also contains numbers (HTTP status, elapsed seconds,
+/// tool/message counts), so only numbers carrying the response token labels
+/// are changed: `in`, `out`, `thinking`, and cache `r`/`w` counts.
+fn format_recent_request_token_counts(text: &str) -> String {
+    let mut columns = Vec::new();
+    for column in recent_request_columns(text) {
+        let mut column = column.to_owned();
+        if column.contains("cache:") {
+            column = format_token_counts_with_suffix(&column, "r");
+            column = format_token_counts_with_suffix(&column, "w");
+        } else {
+            column = format_token_counts_with_suffix(&column, " in");
+            column = format_token_counts_with_suffix(&column, " out");
+            column = format_token_counts_with_suffix(&column, " thinking");
+        }
+        columns.push(column);
+    }
+    columns.join("  |  ")
+}
+
+/// Replace an ASCII number immediately before `suffix`, retaining all other
+/// text byte-for-byte. The suffix boundary prevents matching a number that
+/// is merely part of a larger word.
+fn format_token_counts_with_suffix(text: &str, suffix: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut replacements = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let end = index;
+        if !text[end..].starts_with(suffix) {
+            continue;
+        }
+        let suffix_end = end + suffix.len();
+        if suffix_end < bytes.len() && bytes[suffix_end].is_ascii_alphanumeric() {
+            continue;
+        }
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let Ok(count) = text[start..end].parse::<u64>() else {
+            continue;
+        };
+        replacements.push((
+            start,
+            suffix_end,
+            format!("{}{}", format_token_count(count), suffix),
+        ));
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut previous = 0;
+    for (start, end, replacement) in replacements {
+        out.push_str(&text[previous..start]);
+        out.push_str(&replacement);
+        previous = end;
+    }
+    out.push_str(&text[previous..]);
     out
 }
 
@@ -984,12 +1060,42 @@ fn format_token_total(model: &str, total: &TokenTotals) -> String {
         "  {:<26} {:>6} req  in {:>10}  out {:>10}  cache {:>10}/{:<10}  reason {:>10}",
         truncate(model, 26),
         total.requests,
-        total.input_tokens,
-        total.output_tokens,
-        total.cache_read_input_tokens,
-        total.cache_creation_input_tokens,
-        total.reasoning_tokens,
+        format_token_count(total.input_tokens),
+        format_token_count(total.output_tokens),
+        format_token_count(total.cache_read_input_tokens),
+        format_token_count(total.cache_creation_input_tokens),
+        format_token_count(total.reasoning_tokens),
     )
+}
+
+/// Format a token count compactly for the dashboard.
+///
+/// Counts below one thousand remain integer counts so small values do not
+/// gain needless decimal places. Larger counts use decimal (base-1000) units
+/// and are rounded to two decimal places. If rounding would produce
+/// `1000.00` of one unit, the count is promoted to the next unit instead.
+fn format_token_count(count: u64) -> String {
+    const UNITS: [&str; 6] = ["", "k", "m", "b", "t", "q"];
+
+    if count < 1_000 {
+        return count.to_string();
+    }
+
+    let mut unit_index = 0;
+    let mut scaled = count as f64;
+    while scaled >= 1_000.0 && unit_index + 1 < UNITS.len() {
+        scaled /= 1_000.0;
+        unit_index += 1;
+    }
+
+    // Avoid output such as `1000.00k` when rounding carries into the next
+    // unit. This also keeps values near a unit boundary intuitive.
+    while scaled >= 999.995 && unit_index + 1 < UNITS.len() {
+        scaled /= 1_000.0;
+        unit_index += 1;
+    }
+
+    format!("{scaled:.2}{}", UNITS[unit_index])
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -1050,6 +1156,109 @@ mod tests {
             text: text.to_owned(),
             kind: LogKind::Info,
         }
+    }
+
+    #[test]
+    fn token_counts_use_compact_human_readable_units() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1.00k");
+        assert_eq!(format_token_count(1_234), "1.23k");
+        assert_eq!(format_token_count(999_995), "1.00m");
+        assert_eq!(format_token_count(1_000_000), "1.00m");
+        assert_eq!(format_token_count(1_000_000_000), "1.00b");
+        assert_eq!(format_token_count(1_000_000_000_000), "1.00t");
+        assert_eq!(format_token_count(1_000_000_000_000_000), "1.00q");
+    }
+
+    #[test]
+    fn token_total_formats_every_token_field() {
+        let total = TokenTotals {
+            requests: 7,
+            input_tokens: 1_000,
+            output_tokens: 1_000_000,
+            cache_read_input_tokens: 1_234,
+            cache_creation_input_tokens: 999,
+            reasoning_tokens: 1_000_000_000,
+        };
+
+        assert_eq!(
+            format_token_total("model", &total),
+            "  model                           7 req  in      1.00k  out      1.00m  cache      1.23k/999         reason      1.00b"
+        );
+    }
+
+    #[test]
+    fn recent_request_token_counts_use_compact_units_without_changing_metadata() {
+        let text = "  200  |  1.25s  |  1234 in  |  999995 out  |  2000000 thinking  |  cache: 1000000r 999w";
+
+        assert_eq!(
+            format_recent_request_token_counts(text),
+            "  200  |  1.25s  |  1.23k in  |  1.00m out  |  2.00m thinking  |  cache: 1.00mr 999w"
+        );
+    }
+
+    #[test]
+    fn recent_request_normalization_aligns_formatted_token_counts() {
+        let lines = vec![
+            LogLine {
+                text: "  200  |  1.25s  |  1234 in  |  2 out  |  cache: 1000000r 999w".into(),
+                kind: LogKind::Response,
+            },
+            LogLine {
+                text: "  200  |  1.25s  |  2 in  |  999995 out  |  cache: 3r 1000000w".into(),
+                kind: LogKind::Response,
+            },
+        ];
+        let widths = recent_request_column_widths(lines.iter());
+        let first = normalize_recent_request_text(&lines[0].text, &widths[1]);
+        let second = normalize_recent_request_text(&lines[1].text, &widths[1]);
+
+        assert!(first.contains("1.23k in"));
+        assert!(first.contains("1.00mr"));
+        assert!(second.contains("1.00m out"));
+        assert!(second.contains("1.00mw"));
+        assert_eq!(
+            first.find("|  1.23k in"),
+            second.find("|  2 in"),
+            "input token columns should retain alignment after formatting"
+        );
+    }
+
+    #[test]
+    fn recent_request_rendering_shows_formatted_token_counts() {
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
+        app.push_log(LogLine {
+            text: "  200  |  1.25s  |  1234 in  |  999995 out  |  2000000 thinking  |  cache: 1000000r 999w".into(),
+            kind: LogKind::Response,
+        });
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.render(frame, area);
+            })
+            .expect("draw failed");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\\n");
+
+        assert!(rendered.contains("1.23k in"));
+        assert!(rendered.contains("1.00m out"));
+        assert!(rendered.contains("2.00m thinking"));
+        assert!(rendered.contains("1.00mr 999w"));
     }
 
     #[test]
