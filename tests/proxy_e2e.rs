@@ -39,6 +39,8 @@ struct FakeUpstream {
     /// scenarios (e.g. proxy's default_model fallback) where the
     /// first send must fail and the second must succeed.
     canned_per_attempt: Arc<Mutex<VecDeque<FakeResponse>>>,
+    /// Optional delay before returning a canned response.
+    delay: Arc<Mutex<Option<Duration>>>,
     /// The most recent JSON body the proxy sent to the upstream.
     received: Arc<Mutex<Option<Bytes>>>,
     /// Every JSON body the proxy sent to the upstream, in order.
@@ -57,6 +59,9 @@ struct FakeResponse {
 }
 
 async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
+    if let Some(delay) = *s.delay.lock().await {
+        tokio::time::sleep(delay).await;
+    }
     {
         let mut all = s.received_all.lock().await;
         all.push(body.clone());
@@ -176,6 +181,27 @@ async fn start_proxy_with_store(
         axum::serve(listener, app).await.unwrap();
     });
     addr
+}
+
+#[tokio::test]
+async fn upstream_timeout_returns_gateway_timeout() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.delay.lock().await = Some(Duration::from_millis(100));
+
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.request_timeout = Duration::from_millis(20);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
 }
 
 #[tokio::test]
@@ -902,7 +928,82 @@ async fn fallback_recomputes_reasoning_for_default_model() {
     // Fallback model is in the map → gets its own per-model entry "none".
     assert_eq!(second["reasoning"]["effort"], "none");
 }
-/// Regression test for the bug where the runtime `MappingsStore` was
+#[tokio::test]
+async fn fallback_recomputes_prompt_caching_for_default_model() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"model not supported","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o-mini",
+                    "output": [],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+        prompt_caching: openai_to_anthropic_proxy::config::PromptCachingConfig {
+            models: vec!["claude-sonnet-5".into()],
+            cache_key: Some("cache-key".into()),
+        },
+        log_to_disk: false,
+        proxy_key: None,
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model":"claude-sonnet-5",
+                "max_tokens":4,
+                "messages":[{"role":"user","content":[{"type":"text","text":"cached","cache_control":{"type":"ephemeral"}}]}]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    assert_eq!(first["prompt_cache_key"], "cache-key");
+    assert!(first["input"][0]["content"][0]["prompt_cache_breakpoint"].is_object());
+    assert!(second.get("prompt_cache_key").is_none());
+    assert!(
+        second["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none()
+    );
+}
+
 /// disconnected from request handling: TUI edits to model aliases
 /// had no effect on actual requests because the handler read from
 /// the static `Config::model_aliases`. This test mutates the
