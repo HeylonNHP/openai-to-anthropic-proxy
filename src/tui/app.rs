@@ -694,8 +694,13 @@ impl TuiApp {
         // 30-row terminal the dashboard was given a 120-row-tall
         // area, which caused the log to overflow the buffer. Use a
         // free function (see below) that always uses `parent.height`.
+        let dash_lines = dash
+            .lines
+            .iter()
+            .map(|line| style_token_usage_line(line))
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(dash.lines.join("\n")).style(Style::default().fg(Color::White)),
+            Paragraph::new(dash_lines).style(Style::default().fg(Color::White)),
             centered(dash.width, dash_area),
         );
 
@@ -712,7 +717,8 @@ impl TuiApp {
                     &line.text,
                     &recent_widths[log_kind_index(line.kind)],
                 );
-                ListItem::new(format!("{}  {}", kind_glyph(line.kind), text))
+                let display = format!("{}  {}", kind_glyph(line.kind), text);
+                ListItem::new(style_token_usage_line(&display))
             })
             .collect();
         let title = if self.log.is_empty() {
@@ -1055,6 +1061,52 @@ fn log_kind_index(kind: LogKind) -> usize {
     }
 }
 
+fn style_token_usage_line(text: &str) -> Line<'static> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'.')
+        {
+            index += 1;
+        }
+        let end = index;
+        let before = text[..start].trim_end();
+        let after = &text[end..];
+        let color = if before.ends_with("in") || after.starts_with(" in") {
+            Some(Color::Green)
+        } else if before.ends_with("out") || after.starts_with(" out") {
+            Some(Color::Red)
+        } else {
+            None
+        };
+
+        if let Some(color) = color {
+            ranges.push((start, end, color));
+        }
+    }
+
+    let mut spans = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut cursor = 0;
+    for (start, end, color) in ranges {
+        spans.push(Span::raw(text[cursor..start].to_owned()));
+        spans.push(Span::styled(
+            text[start..end].to_owned(),
+            Style::default().fg(color),
+        ));
+        cursor = end;
+    }
+    spans.push(Span::raw(text[cursor..].to_owned()));
+    Line::from(spans)
+}
+
 fn format_token_total(model: &str, total: &TokenTotals) -> String {
     format!(
         "  {:<26} {:>6} req  in {:>10}  out {:>10}  cache {:>10}/{:<10}  reason {:>10}",
@@ -1169,6 +1221,24 @@ mod tests {
         assert_eq!(format_token_count(1_000_000_000), "1.00b");
         assert_eq!(format_token_count(1_000_000_000_000), "1.00t");
         assert_eq!(format_token_count(1_000_000_000_000_000), "1.00q");
+    }
+
+    #[test]
+    fn token_usage_values_are_color_coded() {
+        let line = style_token_usage_line(
+            "  model                           7 req  in      1.00k  out      1.00m",
+        );
+        let styled: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .collect();
+
+        assert_eq!(styled.len(), 2);
+        assert_eq!(styled[0].content, "1.00k");
+        assert_eq!(styled[0].style.fg, Some(Color::Green));
+        assert_eq!(styled[1].content, "1.00m");
+        assert_eq!(styled[1].style.fg, Some(Color::Red));
     }
 
     #[test]
