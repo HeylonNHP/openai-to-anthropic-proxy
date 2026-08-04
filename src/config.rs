@@ -268,12 +268,14 @@ impl Config {
             cache_key: prompt_cache_key,
         };
 
-        // `proxy_key`: env wins over file, both fall through to `None`
-        // (no client auth).
+        // `proxy_key`: env wins over file, then blank values mean no client auth.
+        // Treat whitespace-only values as unset so `PROXY_KEY=` cannot
+        // accidentally enable an empty authentication secret.
         let proxy_key = pick_str(
             file.and_then(|f| f.proxy_key.as_deref()),
             env.proxy_key.as_deref(),
-        );
+        )
+        .and_then(|key| (!key.trim().is_empty()).then_some(key));
 
         // `log_to_disk`: env wins over file, then default to `false`.
         // For a boolean we can't reuse `pick_str`; do it inline.
@@ -945,5 +947,26 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env).unwrap();
         assert_eq!(cfg.proxy_key.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn blank_proxy_key_values_disable_auth() {
+        let file = JsonConfig {
+            proxy_key: Some("   ".into()),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert!(cfg.proxy_key.is_none());
+
+        let env = EnvInputs {
+            proxy_key: Some(String::new()),
+            ..env_with_required()
+        };
+        let file = JsonConfig {
+            proxy_key: Some("from-file".into()),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert!(cfg.proxy_key.is_none());
     }
 }

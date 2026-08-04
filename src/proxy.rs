@@ -268,17 +268,28 @@ async fn handle_messages_inner(
         if should_retry {
             let fallback = mappings_snapshot.default_model().unwrap();
             let fallback_reasoning = state.config.reasoning_for_model(fallback);
+            let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,
                 fallback_model = %fallback,
                 "upstream rejected model; falling back to default_model"
             );
+
+            // Rebuild the translated request for the fallback model. Prompt
+            // cache breakpoints are embedded in `input`, so patching only the
+            // model and reasoning fields would leak the first model's cache
+            // policy into the retry.
+            outbound = translate::anthropic_to_responses(
+                &req,
+                fallback_reasoning,
+                &fallback_prompt_caching,
+            )
+            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
             outbound.model = fallback.to_owned();
+            if !fallback_prompt_caching.models.is_empty() {
+                outbound.prompt_cache_key = fallback_prompt_caching.cache_key.clone();
+            }
             fallback_used = true;
-            outbound.reasoning = fallback_reasoning.map(|effort| responses::ReasoningConfig {
-                effort,
-                ..responses::ReasoningConfig::default()
-            });
             attempt = 2;
             continue;
         }

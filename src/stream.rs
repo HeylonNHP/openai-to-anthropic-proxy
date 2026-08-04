@@ -64,11 +64,8 @@ pub struct StreamTranslator {
     next_index: u32,
     stop_reason: Option<StopReason>,
     usage: Option<AnthropicUsage>,
-    /// Set to true when the upstream used its built-in web_search tool
-    /// (detected via `url_citation` annotations). Used to populate
-    /// `server_tool_use` in the final `message_delta` usage so Claude
-    /// Code's search counter works.
-    web_search_used: bool,
+    /// Number of web-search calls represented in the emitted Anthropic blocks.
+    web_search_count: u32,
     /// Input-side usage captured from the earliest `response.created` /
     /// `response.in_progress` event so `message_start` can report real
     /// Anthropic-shaped token counts instead of a placeholder.
@@ -144,7 +141,7 @@ impl StreamTranslator {
             next_index: 0,
             stop_reason: None,
             usage: None,
-            web_search_used: false,
+            web_search_count: 0,
             input_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -336,9 +333,9 @@ impl StreamTranslator {
             cache_creation_input_tokens_5m: 0,
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: 0,
-            server_tool_use: if self.web_search_used {
+            server_tool_use: if self.web_search_count > 0 {
                 Some(ServerToolUseUsage {
-                    web_search_requests: 1,
+                    web_search_requests: self.web_search_count,
                 })
             } else {
                 None
@@ -779,9 +776,9 @@ impl StreamTranslator {
                 .map_or(0, |d| d.cache_write_tokens);
             self.input_usage_seen = true;
             let mut u = map_usage(usage);
-            if self.web_search_used {
+            if self.web_search_count > 0 {
                 u.server_tool_use = Some(ServerToolUseUsage {
-                    web_search_requests: 1,
+                    web_search_requests: self.web_search_count,
                 });
             }
             self.usage = Some(u);
@@ -880,8 +877,8 @@ impl StreamTranslator {
         events: &mut Vec<StreamEvent>,
         citations: Option<&[(String, String)]>,
     ) {
-        self.web_search_used = true;
-        let tool_use_id = "stoolu_web_search_01".to_string();
+        self.web_search_count = self.web_search_count.saturating_add(1);
+        let tool_use_id = format!("stoolu_web_search_{:02}", self.web_search_count);
 
         let result_content: Vec<WebSearchResult> = match citations {
             Some(cits) => cits
@@ -1422,6 +1419,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multiple_streaming_web_searches_get_unique_ids_and_accurate_usage() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+
+        let first = t.feed_event(&ResponsesStreamEvent::OutputItemAdded {
+            output_index: 0,
+            item: OutputItem::WebSearchCall {
+                id: Some("ws_01".into()),
+                status: Some("in_progress".into()),
+            },
+        });
+        let second = t.feed_event(&ResponsesStreamEvent::OutputItemAdded {
+            output_index: 1,
+            item: OutputItem::WebSearchCall {
+                id: Some("ws_02".into()),
+                status: Some("in_progress".into()),
+            },
+        });
+
+        let ids: Vec<&str> = first
+            .iter()
+            .chain(&second)
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockKind::ServerToolUse { id, .. },
+                    ..
+                } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["stoolu_web_search_01", "stoolu_web_search_02"]);
+
+        t.feed_event(&completed_event("completed"));
+        let closing = t.finish();
+        let usage = closing
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::MessageDelta { usage, .. } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("terminal usage");
+        assert_eq!(
+            usage
+                .server_tool_use
+                .as_ref()
+                .expect("server search usage")
+                .web_search_requests,
+            2
+        );
+    }
     #[test]
     fn failed_response_surfaces_error() {
         let mut t = StreamTranslator::new(msg_id(), model());

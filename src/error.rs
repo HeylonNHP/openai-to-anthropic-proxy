@@ -90,13 +90,22 @@ impl IntoResponse for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(err: reqwest::Error) -> Self {
-        err.status().map_or_else(
-            || Self::Internal(err.to_string()),
-            |status| Self::Upstream {
+        if let Some(status) = err.status() {
+            return Self::Upstream {
                 status,
                 body: err.to_string(),
-            },
-        )
+            };
+        }
+
+        let status = if err.is_timeout() {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        Self::Upstream {
+            status,
+            body: err.to_string(),
+        }
     }
 }
 
