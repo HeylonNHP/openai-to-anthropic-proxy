@@ -66,6 +66,16 @@ pub struct StreamTranslator {
     usage: Option<AnthropicUsage>,
     /// Number of web-search calls represented in the emitted Anthropic blocks.
     web_search_count: u32,
+    /// `tool_use_id`s of web searches detected in the stream whose
+    /// `web_search_tool_result` block has not yet been emitted. Airia
+    /// emits the `web_search_call` item *before* the message text and its
+    /// `url_citation` annotations, so we defer the result block until the
+    /// citations are available (message done / finalize).
+    pending_web_search_ids: Vec<String>,
+    /// `url_citation` (url, title) pairs collected from
+    /// `response.output_text.annotation.added` events (and the completed
+    /// message content) during streaming.
+    collected_citations: Vec<(String, String)>,
     /// Input-side usage captured from the earliest `response.created` /
     /// `response.in_progress` event so `message_start` can report real
     /// Anthropic-shaped token counts instead of a placeholder.
@@ -142,6 +152,8 @@ impl StreamTranslator {
             stop_reason: None,
             usage: None,
             web_search_count: 0,
+            pending_web_search_ids: Vec::new(),
+            collected_citations: Vec::new(),
             input_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -248,8 +260,15 @@ impl StreamTranslator {
             ResponsesStreamEvent::RefusalDone { .. } => {
                 // No-op.
             }
-            ResponsesStreamEvent::OutputTextAnnotationAdded { .. } => {
-                // No-op; we don't propagate annotations today.
+            ResponsesStreamEvent::OutputTextAnnotationAdded { annotation, .. } => {
+                // Airia streams the web search's `url_citation` annotations
+                // via this event (typically while a `Message` output_text is
+                // streaming). Collect them so the deferred
+                // `web_search_tool_result` block carries the real result
+                // links to Claude Code. Previously this was a no-op, so the
+                // result block was always empty and Claude Code reported
+                // "No links found."
+                collect_url_citations(&mut self.collected_citations, std::slice::from_ref(annotation));
             }
             ResponsesStreamEvent::Completed { response }
             | ResponsesStreamEvent::Incomplete { response } => {
@@ -508,27 +527,25 @@ impl StreamTranslator {
             }
             OutputItem::WebSearchCall { .. } => {
                 // The upstream used its built-in `web_search` tool.
-                // Inject a `server_tool_use` + `web_search_tool_result`
-                // block pair so Claude Code's search counter works. The
-                // actual search results aren't available here (they come
-                // back as `url_citation` annotations on the text later,
-                // which the client renders inline); we use an empty
-                // result list and the placeholder is enough for the
-                // counter.
-                //
-                // `web_search_call` items arrive BEFORE the `Message`
-                // items in the stream, so injecting here puts the blocks
-                // in the right position (before the text).
-                self.emit_web_search_blocks(events, None);
+                // Emit a `server_tool_use` block so Claude Code's search
+                // counter/progress registers the search immediately, and
+                // defer the `web_search_tool_result` block until the
+                // `url_citation` annotations arrive (message done). The
+                // actual result links come back as `url_citation`
+                // annotations on the message text, which arrive AFTER
+                // this item in the stream.
+                self.emit_server_tool_use(events);
             }
             OutputItem::FunctionCall { call_id, name, .. } => {
                 // The model may invoke web search as a function tool
                 // (name == "WebSearch" or "web_search") instead of via
                 // a `web_search_call` output item. Detect that here and
-                // inject the same web search blocks FIRST, then fall
-                // through to the normal tool_use handling.
+                // emit the `server_tool_use` block FIRST, then fall
+                // through to the normal tool_use handling. The matching
+                // `web_search_tool_result` block is emitted later when
+                // annotations are available.
                 if name == "WebSearch" || name == "web_search" {
-                    self.emit_web_search_blocks(events, None);
+                    self.emit_server_tool_use(events);
                 }
 
                 // Close any open text block.
@@ -642,7 +659,23 @@ impl StreamTranslator {
                     }
                 }
             }
-            OutputItem::Message { .. } | OutputItem::Unknown | OutputItem::WebSearchCall { .. } => {
+            OutputItem::Message { content, .. } => {
+                // The message is done; its `output_text` parts carry the
+                // final `url_citation` annotations (Airia includes them on
+                // the completed content even when the intermediate
+                // `content_part.added`/`done` snapshots omit them). Merge
+                // them into the collected citations; the deferred
+                // `web_search_tool_result` blocks are emitted in
+                // `finalize`/`finish`, after the text block is closed, so
+                // the Anthropic content-block sequence stays well-ordered.
+                for part in content {
+                    if let crate::responses::OutputContentPart::OutputText { annotations, .. } = part
+                    {
+                        collect_url_citations(&mut self.collected_citations, annotations);
+                    }
+                }
+            }
+            OutputItem::Unknown | OutputItem::WebSearchCall { .. } => {
                 // Nothing to do; the next item or stream close will
                 // close the text block.
             }
@@ -846,6 +879,11 @@ impl StreamTranslator {
         }
         self.close_open_tool_blocks(events);
         self.close_open_thinking_blocks(events);
+        // Safety net: if the stream ends (e.g. a tool_use-only turn, or an
+        // incomplete/failed response) before the message content that would
+        // carry citations, still emit the deferred `web_search_tool_result`
+        // blocks so every `server_tool_use` has a matching result block.
+        self.emit_pending_web_search_results(events);
         // `message_delta` is emitted by `finish()` instead, so any
         // usage that arrives AFTER `finalize` (a real Responses
         // behaviour, e.g. a late `Completed`) is reflected in the
@@ -872,50 +910,68 @@ impl StreamTranslator {
     /// search, even without the actual URLs/titles (those arrive later
     /// as `url_citation` annotations on the text, which the client
     /// renders inline rather than from this block).
-    fn emit_web_search_blocks(
-        &mut self,
-        events: &mut Vec<StreamEvent>,
-        citations: Option<&[(String, String)]>,
-    ) {
+    fn emit_server_tool_use(&mut self, events: &mut Vec<StreamEvent>) {
         self.web_search_count = self.web_search_count.saturating_add(1);
         let tool_use_id = format!("stoolu_web_search_{:02}", self.web_search_count);
+        self.pending_web_search_ids.push(tool_use_id.clone());
 
-        let result_content: Vec<WebSearchResult> = match citations {
-            Some(cits) => cits
-                .iter()
-                .map(|(url, title)| WebSearchResult {
-                    uri: url.clone(),
-                    title: title.clone(),
-                    encrypted_content: String::new(),
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-
-        // server_tool_use: start + stop.
         let index = self.allocate_index();
         events.push(StreamEvent::ContentBlockStart {
             index,
             content_block: ContentBlockKind::ServerToolUse {
-                id: tool_use_id.clone(),
+                id: tool_use_id,
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "Web search"}),
             },
         });
         events.push(StreamEvent::ContentBlockStop { index });
+    }
 
-        // web_search_tool_result: start + stop.
-        let index = self.allocate_index();
-        events.push(StreamEvent::ContentBlockStart {
-            index,
-            content_block: ContentBlockKind::WebSearchToolResult {
-                block: WebSearchToolResultBlock {
-                    tool_use_id,
-                    content: result_content,
+    fn emit_pending_web_search_results(&mut self, events: &mut Vec<StreamEvent>) {
+        let ids = std::mem::take(&mut self.pending_web_search_ids);
+        let citations = std::mem::take(&mut self.collected_citations);
+        for (i, tool_use_id) in ids.into_iter().enumerate() {
+            let result_content: Vec<WebSearchResult> = if i == 0 {
+                citations
+                    .iter()
+                    .map(|(url, title)| WebSearchResult {
+                        url: url.clone(),
+                        title: title.clone(),
+                        encrypted_content: String::new(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let index = self.allocate_index();
+            events.push(StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlockKind::WebSearchToolResult {
+                    block: WebSearchToolResultBlock {
+                        tool_use_id,
+                        content: result_content,
+                    },
                 },
-            },
-        });
-        events.push(StreamEvent::ContentBlockStop { index });
+            });
+            events.push(StreamEvent::ContentBlockStop { index });
+        }
+    }
+}
+
+/// Extract `url_citation` (url, title) pairs from annotation JSON values,
+/// as emitted by `response.output_text.annotation.added` and carried on
+/// `OutputContentPart::OutputText.annotations`. Airia marks grounded
+/// claims with `{ "type": "url_citation", "url": ..., "title": ... }`.
+fn collect_url_citations(target: &mut Vec<(String, String)>, annotations: &[Value]) {
+    for ann in annotations {
+        if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation")
+            && let (Some(url), Some(title)) = (
+                ann.get("url").and_then(|v| v.as_str()),
+                ann.get("title").and_then(|v| v.as_str()),
+            )
+        {
+            target.push((url.to_string(), title.to_string()));
+        }
     }
 }
 
@@ -971,8 +1027,10 @@ fn ensure_msg_prefix(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::responses::{
-        IncompleteDetails, InputTokensDetails, OutputItem, ResponsesResponse, ResponsesUsage,
+        IncompleteDetails, InputTokensDetails, OutputContentPart, OutputItem, ResponsesResponse,
+        ResponsesUsage,
     };
+    use serde_json::json;
 
     fn msg_id() -> String {
         "msg_test".into()
@@ -1036,6 +1094,27 @@ mod tests {
                 status: Some("in_progress".into()),
                 role: "assistant".into(),
                 content: vec![],
+            },
+        }
+    }
+
+    /// A terminal `output_item.done` for a Message whose output_text part
+    /// carries the given `url_citation` annotations (the shape Airia emits
+    /// on the completed message).
+    fn message_item_done_with_annotations(
+        output_index: u32,
+        annotations: serde_json::Value,
+    ) -> ResponsesStreamEvent {
+        ResponsesStreamEvent::OutputItemDone {
+            output_index,
+            item: OutputItem::Message {
+                id: Some(format!("msg_{output_index}")),
+                status: Some("completed".into()),
+                role: "assistant".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: "answer".into(),
+                    annotations: annotations.as_array().cloned().unwrap_or_default(),
+                }],
             },
         }
     }
@@ -1852,29 +1931,46 @@ mod tests {
         let mut t = StreamTranslator::new(msg_id(), model());
         t.feed_event(&created_event());
 
+        // The `web_search_call` item alone emits only the `server_tool_use`
+        // block (start+stop). The matching `web_search_tool_result` block is
+        // deferred until the message content with its `url_citation`
+        // annotations completes (Airia streams those after the call item).
         let evs = t.feed_event(&web_search_call_added(0));
-        // 4 events: server_tool_use start, stop, web_search_tool_result start, stop.
-        assert_eq!(evs.len(), 4, "expected 4 events for web search blocks");
+        assert_eq!(evs.len(), 2, "expected server_tool_use start+stop");
         assert!(matches!(
             &evs[0],
             StreamEvent::ContentBlockStart {
-                content_block: ContentBlockKind::ServerToolUse { .. },
+                content_block: ContentBlockKind::ServerToolUse { name, .. },
                 ..
-            }
+            } if name == "web_search"
         ));
         assert!(matches!(&evs[1], StreamEvent::ContentBlockStop { .. }));
-        assert!(matches!(
-            &evs[2],
-            StreamEvent::ContentBlockStart {
-                content_block: ContentBlockKind::WebSearchToolResult { .. },
-                ..
-            }
+
+        // Message completes carrying a url_citation annotation; the
+        // terminal Completed event flushes the deferred web_search_tool_result
+        // block populated with the real result link.
+        let _ = t.feed_event(&message_item_done_with_annotations(
+            1,
+            json!([{
+                "type": "url_citation",
+                "url": "https://example.com/weather",
+                "title": "Example Weather"
+            }]),
         ));
-        assert!(matches!(&evs[3], StreamEvent::ContentBlockStop { .. }));
+
+        let evs = t.feed_event(&completed_event("completed"));
+        assert!(evs.iter().any(|e| matches!(e,
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::WebSearchToolResult { block },
+                ..
+            } if block.tool_use_id == "stoolu_web_search_01"
+              && block.content.len() == 1
+              && block.content[0].url == "https://example.com/weather"
+              && block.content[0].title == "Example Weather"
+        )), "expected populated WebSearchToolResult on completion, got {evs:?}");
 
         // The web_search_used flag must be set so the terminal
         // message_delta carries server_tool_use usage.
-        let _ = t.feed_event(&completed_event("completed"));
         let closing = t.finish();
         match &closing[0] {
             StreamEvent::MessageDelta { usage, .. } => {
@@ -1889,6 +1985,58 @@ mod tests {
         }
     }
 
+    /// Regression: Airia streams the real search citations via
+    /// `response.output_text.annotation.added` events. The proxy must
+    /// collect those `url_citation`s and populate the
+    /// `web_search_tool_result` block so Claude Code renders the result
+    /// links, instead of the previous empty block that produced
+    /// "No links found.".
+    #[test]
+    fn web_search_citations_from_annotation_events_populate_result_block() {
+        let mut t = StreamTranslator::new(msg_id(), model());
+        t.feed_event(&created_event());
+
+        // 1. web_search_call item -> server_tool_use block.
+        let _ = t.feed_event(&web_search_call_added(0));
+
+        // 2. Message text streams, then url_citation annotations arrive.
+        let _ = t.feed_event(&message_item_added(1));
+        let _ = t.feed_event(&output_text_delta(1, "Japan's population is 122.85M "));
+        let evs = t.feed_event(&ResponsesStreamEvent::OutputTextAnnotationAdded {
+            item_id: "msg_1".into(),
+            output_index: 1,
+            content_index: 0,
+            annotation_index: 0,
+            annotation: json!({
+                "type": "url_citation",
+                "url": "https://www.stat.go.jp/",
+                "title": "Statistics Bureau of Japan"
+            }),
+        });
+        // Annotation events emit no Anthropic events on their own.
+        assert!(evs.is_empty());
+
+        // 3. Terminal Completed flushes the web_search_tool_result block.
+        let evs = t.feed_event(&completed_event("completed"));
+        // The text block stop must precede the result block start (well-ordered).
+        let text_stop = evs
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 1 }));
+        let result_start = evs.iter().position(|e| matches!(e,
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::WebSearchToolResult { block },
+                ..
+            } if block.tool_use_id == "stoolu_web_search_01"
+              && block.content.len() == 1
+              && block.content[0].url == "https://www.stat.go.jp/"
+              && block.content[0].title == "Statistics Bureau of Japan"
+        ));
+        assert!(
+            text_stop.is_some() && result_start.is_some() && text_stop.unwrap() < result_start.unwrap(),
+            "expected text stop before populated result block, got {evs:?}"
+        );
+    }
+
     /// Regression: a `FunctionCall` whose name is `WebSearch` must emit
     /// the web search blocks FIRST, then the normal `tool_use` block for
     /// the function call. This covers the case where the model invokes
@@ -1898,10 +2046,11 @@ mod tests {
         let mut t = StreamTranslator::new(msg_id(), model());
         t.feed_event(&created_event());
 
+        // server_tool_use start+stop, then the tool_use block start. The
+        // matching web_search_tool_result is deferred until the message
+        // content completes.
         let evs = t.feed_event(&function_call_added(0, "call_ws", "WebSearch"));
-        // web search blocks: server_tool_use start+stop, web_search_tool_result start+stop (4)
-        // then tool_use start (1) = 5 events.
-        assert_eq!(evs.len(), 5, "expected 5 events");
+        assert_eq!(evs.len(), 3, "expected server_tool_use + tool_use start");
         assert!(matches!(
             &evs[0],
             StreamEvent::ContentBlockStart {
@@ -1912,14 +2061,6 @@ mod tests {
         assert!(matches!(&evs[1], StreamEvent::ContentBlockStop { .. }));
         assert!(matches!(
             &evs[2],
-            StreamEvent::ContentBlockStart {
-                content_block: ContentBlockKind::WebSearchToolResult { .. },
-                ..
-            }
-        ));
-        assert!(matches!(&evs[3], StreamEvent::ContentBlockStop { .. }));
-        assert!(matches!(
-            &evs[4],
             StreamEvent::ContentBlockStart {
                 content_block: ContentBlockKind::ToolUse { name, .. },
                 ..

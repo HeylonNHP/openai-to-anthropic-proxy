@@ -243,7 +243,12 @@ pub enum ResponseContentBlock {
 /// A single web search result within a `WebSearchToolResult` block.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebSearchResult {
-    pub uri: String,
+    /// NOTE: the field must be `url`, not `uri`. Claude Code's parser
+    /// reads `c.url` from each entry of a `web_search_tool_result`
+    /// content array; the `uri` spelling (used in some Vertex/Google
+    /// docs) is silently dropped client-side, rendering every result
+    /// with an empty URL.
+    pub url: String,
     pub title: String,
     /// Opaque encrypted content. We don't have the upstream's
     /// encrypted blob, so this is empty — the citation URL and

@@ -2610,7 +2610,7 @@ fn build_content_blocks(items: &[OutputItem]) -> (Vec<ResponseContentBlock>, u32
             citations
                 .iter()
                 .map(|(url, title)| WebSearchResult {
-                    uri: url.clone(),
+                    url: url.clone(),
                     title: title.clone(),
                     encrypted_content: String::new(),
                 })
@@ -3104,7 +3104,7 @@ mod response_tests {
                 // Placeholder citation synthesized because no
                 // url_citation annotations were present.
                 assert_eq!(block.content.len(), 1);
-                assert!(!block.content[0].uri.is_empty());
+                assert!(!block.content[0].url.is_empty());
             }
             other => panic!("expected WebSearchToolResult, got {other:?}"),
         }
