@@ -2579,16 +2579,7 @@ fn extract_web_search_citations(items: &[OutputItem]) -> (Vec<(String, String)>,
     if search_count == 0 && !citations.is_empty() {
         search_count = 1;
     }
-    if search_count > 0 && citations.is_empty() {
-        tracing::info!(
-            search_count,
-            "web search detected without citations; synthesizing placeholder citation"
-        );
-        citations.push((
-            "https://www.openai.com".to_string(),
-            "Web search".to_string(),
-        ));
-    }
+
 
     tracing::info!(
         citations_found = citations.len(),
@@ -3098,16 +3089,17 @@ mod response_tests {
             }
             other => panic!("expected ServerToolUse, got {other:?}"),
         }
-        match &out.content[1] {
-            ResponseContentBlock::WebSearchToolResult { block } => {
-                assert_eq!(block.tool_use_id, "stoolu_web_search_01");
-                // Placeholder citation synthesized because no
-                // url_citation annotations were present.
-                assert_eq!(block.content.len(), 1);
-                assert!(!block.content[0].url.is_empty());
+            match &out.content[1] {
+                ResponseContentBlock::WebSearchToolResult { block } => {
+                    assert_eq!(block.tool_use_id, "stoolu_web_search_01");
+                    // No url_citation annotations were present, so the result
+                    // list is empty. Claude Code renders this as "No links
+                    // found." and the search counter still registers via the
+                    // server_tool_use block count.
+                    assert!(block.content.is_empty());
+                }
+                other => panic!("expected WebSearchToolResult, got {other:?}"),
             }
-            other => panic!("expected WebSearchToolResult, got {other:?}"),
-        }
         match &out.content[2] {
             ResponseContentBlock::Text { text } => {
                 assert_eq!(text, "Based on my search...");
