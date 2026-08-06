@@ -32,6 +32,13 @@ use crate::config::JsonConfig;
 /// `PageUp`/`PageDown`/`Home`/`End`.
 const LOG_TAIL: usize = 1000;
 
+// Keep token colours in one place so SESSION TOKENS and RECENT REQUESTS
+// cannot drift apart as either display is changed.
+const TOKEN_INPUT_COLOR: Color = Color::Green;
+const TOKEN_OUTPUT_COLOR: Color = Color::Red;
+const TOKEN_CACHE_COLOR: Color = Color::Cyan;
+const TOKEN_REASONING_COLOR: Color = Color::Yellow;
+
 /// Stable, ordered list of inbound models for display. We sort the live
 /// map's keys for stability; the `default_model` is rendered as its
 /// own row even if it isn't an inbound name.
@@ -1086,13 +1093,21 @@ fn style_token_usage_line(text: &str) -> Line<'static> {
         let end = index;
         let before = text[..start].trim_end();
         let after = &text[end..];
-        let color = if before.ends_with("in") || after.starts_with(" in") {
-            Some(Color::Green)
-        } else if before.ends_with("out") || after.starts_with(" out") {
-            Some(Color::Red)
-        } else {
-            None
-        };
+        let color =
+            if before.ends_with("cache") || before.contains("cache:") || before.ends_with('/') {
+                Some(TOKEN_CACHE_COLOR)
+            } else if before.ends_with("in") || after.starts_with(" in") {
+                Some(TOKEN_INPUT_COLOR)
+            } else if before.ends_with("out") || after.starts_with(" out") {
+                Some(TOKEN_OUTPUT_COLOR)
+            } else if before.ends_with("reason")
+                || before.ends_with("thinking")
+                || after.starts_with(" thinking")
+            {
+                Some(TOKEN_REASONING_COLOR)
+            } else {
+                None
+            };
 
         if let Some(color) = color {
             ranges.push((start, end, color));
@@ -1232,7 +1247,7 @@ mod tests {
     #[test]
     fn token_usage_values_are_color_coded() {
         let line = style_token_usage_line(
-            "  model                           7 req  in      1.00k  out      1.00m",
+            "  model                           7 req  in      1.00k  out      1.00m  cache      1.23k/999  reason      1.00b",
         );
         let styled: Vec<_> = line
             .spans
@@ -1240,11 +1255,42 @@ mod tests {
             .filter(|span| span.style.fg.is_some())
             .collect();
 
-        assert_eq!(styled.len(), 2);
+        assert_eq!(styled.len(), 5);
         assert_eq!(styled[0].content, "1.00k");
-        assert_eq!(styled[0].style.fg, Some(Color::Green));
+        assert_eq!(styled[0].style.fg, Some(TOKEN_INPUT_COLOR));
         assert_eq!(styled[1].content, "1.00m");
-        assert_eq!(styled[1].style.fg, Some(Color::Red));
+        assert_eq!(styled[1].style.fg, Some(TOKEN_OUTPUT_COLOR));
+        assert_eq!(styled[2].content, "1.23k");
+        assert_eq!(styled[2].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[3].content, "999");
+        assert_eq!(styled[3].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[4].content, "1.00b");
+        assert_eq!(styled[4].style.fg, Some(TOKEN_REASONING_COLOR));
+    }
+
+    #[test]
+    fn recent_request_token_values_are_color_coded() {
+        let text = format_recent_request_token_counts(
+            "  200  |  1.25s  |  1234 in  |  999995 out  |  2000000 thinking  |  cache: 1000000r 999w",
+        );
+        let line = style_token_usage_line(&text);
+        let styled: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .collect();
+
+        assert_eq!(styled.len(), 5);
+        assert_eq!(styled[0].content, "1.23k");
+        assert_eq!(styled[0].style.fg, Some(TOKEN_INPUT_COLOR));
+        assert_eq!(styled[1].content, "1.00m");
+        assert_eq!(styled[1].style.fg, Some(TOKEN_OUTPUT_COLOR));
+        assert_eq!(styled[2].content, "2.00m");
+        assert_eq!(styled[2].style.fg, Some(TOKEN_REASONING_COLOR));
+        assert_eq!(styled[3].content, "1.00mr");
+        assert_eq!(styled[3].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[4].content, "999w");
+        assert_eq!(styled[4].style.fg, Some(TOKEN_CACHE_COLOR));
     }
 
     #[test]
