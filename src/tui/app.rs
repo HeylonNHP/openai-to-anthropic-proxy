@@ -603,6 +603,13 @@ impl TuiApp {
         // Cap rows so a busy process cannot crowd out the request log.
         let totals = self.stats.snapshot_sections();
         dash.row("SESSION TOKENS  (process lifetime; input/output/cache/reasoning)");
+        let mut combined = TokenTotals::default();
+        for total in totals.inbound.values().chain(totals.actual.values()) {
+            combined.add_totals(*total);
+        }
+        if combined.requests > 0 {
+            dash.row(&format_token_total("ALL MODELS COMBINED", &combined));
+        }
         let mut shown = 0usize;
         let mut configured: Vec<_> = totals
             .inbound
@@ -651,8 +658,7 @@ impl TuiApp {
             ));
         }
 
-        // ---- Footer hint ----
-        dash.row("[a] add  [e/Enter] edit  [d] delete  [f] default  [s] save  [q] quit");
+        // ---- Log navigation hint ----
         dash.row("[PgUp/PgDn] scroll log  [Home/End] jump log top/bottom");
 
         // ---- Layout ----
