@@ -23,7 +23,7 @@ use crate::anthropic::{
     StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::config::PromptCachingConfig;
+use crate::config::{PromptCachingConfig, ReasoningDecision};
 use crate::responses::{
     Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig, ResponsesRequest,
     ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition,
@@ -108,8 +108,9 @@ fn truncate_user_id(s: String) -> String {
 ///   `Tool{name}`→`{ type: "function", name: "..." }`.
 /// - `max_tokens` → `max_output_tokens`.
 /// - `temperature`, `top_p` pass through.
-/// - `reasoning_effort` (config-supplied) → `reasoning: Some(ReasoningConfig { effort })`.
-///   Responses accepts `"none"` natively, so we forward whatever the config
+/// - `reasoning_decision` (config-resolved) → `reasoning: Some(ReasoningConfig { effort })`
+///   when it carries an effort, or `reasoning: None` when it is [`ReasoningDecision::Omit`].
+///   Responses accepts `"none"` natively, so we forward whatever the decision
 ///   says — no per-request "downgrade" like the Chat Completions path did.
 /// - `metadata.user_id` → `user`.
 /// - `stream: true` → `stream: true` (no `stream_options`; Responses carries
@@ -117,7 +118,7 @@ fn truncate_user_id(s: String) -> String {
 /// - `stop_sequences` dropped with a warn (Responses has no `stop` field).
 pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
-    reasoning_effort: Option<String>,
+    reasoning_decision: Option<ReasoningDecision>,
     prompt_caching: &PromptCachingConfig,
 ) -> Result<ResponsesRequest> {
     let stream = req.stream.unwrap_or(false);
@@ -210,10 +211,12 @@ pub fn anthropic_to_responses(
         },
         tools,
         tool_choice,
-        reasoning: reasoning_effort.map(|effort| ReasoningConfig {
-            effort,
-            ..ReasoningConfig::default()
-        }),
+        reasoning: reasoning_decision
+            .and_then(|d| d.upstream_effort().map(str::to_owned))
+            .map(|effort| ReasoningConfig {
+                effort,
+                ..ReasoningConfig::default()
+            }),
         text: None,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -963,6 +966,8 @@ mod tests {
             stop_sequences: None,
             stream: Some(false),
             metadata: None,
+            output_config: None,
+            thinking: None,
         }
     }
 
@@ -1479,9 +1484,12 @@ mod tests {
     #[test]
     fn reasoning_effort_passes_through_to_nested_reasoning() {
         let req = fixture_request();
-        let out =
-            anthropic_to_responses(&req, Some("medium".into()), &PromptCachingConfig::default())
-                .unwrap();
+        let out = anthropic_to_responses(
+            &req,
+            Some(ReasoningDecision::Effort("medium".into())),
+            &PromptCachingConfig::default(),
+        )
+        .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
         assert_eq!(reasoning.effort, "medium");
     }
@@ -1489,7 +1497,12 @@ mod tests {
     #[test]
     fn reasoning_effort_none_omits_field() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let out = anthropic_to_responses(
+            &req,
+            Some(ReasoningDecision::Omit),
+            &PromptCachingConfig::default(),
+        )
+        .unwrap();
         let body = serde_json::to_value(&out).unwrap();
         assert!(
             body.get("reasoning").is_none(),
