@@ -11,8 +11,11 @@
 //! usage, and the full streaming SSE event set.
 //!
 //! Out of scope (will produce a `serde` deserialization error if Claude
-//! sends them): vision/image blocks, extended thinking, prompt caching,
-//! server tools, container reuse, service tier, output_config.
+//! sends them): vision/image blocks, extended thinking budget enforcement,
+//! prompt caching, server tools, container reuse, service tier. Note that
+//! `output_config.effort` and `thinking.type = "disabled"` **are** parsed
+//! (see [`OutputConfig`] / [`ThinkingConfig`]); they drive the upstream
+//! reasoning-effort selection rather than being rejected.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +56,43 @@ pub struct CreateMessageRequest {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+
+    /// Request-level output configuration (e.g. Claude's adaptive
+    /// effort control). Carries the effort value the client selected
+    /// (`low`/`medium`/`high`/`xhigh`/`max`). The proxy translates
+    /// this into the upstream's `reasoning.effort` via the configured
+    /// effort map; it is not forwarded verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+
+    /// Thinking configuration. The proxy specifically cares about
+    /// `type: "disabled"`, which takes precedence over
+    /// `output_config.effort` and maps to the upstream's no-reasoning
+    /// representation. Adaptive/enabled modes are preserved as state
+    /// but do not override an explicit effort selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Claude's request-level `output_config` object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OutputConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Claude's request-level `thinking` object.
+///
+/// Kept intentionally loose (string `type`) so newer/unknown modes
+/// deserialize without breaking the whole request; only
+/// `type == "disabled"` changes proxy behavior.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ThinkingConfig {
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 /// System prompt — string or list of text blocks.
@@ -424,4 +464,89 @@ pub struct MessageDeltaPayload {
     pub stop_reason: Option<StopReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> CreateMessageRequest {
+        serde_json::from_str(body).expect("parse CreateMessageRequest")
+    }
+
+    #[test]
+    fn parses_output_config_effort() {
+        let req = parse(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "high"}
+            }"#,
+        );
+        assert_eq!(
+            req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
+            Some("high")
+        );
+        assert!(req.thinking.is_none());
+    }
+
+    #[test]
+    fn parses_thinking_disabled() {
+        let req = parse(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled"}
+            }"#,
+        );
+        let t = req.thinking.as_ref().expect("thinking present");
+        assert_eq!(t.r#type, "disabled");
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn output_config_and_thinking_absent_by_default() {
+        let req = parse(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}]
+            }"#,
+        );
+        assert!(req.output_config.is_none());
+        assert!(req.thinking.is_none());
+    }
+
+    #[test]
+    fn unknown_output_config_fields_are_ignored() {
+        // Forward compatibility: Claude may add future keys to
+        // output_config. They must not break deserialization.
+        let req = parse(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "max", "future_field": 1}
+            }"#,
+        );
+        assert_eq!(
+            req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn unknown_thinking_types_are_ignored() {
+        let req = parse(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"}
+            }"#,
+        );
+        assert_eq!(req.thinking.as_ref().map(|t| t.r#type.as_str()), Some("adaptive"));
+    }
 }

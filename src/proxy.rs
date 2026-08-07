@@ -134,10 +134,25 @@ async fn handle_messages(
     // seed, while `mappings_snapshot` is what the operator sees when
     // they hit `e` in the TUI.
     let upstream_model = mappings_snapshot.resolve(&req.model);
-    let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
+    // Resolve the reasoning intent from the client's explicit signals
+    // (output_config.effort, thinking.type = "disabled") against the
+    // configured effort/thinking-disabled maps, falling back to the
+    // fixed per-model config when the client sent neither.
+    let requested_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|oc| oc.effort.as_deref());
+    let thinking_disabled = req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
+    let reasoning_decision = state
+        .config
+        .reasoning_for_request(&upstream_model, requested_effort, thinking_disabled);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let mut outbound = translate::anthropic_to_responses(&req, reasoning_effort, &prompt_caching)
-        .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    let mut outbound =
+        translate::anthropic_to_responses(&req, Some(reasoning_decision), &prompt_caching)
+            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
     outbound.model = upstream_model;
@@ -267,7 +282,17 @@ async fn handle_messages_inner(
 
         if should_retry {
             let fallback = mappings_snapshot.default_model().unwrap();
-            let fallback_reasoning = state.config.reasoning_for_model(fallback);
+            let requested_effort = req
+                .output_config
+                .as_ref()
+                .and_then(|oc| oc.effort.as_deref());
+            let thinking_disabled = req
+                .thinking
+                .as_ref()
+                .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
+            let fallback_reasoning = state
+                .config
+                .reasoning_for_request(fallback, requested_effort, thinking_disabled);
             let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,
@@ -281,7 +306,7 @@ async fn handle_messages_inner(
             // policy into the retry.
             outbound = translate::anthropic_to_responses(
                 &req,
-                fallback_reasoning,
+                Some(fallback_reasoning),
                 &fallback_prompt_caching,
             )
             .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
@@ -888,6 +913,8 @@ mod tests {
             stop_sequences: None,
             stream: Some(true),
             metadata: None,
+            output_config: None,
+            thinking: None,
         };
         let id = synthetic_message_id(&req);
         assert!(id.starts_with("msg_"));

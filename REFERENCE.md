@@ -69,6 +69,14 @@ For multiple custom headers, separate them with newlines (a single line is enoug
 
 - `REASONING_EFFORT` sets the legacy default effort when no per-model override applies.
 - The `reasoning` object lets you set a default effort plus per-model overrides.
+- `reasoning.effort_map` translates Claude Code's `output_config.effort`
+  (`low`/`medium`/`high`/`xhigh`/`max`) into the upstream model's effort
+  vocabulary. Has `default` (all models) and per-model `models` maps; a
+  `null` value omits the upstream `reasoning` object.
+- `reasoning.thinking_disabled` translates Claude Code's
+  `thinking: {"type": "disabled"}` into the upstream no-reasoning
+  representation (e.g. `reasoning.effort = "none"`). Disabled thinking
+  takes precedence over `output_config.effort` and the fixed config.
 - The `model_aliases` object maps inbound model names to upstream model names.
 - `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model.
 - The `prompt_caching` object lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
@@ -86,6 +94,18 @@ A small example of these in `proxy.json`:
     "models": {
       "gpt-5.4-mini": "high",
       "gpt-5.6-luna":  "medium"
+    },
+    "effort_map": {
+      "default": {
+        "low": "none",
+        "medium": "low",
+        "high": "medium",
+        "xhigh": "high",
+        "max": "high"
+      }
+    },
+    "thinking_disabled": {
+      "default": { "disabled": "none" }
     }
   },
   "model_aliases": {

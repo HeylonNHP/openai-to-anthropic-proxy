@@ -46,11 +46,10 @@ pub struct Config {
     /// the upstream as `reasoning: { effort: "..." }` (the Responses
     /// shape), not the legacy top-level `reasoning_effort` string.
     pub reasoning_effort: Option<String>,
-    /// Per-model `reasoning_effort` overrides. Used by
-    /// [`Config::reasoning_for_model`] to pick the right value for each
-    /// inbound request. The map keys are model names exactly as they
-    /// appear in `CreateMessageRequest.model`. See
-    /// [`ReasoningConfig`] for resolution rules.
+    /// Per-model reasoning configuration: fixed per-model effort,
+    /// a default fallback, and the Claude-Code-effort → upstream-effort
+    /// translation maps (both for explicit effort and for disabled
+    /// thinking). See [`ReasoningConfig`] for the resolution rules.
     pub reasoning: ReasoningConfig,
     /// Map from inbound model name (e.g. `claude-sonnet-5`, what
     /// Claude Code sends) to upstream model name (e.g. `gpt-5.4-mini`,
@@ -106,25 +105,84 @@ pub struct ModelAliases {
     pub default_model: Option<String>,
 }
 
-/// Per-model `reasoning_effort` overrides. The resolution chain is
-/// (highest priority first):
-///   1. `models[req_model]` — exact match
-///   2. `default` — fallback for any model not in the map
-///   3. The legacy `Config::reasoning_effort` field
-///   4. The hardcoded `DEFAULT_REASONING_EFFORT` constant (`"none"`)
+/// Per-model reasoning configuration.
 ///
-/// Valid values: `"none" | "low" | "medium" | "high"`. The proxy
-/// doesn't enforce the set — it forwards whatever the operator wrote —
-/// so a typo surfaces at the upstream as a 400 rather than at proxy
-/// startup. That's deliberate: it's friendlier than refusing to start.
+/// Two independent surfaces exist:
+///
+/// 1. **Fixed per-model effort** (`models` / `default`) — used when the
+///    client does not send an explicit effort or thinking-disabled signal.
+///    Resolution (highest priority first):
+///    1. `models[upstream_model]`
+///    2. `default`
+///    3. legacy `Config::reasoning_effort`
+///    4. hardcoded [`DEFAULT_REASONING_EFFORT`] (`"none"`)
+///
+/// 2. **Request-driven effort translation** (`effort_map` /
+///    `thinking_disabled`) — used when Claude Code sends
+///    `output_config.effort` or `thinking.type = "disabled"`. These
+///    translate the *client's* intent into the *upstream model's* effort
+///    vocabulary, since not every upstream understands the same set of
+///    values. Both maps support a `default` entry plus per-model entries.
+///
+/// Valid upstream values are forwarded verbatim ("none", "low",
+/// "medium", "high", "xhigh", "max", ...). The proxy doesn't enforce the
+/// set — it forwards whatever the operator wrote — so a typo surfaces at
+/// the upstream as a 400 rather than at proxy startup. That's deliberate:
+/// it's friendlier than refusing to start.
 #[derive(Debug, Clone, Default)]
 pub struct ReasoningConfig {
-    /// Default `reasoning_effort` for models not in `models`.
+    /// Default fixed `reasoning_effort` for upstream models not in `models`.
     pub default: Option<String>,
-    /// Per-model `reasoning_effort`. Keys are model names; values are
-    /// the effort string. Compared with the inbound `model` field
-    /// using exact string equality.
+    /// Fixed per-upstream-model `reasoning_effort`. Keys are upstream
+    /// model names; compared exactly.
     pub models: std::collections::BTreeMap<String, String>,
+    /// Claude-Code-effort → upstream-effort translation. Left-hand keys
+    /// are Claude Code effort values (`low`/`medium`/`high`/`xhigh`/`max`);
+    /// right-hand values are upstream effort strings, or `None` to omit the
+    /// upstream `reasoning` object entirely.
+    pub effort_map: EffortMap,
+    /// `thinking.type = "disabled"` → upstream-effort translation. A
+    /// value of `"none"` sends `reasoning.effort = "none"`; `None` omits
+    /// the upstream `reasoning` object. Disabled thinking takes precedence
+    /// over both `output_config.effort` and the fixed per-model config.
+    pub thinking_disabled: EffortMap,
+}
+
+/// A translation map from a client intent key (a Claude effort value or a
+/// disabled-thinking sentinel) to an upstream effort value. Supports a
+/// `default` for all models plus per-model overrides.
+#[derive(Debug, Clone, Default)]
+pub struct EffortMap {
+    /// Fallback for upstream models not present in [`EffortMap::models`].
+    pub default: BTreeMap<String, Option<String>>,
+    /// Per-upstream-model translations. Keys are upstream model names;
+    /// inner keys are the client intent values.
+    pub models: BTreeMap<String, BTreeMap<String, Option<String>>>,
+}
+
+/// The resolved reasoning intent for a single request, after applying the
+/// configured translation maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningDecision {
+    /// Explicit disabled thinking → mapped upstream value (usually
+    /// `"none"`). Takes precedence over an effort selection.
+    Disabled(String),
+    /// A translated effort level.
+    Effort(String),
+    /// Send no upstream `reasoning` object.
+    Omit,
+}
+
+impl ReasoningDecision {
+    /// The upstream `reasoning.effort` string to send, or `None` when the
+    /// upstream `reasoning` object should be omitted entirely.
+    #[must_use]
+    pub fn upstream_effort(&self) -> Option<&str> {
+        match self {
+            Self::Disabled(e) | Self::Effort(e) => Some(e),
+            Self::Omit => None,
+        }
+    }
 }
 
 /// Prompt-caching configuration.
@@ -221,14 +279,19 @@ impl Config {
         // legacy field still feeds the per-request resolution chain
         // (see `reasoning_for_model`), so the operator can use either
         // surface area to set the global default.
+        let reasoning_json = file.and_then(|f| f.reasoning.as_ref());
         let reasoning = ReasoningConfig {
-            default: file
-                .and_then(|f| f.reasoning.as_ref())
+            default: reasoning_json
                 .and_then(|r| r.default.clone())
                 .or_else(|| env.reasoning_effort.clone()),
-            models: file
-                .and_then(|f| f.reasoning.as_ref())
+            models: reasoning_json
                 .map(|r| r.models.clone())
+                .unwrap_or_default(),
+            effort_map: reasoning_json
+                .map(|r| r.effort_map.clone().into())
+                .unwrap_or_default(),
+            thinking_disabled: reasoning_json
+                .map(|r| r.thinking_disabled.clone().into())
                 .unwrap_or_default(),
         };
 
@@ -315,6 +378,94 @@ impl Config {
             return Some(v.clone());
         }
         Some(DEFAULT_REASONING_EFFORT.to_owned())
+    }
+
+    /// Resolve the reasoning intent for a single inbound request.
+    ///
+    /// Precedence:
+    ///   1. Explicit `thinking.type = "disabled"` (from `thinking_disabled`
+    ///      map) — overrides everything else.
+    ///   2. Explicit `output_config.effort` (from `effort_map`) — model
+    ///      entry, then `default` entry, then identity if the requested
+    ///      value is a recognized upstream value.
+    ///   3. No client signal → existing fixed per-model resolution
+    ///      (`reasoning.models` → `reasoning.default` → legacy
+    ///      `reasoning_effort` → `DEFAULT_REASONING_EFFORT`).
+    ///
+    /// `requested_effort` is the normalized Claude Code effort string
+    /// (`low`/`medium`/`high`/`xhigh`/`max`), and `thinking_disabled`
+    /// indicates the client asked for no thinking.
+    #[must_use]
+    pub fn reasoning_for_request(
+        &self,
+        upstream_model: &str,
+        requested_effort: Option<&str>,
+        thinking_disabled: bool,
+    ) -> ReasoningDecision {
+        // 1. Disabled thinking has highest precedence.
+        if thinking_disabled {
+            if let Some(v) = self
+                .reasoning
+                .thinking_disabled
+                .models
+                .get(upstream_model)
+                .and_then(|m| m.get("disabled"))
+            {
+                return v
+                    .clone()
+                    .map_or(ReasoningDecision::Omit, ReasoningDecision::Disabled);
+            }
+            if let Some(v) = self.reasoning.thinking_disabled.default.get("disabled") {
+                return v
+                    .clone()
+                    .map_or(ReasoningDecision::Omit, ReasoningDecision::Disabled);
+            }
+            // No configured disabled mapping: fall through to effort/
+            // fixed resolution rather than inventing a value.
+        }
+
+        // 2. Explicit effort request.
+        if let Some(effort) = requested_effort {
+            let norm = effort.trim().to_ascii_lowercase();
+            if norm.is_empty() {
+                // Treated as no effort signal.
+            } else if let Some(v) = self
+                .reasoning
+                .effort_map
+                .models
+                .get(upstream_model)
+                .and_then(|m| m.get(&norm))
+            {
+                return v
+                    .clone()
+                    .map_or(ReasoningDecision::Omit, ReasoningDecision::Effort);
+            } else if let Some(v) = self.reasoning.effort_map.default.get(&norm) {
+                return v
+                    .clone()
+                    .map_or(ReasoningDecision::Omit, ReasoningDecision::Effort);
+            } else if is_known_upstream_effort(&norm) {
+                // Identity fallback for upstream-native values.
+                return ReasoningDecision::Effort(norm);
+            }
+            // Unmapped/unrecognized requested value: fall through to
+            // the fixed resolution below.
+        }
+
+        // 3. Fixed per-model resolution.
+        ReasoningDecision::Effort(self.reasoning_for_model(upstream_model).unwrap_or_default())
+    }
+
+    /// Normalize a raw Claude Code `output_config.effort` value. Returns
+    /// `None` for absent/blank values so callers can treat them as "no
+    /// effort signal".
+    #[must_use]
+    pub fn normalize_effort(raw: Option<&str>) -> Option<String> {
+        let norm = raw?.trim().to_ascii_lowercase();
+        if norm.is_empty() {
+            None
+        } else {
+            Some(norm)
+        }
     }
 
     /// Resolve the inbound `model` to the upstream model name. If no
@@ -408,6 +559,17 @@ fn pick_str(file_value: Option<&str>, env_value: Option<&str>) -> Option<String>
     env_value.or(file_value).map(str::to_owned)
 }
 
+/// Recognized upstream effort values. Used as the identity fallback when
+/// a client requests a value that is not present in the configured
+/// `effort_map` — the proxy passes it through unchanged because the
+/// upstream already speaks it.
+fn is_known_upstream_effort(v: &str) -> bool {
+    matches!(
+        v,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+}
+
 fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
     env_value.or(file_value)
 }
@@ -443,15 +605,50 @@ pub struct JsonConfig {
     pub log_to_disk: Option<bool>,
 }
 
-/// JSON shape of `reasoning`. `default` is the fallback effort for
-/// any model not in `models`. `models` is a flat string→string object:
-/// model name → effort (`"none" | "low" | "medium" | "high"`).
+/// JSON shape of `reasoning`.
+///
+/// - `default` — fallback fixed effort for models not in `models`.
+/// - `models` — flat model-name → effort object (legacy fixed per-model).
+/// - `effort_map` — Claude-Code-effort → upstream-effort translation.
+///   Keys are Claude effort values; values are upstream effort strings or
+///   `null` (omit the upstream `reasoning` object).
+/// - `thinking_disabled` — mapping for `thinking.type = "disabled"`
+///   requests. Same shape as `effort_map`, keyed by the `"disabled"`
+///   sentinel. A value of `"none"` sends `reasoning.effort = "none"`;
+///   `null` omits the upstream `reasoning` object.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonReasoningConfig {
     pub default: Option<String>,
     #[serde(default)]
     pub models: BTreeMap<String, String>,
+    #[serde(default)]
+    pub effort_map: JsonEffortMap,
+    #[serde(default)]
+    pub thinking_disabled: JsonEffortMap,
+}
+
+/// JSON shape of a translation map (`effort_map` / `thinking_disabled`).
+///
+/// `default` is the fallback for all upstream models; `models` holds
+/// per-upstream-model translations. Inner values are `Option<String>` so
+/// `null` can mean "omit the upstream `reasoning` object".
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct JsonEffortMap {
+    #[serde(default)]
+    pub default: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub models: BTreeMap<String, BTreeMap<String, Option<String>>>,
+}
+
+impl From<JsonEffortMap> for EffortMap {
+    fn from(j: JsonEffortMap) -> Self {
+        EffortMap {
+            default: j.default,
+            models: j.models,
+        }
+    }
 }
 
 /// JSON shape of `model_aliases`. `map` is a flat string→string object:
@@ -562,6 +759,7 @@ mod tests {
                     ("gpt-5.4-mini".into(), "high".into()),
                     ("gpt-5.6-luna".into(), "none".into()),
                 ]),
+                ..JsonReasoningConfig::default()
             }),
             ..JsonConfig::default()
         };
@@ -583,6 +781,7 @@ mod tests {
             reasoning: Some(JsonReasoningConfig {
                 default: Some("low".into()),
                 models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
+                ..JsonReasoningConfig::default()
             }),
             ..JsonConfig::default()
         };
@@ -658,6 +857,7 @@ mod tests {
             reasoning: Some(JsonReasoningConfig {
                 default: Some("none".into()),
                 models: BTreeMap::from([("gpt-5.4-mini".into(), "high".into())]),
+                ..JsonReasoningConfig::default()
             }),
             ..JsonConfig::default()
         };
@@ -968,5 +1168,128 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env).unwrap();
         assert!(cfg.proxy_key.is_none());
+    }
+
+    // ── reasoning_for_request (effort_map / thinking_disabled) ──────
+
+    fn cfg_from_json(json: &str) -> Config {
+        let parsed = JsonConfig::parse(json).expect("parse json");
+        Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap()
+    }
+
+    const REASONING_JSON: &str = r#"{
+        "upstream_base_url": "https://api.example.com",
+        "upstream_api_key":  "sk-test",
+        "reasoning": {
+            "default": "high",
+            "effort_map": {
+                "default": {
+                    "low": "none",
+                    "medium": "low",
+                    "high": "medium",
+                    "xhigh": "high",
+                    "max": "high"
+                },
+                "models": {
+                    "gpt-5.6-luna": {
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "high",
+                        "xhigh": "xhigh",
+                        "max": "max"
+                    }
+                }
+            },
+            "thinking_disabled": {
+                "default": {
+                    "disabled": "none"
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn effort_map_default_entry_translates() {
+        let cfg = cfg_from_json(REASONING_JSON);
+        // gpt-5.4-mini has no per-model entry → uses effort_map.default.
+        let d = cfg.reasoning_for_request("gpt-5.4-mini", Some("high"), false);
+        assert_eq!(d, ReasoningDecision::Effort("medium".into()));
+        let d = cfg.reasoning_for_request("gpt-5.4-mini", Some("low"), false);
+        assert_eq!(d, ReasoningDecision::Effort("none".into()));
+    }
+
+    #[test]
+    fn effort_map_model_entry_overrides_default() {
+        let cfg = cfg_from_json(REASONING_JSON);
+        // gpt-5.6-luna has a per-model entry that overrides default.
+        let d = cfg.reasoning_for_request("gpt-5.6-luna", Some("high"), false);
+        assert_eq!(d, ReasoningDecision::Effort("high".into()));
+        let d = cfg.reasoning_for_request("gpt-5.6-luna", Some("xhigh"), false);
+        assert_eq!(d, ReasoningDecision::Effort("xhigh".into()));
+    }
+
+    #[test]
+    fn effort_map_null_omits_reasoning() {
+        let json = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "reasoning": {
+                "default": "high",
+                "effort_map": {
+                    "default": {"high": null}
+                }
+            }
+        }"#;
+        let cfg = cfg_from_json(json);
+        let d = cfg.reasoning_for_request("any-model", Some("high"), false);
+        assert_eq!(d, ReasoningDecision::Omit);
+        assert_eq!(d.upstream_effort(), None);
+    }
+
+    #[test]
+    fn effort_map_identity_fallback_for_known_values() {
+        let cfg = cfg_from_json(REASONING_JSON);
+        // A requested value with no mapping and no per-model entry falls
+        // back to identity when it's a known upstream value. "minimal" is
+        // not in the default map, so it hits the identity path.
+        let d = cfg.reasoning_for_request("some-other-model", Some("minimal"), false);
+        assert_eq!(d, ReasoningDecision::Effort("minimal".into()));
+    }
+
+    #[test]
+    fn thinking_disabled_takes_precedence_over_effort() {
+        let cfg = cfg_from_json(REASONING_JSON);
+        // Even when an effort is requested, explicit disabled thinking wins.
+        let d = cfg.reasoning_for_request("gpt-5.4-mini", Some("max"), true);
+        assert_eq!(d, ReasoningDecision::Disabled("none".into()));
+    }
+
+    #[test]
+    fn no_client_signal_uses_fixed_default() {
+        let cfg = cfg_from_json(REASONING_JSON);
+        let d = cfg.reasoning_for_request("gpt-5.4-mini", None, false);
+        assert_eq!(d, ReasoningDecision::Effort("high".into()));
+    }
+
+    #[test]
+    fn thinking_disabled_with_no_config_falls_through() {
+        // If no thinking_disabled mapping is configured, a disabled
+        // request still falls through to fixed resolution rather than
+        // inventing a value.
+        let json = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "sk-test",
+            "reasoning": {"default": "medium"}
+        }"#;
+        let cfg = cfg_from_json(json);
+        let d = cfg.reasoning_for_request("any-model", None, true);
+        assert_eq!(d, ReasoningDecision::Effort("medium".into()));
+    }
+
+    #[test]
+    fn normalize_effort_lowercases_and_trims() {
+        assert_eq!(Config::normalize_effort(Some("  HIGH ")), Some("high".into()));
+        assert_eq!(Config::normalize_effort(Some("")), None);
+        assert_eq!(Config::normalize_effort(None), None);
     }
 }
