@@ -134,7 +134,7 @@ pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
     reasoning_effort: Option<String>,
     prompt_caching: &PromptCachingConfig,
-) -> Result<ResponsesRequest> {
+) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
 
@@ -150,6 +150,11 @@ pub fn anthropic_to_responses(
         instructions.clear();
     }
 
+    // Remember the *original* (client-supplied) tool schemas so the
+    // response path can invert the strict sanitization below
+    // (`crate::repair`). The registry is returned alongside the request
+    // and threaded through both response paths by the proxy.
+    let mut registry = crate::repair::ToolSchemaRegistry::new();
     let tools = req.tools.as_ref().map(|tools| {
         tools
             .iter()
@@ -168,12 +173,14 @@ pub fn anthropic_to_responses(
                 }
 
                 let input_schema = t.input_schema.clone()?;
+                registry.insert(t.name.clone(), input_schema.clone());
+                let original = registry.get(&t.name);
                 Some(ToolDefinition::Function(ResponsesTool {
                     kind: "function".to_string(),
                     name: t.name.clone(),
                     description: t.description.clone(),
                     strict: true,
-                    parameters: sanitize_tool_schema(input_schema),
+                    parameters: sanitize_tool_schema(input_schema, original),
                 }))
             })
             .collect()
@@ -215,7 +222,7 @@ pub fn anthropic_to_responses(
         );
     }
 
-    Ok(ResponsesRequest {
+    let outbound = ResponsesRequest {
         model: req.model.clone(),
         input: Input::Items(items),
         instructions: if instructions.is_empty() {
@@ -242,7 +249,8 @@ pub fn anthropic_to_responses(
         user,
         stream,
         metadata: None,
-    })
+    };
+    Ok((outbound, registry))
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -294,6 +302,16 @@ fn system_text(system: &SystemPrompt) -> String {
 ///    keys in `properties` iteration order). The Responses strict
 ///    validator is the source of truth: there is no valid use of a
 ///    `required` array that is a strict subset of `properties`.
+///    Combined with rule 4 this means every property is `required` on
+///    the wire — the strict validator has no notion of optionality.
+///    Optionality is instead *encoded*, not dropped: properties the
+///    original schema does not list as required are made nullable
+///    (`type: ["X", "null"]`, or an added `{"type": "null"}` `anyOf`
+///    branch) so the model can signal "omitted" with `null` instead of
+///    fabricating a value. `crate::repair` inverts this on the response
+///    side: null sentinels on optional properties are stripped before
+///    the input is shipped to the client, which validates against the
+///    *original* schema and would reject a fabricated value.
 /// 6. Drop the `format` keyword. The strict validator only accepts
 ///    the 9 IETF validation formats `date-time`, `time`, `date`,
 ///    `duration`, `email`, `hostname`, `ipv4`, `ipv6`, `uuid`; every
@@ -341,7 +359,7 @@ fn system_text(system: &SystemPrompt) -> String {
 /// validator flags as a misplaced keyword). If a future upstream
 /// version starts honoring `propertyNames`, removing the strip is a
 /// one-line change.
-fn sanitize_tool_schema(mut schema: Value) -> Value {
+fn sanitize_tool_schema(mut schema: Value, original: Option<&Value>) -> Value {
     // Pre-pass: recursive propertyNames strip. Returns the total
     // number of keys removed so we can emit one warn for the whole
     // call rather than one per strip.
@@ -355,7 +373,7 @@ fn sanitize_tool_schema(mut schema: Value) -> Value {
         );
     }
 
-    reconcile_strict(&mut schema);
+    reconcile_strict(&mut schema, original);
     schema
 }
 
@@ -366,8 +384,8 @@ fn sanitize_tool_schema(mut schema: Value) -> Value {
 ///
 /// `v` is expected to have been pre-cleaned of `propertyNames` by
 /// [`strip_property_names`] before this is called.
-fn reconcile_strict(v: &mut Value) {
-    reconcile_strict_inner(v, false);
+fn reconcile_strict(v: &mut Value, original: Option<&Value>) {
+    reconcile_strict_inner(v, false, original);
 }
 
 /// Internal worker for [`reconcile_strict`]. `force_object` is true when
@@ -380,7 +398,10 @@ fn reconcile_strict(v: &mut Value) {
 /// `type: "string"` and the validator rejects the request with
 /// `additionalProperties is required to be supplied and to be false`
 /// pointing at that branch.
-fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
+/// `original` is the matching node of the *untouched* client schema,
+/// threaded down the walk so optionality decisions (`make_nullable`)
+/// consult the real `required` arrays instead of the mutated ones.
+fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&Value>) {
     if force_object && let Value::Object(map) = v {
         // Coerce a typeless or otherwise un-typed combinator branch
         // into an object schema. We don't strip existing keys (the
@@ -473,8 +494,12 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
             // false` even on branches that lack `properties`.
             for keyword in COMBINATOR_KEYWORDS {
                 if let Some(Value::Array(arr)) = map.get_mut(*keyword) {
-                    for child in arr.iter_mut() {
-                        reconcile_strict_inner(child, true);
+                    let orig_branches = original
+                        .and_then(|o| o.get(*keyword))
+                        .and_then(Value::as_array);
+                    for (i, child) in arr.iter_mut().enumerate() {
+                        let child_original = orig_branches.and_then(|b| b.get(i));
+                        reconcile_strict_inner(child, true, child_original);
                     }
                 }
             }
@@ -484,12 +509,28 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
                     // recurse into it but do NOT force-object it -
                     // that field really can be a string/array schema.
                     let force = false;
-                    reconcile_strict_inner(child, force);
+                    let child_original = original.and_then(|o| o.get(*keyword));
+                    reconcile_strict_inner(child, force, child_original);
                 }
             }
             if let Some(Value::Object(props)) = map.get_mut("properties") {
-                for (_, child) in props.iter_mut() {
-                    reconcile_strict_inner(child, false);
+                let orig_props = original
+                    .and_then(|o| o.get("properties"))
+                    .and_then(Value::as_object);
+                for (key, child) in props.iter_mut() {
+                    let child_original = orig_props.and_then(|p| p.get(key));
+                    reconcile_strict_inner(child, false, child_original);
+                    // Nullable encoding: properties the *original*
+                    // schema does not list as required are still added
+                    // to `required` below (strict mode demands it), but
+                    // we mark them nullable so the model can signal
+                    // "omitted" with `null` instead of fabricating a
+                    // value. `crate::repair` strips the null sentinels
+                    // on the response side. Runs AFTER the recursion so
+                    // the child is fully reconciled (typed) first.
+                    if !original_lists_required(original, key) {
+                        make_nullable(child);
+                    }
                 }
             }
             reconcile_required(map);
@@ -499,11 +540,111 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool) {
             // wrapper (e.g. `anyOf` at the schema root). Force-object
             // each element so the strict validator sees
             // `additionalProperties: false` on every branch.
-            for child in arr.iter_mut() {
-                reconcile_strict_inner(child, true);
+            for (i, child) in arr.iter_mut().enumerate() {
+                let child_original = original.and_then(|o| o.as_array()).and_then(|a| a.get(i));
+                reconcile_strict_inner(child, true, child_original);
             }
         }
         _ => {}
+    }
+}
+
+/// True if the *original* (pre-sanitization) schema node lists `key`
+/// in its `required` array. When no original node is available (e.g.
+/// direct sanitizer tests), every property is treated as required —
+/// the legacy behaviour, which keeps the existing test-suite
+/// semantics for `sanitize_tool_schema(schema, None)`.
+fn original_lists_required(original: Option<&Value>, key: &str) -> bool {
+    let Some(node) = original else {
+        return true;
+    };
+    node.get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|req| req.iter().any(|r| r.as_str() == Some(key)))
+}
+
+/// Rewrite a property sub-schema so it also accepts JSON `null`, using
+/// the union forms the OpenAI strict validator compiles:
+/// `"type": ["X", "null"]` for single-typed nodes, and an added
+/// `{"type": "null"}` `anyOf` branch for everything else. Already-
+/// nullable nodes are left untouched.
+fn make_nullable(v: &mut Value) {
+    let Value::Object(map) = v else {
+        return;
+    };
+    // Already nullable in some form?
+    if let Some(Value::Array(ts)) = map.get("type")
+        && ts.iter().any(|t| t.as_str() == Some("null"))
+    {
+        return;
+    }
+    if let Some(arr) = map.get("anyOf").and_then(Value::as_array) {
+        let has_null = arr.iter().any(|b| {
+            b.as_object()
+                .and_then(|o| o.get("type"))
+                .is_some_and(|t| t.as_str() == Some("null"))
+        });
+        if has_null {
+            return;
+        }
+    }
+    match map.get("type") {
+        Some(Value::String(t)) => {
+            // `"type": "X"` → `["X", "null"]`.
+            map.insert(
+                "type".to_owned(),
+                Value::Array(vec![Value::String(t.clone()), Value::String("null".into())]),
+            );
+        }
+        Some(Value::Array(ts)) => {
+            let mut ts = ts.clone();
+            ts.push(Value::String("null".into()));
+            map.insert("type".to_owned(), Value::Array(ts));
+        }
+        _ => {
+            // Typeless / combinator node: add a null branch via anyOf.
+            // The strict validator accepts anyOf only for nullable
+            // unions, which is exactly what this is.
+            let mut branches = match map.remove("anyOf") {
+                Some(Value::Array(a)) => a,
+                other => {
+                    // Move the node's own constraints into a branch so
+                    // semantics are preserved.
+                    let mut branch = serde_json::Map::new();
+                    for (k, val) in map.iter() {
+                        if k != "description" {
+                            branch.insert(k.clone(), val.clone());
+                        }
+                    }
+                    let mut arr = if branch.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Value::Object(branch)]
+                    };
+                    if let Some(Value::Array(extra)) = other {
+                        arr.extend(extra);
+                    }
+                    arr
+                }
+            };
+            branches.push(serde_json::json!({ "type": "null" }));
+            // The node now expresses its type via anyOf; drop the
+            // duplicated keywords (description stays as a hint).
+            for k in [
+                "type",
+                "properties",
+                "required",
+                "additionalProperties",
+                "items",
+                "oneOf",
+                "allOf",
+                "enum",
+                "pattern",
+            ] {
+                map.remove(k);
+            }
+            map.insert("anyOf".to_owned(), Value::Array(branches));
+        }
     }
 }
 
@@ -991,7 +1132,8 @@ mod tests {
     #[test]
     fn basic_request_translates_cleanly() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.model, "test-model");
         assert_eq!(out.max_output_tokens, Some(256));
         assert!(!out.stream);
@@ -1045,7 +1187,8 @@ mod tests {
                 cache_control: None,
             },
         ]));
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(
             out.instructions.as_deref(),
             Some("Be concise.\n\nUse examples.")
@@ -1086,7 +1229,8 @@ mod tests {
             },
         ];
 
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         // user, assistant(message+text), assistant(function_call), user(function_call_output)
         let items = unwrap_items(out);
         assert_eq!(items.len(), 4);
@@ -1150,7 +1294,8 @@ mod tests {
             ]),
         }];
 
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let items = unwrap_items(out);
         // user("Here's what I got:") + function_call_output(first) + user("and:") + function_call_output(second)
         assert_eq!(items.len(), 4);
@@ -1204,7 +1349,8 @@ mod tests {
                 }),
             ]),
         }];
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let items = unwrap_items(out);
         // user(text + image) — both in one message
         assert_eq!(items.len(), 1);
@@ -1240,7 +1386,8 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
             _ => panic!("expected simple tool_choice"),
@@ -1249,14 +1396,16 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "required"),
             _ => panic!("expected simple 'required'"),
         }
 
         req.tool_choice = Some(ToolChoice::None {});
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "none"),
             _ => panic!("expected simple 'none'"),
@@ -1266,7 +1415,8 @@ mod tests {
             name: "get_weather".into(),
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Function { kind, name } => {
                 assert_eq!(kind, "function");
@@ -1288,7 +1438,8 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: Some(true),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.parallel_tool_calls, Some(false));
     }
 
@@ -1301,7 +1452,8 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: Some(false),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.parallel_tool_calls, Some(true));
     }
 
@@ -1315,7 +1467,8 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.parallel_tool_calls, None);
     }
 
@@ -1324,7 +1477,8 @@ mod tests {
         // No `tool_choice` on the inbound request at all — leave both
         // fields `None` so the upstream's defaults apply.
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert!(out.tool_choice.is_none());
         assert_eq!(out.parallel_tool_calls, None);
     }
@@ -1378,7 +1532,8 @@ mod tests {
     fn stream_true_sets_flag() {
         let mut req = fixture_request();
         req.stream = Some(true);
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert!(out.stream);
     }
 
@@ -1388,7 +1543,8 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some("user-123".into()),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
     }
 
@@ -1402,7 +1558,8 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert_eq!(out.user.as_deref(), Some(user_id.as_str()));
         assert_eq!(out.user.as_ref().map(String::len), Some(USER_ID_MAX_LEN));
     }
@@ -1418,7 +1575,8 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         // The leading prefix (the most operationally meaningful part
@@ -1438,7 +1596,8 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         assert_eq!(out_user, &user_id[..USER_ID_MAX_LEN]);
@@ -1450,7 +1609,8 @@ mod tests {
     #[test]
     fn user_id_absent_stays_none() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         assert!(out.user.is_none());
     }
 
@@ -1476,7 +1636,8 @@ mod tests {
     fn stop_sequences_are_dropped() {
         let mut req = fixture_request();
         req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         // stop_sequences has no Responses equivalent; just don't error.
         // (We can't assert against an absent field easily here, but the
         // function completing without error is the contract.)
@@ -1486,7 +1647,7 @@ mod tests {
     #[test]
     fn reasoning_effort_passes_through_to_nested_reasoning() {
         let req = fixture_request();
-        let out =
+        let (out, _reg) =
             anthropic_to_responses(&req, Some("medium".into()), &PromptCachingConfig::default())
                 .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
@@ -1496,7 +1657,8 @@ mod tests {
     #[test]
     fn reasoning_effort_none_omits_field() {
         let req = fixture_request();
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let body = serde_json::to_value(&out).unwrap();
         assert!(
             body.get("reasoning").is_none(),
@@ -1512,7 +1674,7 @@ mod tests {
             "properties": {"x": {"type": "string"}},
             "additionalProperties": {},
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         // Empty-object form is removed AND then re-added as `false`
         // by our strict-mode injection below.
         assert_eq!(out["additionalProperties"], Value::Bool(false));
@@ -1527,7 +1689,7 @@ mod tests {
             "properties": {"x": {"type": "string"}},
             "additionalProperties": false,
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["additionalProperties"], Value::Bool(false));
     }
 
@@ -1541,7 +1703,7 @@ mod tests {
             "properties": {"x": {"type": "string"}},
             "additionalProperties": {"type": "string"},
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["additionalProperties"]["type"], "string");
     }
 
@@ -1549,7 +1711,7 @@ mod tests {
     fn sanitize_tool_schema_adds_empty_properties_if_absent() {
         // Strict mode requires `properties` to be present.
         let schema = json!({"type": "object"});
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["properties"], json!({}));
     }
 
@@ -1569,7 +1731,7 @@ mod tests {
                 "isolation": {"type": "string"},
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let required = out["required"]
             .as_array()
             .expect("required should be an array");
@@ -1594,7 +1756,7 @@ mod tests {
             },
             "required": ["a", "b"],
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["required"], json!(["a", "b"]));
     }
 
@@ -1618,7 +1780,7 @@ mod tests {
             },
             "required": ["description", "prompt"],
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let required = out["required"].as_array().expect("required is array");
         let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
         // Existing client order preserved ("description", "prompt"),
@@ -1650,7 +1812,7 @@ mod tests {
             },
             "required": ["a"],
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["required"], json!(["a", "b", "c"]));
     }
 
@@ -1666,7 +1828,7 @@ mod tests {
             "properties": {"x": {"type": "string"}},
             "propertyNames": {"type": "string"},
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out.get("propertyNames").is_none(),
             "expected propertyNames stripped, got {:?}",
@@ -1692,7 +1854,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out["properties"]["annotations"]
                 .get("propertyNames")
@@ -1718,7 +1880,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out["properties"]["questions"]["items"]
                 .get("propertyNames")
@@ -1744,7 +1906,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out["properties"]["x"]["properties"]["y"]
                 .get("propertyNames")
@@ -1765,7 +1927,7 @@ mod tests {
             },
             "required": ["a"],
         });
-        let out = sanitize_tool_schema(schema.clone());
+        let out = sanitize_tool_schema(schema.clone(), None);
         assert_eq!(out, schema);
     }
 
@@ -1801,7 +1963,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let ap = &out["properties"]["annotations"]["additionalProperties"];
         // The nested object's `required` is now populated.
         assert_eq!(ap["required"], json!(["notes", "preview"]));
@@ -1833,7 +1995,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let items = &out["properties"]["questions"]["items"];
         assert_eq!(items["required"], json!(["a", "q"]));
         assert_eq!(items["additionalProperties"], false);
@@ -1857,7 +2019,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out["properties"]["annotations"]["additionalProperties"]
                 .get("propertyNames")
@@ -1886,7 +2048,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let deep = &out["properties"]["outer"]["properties"]["inner"];
         assert_eq!(deep["additionalProperties"], false);
         assert_eq!(deep["required"], json!(["deep"]));
@@ -1907,7 +2069,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         // After the strip and the false-add, the nested `outer` has
         // `additionalProperties: false`.
         assert_eq!(out["properties"]["outer"]["additionalProperties"], false);
@@ -1940,7 +2102,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let branches = out["properties"]["discriminated"]["oneOf"]
             .as_array()
             .unwrap();
@@ -1979,7 +2141,7 @@ mod tests {
             },
             "required": ["outer"],
         });
-        let out = sanitize_tool_schema(schema.clone());
+        let out = sanitize_tool_schema(schema.clone(), None);
         assert_eq!(out, schema);
     }
 
@@ -2007,7 +2169,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let url = &out["properties"]["url"];
         assert!(url.get("format").is_none(), "format should be stripped");
         // type: "string" is preserved.
@@ -2032,7 +2194,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out["properties"]["endpoints"]["additionalProperties"]
                 .get("format")
@@ -2063,7 +2225,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let deep = &out["properties"]["a"]["properties"]["b"]["properties"]["c"];
         assert!(deep.get("format").is_none());
     }
@@ -2090,7 +2252,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(out["properties"]["when"].get("format").is_none());
         assert!(out["properties"]["id"].get("format").is_none());
     }
@@ -2116,7 +2278,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let args = &out["properties"]["args"];
         assert_eq!(args["type"], "string");
         // Description is preserved.
@@ -2138,7 +2300,7 @@ mod tests {
                 "x": {"type": "number"},
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["properties"]["x"]["type"], "number");
 
         // array form (union type)
@@ -2148,7 +2310,7 @@ mod tests {
                 "y": {"type": ["string", "null"]},
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["properties"]["y"]["type"], json!(["string", "null"]));
     }
 
@@ -2170,7 +2332,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let inner = &out["properties"]["outer"]["properties"]["inner"];
         assert_eq!(inner["type"], "string");
     }
@@ -2192,7 +2354,7 @@ mod tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let ap = &out["properties"]["endpoints"]["additionalProperties"];
         assert_eq!(ap["type"], "string");
     }
@@ -2204,7 +2366,7 @@ mod tests {
     #[test]
     fn sanitize_tool_schema_no_required_when_no_properties() {
         let schema = json!({"type": "object"});
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert!(
             out.get("required").is_none(),
             "expected no required, got {:?}",
@@ -2224,7 +2386,8 @@ mod tests {
                 }),
             })]),
         }];
-        let out = anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
@@ -2254,7 +2417,7 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
@@ -2299,7 +2462,7 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {
@@ -2357,7 +2520,7 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let out = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {
@@ -2409,8 +2572,11 @@ use crate::responses::{OutputContentPart, OutputItem};
 ///   `output_tokens`, `output_tokens_details.reasoning_tokens` →
 ///   `thinking_tokens`. Cache fields are 0.
 #[must_use]
-pub fn responses_to_anthropic(resp: &ResponsesResponse) -> Message {
-    let (mut content, web_search_used) = build_content_blocks(&resp.output);
+pub fn responses_to_anthropic(
+    resp: &ResponsesResponse,
+    registry: &crate::repair::ToolSchemaRegistry,
+) -> Message {
+    let (mut content, web_search_used) = build_content_blocks(&resp.output, registry);
 
     // If the response failed AND we have no output blocks of our own,
     // surface the upstream error message as a `[error] ...` text block
@@ -2609,7 +2775,10 @@ fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
     citations
 }
 
-fn build_content_blocks(items: &[OutputItem]) -> (Vec<ResponseContentBlock>, bool) {
+fn build_content_blocks(
+    items: &[OutputItem],
+    registry: &crate::repair::ToolSchemaRegistry,
+) -> (Vec<ResponseContentBlock>, bool) {
     let citations = extract_web_search_citations(items);
     let web_search_used = !citations.is_empty();
 
@@ -2672,8 +2841,44 @@ fn build_content_blocks(items: &[OutputItem]) -> (Vec<ResponseContentBlock>, boo
                 arguments,
                 ..
             } => {
-                let input = serde_json::from_str(arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "_raw_arguments": arguments }));
+                // Parse the raw arguments. Unparseable blobs used to be
+                // shipped as `{"_raw_arguments": ...}` — a synthetic key
+                // every strict client schema rejects. Ship `{}` instead:
+                // the client's validator then reports a specific
+                // "missing required parameter" error the model can act
+                // on, rather than an opaque unexpected-key rejection.
+                let parsed = match serde_json::from_str::<Value>(arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = %name,
+                            error = %e,
+                            "upstream tool arguments are not valid JSON; shipping empty input"
+                        );
+                        Value::Object(Default::default())
+                    }
+                };
+                // Invert the strict sanitization so the client sees
+                // input that conforms to the schema *it* sent us.
+                let input = match registry.get(name) {
+                    Some(original) => {
+                        let repaired = crate::repair::repair(parsed, original);
+                        if let Some(violation) = crate::repair::validate(&repaired, original) {
+                            // Unrepairable (e.g. a genuinely required
+                            // parameter the model botched). Ship the
+                            // best-effort input anyway; the proxy's
+                            // hidden retry loop may re-query the
+                            // upstream with this violation attached.
+                            tracing::warn!(
+                                tool = %name,
+                                violation = %violation,
+                                "tool input still violates the original schema after repair"
+                            );
+                        }
+                        repaired
+                    }
+                    None => parsed,
+                };
                 blocks.push(ResponseContentBlock::ToolUse {
                     id: call_id.clone(),
                     name: name.clone(),
@@ -2747,7 +2952,10 @@ mod response_tests {
 
     #[test]
     fn text_response_maps_to_message() {
-        let out = responses_to_anthropic(&fixture_response());
+        let out = responses_to_anthropic(
+            &fixture_response(),
+            &crate::repair::ToolSchemaRegistry::new(),
+        );
         assert_eq!(out.id, "msg_resp_abc123");
         assert_eq!(out.r#type, "message");
         assert_eq!(out.role, "assistant");
@@ -2783,7 +2991,7 @@ mod response_tests {
                 arguments: r#"{"location":"SF"}"#.into(),
             },
         ];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(out.content.len(), 2);
         match &out.content[0] {
@@ -2810,7 +3018,7 @@ mod response_tests {
             name: "noop".into(),
             arguments: "{}".into(),
         }];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         // Just the tool_use; no empty text block.
         assert_eq!(out.content.len(), 1);
         assert!(matches!(
@@ -2820,7 +3028,11 @@ mod response_tests {
     }
 
     #[test]
-    fn malformed_tool_arguments_fall_back_to_raw() {
+    fn malformed_tool_arguments_become_empty_object() {
+        // Unparseable upstream arguments used to be shipped as
+        // `{"_raw_arguments": ...}` — a synthetic key every strict
+        // client schema rejects. Now they become `{}`, so the client
+        // reports a specific "missing required parameter" error.
         let mut resp = fixture_response();
         resp.output = vec![OutputItem::FunctionCall {
             id: Some("fc_x".into()),
@@ -2829,10 +3041,10 @@ mod response_tests {
             name: "bad".into(),
             arguments: "not valid json".into(),
         }];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         match &out.content[0] {
             ResponseContentBlock::ToolUse { input, .. } => {
-                assert!(input.get("_raw_arguments").is_some());
+                assert_eq!(input, &serde_json::json!({}));
             }
             _ => panic!("expected tool_use block"),
         }
@@ -2860,7 +3072,7 @@ mod response_tests {
                 }],
             },
         ];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.content.len(), 2);
         match &out.content[0] {
             ResponseContentBlock::Thinking {
@@ -2885,7 +3097,7 @@ mod response_tests {
         resp.incomplete_details = Some(IncompleteDetails {
             reason: "max_output_tokens".into(),
         });
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.stop_reason, Some(StopReason::MaxTokens));
     }
 
@@ -2896,7 +3108,7 @@ mod response_tests {
         resp.incomplete_details = Some(IncompleteDetails {
             reason: "content_filter".into(),
         });
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     }
 
@@ -2911,7 +3123,7 @@ mod response_tests {
             param: None,
         });
         resp.output = vec![];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(out.content.len(), 1);
         match &out.content[0] {
@@ -2938,7 +3150,7 @@ mod response_tests {
                 reasoning_tokens: 14,
             }),
         });
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.usage.thinking_tokens, 14);
     }
 
@@ -2955,7 +3167,7 @@ mod response_tests {
             }),
             output_tokens_details: None,
         });
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.usage.input_tokens, 100);
         assert_eq!(out.usage.output_tokens, 50);
         assert_eq!(out.usage.cache_read_input_tokens, 20);
@@ -2966,7 +3178,7 @@ mod response_tests {
     fn missing_usage_zeros_tokens() {
         let mut resp = fixture_response();
         resp.usage = None;
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.usage.input_tokens, 0);
         assert_eq!(out.usage.output_tokens, 0);
     }
@@ -2974,7 +3186,7 @@ mod response_tests {
     #[test]
     fn id_without_msg_prefix_gets_one() {
         let resp = fixture_response();
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert!(out.id.starts_with("msg_"));
     }
 
@@ -2982,7 +3194,7 @@ mod response_tests {
     fn id_already_prefixed_is_not_double_prefixed() {
         let mut resp = fixture_response();
         resp.id = "msg_already".into();
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.id, "msg_already");
     }
 
@@ -2997,7 +3209,7 @@ mod response_tests {
                 refusal: "I won't do that".into(),
             }],
         }];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.content.len(), 1);
         match &out.content[0] {
             ResponseContentBlock::Text { text } => {
@@ -3021,7 +3233,7 @@ mod response_tests {
             code: None,
             param: None,
         });
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(out.content.len(), 1);
         assert!(matches!(out.content[0], ResponseContentBlock::Text { .. }));
@@ -3093,7 +3305,7 @@ mod response_tests {
                 }],
             },
         ];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
 
         // server_tool_use + web_search_tool_result + text = 3 blocks.
         assert_eq!(out.content.len(), 3, "expected 3 content blocks");
@@ -3157,7 +3369,7 @@ mod response_tests {
                 }],
             },
         ];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
 
         // server_tool_use + web_search_tool_result (injected) +
         // tool_use (the WebSearch function call) + text = 4 blocks.
@@ -3198,7 +3410,7 @@ mod response_tests {
             name: "web_search".into(),
             arguments: "{}".into(),
         }];
-        let out = responses_to_anthropic(&resp);
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
         // server_tool_use + web_search_tool_result + tool_use = 3 blocks.
         assert_eq!(out.content.len(), 3);
         assert!(matches!(
@@ -3248,7 +3460,7 @@ mod response_tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let branch = &out["properties"]["description"]["anyOf"][1];
         assert_eq!(branch["type"], "object");
         assert_eq!(
@@ -3299,7 +3511,7 @@ mod response_tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let branch = &out["properties"]["description"]["anyOf"][1];
         assert_eq!(branch["type"], "object");
         assert_eq!(
@@ -3333,7 +3545,7 @@ mod response_tests {
                 },
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         for path in ["properties/x/oneOf/0", "properties/y/allOf/0"] {
             let node = out
                 .pointer(&format!("/{}", path))
@@ -3364,7 +3576,7 @@ mod response_tests {
                 "x": {"type": "string"},
             },
         });
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["type"], "object");
         assert_eq!(out["additionalProperties"], Value::Bool(false));
         let required = out["required"]
@@ -3426,7 +3638,7 @@ mod response_tests {
 
         // 3. Sanitize and assert the offender branch now has
         //    `additionalProperties: false`.
-        let out = sanitize_tool_schema(schema);
+        let out = sanitize_tool_schema(schema, None);
         let branch = &out["properties"]["description"]["anyOf"][1];
         assert_eq!(
             branch["additionalProperties"],
