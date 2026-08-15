@@ -13,6 +13,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+# Pattern checks during response-side tool-input repair (src/repair.rs).
+regex = "1"
 serde_json = "1"
 serde_with = { version = "3", features = ["json"] }
 

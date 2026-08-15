@@ -136,8 +136,9 @@ async fn handle_messages(
     let upstream_model = mappings_snapshot.resolve(&req.model);
     let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let mut outbound = translate::anthropic_to_responses(&req, reasoning_effort, &prompt_caching)
-        .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    let (mut outbound, registry) =
+        translate::anthropic_to_responses(&req, reasoning_effort, &prompt_caching)
+            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
     outbound.model = upstream_model;
@@ -187,9 +188,60 @@ async fn handle_messages(
     LAST_SENT_BODY
         .scope(
             body_json,
-            handle_messages_inner(state, headers, req, outbound, start, mappings_snapshot),
+            handle_messages_inner(
+                state,
+                headers,
+                req,
+                outbound,
+                registry,
+                start,
+                mappings_snapshot,
+            ),
         )
         .await
+}
+
+/// One POST to the upstream with the shared headers. Extracted from the
+/// retry loop so the hidden validation-retry path can reuse it.
+async fn send_upstream_once(
+    state: &AppState,
+    url: &str,
+    headers: &HeaderMap,
+    outbound: &responses::ResponsesRequest,
+) -> Result<reqwest::Response, AppError> {
+    let mut upstream_req = state
+        .client
+        .post(url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .bearer_auth(&state.config.upstream_api_key)
+        .json(outbound);
+
+    // Forward a few select headers if the client set them (e.g. tracing
+    // identifiers). We don't blindly forward — that risks leaking
+    // credentials or breaking the upstream contract.
+    for key in ["x-request-id", "anthropic-version"] {
+        if let Some(v) = headers.get(key) {
+            upstream_req = upstream_req.header(key, v.clone());
+        }
+    }
+
+    upstream_req.send().await.map_err(AppError::from)
+}
+
+/// Read and parse a non-streaming upstream body. Extracted so the
+/// hidden validation-retry loop can re-read a fresh response.
+async fn parse_upstream_body(
+    resp: reqwest::Response,
+) -> Result<responses::ResponsesResponse, AppError> {
+    let bytes = resp.bytes().await?;
+    tracing::debug!(
+        raw_body = %String::from_utf8_lossy(&bytes),
+        "raw upstream response (non-streaming)"
+    );
+    serde_json::from_slice(&bytes).map_err(|e| AppError::Upstream {
+        status: StatusCode::BAD_GATEWAY,
+        body: format!("upstream returned non-JSON body: {e}"),
+    })
 }
 
 async fn handle_messages_inner(
@@ -197,6 +249,10 @@ async fn handle_messages_inner(
     headers: HeaderMap,
     req: CreateMessageRequest,
     outbound: responses::ResponsesRequest,
+    // Original (client-supplied) tool schemas captured at request
+    // translation; threaded to both response paths so tool-call
+    // arguments can be repaired before shipping.
+    registry: crate::repair::ToolSchemaRegistry,
     start: Instant,
     // Snapshot of the runtime mappings taken at handler entry. Used
     // for the `default_model` fallback so an edit made mid-request
@@ -219,23 +275,7 @@ async fn handle_messages_inner(
     let mut fallback_used = false;
     let mut attempt = 1u8;
     let upstream_resp = loop {
-        let mut upstream_req = state
-            .client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .bearer_auth(&state.config.upstream_api_key)
-            .json(&outbound);
-
-        // Forward a few select headers if the client set them (e.g. tracing
-        // identifiers). We don't blindly forward — that risks leaking
-        // credentials or breaking the upstream contract.
-        for key in ["x-request-id", "anthropic-version"] {
-            if let Some(v) = headers.get(key) {
-                upstream_req = upstream_req.header(key, v.clone());
-            }
-        }
-
-        let resp = upstream_req.send().await?;
+        let resp = send_upstream_once(&state, &url, &headers, &outbound).await?;
         let status = resp.status();
         if status.is_success() {
             break resp;
@@ -304,6 +344,7 @@ async fn handle_messages_inner(
             sse,
             msg_id,
             model,
+            registry,
             start,
             state.output.clone(),
             state.stats.clone(),
@@ -320,17 +361,41 @@ async fn handle_messages_inner(
             .map_err(|e| AppError::Internal(format!("build streaming response: {e}")))?;
         Ok(response)
     } else {
-        let bytes = upstream_resp.bytes().await?;
-        tracing::debug!(
-            raw_body = %String::from_utf8_lossy(&bytes),
-            "raw upstream response (non-streaming)"
-        );
-        let upstream_resp_body: responses::ResponsesResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Upstream {
-                status: StatusCode::BAD_GATEWAY,
-                body: format!("upstream returned non-JSON body: {e}"),
-            })?;
-        let anth = translate::responses_to_anthropic(&upstream_resp_body);
+        let mut upstream_resp_body = parse_upstream_body(upstream_resp).await?;
+
+        // Hidden validation retry: if the repaired tool input still
+        // violates the client's *original* schema (e.g. a genuinely
+        // required parameter the model botched), give the model one
+        // corrective round-trip instead of shipping a call the client
+        // will reject with "Invalid tool parameters". Bounded to a
+        // single extra attempt; the streaming path can't do this at
+        // all (bytes are already flowing).
+        let mut validation_retries = 0u8;
+        while validation_retries < 1 {
+            let violations = crate::repair::tool_input_violations(&upstream_resp_body, &registry);
+            if violations.is_empty() {
+                break;
+            }
+            tracing::warn!(
+                violations = ?violations,
+                "tool input violates the original schema after repair; issuing corrective retry"
+            );
+            crate::repair::append_corrective_input(
+                &mut outbound.input,
+                &upstream_resp_body,
+                &violations,
+            );
+            let resp = send_upstream_once(&state, &url, &headers, &outbound).await?;
+            if !resp.status().is_success() {
+                // Upstream error on the retry: keep the original
+                // (already-successful) response body for error mapping.
+                break;
+            }
+            upstream_resp_body = parse_upstream_body(resp).await?;
+            validation_retries += 1;
+        }
+
+        let anth = translate::responses_to_anthropic(&upstream_resp_body, &registry);
         if is_countable_response_status(&upstream_resp_body.status)
             && let Some(usage) = upstream_resp_body.usage.as_ref()
         {
@@ -544,6 +609,7 @@ where
         inner: S,
         msg_id: String,
         model: String,
+        registry: crate::repair::ToolSchemaRegistry,
         start: Instant,
         sink: crate::tui::OutputSink,
         session_stats: Arc<crate::tui::SessionStatsStore>,
@@ -552,7 +618,7 @@ where
     ) -> Self {
         Self {
             inner,
-            translator: Some(StreamTranslator::new(msg_id, model)),
+            translator: Some(StreamTranslator::new(msg_id, model, registry)),
             start,
             stats: None,
             session_stats,

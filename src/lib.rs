@@ -6,6 +6,7 @@ pub mod stream;
 
 pub mod anthropic;
 pub mod proxy;
+pub mod repair;
 mod translate;
 pub mod tui;
 

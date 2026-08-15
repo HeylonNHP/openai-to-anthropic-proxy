@@ -54,6 +54,10 @@ pub struct StreamTranslator {
     msg_id: String,
     model: String,
     started: bool,
+    /// Original (client-supplied) tool schemas for this request. Used
+    /// to repair buffered tool-call arguments before they are shipped
+    /// downstream (see `emit_repaired_args`).
+    registry: crate::repair::ToolSchemaRegistry,
     text_block: Option<TextBlockState>,
     /// Per upstream `output_index`. Responses uses the `output_index`
     /// from the event to identify items.
@@ -113,10 +117,15 @@ struct ToolBlockState {
     #[allow(dead_code)]
     name: String,
     /// JSON-encoded arguments accumulated across the
-    /// `function_call_arguments.delta` events. Tracked so we can emit a
-    /// final `input_json_delta` if the upstream's terminal `done` event
-    /// sends a complete `arguments` we haven't seen before.
+    /// `function_call_arguments.delta` events. Buffered (NOT streamed
+    /// through) so the complete blob can be repaired against the
+    /// original tool schema before it is shipped downstream.
     arguments: String,
+    /// Whether the (repaired) argument blob has already been emitted
+    /// as an `input_json_delta`. Makes the emit path idempotent across
+    /// `output_item.done`, `function_call_arguments.done`, and block
+    /// close.
+    emitted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,13 +140,16 @@ struct ThinkingBlockState {
 
 impl StreamTranslator {
     /// Build a translator. `msg_id` is the message id to emit in
-    /// `message_start.message.id`; `model` is the model name.
+    /// `message_start.message.id`; `model` is the model name;
+    /// `registry` carries the original tool schemas captured at
+    /// request-translation time (empty when none were declared).
     #[must_use]
-    pub fn new(msg_id: String, model: String) -> Self {
+    pub fn new(msg_id: String, model: String, registry: crate::repair::ToolSchemaRegistry) -> Self {
         Self {
             msg_id,
             model,
             started: false,
+            registry,
             text_block: None,
             tool_blocks: BTreeMap::new(),
             thinking_blocks: BTreeMap::new(),
@@ -561,6 +573,7 @@ impl StreamTranslator {
                         id: call_id.clone(),
                         name: name.clone(),
                         arguments: String::new(),
+                        emitted: false,
                     },
                 );
             }
@@ -602,32 +615,9 @@ impl StreamTranslator {
         match item {
             OutputItem::FunctionCall { arguments, .. } => {
                 // The terminal `output_item.done` for a FunctionCall
-                // may carry a *complete* arguments blob. If so, and if
-                // it differs from what we accumulated, emit a final
-                // `input_json_delta` so the client sees the truth.
-                if let Some(state) = self.tool_blocks.get(&output_index)
-                    && state.arguments != *arguments
-                    && !arguments.is_empty()
-                {
-                    // The accumulated string is missing the tail.
-                    // Emit the difference as one final delta.
-                    if let Some(tail) = arguments.strip_prefix(&state.arguments) {
-                        events.push(StreamEvent::ContentBlockDelta {
-                            index: state.index,
-                            delta: ContentDelta::InputJsonDelta {
-                                partial_json: tail.to_owned(),
-                            },
-                        });
-                    } else {
-                        // Total mismatch — emit the whole thing.
-                        events.push(StreamEvent::ContentBlockDelta {
-                            index: state.index,
-                            delta: ContentDelta::InputJsonDelta {
-                                partial_json: arguments.clone(),
-                            },
-                        });
-                    }
-                }
+                // may carry a *complete* arguments blob; adopt it and
+                // emit the repaired arguments exactly once.
+                self.maybe_finalize_tool_args(events, output_index, arguments);
             }
             OutputItem::Reasoning {
                 encrypted_content, ..
@@ -687,9 +677,16 @@ impl StreamTranslator {
         });
     }
 
+    /// Accumulate a tool-argument delta *without* shipping it. The
+    /// full argument blob is repaired against the original tool schema
+    /// and emitted once, when the tool block closes (see
+    /// [`Self::emit_repaired_args`]). Buffering is what makes repair
+    /// possible at all: the sanitizer's mutations (null sentinels,
+    /// string-encoded JSON, fabricated optional values) can only be
+    /// inverted on complete JSON.
     fn emit_tool_args_delta(
         &mut self,
-        events: &mut Vec<StreamEvent>,
+        _events: &mut Vec<StreamEvent>,
         output_index: u32,
         args: &str,
     ) {
@@ -702,43 +699,63 @@ impl StreamTranslator {
             return;
         };
         state.arguments.push_str(args);
-        events.push(StreamEvent::ContentBlockDelta {
-            index: state.index,
-            delta: ContentDelta::InputJsonDelta {
-                partial_json: args.to_owned(),
-            },
-        });
     }
 
+    /// The terminal `done` event carries the upstream's view of the
+    /// complete arguments. Adopt it when non-empty (it is
+    /// authoritative over a possibly-truncated delta accumulation),
+    /// then emit the repaired blob.
     fn maybe_finalize_tool_args(
         &mut self,
         events: &mut Vec<StreamEvent>,
         output_index: u32,
         arguments: &str,
     ) {
-        let Some(state) = self.tool_blocks.get(&output_index) else {
+        let Some(state) = self.tool_blocks.get_mut(&output_index) else {
             return;
         };
-        if state.arguments != arguments && !arguments.is_empty() {
-            // The done event carries a complete arguments blob. Emit
-            // a final delta with the trailing portion.
-            if let Some(tail) = arguments.strip_prefix(&state.arguments) {
-                events.push(StreamEvent::ContentBlockDelta {
-                    index: state.index,
-                    delta: ContentDelta::InputJsonDelta {
-                        partial_json: tail.to_owned(),
-                    },
-                });
-            } else {
-                events.push(StreamEvent::ContentBlockDelta {
-                    index: state.index,
-                    delta: ContentDelta::InputJsonDelta {
-                        partial_json: arguments.to_owned(),
-                    },
-                });
+        if !arguments.is_empty() && state.arguments != arguments {
+            if !state.arguments.is_empty() && arguments.strip_prefix(&state.arguments).is_none() {
+                // Total mismatch between delta accumulation and the
+                // done blob. The old code re-emitted the whole done
+                // blob *on top of* the deltas, producing concatenated
+                // garbage on the client. Trust the authoritative done
+                // blob instead.
+                tracing::warn!(
+                    output_index,
+                    "function_call done arguments diverge from accumulated deltas; using done blob"
+                );
             }
-            self.tool_blocks.get_mut(&output_index).unwrap().arguments = arguments.to_owned();
+            // Extension of what we saw, first sight of the blob, or a
+            // divergence resolved in favour of the authoritative done
+            // blob.
+            state.arguments = arguments.to_owned();
         }
+        self.emit_repaired_args(events, output_index);
+    }
+
+    /// Emit the (repaired) argument JSON for a tool block as a single
+    /// `input_json_delta`, exactly once. Idempotent: a block whose
+    /// arguments were already emitted is a no-op.
+    fn emit_repaired_args(&mut self, events: &mut Vec<StreamEvent>, output_index: u32) {
+        let Some(state) = self.tool_blocks.get_mut(&output_index) else {
+            return;
+        };
+        if state.emitted {
+            return;
+        }
+        state.emitted = true;
+        let raw = std::mem::take(&mut state.arguments);
+        let repaired = repair_arguments(&self.registry, &state.name, &raw);
+        if repaired.is_empty() {
+            return;
+        }
+        events.push(StreamEvent::ContentBlockDelta {
+            index: state.index,
+            delta: ContentDelta::InputJsonDelta {
+                partial_json: repaired,
+            },
+        });
     }
 
     fn emit_thinking_delta(
@@ -809,9 +826,17 @@ impl StreamTranslator {
         if self.tool_blocks.is_empty() {
             return;
         }
-        let indices: Vec<u32> = self.tool_blocks.values().map(|s| s.index).collect();
-        for idx in indices {
-            events.push(StreamEvent::ContentBlockStop { index: idx });
+        // Flush any tool block whose arguments were never emitted
+        // (e.g. an upstream that sends deltas but no terminal done
+        // event), then close it. Per block: args delta, then stop, in
+        // BTreeMap (output_index) order so parallel calls close
+        // deterministically.
+        let ordered: Vec<u32> = self.tool_blocks.keys().cloned().collect();
+        for output_index in ordered {
+            self.emit_repaired_args(events, output_index);
+            if let Some(state) = self.tool_blocks.get(&output_index) {
+                events.push(StreamEvent::ContentBlockStop { index: state.index });
+            }
         }
         self.tool_blocks.clear();
     }
@@ -920,6 +945,43 @@ impl StreamTranslator {
         });
         events.push(StreamEvent::ContentBlockStop { index });
     }
+}
+
+/// Parse + repair a raw upstream tool-argument blob against the original
+/// schema for `tool` (when registered). Returns the JSON text to ship
+/// downstream. Empty/whitespace input becomes `{}` (Anthropic
+/// `tool_use.input` must be an object); unparseable input is logged and
+/// shipped as `{}` rather than as a synthetic `_raw_arguments` key the
+/// client's strict schema would reject outright.
+fn repair_arguments(registry: &crate::repair::ToolSchemaRegistry, tool: &str, raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return "{}".to_owned();
+    }
+    let parsed = match serde_json::from_str::<Value>(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                tool = %tool,
+                error = %e,
+                "upstream tool arguments are not valid JSON; shipping empty input"
+            );
+            return "{}".to_owned();
+        }
+    };
+    let Some(original) = registry.get(tool) else {
+        // No original schema (tool not declared inbound, e.g. a
+        // server-injected call): pass through untouched.
+        return serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_owned());
+    };
+    let repaired = crate::repair::repair(parsed, original);
+    if let Some(violation) = crate::repair::validate(&repaired, original) {
+        tracing::warn!(
+            tool = %tool,
+            violation = %violation,
+            "tool input still violates the original schema after repair"
+        );
+    }
+    serde_json::to_string(&repaired).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
@@ -1114,7 +1176,8 @@ mod tests {
 
     #[test]
     fn text_stream_emits_message_start_then_text_deltas_then_stop() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         let evs = t.feed_event(&output_text_delta(0, "Hello"));
@@ -1151,7 +1214,8 @@ mod tests {
 
     #[test]
     fn tool_call_stream_emits_tool_use_block() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
 
         let evs = t.feed_event(&function_call_added(0, "call_1", "get_weather"));
@@ -1174,25 +1238,27 @@ mod tests {
             _ => panic!("expected content_block_start"),
         }
 
-        // Args delta.
+        // Args deltas are BUFFERED, not streamed through: the complete
+        // blob must be repairable before it is shipped downstream.
         let evs = t.feed_event(&function_call_args_delta(0, r#"{"loc"#));
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(
-            evs[0],
-            StreamEvent::ContentBlockDelta {
-                delta: ContentDelta::InputJsonDelta { .. },
-                ..
-            }
-        ));
-
-        let evs = t.feed_event(&function_call_args_delta(0, r#"ation":"SF"}"#));
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], StreamEvent::ContentBlockDelta { .. }));
-
-        // Terminal done with full args; matches what we accumulated, so
-        // no extra delta is emitted.
-        let evs = t.feed_event(&function_call_args_done(0, r#"{"location":"SF"}"#));
         assert!(evs.is_empty());
+        let evs = t.feed_event(&function_call_args_delta(0, r#"ation":"SF"}"#));
+        assert!(evs.is_empty());
+
+        // The terminal done event flushes the repaired arguments as a
+        // single `input_json_delta`.
+        let evs = t.feed_event(&function_call_args_done(0, r#"{"location":"SF"}"#));
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::ContentBlockDelta {
+                index,
+                delta: ContentDelta::InputJsonDelta { partial_json },
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(partial_json, r#"{"location":"SF"}"#);
+            }
+            _ => panic!("expected input_json_delta"),
+        }
 
         // The terminal Completed event should carry the function call
         // in its output so the translator can detect has_tool_use and
@@ -1223,7 +1289,8 @@ mod tests {
 
     #[test]
     fn text_then_tool_call_closes_text_first() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "Let me check."));
@@ -1237,15 +1304,20 @@ mod tests {
             StreamEvent::ContentBlockStart { index: 1, .. }
         ));
 
-        // Args delta goes to index 1.
+        // Args delta is buffered; nothing is emitted yet.
         let evs = t.feed_event(&function_call_args_delta(0, "{}"));
-        assert_eq!(evs.len(), 1);
+        assert!(evs.is_empty());
+
+        // Closing the block flushes the (repaired) args delta on index 1
+        // and then stops the block.
+        let evs = t.feed_event(&completed_event("completed"));
+        assert_eq!(evs.len(), 2);
         match &evs[0] {
             StreamEvent::ContentBlockDelta { index, .. } => assert_eq!(*index, 1),
             _ => panic!(),
         }
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 1 }));
 
-        let _ = t.feed_event(&completed_event("completed"));
         let closing = t.finish();
         assert!(matches!(closing[0], StreamEvent::MessageDelta { .. }));
         assert!(matches!(closing[1], StreamEvent::MessageStop {}));
@@ -1253,23 +1325,33 @@ mod tests {
 
     #[test]
     fn parallel_tool_calls_close_in_output_index_order() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&function_call_added(0, "call_a", "tool_a"));
         let _ = t.feed_event(&function_call_added(1, "call_b", "tool_b"));
 
         // Both blocks are open at output_index 0 and 1, Anthropic
-        // indices 0 and 1.
+        // indices 0 and 1. Closing flushes each block's repaired args
+        // delta followed by its stop, in BTreeMap (output_index) order.
         let evs = t.feed_event(&completed_event("completed"));
-        // content_block_stop(0), content_block_stop(1) — BTreeMap order.
-        assert_eq!(evs.len(), 2);
-        assert!(matches!(evs[0], StreamEvent::ContentBlockStop { index: 0 }));
-        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 1 }));
+        assert_eq!(evs.len(), 4);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::ContentBlockDelta { index: 0, .. }
+        ));
+        assert!(matches!(evs[1], StreamEvent::ContentBlockStop { index: 0 }));
+        assert!(matches!(
+            evs[2],
+            StreamEvent::ContentBlockDelta { index: 1, .. }
+        ));
+        assert!(matches!(evs[3], StreamEvent::ContentBlockStop { index: 1 }));
     }
 
     #[test]
     fn reasoning_item_emits_thinking_block() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
 
         let evs = t.feed_event(&reasoning_item_added(0));
@@ -1345,7 +1427,8 @@ mod tests {
         // with a plain `ContentBlockStop` and no SignatureDelta —
         // emitting an empty `SignatureDelta { signature: "" }` would
         // be a confusing no-op on the wire.
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         let evs = t.feed_event(&reasoning_item_added(0));
         assert!(matches!(evs[0], StreamEvent::ContentBlockStart { .. }));
@@ -1381,7 +1464,8 @@ mod tests {
 
     #[test]
     fn late_reasoning_item_after_text_closes_text_first() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "intro"));
@@ -1405,7 +1489,8 @@ mod tests {
 
     #[test]
     fn incomplete_response_max_tokens_maps_to_max_tokens() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "a bit"));
@@ -1424,7 +1509,8 @@ mod tests {
 
     #[test]
     fn failed_response_surfaces_error() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         let mut r = base_response("failed");
         r.error = Some(crate::responses::ResponsesError {
@@ -1448,7 +1534,8 @@ mod tests {
         // matching `content_block_stop`, leaving the Anthropic client
         // with a half-streamed response. The translator must now
         // close the block first.
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "partial output"));
@@ -1490,7 +1577,8 @@ mod tests {
         // Same regression as above, but via a FunctionCall instead of
         // a text block, and triggered by the top-level `Error` SSE
         // event (not `Failed`).
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         // Open a tool_use block.
         let tool_added = ResponsesStreamEvent::OutputItemAdded {
@@ -1538,7 +1626,8 @@ mod tests {
 
     #[test]
     fn usage_in_completed_event_is_captured() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "x"));
@@ -1556,7 +1645,8 @@ mod tests {
 
     #[test]
     fn completed_event_usage_includes_cache_fields() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         t.feed_event(&output_text_delta(0, "x"));
@@ -1589,7 +1679,7 @@ mod tests {
 
     #[test]
     fn finish_without_start_emits_message_start_first() {
-        let t = StreamTranslator::new(msg_id(), model());
+        let t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         let evs = t.finish();
         assert_eq!(evs.len(), 3);
         assert!(matches!(evs[0], StreamEvent::MessageStart { .. }));
@@ -1599,7 +1689,8 @@ mod tests {
 
     #[test]
     fn feed_after_finish_is_noop() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         let _ = t.feed_event(&completed_event("completed"));
@@ -1610,7 +1701,11 @@ mod tests {
 
     #[test]
     fn created_event_replaces_msg_id_and_model() {
-        let mut t = StreamTranslator::new("synthetic".into(), "inbound".into());
+        let mut t = StreamTranslator::new(
+            "synthetic".into(),
+            "inbound".into(),
+            crate::repair::ToolSchemaRegistry::new(),
+        );
         let ev = ResponsesStreamEvent::Created {
             response: ResponsesResponse {
                 id: "resp_real".into(),
@@ -1637,7 +1732,11 @@ mod tests {
 
     #[test]
     fn created_event_usage_surfaces_in_message_start() {
-        let mut t = StreamTranslator::new("synthetic".into(), "inbound".into());
+        let mut t = StreamTranslator::new(
+            "synthetic".into(),
+            "inbound".into(),
+            crate::repair::ToolSchemaRegistry::new(),
+        );
         let ev = ResponsesStreamEvent::Created {
             response: ResponsesResponse {
                 id: "resp_real".into(),
@@ -1675,7 +1774,8 @@ mod tests {
 
     #[test]
     fn dangling_args_delta_is_dropped() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         // No tool use opened yet.
         let evs = t.feed_event(&function_call_args_delta(0, "ignored"));
@@ -1684,7 +1784,8 @@ mod tests {
 
     #[test]
     fn dangling_thinking_delta_is_dropped() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         let evs = t.feed_event(&reasoning_summary_delta(0, "ignored"));
         assert!(evs.is_empty());
@@ -1692,7 +1793,8 @@ mod tests {
 
     #[test]
     fn empty_text_delta_is_dropped() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         let evs = t.feed_event(&output_text_delta(0, ""));
@@ -1701,7 +1803,8 @@ mod tests {
 
     #[test]
     fn empty_args_delta_is_dropped() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&function_call_added(0, "call_1", "tool"));
         let evs = t.feed_event(&function_call_args_delta(0, ""));
@@ -1710,14 +1813,16 @@ mod tests {
 
     #[test]
     fn unknown_event_is_dropped() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         let evs = t.feed_event(&ResponsesStreamEvent::Unknown);
         assert!(evs.is_empty());
     }
 
     #[test]
     fn top_level_error_event_routes_through_emit_error() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         let evs = t.feed_event(&ResponsesStreamEvent::Error {
             code: Some("server_error".into()),
@@ -1733,7 +1838,8 @@ mod tests {
         // Regression: an upstream error SSE that arrives after a
         // content_block_start must emit content_block_stop before the
         // error event, otherwise the client sees an unbalanced block.
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&message_item_added(0));
         let _ = t.feed_event(&output_text_delta(0, "partial"));
@@ -1761,7 +1867,8 @@ mod tests {
     #[test]
     fn emit_error_after_open_tool_block_closes_it_first() {
         // Same regression, but for an in-flight tool_use block.
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
         t.feed_event(&function_call_added(0, "call_1", "get_weather"));
         let _ = t.feed_event(&function_call_args_delta(0, r#"{"loc"#));
@@ -1801,7 +1908,8 @@ mod tests {
     /// producing "Did 0 searches".
     #[test]
     fn web_search_call_emits_server_tool_use_and_result_blocks() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
 
         let evs = t.feed_event(&web_search_call_added(0));
@@ -1847,7 +1955,8 @@ mod tests {
     /// web search as a function tool rather than via a `web_search_call`.
     #[test]
     fn web_search_function_call_emits_blocks_then_tool_use() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
 
         let evs = t.feed_event(&function_call_added(0, "call_ws", "WebSearch"));
@@ -1899,7 +2008,8 @@ mod tests {
     /// so the name-based detection doesn't over-trigger.
     #[test]
     fn non_web_search_function_call_does_not_emit_search_blocks() {
-        let mut t = StreamTranslator::new(msg_id(), model());
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
         t.feed_event(&created_event());
 
         let evs = t.feed_event(&function_call_added(0, "call_1", "get_weather"));
