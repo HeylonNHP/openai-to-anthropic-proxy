@@ -23,7 +23,7 @@ use crate::anthropic::{
     StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::config::PromptCachingConfig;
+use crate::config::{PromptCachingConfig, ReasoningDecision};
 use crate::responses::{
     Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig, ResponsesRequest,
     ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition,
@@ -57,30 +57,13 @@ use serde_json::Value;
 ///   `metadata_user_id_becomes_user` test (which expects 7 chars
 ///   unchanged) keeps passing with no other code changes.
 ///
-/// **Why 64 (not e.g. 60) and not char-based truncation:**
+/// **Why 64 (not e.g. 60):**
 /// - The 64 limit is the upstream's published max; we set the constant
-///   to match exactly so a future upstream version that raises or
-///   lowers it is a one-line change.
-/// - We truncate on a byte boundary with `String::truncate`, not on a
-///   char boundary with `char_indices`. A `user_id` from a non-ASCII
-///   workspace path could have a multi-byte char straddling the cut;
-///   `truncate` is a panic on a non-char boundary, which would convert
-///   a 400 from upstream into a 500 from us. Byte-truncation can split
-///   a UTF-8 sequence, producing technically-invalid UTF-8 in the
-///   string, but the `user` field is opaque to the upstream (it's a
-///   rate-limit key, not parsed content) so this is harmless in
-///   practice. If a future maintainer wants strictly valid UTF-8,
-///   switch to `s.char_indices().nth(USER_ID_MAX_LEN).map(|(i, _)| i).unwrap_or(s.len())`
-///   — but note that this can let a single multi-byte char push the
-///   effective length *above* 64, re-triggering the upstream 400.
-///
-/// If a future change wants to switch to hashing, replace
-/// [`truncate_user_id`] with a SHA-256 (or similar) helper. The test
-/// `user_id_over_limit_is_truncated` will need to be updated to assert
-/// the hash format. Consider also keeping the original `user_id` in a
-/// separate `X-Original-User` header for debugging — the proxy already
-/// has a `LAST_SENT_BODY` task-local for request-level introspection
-/// if a custom header is too intrusive.
+///   to match exactly so a future upstream version that raises or lowers it
+///   is a one-line change.
+/// - We truncate at the last valid UTF-8 boundary at or before byte 64.
+///   This preserves the leading prefix without panicking on non-ASCII
+///   workspace paths.
 const USER_ID_MAX_LEN: usize = 64;
 
 fn truncate_user_id(s: String) -> String {
@@ -94,9 +77,11 @@ fn truncate_user_id(s: String) -> String {
              see USER_ID_MAX_LEN doc comment in src/translate.rs for rationale and \
              alternatives (e.g. SHA-256 hashing)",
         );
-        let mut s = s;
-        s.truncate(USER_ID_MAX_LEN);
-        s
+        let cutoff = (0..=USER_ID_MAX_LEN)
+            .rev()
+            .find(|&idx| s.is_char_boundary(idx))
+            .expect("0 is always a UTF-8 character boundary");
+        s[..cutoff].to_owned()
     }
 }
 
@@ -123,8 +108,9 @@ fn truncate_user_id(s: String) -> String {
 ///   `Tool{name}`→`{ type: "function", name: "..." }`.
 /// - `max_tokens` → `max_output_tokens`.
 /// - `temperature`, `top_p` pass through.
-/// - `reasoning_effort` (config-supplied) → `reasoning: Some(ReasoningConfig { effort })`.
-///   Responses accepts `"none"` natively, so we forward whatever the config
+/// - `reasoning_decision` (config-resolved) → `reasoning: Some(ReasoningConfig { effort })`
+///   when it carries an effort, or `reasoning: None` when it is [`ReasoningDecision::Omit`].
+///   Responses accepts `"none"` natively, so we forward whatever the decision
 ///   says — no per-request "downgrade" like the Chat Completions path did.
 /// - `metadata.user_id` → `user`.
 /// - `stream: true` → `stream: true` (no `stream_options`; Responses carries
@@ -132,7 +118,7 @@ fn truncate_user_id(s: String) -> String {
 /// - `stop_sequences` dropped with a warn (Responses has no `stop` field).
 pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
-    reasoning_effort: Option<String>,
+    reasoning_decision: Option<ReasoningDecision>,
     prompt_caching: &PromptCachingConfig,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
@@ -232,10 +218,12 @@ pub fn anthropic_to_responses(
         },
         tools,
         tool_choice,
-        reasoning: reasoning_effort.map(|effort| ReasoningConfig {
-            effort,
-            ..ReasoningConfig::default()
-        }),
+        reasoning: reasoning_decision
+            .and_then(|d| d.upstream_effort().map(str::to_owned))
+            .map(|effort| ReasoningConfig {
+                effort,
+                ..ReasoningConfig::default()
+            }),
         text: None,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -1119,6 +1107,8 @@ mod tests {
             stop_sequences: None,
             stream: Some(false),
             metadata: None,
+            output_config: None,
+            thinking: None,
         }
     }
 
@@ -1633,6 +1623,14 @@ mod tests {
     }
 
     #[test]
+    fn truncate_user_id_handles_multibyte_boundary() {
+        let value = format!("{}é{}", "a".repeat(63), "b".repeat(20));
+        let truncated = truncate_user_id(value);
+        assert!(truncated.len() <= USER_ID_MAX_LEN);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert_eq!(truncated, "a".repeat(63));
+    }
+    #[test]
     fn stop_sequences_are_dropped() {
         let mut req = fixture_request();
         req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
@@ -1647,9 +1645,12 @@ mod tests {
     #[test]
     fn reasoning_effort_passes_through_to_nested_reasoning() {
         let req = fixture_request();
-        let (out, _reg) =
-            anthropic_to_responses(&req, Some("medium".into()), &PromptCachingConfig::default())
-                .unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            Some(ReasoningDecision::Effort("medium".into())),
+            &PromptCachingConfig::default(),
+        )
+        .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
         assert_eq!(reasoning.effort, "medium");
     }
@@ -1657,8 +1658,12 @@ mod tests {
     #[test]
     fn reasoning_effort_none_omits_field() {
         let req = fixture_request();
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            Some(ReasoningDecision::Omit),
+            &PromptCachingConfig::default(),
+        )
+        .unwrap();
         let body = serde_json::to_value(&out).unwrap();
         assert!(
             body.get("reasoning").is_none(),
@@ -2576,7 +2581,7 @@ pub fn responses_to_anthropic(
     resp: &ResponsesResponse,
     registry: &crate::repair::ToolSchemaRegistry,
 ) -> Message {
-    let (mut content, web_search_used) = build_content_blocks(&resp.output, registry);
+    let (mut content, web_search_count) = build_content_blocks(&resp.output, registry);
 
     // If the response failed AND we have no output blocks of our own,
     // surface the upstream error message as a `[error] ...` text block
@@ -2624,9 +2629,9 @@ pub fn responses_to_anthropic(
                 .output_tokens_details
                 .as_ref()
                 .map_or(0, |d| d.reasoning_tokens),
-            server_tool_use: if web_search_used {
+            server_tool_use: if web_search_count > 0 {
                 Some(ServerToolUseUsage {
-                    web_search_requests: 1,
+                    web_search_requests: web_search_count,
                 })
             } else {
                 None
@@ -2688,7 +2693,7 @@ fn map_status_to_stop_reason(
 ///
 /// Returns a vector of (url, title) pairs. The vector is non-empty if
 /// any web search signal is detected — this is what drives the
-/// `web_search_used` flag in [`build_content_blocks`] and the
+/// `web_search_count` field in [`build_content_blocks`] and the
 /// `server_tool_use` usage in the final message.
 ///
 /// The primary detection signal is the upstream's `web_search_call`
@@ -2700,23 +2705,23 @@ fn map_status_to_stop_reason(
 /// `url_citation` annotations on `OutputText` parts, which is what the
 /// non-streaming response path populates once content is fully
 /// materialized.
-fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
+fn extract_web_search_citations(items: &[OutputItem]) -> (Vec<(String, String)>, u32) {
     let mut citations = Vec::new();
-    let mut saw_web_search_call = false;
-    let mut saw_web_search_function_call = false;
+    let mut search_count = 0u32;
 
     for item in items {
         match item {
             OutputItem::WebSearchCall { .. } => {
                 tracing::debug!("detected web_search_call output item");
-                saw_web_search_call = true;
+                search_count = search_count.saturating_add(1);
             }
-            OutputItem::FunctionCall { name, .. } => {
-                if name == "WebSearch" || name == "web_search" {
-                    tracing::debug!(name = %name, "detected web search FunctionCall");
-                    saw_web_search_function_call = true;
-                }
+            OutputItem::FunctionCall { name, .. }
+                if name == "WebSearch" || name == "web_search" =>
+            {
+                tracing::debug!(name = %name, "detected web search FunctionCall");
+                search_count = search_count.saturating_add(1);
             }
+            OutputItem::FunctionCall { .. } => {}
             OutputItem::Message { content, .. } => {
                 for part in content {
                     if let OutputContentPart::OutputText { text, annotations } = part {
@@ -2727,13 +2732,13 @@ fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
                             "OutputText part with annotations"
                         );
                         for ann in annotations {
-                            if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation") {
-                                if let (Some(url), Some(title)) = (
+                            if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation")
+                                && let (Some(url), Some(title)) = (
                                     ann.get("url").and_then(|v| v.as_str()),
                                     ann.get("title").and_then(|v| v.as_str()),
-                                ) {
-                                    citations.push((url.to_string(), title.to_string()));
-                                }
+                                )
+                            {
+                                citations.push((url.to_string(), title.to_string()));
                             }
                         }
                     }
@@ -2746,48 +2751,44 @@ fn extract_web_search_citations(items: &[OutputItem]) -> Vec<(String, String)> {
         }
     }
 
-    // If we detected a web_search_call or a WebSearch function call but
-    // have no url_citation annotations (the streaming path often has
-    // none at this point, and some upstreams don't return citations on
-    // the non-streaming response either), synthesize a placeholder
-    // citation so `web_search_used` is still true and the
-    // server_tool_use usage is reported. The placeholder URL/title are
-    // not load-bearing — Claude Code's search counter only needs the
-    // `server_tool_use` + `web_search_tool_result` block pair to exist.
-    if citations.is_empty() && (saw_web_search_call || saw_web_search_function_call) {
-        tracing::info!(
-            saw_web_search_call,
-            saw_web_search_function_call,
-            "web search detected via output item; synthesizing placeholder citation"
-        );
-        citations.push((
-            "https://www.openai.com".to_string(),
-            "Web search".to_string(),
-        ));
+    // Citation-only responses still represent one search. When the upstream
+    // exposes a search output item without citations, synthesize one result so
+    // the downstream search counter remains visible.
+    if search_count == 0 && !citations.is_empty() {
+        search_count = 1;
     }
 
     tracing::info!(
         citations_found = citations.len(),
-        saw_web_search_call,
-        saw_web_search_function_call,
+        search_count,
         "web search citation extraction"
     );
-    citations
+    (citations, search_count)
 }
 
 fn build_content_blocks(
     items: &[OutputItem],
     registry: &crate::repair::ToolSchemaRegistry,
-) -> (Vec<ResponseContentBlock>, bool) {
-    let citations = extract_web_search_citations(items);
-    let web_search_used = !citations.is_empty();
+) -> (Vec<ResponseContentBlock>, u32) {
+    let (citations, web_search_count) = extract_web_search_citations(items);
 
     let mut blocks = Vec::new();
 
-    // If web search was used, inject server_tool_use + web_search_tool_result
-    // blocks before the text content so Claude Code's search counter works.
-    if web_search_used {
-        let tool_use_id = "stoolu_web_search_01".to_string();
+    // Inject one server-tool/result pair per search with a distinct ID.
+    for search_index in 0..web_search_count {
+        let tool_use_id = format!("stoolu_web_search_{:02}", search_index + 1);
+        let result_content = if search_index == 0 {
+            citations
+                .iter()
+                .map(|(url, title)| WebSearchResult {
+                    url: url.clone(),
+                    title: title.clone(),
+                    encrypted_content: String::new(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         blocks.push(ResponseContentBlock::ServerToolUse {
             id: tool_use_id.clone(),
             name: "web_search".to_string(),
@@ -2796,17 +2797,11 @@ fn build_content_blocks(
         blocks.push(ResponseContentBlock::WebSearchToolResult {
             block: WebSearchToolResultBlock {
                 tool_use_id,
-                content: citations
-                    .iter()
-                    .map(|(url, title)| WebSearchResult {
-                        uri: url.clone(),
-                        title: title.clone(),
-                        encrypted_content: String::new(),
-                    })
-                    .collect(),
+                content: result_content,
             },
         });
     }
+
     for item in items {
         match item {
             OutputItem::Message { content, .. } => {
@@ -2910,7 +2905,7 @@ fn build_content_blocks(
             OutputItem::Unknown => {}
         }
     }
-    (blocks, web_search_used)
+    (blocks, web_search_count)
 }
 
 #[cfg(test)]
@@ -3320,10 +3315,11 @@ mod response_tests {
         match &out.content[1] {
             ResponseContentBlock::WebSearchToolResult { block } => {
                 assert_eq!(block.tool_use_id, "stoolu_web_search_01");
-                // Placeholder citation synthesized because no
-                // url_citation annotations were present.
-                assert_eq!(block.content.len(), 1);
-                assert!(!block.content[0].uri.is_empty());
+                // No url_citation annotations were present, so the result
+                // list is empty. Claude Code renders this as "No links
+                // found." and the search counter still registers via the
+                // server_tool_use block count.
+                assert!(block.content.is_empty());
             }
             other => panic!("expected WebSearchToolResult, got {other:?}"),
         }
@@ -3343,7 +3339,52 @@ mod response_tests {
         assert_eq!(stu.web_search_requests, 1);
     }
 
-    /// Regression: when the upstream emits a `FunctionCall` whose name is
+    #[test]
+    fn multiple_web_searches_get_unique_ids_and_accurate_usage() {
+        let mut resp = fixture_response();
+        resp.output = vec![
+            OutputItem::WebSearchCall {
+                id: Some("ws_01".into()),
+                status: Some("completed".into()),
+            },
+            OutputItem::WebSearchCall {
+                id: Some("ws_02".into()),
+                status: Some("completed".into()),
+            },
+        ];
+
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+        assert_eq!(out.content.len(), 4);
+        let ids: Vec<&str> = out
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseContentBlock::ServerToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["stoolu_web_search_01", "stoolu_web_search_02"]);
+        let result_ids: Vec<&str> = out
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ResponseContentBlock::WebSearchToolResult { block } => {
+                    Some(block.tool_use_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_ids, ids);
+        assert_eq!(
+            out.usage
+                .server_tool_use
+                .as_ref()
+                .expect("server search usage")
+                .web_search_requests,
+            2
+        );
+    }
+
     /// `WebSearch` (the model invoking web search as a function tool
     /// instead of via the built-in `web_search_call` item), the proxy
     /// must also inject the web search blocks and report usage. The

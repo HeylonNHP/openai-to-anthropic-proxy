@@ -32,6 +32,13 @@ use crate::config::JsonConfig;
 /// `PageUp`/`PageDown`/`Home`/`End`.
 const LOG_TAIL: usize = 1000;
 
+// Keep token colours in one place so SESSION TOKENS and RECENT REQUESTS
+// cannot drift apart as either display is changed.
+const TOKEN_INPUT_COLOR: Color = Color::Green;
+const TOKEN_OUTPUT_COLOR: Color = Color::Red;
+const TOKEN_CACHE_COLOR: Color = Color::Cyan;
+const TOKEN_REASONING_COLOR: Color = Color::Yellow;
+
 /// Stable, ordered list of inbound models for display. We sort the live
 /// map's keys for stability; the `default_model` is rendered as its
 /// own row even if it isn't an inbound name.
@@ -603,6 +610,13 @@ impl TuiApp {
         // Cap rows so a busy process cannot crowd out the request log.
         let totals = self.stats.snapshot_sections();
         dash.row("SESSION TOKENS  (process lifetime; input/output/cache/reasoning)");
+        let mut combined = TokenTotals::default();
+        for total in totals.inbound.values().chain(totals.actual.values()) {
+            combined.add_totals(*total);
+        }
+        if combined.requests > 0 {
+            dash.row(&format_token_total("ALL MODELS COMBINED", &combined));
+        }
         let mut shown = 0usize;
         let mut configured: Vec<_> = totals
             .inbound
@@ -651,8 +665,7 @@ impl TuiApp {
             ));
         }
 
-        // ---- Footer hint ----
-        dash.row("[a] add  [e/Enter] edit  [d] delete  [f] default  [s] save  [q] quit");
+        // ---- Log navigation hint ----
         dash.row("[PgUp/PgDn] scroll log  [Home/End] jump log top/bottom");
 
         // ---- Layout ----
@@ -694,8 +707,13 @@ impl TuiApp {
         // 30-row terminal the dashboard was given a 120-row-tall
         // area, which caused the log to overflow the buffer. Use a
         // free function (see below) that always uses `parent.height`.
+        let dash_lines = dash
+            .lines
+            .iter()
+            .map(|line| style_token_usage_line(line))
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(dash.lines.join("\n")).style(Style::default().fg(Color::White)),
+            Paragraph::new(dash_lines).style(Style::default().fg(Color::White)),
             centered(dash.width, dash_area),
         );
 
@@ -712,7 +730,8 @@ impl TuiApp {
                     &line.text,
                     &recent_widths[log_kind_index(line.kind)],
                 );
-                ListItem::new(format!("{}  {}", kind_glyph(line.kind), text))
+                let display = format!("{}  {}", kind_glyph(line.kind), text);
+                ListItem::new(style_token_usage_line(&display))
             })
             .collect();
         let title = if self.log.is_empty() {
@@ -1055,6 +1074,60 @@ fn log_kind_index(kind: LogKind) -> usize {
     }
 }
 
+fn style_token_usage_line(text: &str) -> Line<'static> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'.')
+        {
+            index += 1;
+        }
+        let end = index;
+        let before = text[..start].trim_end();
+        let after = &text[end..];
+        let color =
+            if before.ends_with("cache") || before.contains("cache:") || before.ends_with('/') {
+                Some(TOKEN_CACHE_COLOR)
+            } else if before.ends_with("in") || after.starts_with(" in") {
+                Some(TOKEN_INPUT_COLOR)
+            } else if before.ends_with("out") || after.starts_with(" out") {
+                Some(TOKEN_OUTPUT_COLOR)
+            } else if before.ends_with("reason")
+                || before.ends_with("thinking")
+                || after.starts_with(" thinking")
+            {
+                Some(TOKEN_REASONING_COLOR)
+            } else {
+                None
+            };
+
+        if let Some(color) = color {
+            ranges.push((start, end, color));
+        }
+    }
+
+    let mut spans = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut cursor = 0;
+    for (start, end, color) in ranges {
+        spans.push(Span::raw(text[cursor..start].to_owned()));
+        spans.push(Span::styled(
+            text[start..end].to_owned(),
+            Style::default().fg(color),
+        ));
+        cursor = end;
+    }
+    spans.push(Span::raw(text[cursor..].to_owned()));
+    Line::from(spans)
+}
+
 fn format_token_total(model: &str, total: &TokenTotals) -> String {
     format!(
         "  {:<26} {:>6} req  in {:>10}  out {:>10}  cache {:>10}/{:<10}  reason {:>10}",
@@ -1169,6 +1242,55 @@ mod tests {
         assert_eq!(format_token_count(1_000_000_000), "1.00b");
         assert_eq!(format_token_count(1_000_000_000_000), "1.00t");
         assert_eq!(format_token_count(1_000_000_000_000_000), "1.00q");
+    }
+
+    #[test]
+    fn token_usage_values_are_color_coded() {
+        let line = style_token_usage_line(
+            "  model                           7 req  in      1.00k  out      1.00m  cache      1.23k/999  reason      1.00b",
+        );
+        let styled: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .collect();
+
+        assert_eq!(styled.len(), 5);
+        assert_eq!(styled[0].content, "1.00k");
+        assert_eq!(styled[0].style.fg, Some(TOKEN_INPUT_COLOR));
+        assert_eq!(styled[1].content, "1.00m");
+        assert_eq!(styled[1].style.fg, Some(TOKEN_OUTPUT_COLOR));
+        assert_eq!(styled[2].content, "1.23k");
+        assert_eq!(styled[2].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[3].content, "999");
+        assert_eq!(styled[3].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[4].content, "1.00b");
+        assert_eq!(styled[4].style.fg, Some(TOKEN_REASONING_COLOR));
+    }
+
+    #[test]
+    fn recent_request_token_values_are_color_coded() {
+        let text = format_recent_request_token_counts(
+            "  200  |  1.25s  |  1234 in  |  999995 out  |  2000000 thinking  |  cache: 1000000r 999w",
+        );
+        let line = style_token_usage_line(&text);
+        let styled: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .collect();
+
+        assert_eq!(styled.len(), 5);
+        assert_eq!(styled[0].content, "1.23k");
+        assert_eq!(styled[0].style.fg, Some(TOKEN_INPUT_COLOR));
+        assert_eq!(styled[1].content, "1.00m");
+        assert_eq!(styled[1].style.fg, Some(TOKEN_OUTPUT_COLOR));
+        assert_eq!(styled[2].content, "2.00m");
+        assert_eq!(styled[2].style.fg, Some(TOKEN_REASONING_COLOR));
+        assert_eq!(styled[3].content, "1.00mr");
+        assert_eq!(styled[3].style.fg, Some(TOKEN_CACHE_COLOR));
+        assert_eq!(styled[4].content, "999w");
+        assert_eq!(styled[4].style.fg, Some(TOKEN_CACHE_COLOR));
     }
 
     #[test]
