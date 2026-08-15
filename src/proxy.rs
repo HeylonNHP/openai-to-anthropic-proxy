@@ -134,11 +134,29 @@ async fn handle_messages(
     // seed, while `mappings_snapshot` is what the operator sees when
     // they hit `e` in the TUI.
     let upstream_model = mappings_snapshot.resolve(&req.model);
-    let reasoning_effort = state.config.reasoning_for_model(&upstream_model);
+    // Resolve the reasoning intent from the client's explicit signals
+    // (output_config.effort, thinking.type = "disabled") against the
+    // configured effort/thinking-disabled maps, falling back to the
+    // fixed per-model config when the client sent neither.
+    let requested_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|oc| oc.effort.as_deref());
+    let thinking_disabled = req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
+    let reasoning_decision =
+        state
+            .config
+            .reasoning_for_request(&upstream_model, requested_effort, thinking_disabled);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let (mut outbound, registry) =
-        translate::anthropic_to_responses(&req, reasoning_effort, &prompt_caching)
+    let (mut outbound, mut registry) =
+        translate::anthropic_to_responses(&req, Some(reasoning_decision), &prompt_caching)
             .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    // `registry` is reassigned in the `should_retry` branch below when we
+    // rebuild the outbound request for the fallback model. The `mut` on
+    // the second destructure is load-bearing for that branch.
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
     outbound.model = upstream_model;
@@ -251,8 +269,11 @@ async fn handle_messages_inner(
     outbound: responses::ResponsesRequest,
     // Original (client-supplied) tool schemas captured at request
     // translation; threaded to both response paths so tool-call
-    // arguments can be repaired before shipping.
-    registry: crate::repair::ToolSchemaRegistry,
+    // arguments can be repaired before shipping. Mutable because the
+    // fallback-model path rebuilds the request and its registry from
+    // scratch to avoid leaking the first model's cache policy into
+    // the retry.
+    mut registry: crate::repair::ToolSchemaRegistry,
     start: Instant,
     // Snapshot of the runtime mappings taken at handler entry. Used
     // for the `default_model` fallback so an edit made mid-request
@@ -307,18 +328,43 @@ async fn handle_messages_inner(
 
         if should_retry {
             let fallback = mappings_snapshot.default_model().unwrap();
-            let fallback_reasoning = state.config.reasoning_for_model(fallback);
+            let requested_effort = req
+                .output_config
+                .as_ref()
+                .and_then(|oc| oc.effort.as_deref());
+            let thinking_disabled = req
+                .thinking
+                .as_ref()
+                .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
+            let fallback_reasoning =
+                state
+                    .config
+                    .reasoning_for_request(fallback, requested_effort, thinking_disabled);
+            let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,
                 fallback_model = %fallback,
                 "upstream rejected model; falling back to default_model"
             );
+
+            // Rebuild the translated request for the fallback model. Prompt
+            // cache breakpoints are embedded in `input`, so patching only the
+            // model and reasoning fields would leak the first model's cache
+            // policy into the retry. The registry is also rebuilt so its
+            // repaired-input path stays bound to this attempt's tools.
+            let (fb_outbound, fb_registry) = translate::anthropic_to_responses(
+                &req,
+                Some(fallback_reasoning),
+                &fallback_prompt_caching,
+            )
+            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+            outbound = fb_outbound;
+            registry = fb_registry;
             outbound.model = fallback.to_owned();
+            if !fallback_prompt_caching.models.is_empty() {
+                outbound.prompt_cache_key = fallback_prompt_caching.cache_key.clone();
+            }
             fallback_used = true;
-            outbound.reasoning = fallback_reasoning.map(|effort| responses::ReasoningConfig {
-                effort,
-                ..responses::ReasoningConfig::default()
-            });
             attempt = 2;
             continue;
         }
@@ -943,6 +989,8 @@ mod tests {
             stop_sequences: None,
             stream: Some(true),
             metadata: None,
+            output_config: None,
+            thinking: None,
         };
         let id = synthetic_message_id(&req);
         assert!(id.starts_with("msg_"));

@@ -100,16 +100,72 @@ By default the proxy **drops** every `tracing` event — nothing reaches the ter
 
 ### Reasoning
 
-The proxy chooses `reasoning_effort` in this order for each request:
+The proxy selects the upstream `reasoning.effort` for each request from two
+independent surfaces:
+
+**1. Fixed per-model effort** (used when the client sends no explicit
+reasoning signal):
 
 1. `reasoning.models[resolved_model]`
 2. `reasoning.default`
 3. top-level `reasoning_effort`
 4. built-in `none`
 
-A useful rule: if a model gets renamed by `model_aliases.map`, key the reasoning entry by the renamed upstream model, not the Claude-facing name. That way an aliased request lands on the right effort automatically.
+**2. Claude Code request-driven effort** (used when the client explicitly
+requests an effort or disables thinking):
 
-In the redacted example above, `claude-opus-4-8` and `claude-sonnet-5` both route to models with explicit `reasoning.models` entries. `claude-haiku-4-5` routes to `gpt-5.4-nano`, which falls back to `reasoning.default = "none"` because there is no dedicated entry for that model.
+- `reasoning.effort_map` — translates Claude Code's `output_config.effort`
+  (`low`/`medium`/`high`/`xhigh`/`max`) into the upstream model's effort
+  vocabulary. Each entry is a Claude-effort → upstream-effort object, with
+  a `default` for all models and per-model `models` overrides. A value of
+  `null` omits the upstream `reasoning` object entirely.
+- `reasoning.thinking_disabled` — translates Claude Code's
+  `thinking: {"type": "disabled"}` request. It uses the same shape as
+  `effort_map`, keyed by the `disabled` sentinel (normally mapping to
+  `none` so the upstream does no reasoning). Disabled thinking takes
+  precedence over both `output_config.effort` and the fixed per-model
+  config.
+
+Resolution precedence for a single request:
+
+1. `thinking.type = "disabled"` → `thinking_disabled` map
+2. `output_config.effort` → `effort_map` map
+3. no explicit signal → fixed per-model resolution above
+
+A useful rule: if a model gets renamed by `model_aliases.map`, key the
+reasoning entries by the renamed upstream model, not the Claude-facing name.
+That way an aliased request lands on the right effort automatically.
+
+```json
+{
+  "reasoning": {
+    "default": "none",
+    "models": {
+      "gpt-5.4-mini": "high",
+      "gpt-5.6-luna": "medium"
+    },
+    "effort_map": {
+      "default": {
+        "low": "none",
+        "medium": "low",
+        "high": "medium",
+        "xhigh": "high",
+        "max": "high"
+      }
+    },
+    "thinking_disabled": {
+      "default": {
+        "disabled": "none"
+      }
+    }
+  }
+}
+```
+
+In the redacted example above, `claude-opus-4-8` and `claude-sonnet-5` both
+route to models with explicit `reasoning.models` entries. `claude-haiku-4-5`
+routes to `gpt-5.4-nano`, which falls back to `reasoning.default = "none"`
+because there is no dedicated entry for that model.
 
 ### Prompt caching
 

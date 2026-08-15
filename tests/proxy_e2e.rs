@@ -39,6 +39,8 @@ struct FakeUpstream {
     /// scenarios (e.g. proxy's default_model fallback) where the
     /// first send must fail and the second must succeed.
     canned_per_attempt: Arc<Mutex<VecDeque<FakeResponse>>>,
+    /// Optional delay before returning a canned response.
+    delay: Arc<Mutex<Option<Duration>>>,
     /// The most recent JSON body the proxy sent to the upstream.
     received: Arc<Mutex<Option<Bytes>>>,
     /// Every JSON body the proxy sent to the upstream, in order.
@@ -57,6 +59,9 @@ struct FakeResponse {
 }
 
 async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
+    if let Some(delay) = *s.delay.lock().await {
+        tokio::time::sleep(delay).await;
+    }
     {
         let mut all = s.received_all.lock().await;
         all.push(body.clone());
@@ -176,6 +181,27 @@ async fn start_proxy_with_store(
         axum::serve(listener, app).await.unwrap();
     });
     addr
+}
+
+#[tokio::test]
+async fn upstream_timeout_returns_gateway_timeout() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.delay.lock().await = Some(Duration::from_millis(100));
+
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.request_timeout = Duration::from_millis(20);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
 }
 
 #[tokio::test]
@@ -380,6 +406,7 @@ async fn per_model_reasoning_effort_lookup() {
         reasoning: ReasoningConfig {
             default: Some("medium".into()),
             models: std::iter::once(("gpt-5.6-luna".into(), "none".into())).collect(),
+            ..ReasoningConfig::default()
         },
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
@@ -417,6 +444,96 @@ async fn per_model_reasoning_effort_lookup() {
     let second = upstream.received.lock().await.clone().unwrap();
     let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
     assert_eq!(second["reasoning"]["effort"], "medium");
+}
+
+/// A Claude Code request that carries `output_config.effort` (or
+/// `thinking.type = "disabled"`) is translated through the configured
+/// effort/thinking-disabled maps before it reaches the upstream.
+///
+/// This is the wire-level proof for the feature:
+///   - `output_config.effort = "high"` → `reasoning.effort = "medium"`
+///   - `thinking.type = "disabled"` → `reasoning.effort = "none"`
+#[tokio::test]
+async fn effort_map_and_thinking_disabled_flow_to_upstream() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "any",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+
+    // Configure an effort_map (high→medium) and a thinking_disabled
+    // mapping (disabled→none), both under the `default` key.
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: None,
+        reasoning: ReasoningConfig {
+            default: Some("high".into()), // fixed fallback when no signal
+            models: Default::default(),
+            effort_map: openai_to_anthropic_proxy::config::EffortMap {
+                default: BTreeMap::from([("high".into(), Some("medium".into()))]),
+                models: Default::default(),
+            },
+            thinking_disabled: openai_to_anthropic_proxy::config::EffortMap {
+                default: BTreeMap::from([("disabled".into(), Some("none".into()))]),
+                models: Default::default(),
+            },
+        },
+        model_aliases: Default::default(),
+        prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
+    });
+    let proxy_addr = start_proxy(config).await;
+    let client = reqwest::Client::new();
+
+    // Request with output_config.effort = "high" → mapped to "medium".
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-5.4-mini","max_tokens":4,"output_config":{"effort":"high"},"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    let first = upstream.received.lock().await.clone().unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(first["reasoning"]["effort"], "medium");
+
+    // Request with thinking disabled → mapped to "none", and it must
+    // NOT forward any Anthropic `thinking` object.
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-5.4-mini","max_tokens":4,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"b"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    let second = upstream.received.lock().await.clone().unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+    assert_eq!(second["reasoning"]["effort"], "none");
+    assert!(
+        second.get("thinking").is_none(),
+        "Anthropic thinking object must not be forwarded upstream"
+    );
 }
 
 /// When the proxy's config has a `model_aliases` map, an inbound
@@ -878,6 +995,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         reasoning: ReasoningConfig {
             default: Some("low".into()),
             models: std::iter::once(("gpt-4o-mini".into(), "none".into())).collect(),
+            ..ReasoningConfig::default()
         },
         model_aliases: ModelAliases {
             map: BTreeMap::new(),
@@ -911,7 +1029,82 @@ async fn fallback_recomputes_reasoning_for_default_model() {
     // Fallback model is in the map → gets its own per-model entry "none".
     assert_eq!(second["reasoning"]["effort"], "none");
 }
-/// Regression test for the bug where the runtime `MappingsStore` was
+#[tokio::test]
+async fn fallback_recomputes_prompt_caching_for_default_model() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"model not supported","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o-mini",
+                    "output": [],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+        prompt_caching: openai_to_anthropic_proxy::config::PromptCachingConfig {
+            models: vec!["claude-sonnet-5".into()],
+            cache_key: Some("cache-key".into()),
+        },
+        log_to_disk: false,
+        proxy_key: None,
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model":"claude-sonnet-5",
+                "max_tokens":4,
+                "messages":[{"role":"user","content":[{"type":"text","text":"cached","cache_control":{"type":"ephemeral"}}]}]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    assert_eq!(first["prompt_cache_key"], "cache-key");
+    assert!(first["input"][0]["content"][0]["prompt_cache_breakpoint"].is_object());
+    assert!(second.get("prompt_cache_key").is_none());
+    assert!(
+        second["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none()
+    );
+}
+
 /// disconnected from request handling: TUI edits to model aliases
 /// had no effect on actual requests because the handler read from
 /// the static `Config::model_aliases`. This test mutates the

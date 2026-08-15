@@ -99,7 +99,7 @@ impl SessionStatsStore {
 }
 
 impl TokenTotals {
-    fn add_totals(&mut self, other: Self) {
+    pub(crate) fn add_totals(&mut self, other: Self) {
         self.requests += other.requests;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;

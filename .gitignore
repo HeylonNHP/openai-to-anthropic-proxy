@@ -6,6 +6,11 @@
 .env
 .env.local
 
+# Proxy logs
+/proxy.out.log
+/proxy.err.log
+/proxy*.json
+
 # Editor
 .vscode/
 .idea/
