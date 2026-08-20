@@ -297,9 +297,9 @@ pub struct WebSearchResult {
     pub encrypted_content: String,
 }
 
-/// A `web_search_tool_result` content block. Returned by Anthropic's
-/// server-side web search after a `server_tool_use` block. We inject
-/// a synthetic one when the upstream (OpenAI) used its built-in
+/// A `web_search_tool_result` content block from Anthropic's server-side web search.
+///
+/// We inject a synthetic one when the upstream (OpenAI) uses its built-in
 /// `web_search` tool so Claude Code's search counter works.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebSearchToolResultBlock {

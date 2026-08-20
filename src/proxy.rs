@@ -151,7 +151,7 @@ async fn handle_messages(
             .config
             .reasoning_for_request(&upstream_model, requested_effort, thinking_disabled);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let (mut outbound, mut registry) =
+    let (mut outbound, registry) =
         translate::anthropic_to_responses(&req, Some(reasoning_decision), &prompt_caching)
             .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // `registry` is reassigned in the `should_retry` branch below when we
@@ -388,14 +388,16 @@ async fn handle_messages_inner(
         let model = outbound.model.clone();
         let translator_stream = TranslatorStream::new(
             sse,
-            msg_id,
-            model,
-            registry,
-            start,
-            state.output.clone(),
-            state.stats.clone(),
-            stats_model(&req.model, &outbound.model, fallback_used),
-            fallback_used,
+            TranslatorStreamConfig {
+                msg_id,
+                model,
+                registry,
+                start,
+                sink: state.output.clone(),
+                session_stats: state.stats.clone(),
+                stats_model: stats_model(&req.model, &outbound.model, fallback_used),
+                fallback_used,
+            },
         );
 
         let body = Body::from_stream(translator_stream);
@@ -647,30 +649,36 @@ where
     sink: crate::tui::OutputSink,
 }
 
+/// Configuration for creating a `TranslatorStream`.
+struct TranslatorStreamConfig {
+    msg_id: String,
+    model: String,
+    registry: crate::repair::ToolSchemaRegistry,
+    start: Instant,
+    sink: crate::tui::OutputSink,
+    session_stats: Arc<crate::tui::SessionStatsStore>,
+    stats_model: String,
+    fallback_used: bool,
+}
+
 impl<S> TranslatorStream<S>
 where
     S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
 {
-    fn new(
-        inner: S,
-        msg_id: String,
-        model: String,
-        registry: crate::repair::ToolSchemaRegistry,
-        start: Instant,
-        sink: crate::tui::OutputSink,
-        session_stats: Arc<crate::tui::SessionStatsStore>,
-        stats_model: String,
-        fallback_used: bool,
-    ) -> Self {
+    fn new(inner: S, config: TranslatorStreamConfig) -> Self {
         Self {
             inner,
-            translator: Some(StreamTranslator::new(msg_id, model, registry)),
-            start,
+            translator: Some(StreamTranslator::new(
+                config.msg_id,
+                config.model,
+                config.registry,
+            )),
+            start: config.start,
             stats: None,
-            session_stats,
-            stats_model,
-            fallback_used,
-            sink,
+            session_stats: config.session_stats,
+            stats_model: config.stats_model,
+            fallback_used: config.fallback_used,
+            sink: config.sink,
         }
     }
 

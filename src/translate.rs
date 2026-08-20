@@ -172,13 +172,7 @@ pub fn anthropic_to_responses(
             .collect()
     });
 
-    let (tool_choice, parallel_tool_calls) = match req.tool_choice.as_ref() {
-        // No `tool_choice` on the inbound request → leave both fields
-        // `None`. The Responses API default is `"auto"` and we don't
-        // want to override `parallel_tool_calls` unless the client
-        // asked us to.
-        None => (None, None),
-        Some(c) => {
+    let (tool_choice, parallel_tool_calls) = req.tool_choice.as_ref().map_or((None, None), |c| {
             let (tc, disable) = map_tool_choice(c);
             // Anthropic's `disable_parallel_tool_use: true` means "the
             // model may call at most one tool per turn." On Responses,
@@ -187,8 +181,7 @@ pub fn anthropic_to_responses(
             // — `None` leaves it to the upstream's default.
             let parallel = disable.map(|d| !d);
             (Some(tc), parallel)
-        }
-    };
+        });
 
     let user = req
         .metadata
@@ -818,7 +811,7 @@ fn append_user_message(
                     }
                     ContentBlockParam::ToolResult(tr) => {
                         flush_user_parts(out, &mut parts);
-                        let output = tool_result_output(&tr);
+                        let output = tool_result_output(tr);
                         out.push(InputItem::FunctionCallOutput {
                             call_id: tr.tool_use_id.clone(),
                             output,

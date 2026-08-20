@@ -412,7 +412,7 @@ impl TuiApp {
         self.mode = Mode::Editing(EditField::Outbound);
     }
 
-    fn delete_selected(&mut self) {
+    fn delete_selected(&self) {
         let rows = self.rows();
         let Some(row) = rows.get(self.selected) else {
             return;
@@ -623,7 +623,7 @@ impl TuiApp {
             .iter()
             .filter(|(model, _)| snap.live.map.contains_key(*model))
             .collect();
-        configured.sort_by(|(a, _), (b, _)| a.cmp(b));
+        configured.sort_by_key(|(a, _)| *a);
         for (model, total) in configured {
             if shown >= 24 {
                 break;
@@ -636,7 +636,7 @@ impl TuiApp {
             .iter()
             .filter(|(model, _)| !snap.live.map.contains_key(*model))
             .collect();
-        unmapped_inbound.sort_by(|(a, _), (b, _)| a.cmp(b));
+        unmapped_inbound.sort_by_key(|(a, _)| *a);
         if !unmapped_inbound.is_empty() {
             dash.row("UNMAPPED INBOUND MODEL TOTALS");
             for (model, total) in unmapped_inbound {
