@@ -40,7 +40,16 @@ pub async fn run(
     terminal.clear()?;
 
     let mut app = TuiApp::new_with_stats(store, stats, config_path, listen_addr, upstream_base_url);
-    let tick_rate = Duration::from_millis(250);
+    // The tick exists for exactly one job: keeping the uptime counter
+    // and other coarse "wall-clock" UI states visibly fresh. We
+    // previously redrew at 4 Hz which was wasteful — every frame
+    // walks the full log buffer (see `recent_request_column_widths`
+    // and `style_token_usage_line` in `app.rs`) — and it produced a
+    // noticeable per-second CPU hum. 1 s matches the granularity of
+    // the uptime display and is the cheapest cadence that still
+    // looks "live". The dirty-flag fast path means idle ticks
+    // produce no draw at all.
+    let tick_rate = Duration::from_secs(1);
     let mut ticker = interval_at(Instant::now() + tick_rate, tick_rate);
 
     let result: std::io::Result<()> = async {
@@ -50,10 +59,18 @@ pub async fn run(
                 app.push_log(line);
             }
 
-            terminal.draw(|frame| {
-                let area = frame.area();
-                app.render(frame, area);
-            })?;
+            // Only redraw when something visible actually changed.
+            // `push_log`, `apply_mutation`, `save_to_disk`, scroll
+            // selection changes, mode transitions, and the toast
+            // clearing all flip the dirty flag. The tick alone is no
+            // longer sufficient — see Fix 1 in
+            // `.claude/plans/foamy-wondering-pike.md`.
+            if app.take_dirty() {
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    app.render(frame, area);
+                })?;
+            }
 
             tokio::select! {
                 biased;
@@ -75,10 +92,11 @@ pub async fn run(
                         break;
                     }
                 }
-                // Periodic redraw so the uptime clock ticks and any
-                // external state changes (e.g. another task mutating
-                // the store) become visible.
-                _ = ticker.tick() => {}
+                // Periodic redraw so the uptime clock ticks. With the
+                // dirty-flag gate above, this branch is only followed
+                // by an actual `terminal.draw` when something has
+                // changed since the last frame.
+                _ = ticker.tick() => app.mark_dirty(),
             }
         }
         Ok(())
