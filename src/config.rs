@@ -638,7 +638,7 @@ pub struct JsonEffortMap {
 
 impl From<JsonEffortMap> for EffortMap {
     fn from(j: JsonEffortMap) -> Self {
-        EffortMap {
+        Self {
             default: j.default,
             models: j.models,
         }

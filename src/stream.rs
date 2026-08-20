@@ -793,7 +793,7 @@ impl StreamTranslator {
     }
 
     fn emit_thinking_delta(
-        &mut self,
+        &self,
         events: &mut Vec<StreamEvent>,
         output_index: u32,
         text: &str,

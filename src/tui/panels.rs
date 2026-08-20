@@ -75,9 +75,7 @@ impl Panel {
         bot.push_str(BR);
         debug_assert_eq!(bot.width(), total, "bottom border width mismatch");
 
-        let mut lines = Vec::with_capacity(2);
-        lines.push(top);
-        lines.push(bot);
+        let lines = vec![top, bot];
         Self {
             width: total as u16,
             lines,
