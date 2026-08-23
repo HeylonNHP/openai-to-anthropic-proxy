@@ -110,6 +110,13 @@ pub struct TuiApp {
     toast: Option<String>,
     /// Index of the currently-selected mapping row (0-based, sorted).
     selected: usize,
+    /// True when the on-screen state has changed since the last
+    /// `terminal.draw`. The runner loop only issues a draw when this
+    /// flips to true. Set in `push_log`, scroll handlers, mode
+    /// transitions, mutations, save, and toast clearing; cleared by
+    /// the runner after each successful draw. See Fix 1 in
+    /// `.claude/plans/foamy-wondering-pike.md`.
+    dirty: bool,
 }
 
 impl TuiApp {
@@ -157,6 +164,10 @@ impl TuiApp {
             edit_cursor: 0,
             toast: None,
             selected: 0,
+            // First frame must draw — initial state (title, "0
+            // mappings", empty log) needs to be rendered before the
+            // dirty flag can do anything useful.
+            dirty: true,
         }
     }
 
@@ -175,6 +186,29 @@ impl TuiApp {
         // If the user has scrolled away, leave their position alone.
         // When new lines arrive the offset stays put so the relative
         // view of the older history is preserved.
+        // A new line is always visible to the operator, so the next
+        // frame must redraw. Mark dirty.
+        self.dirty = true;
+    }
+
+    /// Mark the TUI as needing a redraw. Called by every code path
+    /// that mutates visible state: `apply_mutation`, `save_to_disk`,
+    /// scroll handlers, mode transitions, the toast-dismiss branch
+    /// in `on_key`, and the runner's tick arm (which exists only
+    /// to keep the uptime counter visibly fresh).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Returns `true` exactly once for each "dirty" edge. The runner
+    /// calls this before issuing `terminal.draw(...)`; if it returns
+    /// `false` the previous frame is still on screen and no draw is
+    /// needed. After returning `true` the flag is cleared so a
+    /// subsequent call (before any state change) returns `false`.
+    pub fn take_dirty(&mut self) -> bool {
+        let was = self.dirty;
+        self.dirty = false;
+        was
     }
 
     /// Display rows in the same order each frame (sorted by inbound).
@@ -213,12 +247,18 @@ impl TuiApp {
                 // Any key dismisses the toast and returns to normal.
                 self.toast = None;
                 self.mode = Mode::Normal;
+                self.dirty = true;
                 false
             }
         }
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> bool {
+        // Almost every key in this arm changes visible state (cursor
+        // moves, mode changes, dialog opens). Mark dirty up front;
+        // the few cases that early-return without doing anything
+        // (q/Esc) still pay the flip but the next render is a no-op.
+        self.dirty = true;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => true,
             // Mapping-list navigation (existing behavior).
@@ -296,6 +336,7 @@ impl TuiApp {
         self.log_list_state.select(Some(clamped));
         // Reaching the newest entry re-enables tail-following.
         self.log_follow_tail = clamped == 0;
+        self.dirty = true;
     }
 
     /// Move the log scroll offset up by `n` cells (toward older
@@ -313,6 +354,7 @@ impl TuiApp {
         self.log_list_state.select(Some(clamped));
         // Moving away from the newest entry disables tail-following.
         self.log_follow_tail = clamped == 0;
+        self.dirty = true;
     }
 
     /// Jump to the oldest log entry (largest valid offset).
@@ -324,6 +366,7 @@ impl TuiApp {
         *self.log_list_state.offset_mut() = max_offset;
         self.log_list_state.select(Some(max_offset));
         self.log_follow_tail = false;
+        self.dirty = true;
     }
 
     /// Jump to the newest log entry (offset 0). Re-enables tail-follow.
@@ -334,6 +377,7 @@ impl TuiApp {
         *self.log_list_state.offset_mut() = 0;
         self.log_list_state.select(Some(0));
         self.log_follow_tail = true;
+        self.dirty = true;
     }
 
     fn on_key_editing(&mut self, key: KeyEvent, field: EditField) -> bool {
@@ -341,6 +385,9 @@ impl TuiApp {
         //   Tab toggles the focused field.
         //   Enter applies the change (in-memory).
         //   Esc cancels.
+        // Every input in this arm changes the dialog content; mark
+        // dirty unconditionally.
+        self.dirty = true;
         let active = match field {
             EditField::Inbound => &mut self.edit_inbound,
             EditField::Outbound => &mut self.edit_outbound,
@@ -388,6 +435,7 @@ impl TuiApp {
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) -> bool {
+        self.dirty = true;
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 self.save_to_disk();
@@ -410,9 +458,10 @@ impl TuiApp {
         self.edit_outbound = row.outbound.clone();
         self.edit_cursor = self.edit_outbound.len();
         self.mode = Mode::Editing(EditField::Outbound);
+        self.dirty = true;
     }
 
-    fn delete_selected(&self) {
+    fn delete_selected(&mut self) {
         let rows = self.rows();
         let Some(row) = rows.get(self.selected) else {
             return;
@@ -429,6 +478,7 @@ impl TuiApp {
         self.edit_outbound = snap.live.default_model.clone().unwrap_or_default();
         self.edit_cursor = self.edit_outbound.len();
         self.mode = Mode::Editing(EditField::Outbound);
+        self.dirty = true;
         // Pressing Enter on this pseudo-row should set default_model,
         // not insert a new mapping. We flag that with a sentinel
         // value in edit_inbound.
@@ -454,19 +504,24 @@ impl TuiApp {
         self.edit_inbound.clear();
         self.edit_outbound.clear();
         self.edit_cursor = 0;
+        self.dirty = true;
     }
 
-    fn apply_mutation(&self, f: impl FnOnce(&mut super::runtime::RuntimeMappings)) {
+    fn apply_mutation(&mut self, f: impl FnOnce(&mut super::runtime::RuntimeMappings)) {
         // Read the current live snapshot, mutate a clone, and swap.
         let mut next: super::runtime::RuntimeMappings = (*self.store.load_live()).as_ref().clone();
         f(&mut next);
         self.store.set_live(next);
+        // The mappings table (and the `*` markers / dirty counter in
+        // the status row) visibly change — schedule a redraw.
+        self.dirty = true;
     }
 
     fn save_to_disk(&mut self) {
         let Some(path) = self.config_path.as_ref() else {
             self.toast = Some("save disabled: --no-config or no proxy.json".into());
             self.mode = Mode::SavedToast;
+            self.dirty = true;
             return;
         };
 
@@ -478,12 +533,14 @@ impl TuiApp {
                     Err(e) => {
                         self.toast = Some(format!("save failed: parse error: {e}"));
                         self.mode = Mode::SavedToast;
+                        self.dirty = true;
                         return;
                     }
                 },
                 Err(e) => {
                     self.toast = Some(format!("save failed: read error: {e}"));
                     self.mode = Mode::SavedToast;
+                    self.dirty = true;
                     return;
                 }
             }
@@ -503,6 +560,7 @@ impl TuiApp {
             Err(e) => {
                 self.toast = Some(format!("save failed: serialize error: {e}"));
                 self.mode = Mode::SavedToast;
+                self.dirty = true;
                 return;
             }
         };
@@ -513,6 +571,7 @@ impl TuiApp {
         if let Err(e) = std::fs::write(&tmp, &json) {
             self.toast = Some(format!("save failed: write error: {e}"));
             self.mode = Mode::SavedToast;
+            self.dirty = true;
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
@@ -520,11 +579,13 @@ impl TuiApp {
             let _ = std::fs::remove_file(&tmp);
             self.toast = Some(format!("save failed: rename error: {e}"));
             self.mode = Mode::SavedToast;
+            self.dirty = true;
             return;
         }
         self.store.mark_saved();
         self.toast = Some(format!("saved {path:?}"));
         self.mode = Mode::SavedToast;
+        self.dirty = true;
     }
 
     /// Render the TUI. `area` is the full terminal area.
@@ -1434,7 +1495,10 @@ mod tests {
 
     #[test]
     fn add_then_dirty() {
-        let app = TuiApp::new(
+        // `apply_mutation` now flips the TUI dirty flag, which
+        // requires `&mut self` (so the runner's redraw gate sees
+        // the update).
+        let mut app = TuiApp::new(
             make_store(),
             None,
             "0.0.0.0:8085".into(),
@@ -1612,6 +1676,107 @@ mod tests {
             app.push_log(make_log_line(&format!("line {i}")));
         }
         assert_eq!(app.log.len(), LOG_TAIL);
+    }
+
+    /// A freshly-constructed app must mark itself dirty so the
+    /// runner draws the very first frame (initial title, empty log,
+    /// "0 mappings" status row).
+    #[test]
+    fn new_app_is_initially_dirty() {
+        let app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
+        assert!(app.dirty, "new app should need a first-frame draw");
+    }
+
+    /// `take_dirty` returns the current value, then clears the flag.
+    /// A second consecutive call must return `false` so the runner
+    /// doesn't redraw twice on the same state.
+    #[test]
+    fn take_dirty_is_edge_triggered() {
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
+        // First call observes the initial dirty state and clears it.
+        assert!(app.take_dirty());
+        // Second call must observe a clean state — no further
+        // mutation has happened.
+        assert!(!app.take_dirty());
+    }
+
+    /// Every code path that mutates visible state must mark the app
+    /// dirty so the next runner iteration issues a `terminal.draw`.
+    /// This test pins the contract by clearing the flag (simulating
+    /// "we just drew") and verifying that each mutation flips it
+    /// back on.
+    #[test]
+    fn mutations_mark_dirty() {
+        let mut app = TuiApp::new(
+            make_store(),
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        );
+        // Drain the initial dirty bit so each subsequent assertion
+        // observes the effect of the mutation alone.
+        let _ = app.take_dirty();
+
+        // Mappings mutations (apply_mutation, delete_selected).
+        app.apply_mutation(|m| {
+            m.map.insert("claude-haiku-4-5".into(), "gpt-4o-mini".into());
+        });
+        assert!(app.dirty, "apply_mutation must mark dirty");
+        let _ = app.take_dirty();
+        app.selected = 0;
+        app.delete_selected();
+        assert!(app.dirty, "delete_selected must mark dirty");
+        let _ = app.take_dirty();
+
+        // Log scroll handlers.
+        for i in 0..5 {
+            app.push_log(make_log_line(&format!("line {i}")));
+        }
+        let _ = app.take_dirty();
+        app.log_scroll_down(1);
+        assert!(app.dirty, "log_scroll_down must mark dirty");
+        let _ = app.take_dirty();
+        app.log_scroll_up(1);
+        assert!(app.dirty, "log_scroll_up must mark dirty");
+        let _ = app.take_dirty();
+        app.log_jump_to_oldest();
+        assert!(app.dirty, "log_jump_to_oldest must mark dirty");
+        let _ = app.take_dirty();
+        app.log_jump_to_newest();
+        assert!(app.dirty, "log_jump_to_newest must mark dirty");
+        let _ = app.take_dirty();
+
+        // Mode transitions via the public on_key entry point.
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let key = |c| KeyEvent {
+            code: c,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        let _ = app.take_dirty();
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.dirty, "opening the add dialog must mark dirty");
+        let _ = app.take_dirty();
+        // Esc cancels and closes the dialog.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dirty, "closing a dialog must mark dirty");
+        let _ = app.take_dirty();
+
+        // push_log itself marks dirty — pinned here to guard the
+        // hot path (one of the most frequent sources of frames).
+        app.push_log(make_log_line("hello"));
+        assert!(app.dirty, "push_log must mark dirty");
     }
 
     /// The log scroll handlers must keep `ListState.offset` in
