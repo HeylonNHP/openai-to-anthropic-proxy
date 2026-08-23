@@ -19,6 +19,13 @@ use tokio::time::{Instant, interval_at};
 use super::app::TuiApp;
 use super::output::LogLine;
 
+#[derive(Debug, PartialEq, Eq)]
+enum KeyRead {
+    Key(KeyEvent),
+    Resize,
+    None,
+}
+
 /// Run the TUI until the user quits. `tui_rx` delivers log lines from
 /// the proxy handler; dropping `tui_tx` (which the TUI bridge owns
 /// via a forwarding task) causes the TUI loop to exit on the next
@@ -84,12 +91,14 @@ pub async fn run(
                 }
                 // Keyboard input.
                 maybe_key = read_key_async() => {
-                    let key = match maybe_key? {
-                        Some(k) => k,
-                        None => continue, // spurious wakeup
-                    };
-                    if app.on_key(key) {
-                        break;
+                    match maybe_key? {
+                        KeyRead::Key(key) => {
+                            if app.on_key(key) {
+                                break;
+                            }
+                        }
+                        KeyRead::Resize => app.mark_dirty(),
+                        KeyRead::None => continue, // spurious wakeup
                     }
                 }
                 // Periodic redraw so the uptime clock ticks. With the
@@ -113,17 +122,26 @@ pub async fn run(
 /// Async wrapper around `crossterm::event::poll` + `read`. Polling
 /// the synchronous API on a Tokio worker thread is fine here because
 /// the TUI loop is single-threaded and the call returns quickly.
-async fn read_key_async() -> std::io::Result<Option<KeyEvent>> {
+async fn read_key_async() -> std::io::Result<KeyRead> {
     if event::poll(Duration::from_millis(50))? {
         match event::read()? {
-            Event::Key(k) => Ok(Some(k)),
-            // Resize events: redraw, don't return a key.
-            Event::Resize(_, _) => Ok(None),
-            _ => Ok(None),
+            Event::Key(k) => Ok(KeyRead::Key(k)),
+            Event::Resize(_, _) => Ok(KeyRead::Resize),
+            _ => Ok(KeyRead::None),
         }
     } else {
         // Yield to the runtime so we don't busy-loop.
         tokio::task::yield_now().await;
-        Ok(None)
+        Ok(KeyRead::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_is_distinct_from_poll_wakeup() {
+        assert_ne!(KeyRead::Resize, KeyRead::None);
     }
 }

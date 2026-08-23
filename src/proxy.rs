@@ -808,19 +808,32 @@ where
                         let events = this.take_and_report_error(kind, message);
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
+                    if let responses::ResponsesStreamEvent::Error { message, .. } = &event {
+                        let events = this.take_and_report_error("upstream_error", message.clone());
+                        return Poll::Ready(Some(Ok(encode_sse_events(&events))));
+                    }
                     let terminal = matches!(
                         event,
                         responses::ResponsesStreamEvent::Completed { .. }
                             | responses::ResponsesStreamEvent::Incomplete { .. }
                     );
-                    let events = translator.feed_event(&event);
-                    // Capture terminal usage before yielding its events. If
-                    // the downstream disconnects immediately after receiving
-                    // the terminal event, Drop still has enough information
-                    // to count this completed response exactly once.
-                    if terminal {
+                    let events = if terminal {
+                        let mut translator =
+                            this.translator.take().expect("translator already taken");
+                        let mut events = translator.feed_event(&event);
+                        // Capture terminal usage before yielding its events. If
+                        // the downstream disconnects immediately after receiving
+                        // the terminal event, Drop still has enough information
+                        // to count this completed response exactly once.
                         this.stats = Some(translator.stats());
-                    }
+                        events.extend(translator.finish());
+                        events
+                    } else {
+                        let Some(translator) = this.translator.as_mut() else {
+                            return Poll::Ready(None);
+                        };
+                        translator.feed_event(&event)
+                    };
                     if events.is_empty() {
                         continue;
                     }
@@ -834,12 +847,19 @@ where
                     return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                 }
                 Poll::Ready(None) => {
-                    // Upstream closed without a terminal event — flush
-                    // whatever we have. (Real Responses upstreams emit
-                    // a `response.completed` / `incomplete` before
-                    // closing; this branch handles the rare truncated
-                    // case.)
-                    if let Some(events) = this.take_and_report() {
+                    let completed = this
+                        .translator
+                        .as_ref()
+                        .is_some_and(|translator| translator.stats().completed);
+                    if completed {
+                        if let Some(events) = this.take_and_report() {
+                            return Poll::Ready(Some(Ok(encode_sse_events(&events))));
+                        }
+                    } else if this.translator.is_some() {
+                        let events = this.take_and_report_error(
+                            "api_error",
+                            "upstream stream ended before a terminal response event",
+                        );
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
                     return Poll::Ready(None);
@@ -1219,4 +1239,5 @@ mod tests {
         let resp = AppError::Unauthorized.into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
 }

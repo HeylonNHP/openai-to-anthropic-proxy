@@ -271,6 +271,141 @@ async fn non_streaming_round_trip() {
 }
 
 #[tokio::test]
+async fn truncated_stream_returns_error_instead_of_success() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_x","status":"in_progress","role":"assistant","content":[]}}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_x","output_index":0,"content_index":0,"delta":"partial"}"#, 
+    ]
+    .join("\n\n")
+        + "\n\n";
+    *upstream.canned_stream.lock().await = Some(sse);
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "Hi"}]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+    let events: Vec<&str> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("event: ")))
+        .collect();
+
+    assert_eq!(
+        kinds,
+        vec![
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "error",
+            "message_stop",
+        ]
+    );
+    assert!(!kinds.contains(&"message_delta"));
+}
+
+#[tokio::test]
+async fn upstream_error_stream_returns_one_error_sequence() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let sse = r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}
+
+event: error
+data: {"type":"error","message":"upstream failed"}
+
+"#;
+    *upstream.canned_stream.lock().await = Some(sse.into());
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":16,"stream":true,"messages":[{"role": "user", "content":"x"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+    let kinds: Vec<&str> = text
+        .split("\n\n")
+        .filter(|s| !s.is_empty())
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("event: ")))
+        .collect();
+    assert_eq!(kinds, vec!["message_start", "error", "message_stop"]);
+}
+
+#[tokio::test]
+async fn late_upstream_error_after_completed_stream_is_ignored() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let sse = [
+        r#"event: response.created
+ data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}"#,
+        r#"event: response.completed
+ data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+        r#"event: error
+ data: {"type":"error","message":"late upstream error"}"#,
+    ]
+    .join("\n\n")
+    .replace(" data:", "data:")
+        + "\n\n";
+    *upstream.canned_stream.lock().await = Some(sse);
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":16,"stream":true,"messages":[{"role": "user", "content":"x"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+    let kinds: Vec<&str> = text
+        .split("\n\n")
+        .filter(|s| !s.is_empty())
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("event: ")))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["message_start", "message_delta", "message_stop"]
+    );
+}
+
+#[tokio::test]
 async fn streaming_round_trip() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     // Responses API SSE event format: `event: <type>\ndata: <json>\n\n`.
