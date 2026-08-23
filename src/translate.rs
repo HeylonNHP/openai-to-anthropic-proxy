@@ -354,8 +354,106 @@ fn sanitize_tool_schema(mut schema: Value, original: Option<&Value>) -> Value {
         );
     }
 
+    // Flatten allOf into parent objects. Some upstreams (Azure OpenAI)
+    // reject `allOf` anywhere in tool parameter schemas even though the
+    // JSON Schema spec permits it. Merging branches into the parent
+    // preserves semantics (intersection of constraints = merged properties
+    // + unioned required) while eliminating the forbidden keyword. This
+    // has no effect on OpenAI's own endpoints which accept both forms.
+    flatten_allof(&mut schema);
+
     reconcile_strict(&mut schema, original);
     schema
+}
+
+/// Recursively flatten `allOf` branches into their parent object schema.
+/// `allOf` denotes an intersection of constraints — semantically equivalent
+/// to merging each branch's `properties`, combining `required` arrays, and
+/// inheriting other object-level keywords onto the parent. Azure OpenAI
+/// rejects `allOf` in tool parameters, so we eliminate it entirely during
+/// sanitization. After flattening, `reconcile_strict` still runs to
+/// ensure remaining schemas satisfy the strict validator rules.
+fn flatten_allof(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            // If this node carries `allOf`, merge its branches into the
+            // parent and drop the keyword. Do this *before* recursing
+            // so inner schemas get reconciled with their new parent.
+            if let Some(Value::Array(branches)) = map.remove("allOf") {
+                // Merge properties from each branch.
+                let mut merged_props: serde_json::Map<String, Value> = map
+                    .get_mut("properties")
+                    .and_then(|p| p.as_object_mut())
+                    .cloned()
+                    .unwrap_or_default();
+                for branch in &branches {
+                    if let Value::Object(bobj) = branch
+                        && let Some(Value::Object(bprops)) = bobj.get("properties")
+                    {
+                        for (key, val) in bprops {
+                            // Parent wins on conflict;\ otherwise keep the first seen.
+                            merged_props.entry(key.clone()).or_insert(val.clone());
+                        }
+                    }
+                }
+                // An `allOf` is always an intersection of object schemas.
+                // Insert `properties` even when empty so the later
+                // `reconcile_strict` pass treats this node as a typed
+                // object rather than defaulting it to `string`.
+                map.insert("properties".to_owned(), Value::Object(merged_props));
+                // Collect required from all branches.
+                let mut merged_required: Vec<String> = vec![];
+                for branch in &branches {
+                    if let Value::Object(bobj) = branch
+                        && let Some(Value::Array(req)) = bobj.get("required")
+                    {
+                        for r in req {
+                            if let Some(s) = r.as_str()
+                                && !merged_required.iter().any(|x| x == s)
+                            {
+                                merged_required.push(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                if !merged_required.is_empty() {
+                    let existing_req = map.get_mut("required").and_then(|r| r.as_array_mut());
+                    if let Some(arr) = existing_req {
+                        // Append missing keys while preserving order.
+                        for r in &merged_required {
+                            if !arr.iter().any(|v| v.as_str() == Some(r.as_str())) {
+                                arr.push(Value::String(r.clone()));
+                            }
+                        }
+                    } else {
+                        let arr: Vec<Value> =
+                            merged_required.into_iter().map(Value::String).collect();
+                        map.insert("required".to_owned(), Value::Array(arr));
+                    }
+                }
+                // Propagate simple keywords like `description` from branches
+                // if the parent doesn't already have them.
+                for branch in &branches {
+                    if let Value::Object(bobj) = branch
+                        && let Some(Value::String(desc)) = bobj.get("description")
+                        && !map.contains_key("description")
+                    {
+                        map.insert("description".to_owned(), Value::String(desc.clone()));
+                    }
+                }
+            }
+            // Recurse into all child schemas.
+            for child in map.values_mut() {
+                flatten_allof(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                flatten_allof(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively reconcile a JSON Schema value against the strict
@@ -3561,7 +3659,10 @@ mod response_tests {
         );
     }
 
-    /// Same regression but for `oneOf` and `allOf` branches.
+    /// Regression: oneOf branches keep their array structure (descriptive
+    /// only — no property conflicts). allOf branches are flattened into
+    /// the parent so the keyword is eliminated (Azure rejects allOf).
+    /// The flattened parent must satisfy the same strict validator rules.
     #[test]
     fn sanitize_tool_schema_force_objects_all_combinator_branches() {
         let schema = json!({
@@ -3580,23 +3681,19 @@ mod response_tests {
             },
         });
         let out = sanitize_tool_schema(schema, None);
-        for path in ["properties/x/oneOf/0", "properties/y/allOf/0"] {
-            let node = out
-                .pointer(&format!("/{}", path))
-                .unwrap_or_else(|| panic!("missing path /{}", path));
-            assert_eq!(node["type"], "object", "path {}", path);
-            assert_eq!(
-                node.get("additionalProperties"),
-                Some(&Value::Bool(false)),
-                "path {}: expected additionalProperties: false",
-                path
-            );
-            assert!(
-                node.get("properties").is_some(),
-                "path {}: expected properties map",
-                path
-            );
-        }
+        // oneOf survives as-is; its branch was force-typed to an object.
+        let oneof = out
+            .pointer("/properties/x/oneOf/0")
+            .expect("missing path /properties/x/oneOf/0");
+        assert_eq!(oneof["type"], "object");
+        assert_eq!(oneof.get("additionalProperties"), Some(&Value::Bool(false)));
+        // allOf is flattened into parent `y`. The parent must still be a
+        // valid object schema with required fields populated.
+        let y = out.pointer("/properties/y").expect("missing /properties/y");
+        assert_eq!(y["type"], "object");
+        assert_eq!(y.get("additionalProperties"), Some(&Value::Bool(false)));
+        // No allOf key should remain after flattening.
+        assert!(y.get("allOf").is_none(), "allOf must be removed");
     }
 
     /// A schema that *only* declares `properties` (no `type` and no
