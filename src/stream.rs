@@ -1001,7 +1001,10 @@ fn collect_url_citations(target: &mut Vec<(String, String)>, annotations: &[Valu
                 ann.get("title").and_then(|v| v.as_str()),
             )
         {
-            target.push((url.to_string(), title.to_string()));
+            let citation = (url.to_string(), title.to_string());
+            if !target.iter().any(|existing| existing.0 == citation.0) {
+                target.push(citation);
+            }
         }
     }
 }
@@ -2158,6 +2161,64 @@ mod tests {
                 && text_stop.unwrap() < result_start.unwrap(),
             "expected text stop before populated result block, got {evs:?}"
         );
+    }
+
+    #[test]
+    fn duplicate_web_search_citations_are_emitted_once_in_arrival_order() {
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+        t.feed_event(&created_event());
+        let _ = t.feed_event(&web_search_call_added(0));
+        let _ = t.feed_event(&message_item_added(1));
+
+        let first = json!({
+            "type": "url_citation",
+            "url": "https://example.com/first",
+            "title": "First",
+        });
+        let second = json!({
+            "type": "url_citation",
+            "url": "https://example.com/second",
+            "title": "Second",
+        });
+        t.feed_event(&ResponsesStreamEvent::OutputTextAnnotationAdded {
+            item_id: "msg_1".into(),
+            output_index: 1,
+            content_index: 0,
+            annotation_index: 0,
+            annotation: first.clone(),
+        });
+        t.feed_event(&ResponsesStreamEvent::OutputTextAnnotationAdded {
+            item_id: "msg_1".into(),
+            output_index: 1,
+            content_index: 0,
+            annotation_index: 1,
+            annotation: first,
+        });
+
+        let _ = t.feed_event(&message_item_done_with_annotations(
+            1,
+            json!([second.clone(), {
+                "type": "url_citation",
+                "url": "https://example.com/first",
+                "title": "First (final annotation)",
+            }]),
+        ));
+        let evs = t.feed_event(&completed_event("completed"));
+
+        let result = evs.iter().find_map(|event| match event {
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::WebSearchToolResult { block },
+                ..
+            } => Some(block),
+            _ => None,
+        });
+        let result = result.expect("expected web search result block");
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content[0].url, "https://example.com/first");
+        assert_eq!(result.content[0].title, "First");
+        assert_eq!(result.content[1].url, "https://example.com/second");
+        assert_eq!(result.content[1].title, "Second");
     }
 
     /// Regression: a `FunctionCall` whose name is `WebSearch` must emit
