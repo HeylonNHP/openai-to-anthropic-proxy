@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use openai_to_anthropic_proxy::{
-    Config, MappingsStore, OutputSink, RuntimeMappings, SessionStatsStore,
+    CapabilityStore, Config, MappingsStore, OutputSink, RuntimeMappings, SessionStatsStore,
 };
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -48,6 +48,10 @@ async fn main() -> Result<()> {
     let store = MappingsStore::seeded(Arc::new(RuntimeMappings::from_config(&config)));
     let store_arc = Arc::new(store);
     let stats = Arc::new(SessionStatsStore::new());
+    // Process-lifetime record of parameter support learned from upstream
+    // rejections. Created here (not inside the router) so it outlives any
+    // single connection and is shared by whichever server path we take.
+    let capabilities = Arc::new(CapabilityStore::new());
 
     if config.proxy_key.is_none() {
         // Loud, single-line warning, written to stderr so it surfaces
@@ -86,12 +90,13 @@ async fn main() -> Result<()> {
     if no_tui {
         // No TUI: build a plain router that writes request lines to
         // stdout, preserving the original behavior.
-        let app = openai_to_anthropic_proxy::proxy::router_with_stats(
+        let app = openai_to_anthropic_proxy::proxy::router_with_stores(
             Arc::new(config.clone()),
             store_arc.clone(),
             client,
             OutputSink::plain(),
             stats.clone(),
+            capabilities.clone(),
         );
         axum::serve(listener, app)
             .with_graceful_shutdown(server_shutdown)
@@ -105,12 +110,13 @@ async fn main() -> Result<()> {
     // TUI on the main task.
     let (tui_tx, tui_rx) = mpsc::unbounded_channel::<openai_to_anthropic_proxy::tui::LogLine>();
     let tui_sink = TuiBridge::new(tui_tx.clone());
-    let app = openai_to_anthropic_proxy::proxy::router_with_stats(
+    let app = openai_to_anthropic_proxy::proxy::router_with_stores(
         Arc::new(config.clone()),
         store_arc.clone(),
         client,
         tui_sink.into_sink(),
         stats.clone(),
+        capabilities.clone(),
     );
     let server = axum::serve(listener, app).with_graceful_shutdown(server_shutdown);
     let server_task = tokio::spawn(async move {

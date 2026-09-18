@@ -21,6 +21,7 @@ use eventsource_stream::{EventStream, Eventsource};
 use futures_util::{Stream, StreamExt};
 
 use crate::anthropic::{CreateMessageRequest, StreamEvent};
+use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::responses;
@@ -47,6 +48,10 @@ pub struct AppState {
     pub output: crate::tui::OutputSink,
     /// Process-lifetime token totals shared with the TUI.
     pub stats: Arc<crate::tui::SessionStatsStore>,
+    /// Process-lifetime record of parameter support learned from
+    /// upstream rejections (see [`crate::capabilities`]). Shared across
+    /// every request so a fact learned once is applied everywhere.
+    pub capabilities: Arc<CapabilityStore>,
 }
 
 // Per-request stash of the JSON body we sent upstream. Used only on
@@ -84,12 +89,37 @@ pub fn router_with_stats(
     output: crate::tui::OutputSink,
     stats: Arc<crate::tui::SessionStatsStore>,
 ) -> Router {
+    router_with_stores(
+        config,
+        mappings,
+        client,
+        output,
+        stats,
+        Arc::new(CapabilityStore::new()),
+    )
+}
+
+/// Build a router with every long-lived store supplied by the caller.
+///
+/// `capabilities` is the process-lifetime record of parameter support
+/// learned from upstream rejections. `main.rs` creates one and shares
+/// it across the server paths so the knowledge survives for the whole
+/// process rather than for a single connection.
+pub fn router_with_stores(
+    config: Arc<Config>,
+    mappings: Arc<MappingsStore>,
+    client: reqwest::Client,
+    output: crate::tui::OutputSink,
+    stats: Arc<crate::tui::SessionStatsStore>,
+    capabilities: Arc<CapabilityStore>,
+) -> Router {
     let state = AppState {
         config,
         mappings,
         client,
         output,
         stats,
+        capabilities,
     };
     Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -287,14 +317,32 @@ async fn handle_messages_inner(
         state.config.upstream_path
     );
 
-    // Send the first attempt. The non-streaming path may issue a
-    // single retry with the configured `default_model` if the
-    // upstream rejects the requested model; the streaming path
-    // can't safely retry once the response stream has started (see
-    // TODO at the end of this file).
+    // Send the first attempt. Retries are issued here -- before any
+    // response bytes are written, so the streaming path is safe too
+    // (see TODO at the end of this file): once per sampling parameter
+    // the upstream says it does not support, and once with the
+    // configured `default_model` if the upstream rejects the requested
+    // model entirely.
     let mut outbound = outbound;
     let mut fallback_used = false;
+    // One parameter-strip retry is allowed *per droppable parameter*, so
+    // a model that rejects both `temperature` and `top_p` is still
+    // retried back to a working request. The `is_set` guard below means
+    // each retry removes a distinct parameter and none is ever re-added,
+    // so the loop cannot spin; the explicit cap is belt-and-braces.
+    let mut param_retries = 0usize;
     let mut attempt = 1u8;
+    // Apply anything already learned about this model before the first
+    // send, so a fact cached on an earlier request (or by a concurrent
+    // one) is honoured immediately instead of re-triggering the 400.
+    let already_dropped = state.capabilities.apply_known(&mut outbound);
+    if !already_dropped.is_empty() {
+        tracing::debug!(
+            model = %outbound.model,
+            params = ?already_dropped,
+            "omitting parameters previously rejected by this model"
+        );
+    }
     let upstream_resp = loop {
         let resp = send_upstream_once(&state, &url, &headers, &outbound).await?;
         let status = resp.status();
@@ -313,6 +361,30 @@ async fn handle_messages_inner(
             sent_body = %sent,
             "← upstream error (full payload)"
         );
+
+        // Retry without a parameter the upstream says it does not
+        // support (e.g. `temperature` on an always-reasoning model).
+        // Two guard rails keep this conservative: the error must name a
+        // parameter we actually sent, and the body must say it is
+        // *unsupported* rather than merely invalid (see
+        // `capabilities::unsupported_parameter`). Each fact is recorded
+        // for the rest of the process, so the retry costs at most one
+        // wasted request per (model, parameter) per process lifetime.
+        if param_retries < capabilities::RequestParam::ALL.len()
+            && let Some(param) = capabilities::unsupported_parameter(status, &body)
+            && param.is_set(&outbound)
+        {
+            let newly_learned = state.capabilities.record_unsupported(&outbound.model, param);
+            tracing::warn!(
+                model = %outbound.model,
+                param = %param.as_str(),
+                newly_learned,
+                "upstream rejected request parameter; retrying without it"
+            );
+            param.clear_from(&mut outbound);
+            param_retries += 1;
+            continue;
+        }
 
         // Decide whether to retry with the default model. The retry
         // happens before any response bytes are written to the client
@@ -364,6 +436,10 @@ async fn handle_messages_inner(
             if !fallback_prompt_caching.models.is_empty() {
                 outbound.prompt_cache_key = fallback_prompt_caching.cache_key.clone();
             }
+            // The rebuilt request carries the client's full parameter
+            // set again, so apply anything already learned about the
+            // fallback model before it goes on the wire.
+            state.capabilities.apply_known(&mut outbound);
             fallback_used = true;
             attempt = 2;
             continue;
