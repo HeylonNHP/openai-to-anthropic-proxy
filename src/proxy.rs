@@ -381,6 +381,20 @@ async fn handle_messages_inner(
                 newly_learned,
                 "upstream rejected request parameter; retrying without it"
             );
+            // Surface the discovery in the operator's log pane (and on
+            // stdout with --no-tui). Only on first sight of the fact:
+            // a model that rejects both temperature and top_p produces
+            // one line each, and repeats would just be noise.
+            if newly_learned {
+                state.output.emit(crate::tui::LogLine {
+                    kind: crate::tui::LogKind::Warning,
+                    text: format!(
+                        "  \u{26a0} learned: {} does not support {}  (dropping it from now on; press c to re-probe)",
+                        outbound.model,
+                        param.as_str()
+                    ),
+                });
+            }
             param.clear_from(&mut outbound);
             param_retries += 1;
             continue;

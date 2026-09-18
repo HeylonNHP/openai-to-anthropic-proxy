@@ -26,6 +26,7 @@ use super::output::LogLine;
 pub async fn run(
     store: std::sync::Arc<super::runtime::MappingsStore>,
     stats: std::sync::Arc<super::stats::SessionStatsStore>,
+    capabilities: std::sync::Arc<crate::capabilities::CapabilityStore>,
     config_path: Option<std::path::PathBuf>,
     listen_addr: String,
     upstream_base_url: String,
@@ -39,7 +40,14 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = TuiApp::new_with_stats(store, stats, config_path, listen_addr, upstream_base_url);
+    let mut app = TuiApp::new_with_stores(
+        store,
+        stats,
+        capabilities,
+        config_path,
+        listen_addr,
+        upstream_base_url,
+    );
     let tick_rate = Duration::from_millis(250);
     let mut ticker = interval_at(Instant::now() + tick_rate, tick_rate);
 

@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
     let tui_result = openai_to_anthropic_proxy::tui::runner::run(
         store_arc.clone(),
         stats,
+        capabilities,
         config_path,
         config.listen_addr.to_string(),
         config.upstream_base_url.clone(),

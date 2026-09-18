@@ -254,6 +254,20 @@ impl CapabilityRegistry {
         self.unsupported_for(model).contains(&param)
     }
 
+    /// Every learned fact, sorted by model name. Used by the TUI to
+    /// render the current blacklist. `BTreeMap` iteration is already in
+    /// model order, so no extra sort is needed.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &[RequestParam])> {
+        self.unsupported
+            .iter()
+            .map(|(model, params)| (model.as_str(), params.as_slice()))
+    }
+
+    /// Number of models with at least one learned rejection.
+    pub fn model_count(&self) -> usize {
+        self.unsupported.len()
+    }
+
     /// Copy-on-write variant with `param` recorded for `model`.
     fn with_learned(&self, model: &str, param: RequestParam) -> Self {
         let mut next = self.clone();
@@ -326,6 +340,20 @@ impl CapabilityStore {
             param.clear_from(req);
         }
         known
+    }
+
+    /// Forget every learned fact, returning how many models were
+    /// affected.
+    ///
+    /// The TUI exposes this as `c` (clear). It is the operator's escape
+    /// hatch for the one-way latch: after an upstream change, clearing
+    /// re-probes each model on its next request instead of waiting for
+    /// a proxy restart. Dropping the last facts is not a concern -- the
+    /// store is tiny and the only cost of being wrong is one 400.
+    pub fn clear(&self) -> usize {
+        let removed = self.registry.load().model_count();
+        self.registry.store(Arc::new(CapabilityRegistry::default()));
+        removed
     }
 }
 
@@ -443,6 +471,40 @@ mod tests {
             &[RequestParam::Temperature, RequestParam::TopP]
         );
         assert_eq!(store.load().unsupported_for("b"), &[RequestParam::TopP]);
+    }
+
+    #[test]
+    fn entries_lists_learned_facts_sorted_by_model() {
+        let store = CapabilityStore::new();
+        store.record_unsupported("zeta", RequestParam::TopP);
+        store.record_unsupported("alpha", RequestParam::Temperature);
+        store.record_unsupported("alpha", RequestParam::TopP);
+
+        let listed: Vec<_> = store
+            .load()
+            .entries()
+            .map(|(m, p)| (m.to_owned(), p.to_vec()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("alpha".to_owned(), vec![RequestParam::Temperature, RequestParam::TopP]),
+                ("zeta".to_owned(), vec![RequestParam::TopP]),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_forgets_everything_and_reports_affected_models() {
+        let store = CapabilityStore::new();
+        store.record_unsupported("a", RequestParam::Temperature);
+        store.record_unsupported("b", RequestParam::TopP);
+        assert_eq!(store.clear(), 2);
+
+        assert_eq!(store.load().model_count(), 0);
+        assert!(!store.load().is_unsupported("a", RequestParam::Temperature));
+        // Clearing an empty store is a no-op, not an error.
+        assert_eq!(store.clear(), 0);
     }
 
     #[test]

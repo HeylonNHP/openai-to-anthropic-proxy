@@ -23,6 +23,7 @@ use super::output::{LogKind, LogLine};
 use super::panels::{Panel, truncate_to_width};
 use super::runtime::{MappingsStore, RuntimeMappings};
 use super::stats::{SessionStatsStore, TokenTotals};
+use crate::capabilities::CapabilityStore;
 use crate::config::JsonConfig;
 
 /// Maximum number of log lines retained for the on-screen tail.
@@ -72,6 +73,10 @@ pub struct TuiApp {
     store: std::sync::Arc<MappingsStore>,
     /// Session-only token totals shared with request handlers.
     stats: std::sync::Arc<SessionStatsStore>,
+    /// Process-lifetime record of request parameters learned to be
+    /// unsupported per upstream model. Shared with the request handlers
+    /// so the dashboard shows what the running proxy has discovered.
+    capabilities: std::sync::Arc<CapabilityStore>,
     /// Path to `proxy.json` for save operations. `None` disables saving
     /// (the TUI still works for in-memory changes).
     config_path: Option<PathBuf>,
@@ -137,12 +142,35 @@ impl TuiApp {
         listen_addr: String,
         upstream_base_url: String,
     ) -> Self {
+        Self::new_with_stores(
+            store,
+            stats,
+            std::sync::Arc::new(CapabilityStore::new()),
+            config_path,
+            listen_addr,
+            upstream_base_url,
+        )
+    }
+
+    /// Construct an app sharing every long-lived store with the request
+    /// handlers. This is the constructor `runner::run` uses; the older
+    /// ones stay in place so tests (and any caller that does not care
+    /// about the capability view) keep compiling unchanged.
+    pub fn new_with_stores(
+        store: std::sync::Arc<MappingsStore>,
+        stats: std::sync::Arc<SessionStatsStore>,
+        capabilities: std::sync::Arc<CapabilityStore>,
+        config_path: Option<PathBuf>,
+        listen_addr: String,
+        upstream_base_url: String,
+    ) -> Self {
         let mut log_list_state = ListState::default();
         // Show the newest entry at the top by default (offset 0).
         log_list_state.select(Some(0));
         Self {
             store,
             stats,
+            capabilities,
             config_path,
             listen_addr,
             upstream_base_url,
@@ -275,6 +303,20 @@ impl TuiApp {
                 if self.store.snapshot().is_dirty() {
                     self.mode = Mode::ConfirmSave;
                 }
+                false
+            }
+            // Clear the learned parameter blacklist. The operator's
+            // escape hatch around the one-way latch: after an upstream
+            // change, clearing re-probes each model on its next request
+            // instead of waiting for a proxy restart.
+            KeyCode::Char('c') => {
+                let removed = self.capabilities.clear();
+                self.toast = Some(if removed == 0 {
+                    "nothing learned to clear".to_string()
+                } else {
+                    format!("cleared {removed} model(s); params will be re-probed")
+                });
+                self.mode = Mode::SavedToast;
                 false
             }
             _ => false,
@@ -665,6 +707,31 @@ impl TuiApp {
             ));
         }
 
+        // ---- Learned unsupported parameters ----
+        // Rendered only when something has actually been learned, so a
+        // fresh proxy looks exactly as it did before. Keyed by upstream
+        // model, matching the token sections above.
+        // Bind the read guard so its borrowed entries outlive the map.
+        let registry = self.capabilities.load();
+        let learned: Vec<(&str, Vec<&'static str>)> = registry
+            .entries()
+            .map(|(model, params)| (model, params.iter().map(|p| p.as_str()).collect()))
+            .collect();
+        if !learned.is_empty() {
+            dash.rule();
+            dash.row(&format!(
+                "LEARNED UNSUPPORTED PARAMS  (process lifetime; {} model(s); [c] clear to re-probe)",
+                learned.len()
+            ));
+            for (model, params) in &learned {
+                dash.row(&format!(
+                    "    {:<30}{}",
+                    truncate(model, 30),
+                    params.join(", ")
+                ));
+            }
+        }
+
         // ---- Log navigation hint ----
         dash.row("[PgUp/PgDn] scroll log  [Home/End] jump log top/bottom");
 
@@ -781,7 +848,7 @@ impl TuiApp {
         };
         let footer_text = truncate(
             &format!(
-                "[a] add  [e] edit  [d] delete  [f] default  [s] save  [q] quit   |   log: {tail_note}   |   PgUp/PgDn scroll"
+                "[a] add  [e] edit  [d] delete  [f] default  [s] save  [c] clear learned  [q] quit   |   log: {tail_note}   |   PgUp/PgDn scroll"
             ),
             area.width.saturating_sub(2) as usize,
         );
@@ -1676,5 +1743,106 @@ mod tests {
         assert_eq!(r.height, 20);
         // Width is clamped to parent.width.
         assert_eq!(r.width, 40);
+    }
+
+    fn make_app_with_capabilities(
+        capabilities: std::sync::Arc<crate::capabilities::CapabilityStore>,
+    ) -> TuiApp {
+        TuiApp::new_with_stores(
+            make_store(),
+            std::sync::Arc::new(SessionStatsStore::new()),
+            capabilities,
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        )
+    }
+
+    fn render_to_string(app: &mut TuiApp, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.render(frame, area);
+            })
+            .expect("draw failed");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn press(app: &mut TuiApp, ch: char) -> bool {
+        app.on_key(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    /// The learned-parameter section is invisible until something has
+    /// actually been learned, so a fresh proxy renders exactly as before.
+    #[test]
+    fn learned_params_section_hidden_when_nothing_learned() {
+        let mut app = make_app_with_capabilities(std::sync::Arc::new(
+            crate::capabilities::CapabilityStore::new(),
+        ));
+        let rendered = render_to_string(&mut app, 120, 40);
+        assert!(
+            !rendered.contains("LEARNEDUNSUPPORTEDPARAMS"),
+            "section must not appear with an empty store"
+        );
+    }
+
+    /// Once the proxy has learned a rejection, the dashboard lists it
+    /// per upstream model so the operator can see what is being dropped.
+    #[test]
+    fn learned_params_section_lists_model_and_params() {
+        let caps = std::sync::Arc::new(crate::capabilities::CapabilityStore::new());
+        caps.record_unsupported(
+            "gpt-6-astra",
+            crate::capabilities::RequestParam::Temperature,
+        );
+        caps.record_unsupported("gpt-6-astra", crate::capabilities::RequestParam::TopP);
+        let mut app = make_app_with_capabilities(caps);
+
+        let rendered = render_to_string(&mut app, 120, 40);
+        assert!(
+            rendered.replace(' ', "").contains("LEARNEDUNSUPPORTEDPARAMS"),
+            "section header should render once something is learned:\n{rendered}"
+        );
+        assert!(rendered.contains("gpt-6-astra"));
+        // The model column is space-padded, so compare with whitespace
+        // collapsed rather than matching the literal gap.
+        assert!(
+            rendered.replace(' ', "").contains("temperature,top_p"),
+            "both learned params should be listed for the model:\n{rendered}"
+        );
+    }
+
+    /// `c` clears the blacklist, which is the operator's way to force a
+    /// re-probe after an upstream change without restarting the proxy.
+    #[test]
+    fn clear_key_empties_the_learned_registry() {
+        let caps = std::sync::Arc::new(crate::capabilities::CapabilityStore::new());
+        caps.record_unsupported(
+            "gpt-6-astra",
+            crate::capabilities::RequestParam::Temperature,
+        );
+        let mut app = make_app_with_capabilities(caps.clone());
+        assert!(render_to_string(&mut app, 120, 40).contains("gpt-6-astra"));
+
+        assert!(!press(&mut app, 'c'), "clear must not quit the app");
+        assert_eq!(caps.load().model_count(), 0);
+        assert!(
+            !render_to_string(&mut app, 120, 40).contains("gpt-6-astra"),
+            "cleared facts must disappear from the dashboard"
+        );
     }
 }
