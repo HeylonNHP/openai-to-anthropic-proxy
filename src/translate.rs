@@ -323,6 +323,23 @@ fn system_text(system: &SystemPrompt) -> String {
 ///    to express "any JSON value", but that's a Claude Code SDK
 ///    change we can't make. If a `type` is already present in any
 ///    form (string or array), we leave it alone.
+///
+///    One exception, and it matters: a node that carries `anyOf` (or
+///    `oneOf`, which rule 9 rewrites to `anyOf`) already has a
+///    complete type expression, so `type` is dropped from it and rule
+///    7 is skipped for it. A `type` that agrees with the branches is
+///    merely redundant; a `type` DISJOINT from every branch is fatal,
+///    because the upstream does not answer with a schema error - it
+///    gives up, returning `status: "incomplete"`,
+///    `incomplete_details.reason: "max_output_tokens"`, an empty
+///    `output` and an all-zero `usage`. Claude Code renders that as
+///    "response exceeded the ... output token maximum" (live: Claude
+///    Code's `Artifact` tool declares `files` as
+///    `type: ["string", "null"]` alongside an `anyOf` of an array
+///    branch and an object branch - disjoint from `string`, so every
+///    request carrying that tool died with 0 in / 0 out). `allOf`
+///    deliberately does not count here: rule 10 removes it, so an
+///    `allOf`-only node still needs its injected `type`.
 /// 8. If a schema node declares (or includes) `type: "array"`, make
 ///    sure it carries an object-valued `items`. The strict validator
 ///    requires `items` on every array schema — `array schema missing
@@ -495,7 +512,42 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&V
                      src/translate.rs."
                 );
             }
-            if !map.contains_key("type") {
+            // Rules 7a + 7: `type` and combinators.
+            //
+            // `anyOf` is itself a complete type expression, and `oneOf`
+            // becomes one under rule 9, so a node carrying either must not
+            // also carry a `type`:
+            //
+            // - A `type` DISJOINT from every branch breaks the upstream
+            //   compiler outright. It does not return a schema error, it
+            //   gives up: `status: "incomplete"`,
+            //   `incomplete_details.reason: "max_output_tokens"`, an empty
+            //   `output` and an all-zero `usage`. The client renders that
+            //   as "response exceeded the ... output token maximum" (live:
+            //   Claude Code's `Artifact` tool sends `files` as
+            //   `type: ["string", "null"]` alongside an `anyOf` whose
+            //   branches are an array and an object - disjoint from
+            //   `string`, so every request carrying that tool died).
+            // - A `type` that AGREES with the branches is merely redundant.
+            //
+            // So a client-sent `type` is dropped here and the injection
+            // below is skipped. `allOf` deliberately does NOT count: rule
+            // 10 removes it, so a node whose only combinator is `allOf`
+            // still needs a `type` and would become invalid without one.
+            let combinator_expresses_type = ["anyOf", "oneOf"]
+                .iter()
+                .any(|keyword| map.contains_key(*keyword));
+            if combinator_expresses_type && let Some(dropped) = map.remove("type") {
+                tracing::warn!(
+                    type_keyword = ?dropped,
+                    "dropping `type` from a schema node that carries `anyOf`/`oneOf`; the \
+                     combinator already expresses the type, and a `type` disjoint from every \
+                     branch makes the upstream answer with an empty `incomplete` response \
+                     instead of a schema error. See sanitize_tool_schema doc comment in \
+                     src/translate.rs."
+                );
+            }
+            if !map.contains_key("type") && !combinator_expresses_type {
                 if is_object_schema(map) {
                     tracing::warn!(
                         "schema node missing `type` key but has `properties`; defaulting to `object`. The \
@@ -2270,6 +2322,107 @@ mod tests {
         });
         let out = sanitize_tool_schema(schema, None);
         assert!(out["properties"]["name"].get("pattern").is_none());
+    }
+
+    /// Regression test for the `Artifact` tool. The upstream does not
+    /// reject this shape, it gives up on it: `status: "incomplete"`,
+    /// `incomplete_details.reason: "max_output_tokens"`, an empty
+    /// `output` and an all-zero `usage`, which Claude Code renders as
+    /// "response exceeded the ... output token maximum". Trigger: a
+    /// `type` disjoint from every `anyOf` branch (verified against the
+    /// live gateway - an agreeing `type` is accepted). The combinator is
+    /// the authoritative type expression, so `type` is dropped.
+    #[test]
+    fn sanitize_tool_schema_drops_type_disjoint_from_any_of_branches() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": ["string", "null"],
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "object", "additionalProperties": {"type": "string"}},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["files"];
+        assert!(node.get("type").is_none(), "`type` must be dropped: {node}");
+        assert!(node.get("anyOf").is_some(), "`anyOf` must survive: {node}");
+    }
+
+    /// The same guard has to catch `oneOf`, which rule 9 rewrites to
+    /// `anyOf` *after* rule 7a has already dropped the contradicting
+    /// `type`.
+    #[test]
+    fn sanitize_tool_schema_drops_type_from_one_of_node() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "oneOf": [
+                        {"type": "number"},
+                        {"type": "boolean"},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["value"];
+        assert!(node.get("type").is_none(), "`type` must be dropped: {node}");
+        assert!(node.get("oneOf").is_none(), "rule 9 removes `oneOf`");
+        assert_eq!(node["anyOf"].as_array().expect("oneOf -> anyOf").len(), 2);
+    }
+
+    /// An agreeing `type` is redundant rather than fatal, but it still
+    /// goes: the combinator stays the single source of truth.
+    #[test]
+    fn sanitize_tool_schema_drops_agreeing_type_from_any_of_node() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(out["properties"]["value"].get("type").is_none());
+    }
+
+    /// Non-over-reach guard: `allOf` must NOT count as a type expression,
+    /// because rule 10 removes it. Dropping `type` from an `allOf`-only
+    /// node would leave `{}` and the validator would reject it with
+    /// `schema must have a 'type' key`.
+    #[test]
+    fn sanitize_tool_schema_keeps_type_when_all_of_is_the_only_combinator() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "note": {"allOf": [{"type": "string"}]},
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["note"];
+        assert_eq!(node["type"], "string", "must keep a `type`: {node}");
+        assert!(node.get("allOf").is_none());
+    }
+
+    /// Non-over-reach guard: a combinator-free typeless node still gets
+    /// the rule 7 `type` injection (the `Workflow.args` regression).
+    #[test]
+    fn sanitize_tool_schema_still_injects_type_when_no_combinator() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "args": {"description": "no type here"},
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert_eq!(out["properties"]["args"]["type"], "string");
     }
 
     /// Regression test for the `Agent` tool 400: Claude Code emits
