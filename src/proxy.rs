@@ -874,9 +874,6 @@ where
                                 continue;
                             }
                         };
-                    let Some(translator) = this.translator.as_mut() else {
-                        return Poll::Ready(None);
-                    };
                     // Detect `response.failed` and route to
                     // `emit_error` so the bridge surfaces a clean
                     // error event rather than a half-streamed message.
