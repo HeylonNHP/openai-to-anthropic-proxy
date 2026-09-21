@@ -14,15 +14,16 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::output::{LogKind, LogLine};
 use super::panels::{Panel, truncate_to_width};
 use super::runtime::{MappingsStore, RuntimeMappings};
-use super::stats::{SessionStatsStore, TokenTotals};
+use super::stats::{SessionStatsSnapshot, SessionStatsStore, TokenTotals};
+use crate::capabilities::CapabilityStore;
 use crate::config::JsonConfig;
 
 /// Maximum number of log lines retained for the on-screen tail.
@@ -72,6 +73,10 @@ pub struct TuiApp {
     store: std::sync::Arc<MappingsStore>,
     /// Session-only token totals shared with request handlers.
     stats: std::sync::Arc<SessionStatsStore>,
+    /// Process-lifetime record of request parameters learned to be
+    /// unsupported per upstream model. Shared with the request handlers
+    /// so the dashboard shows what the running proxy has discovered.
+    capabilities: std::sync::Arc<CapabilityStore>,
     /// Path to `proxy.json` for save operations. `None` disables saving
     /// (the TUI still works for in-memory changes).
     config_path: Option<PathBuf>,
@@ -144,12 +149,35 @@ impl TuiApp {
         listen_addr: String,
         upstream_base_url: String,
     ) -> Self {
+        Self::new_with_stores(
+            store,
+            stats,
+            std::sync::Arc::new(CapabilityStore::new()),
+            config_path,
+            listen_addr,
+            upstream_base_url,
+        )
+    }
+
+    /// Construct an app sharing every long-lived store with the request
+    /// handlers. This is the constructor `runner::run` uses; the older
+    /// ones stay in place so tests (and any caller that does not care
+    /// about the capability view) keep compiling unchanged.
+    pub fn new_with_stores(
+        store: std::sync::Arc<MappingsStore>,
+        stats: std::sync::Arc<SessionStatsStore>,
+        capabilities: std::sync::Arc<CapabilityStore>,
+        config_path: Option<PathBuf>,
+        listen_addr: String,
+        upstream_base_url: String,
+    ) -> Self {
         let mut log_list_state = ListState::default();
         // Show the newest entry at the top by default (offset 0).
         log_list_state.select(Some(0));
         Self {
             store,
             stats,
+            capabilities,
             config_path,
             listen_addr,
             upstream_base_url,
@@ -315,6 +343,20 @@ impl TuiApp {
                 if self.store.snapshot().is_dirty() {
                     self.mode = Mode::ConfirmSave;
                 }
+                false
+            }
+            // Clear the learned parameter blacklist. The operator's
+            // escape hatch around the one-way latch: after an upstream
+            // change, clearing re-probes each model on its next request
+            // instead of waiting for a proxy restart.
+            KeyCode::Char('c') => {
+                let removed = self.capabilities.clear();
+                self.toast = Some(if removed == 0 {
+                    "nothing learned to clear".to_string()
+                } else {
+                    format!("cleared {removed} model(s); params will be re-probed")
+                });
+                self.mode = Mode::SavedToast;
                 false
             }
             _ => false,
@@ -623,111 +665,122 @@ impl TuiApp {
             ),
             inner_w,
         );
+        // ---- Status strip ----
+        // One compact line. The dashboard's job is the table below, so
+        // the old two-row STATUS/MAPPINGS block folds into a single
+        // strip and the key hints move to the footer.
+        let config_label = self
+            .config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into());
+        let fallback = snap.live.default_model.as_deref().unwrap_or("<none>");
         dash.row(&format!(
-            "STATUS  ONLINE   LISTEN  {:<21}   UPSTREAM  {}   CONFIG  {}",
-            self.listen_addr,
-            self.upstream_base_url,
-            self.config_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none>".into())
-        ));
-        dash.row(&format!(
-            "MAPPINGS  {}          UNSAVED CHANGES  {}             PRESS  q TO QUIT",
-            snap.live.map.len(),
-            if snap.is_dirty() { "1" } else { "0" }
+            "\u{25cf} ONLINE   {listen}   \u{2192} {upstream}   cfg {config} \u{00b7} {save}   {n} mappings   fallback {fallback}",
+            listen = self.listen_addr,
+            upstream = self.upstream_base_url,
+            config = config_label,
+            save = if snap.is_dirty() { "unsaved" } else { "saved" },
+            n = snap.live.map.len(),
         ));
         dash.rule();
 
-        // ---- Mappings panel ----
-        dash.row("MODEL MAPPINGS  (use j/k to select, Enter to edit, a/d to add/delete)");
-        dash.row("  #   INBOUND MODEL             UPSTREAM MODEL             STATE");
-        for (i, row) in self.rows().iter().enumerate() {
-            let marker = if row.dirty { " * " } else { "   " };
-            let cursor = if i == self.selected { "> " } else { "  " };
-            let line = format!(
-                "  {}{}{:<26}{:<30}{}",
-                cursor,
-                marker,
-                truncate(&row.inbound, 26),
-                truncate(&row.outbound, 30),
-                "ACTIVE"
-            );
-            dash.row(&line);
-        }
-        dash.rule();
-        let fb = snap.live.default_model.as_deref().unwrap_or("<none>");
-        dash.row(&format!(
-            "DEFAULT FALLBACK  {fb}        SAVE STATUS  {}",
-            if snap.is_dirty() {
-                "UNSAVED  (press S to save)"
-            } else {
-                "SAVED"
-            }
-        ));
-
-        // ---- Session token totals ----
-        // These are process-lifetime values in a separate in-memory store.
-        // Cap rows so a busy process cannot crowd out the request log.
+        // ---- Merged routing + token table ----
+        // A mapping row and its token totals share the same key (the
+        // inbound model name), so they render as one table instead of
+        // two sections that print the model name twice. The LEARNED
+        // column comes from the capability store and is keyed by the
+        // resolved upstream model, so sibling aliases legitimately
+        // share the same value.
+        let rows = self.rows();
+        let registry = self.capabilities.load();
         let totals = self.stats.snapshot_sections();
-        dash.row("SESSION TOKENS  (process lifetime; input/output/cache/reasoning)");
-        let mut combined = TokenTotals::default();
-        for total in totals.inbound.values().chain(totals.actual.values()) {
-            combined.add_totals(*total);
-        }
-        if combined.requests > 0 {
-            dash.row(&format_token_total("ALL MODELS COMBINED", &combined));
-        }
-        let mut shown = 0usize;
-        let mut configured: Vec<_> = totals
-            .inbound
-            .iter()
-            .filter(|(model, _)| snap.live.map.contains_key(*model))
-            .collect();
-        configured.sort_by_key(|(a, _)| *a);
-        for (model, total) in configured {
-            if shown >= 24 {
-                break;
-            }
-            dash.row(&format_token_total(model, total));
-            shown += 1;
-        }
-        let mut unmapped_inbound: Vec<_> = totals
-            .inbound
-            .iter()
-            .filter(|(model, _)| !snap.live.map.contains_key(*model))
-            .collect();
-        unmapped_inbound.sort_by_key(|(a, _)| *a);
-        if !unmapped_inbound.is_empty() {
-            dash.row("UNMAPPED INBOUND MODEL TOTALS");
-            for (model, total) in unmapped_inbound {
-                if shown >= 24 {
-                    break;
-                }
-                dash.row(&format_token_total(model, total));
-                shown += 1;
-            }
-        }
-        if !totals.actual.is_empty() {
-            dash.row("ACTUAL FALLBACK MODEL TOTALS");
-            for (model, total) in &totals.actual {
-                if shown >= 24 {
-                    break;
-                }
-                dash.row(&format_token_total(model, total));
-                shown += 1;
-            }
-        }
-        let total_rows = totals.inbound.len() + totals.actual.len();
-        if total_rows > shown {
-            dash.row(&format!(
-                "  … {} additional model totals hidden",
-                total_rows - shown
+        let inner = inner_w as usize;
+
+        dash.row(
+            "MODEL MAPPINGS + SESSION TOKENS   j/k select \u{00b7} Enter edit \u{00b7} a/d add/remove",
+        );
+        dash.row(&format!(
+            "  {:<5}{:<26} {:<20} {:<12} {:>5} {:>7} {:>7} {:>7} {:>12}",
+            "#", "INBOUND MODEL", "UPSTREAM MODEL", "LEARNED", "REQ", "IN", "OUT", "THINK", "CACHE"
+        ));
+        for (i, row) in rows.iter().enumerate() {
+            let learned = format_learned_params(registry.unsupported_for(&row.outbound));
+            dash.row(&format_table_row(
+                i == self.selected,
+                row.dirty,
+                i + 1,
+                &row.inbound,
+                &row.outbound,
+                &learned,
+                totals.inbound.get(&row.inbound),
             ));
         }
 
-        // ---- Log navigation hint ----
-        dash.row("[PgUp/PgDn] scroll log  [Home/End] jump log top/bottom");
+        // ---- Trailing totals ----
+        // The grand total, then the models that have no mapping row of
+        // their own. Grouped rows are capped so a busy proxy cannot
+        // crowd the request log out of the frame.
+        const GROUP_CAP: usize = 6;
+        dash.row(&labelled_rule("ALL COMBINED", inner));
+        dash.row(&format_summary_row("ALL MODELS", &combined_totals(&totals)));
+
+        let mut unmapped: Vec<(String, TokenTotals)> = totals
+            .inbound
+            .iter()
+            .filter(|(model, _)| !snap.live.map.contains_key(*model))
+            .map(|(model, total)| (model.clone(), *total))
+            .collect();
+        unmapped.sort_by(|a, b| a.0.cmp(&b.0));
+        if !unmapped.is_empty() {
+            let count = unmapped.len();
+            dash.row(&labelled_rule("unmapped inbound", inner));
+            for (model, totals) in unmapped.into_iter().take(GROUP_CAP) {
+                dash.row(&format_summary_row(&model, &totals));
+            }
+            if count > GROUP_CAP {
+                dash.row(&format!(
+                    "  \u{2026} {} more unmapped model(s)",
+                    count - GROUP_CAP
+                ));
+            }
+        }
+
+        let mut actual: Vec<(String, TokenTotals)> = totals
+            .actual
+            .iter()
+            .map(|(model, total)| (model.clone(), *total))
+            .collect();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+        if !actual.is_empty() {
+            let count = actual.len();
+            dash.row(&labelled_rule("actual fallback models", inner));
+            for (model, totals) in actual.into_iter().take(GROUP_CAP) {
+                dash.row(&format_summary_row(&model, &totals));
+            }
+            if count > GROUP_CAP {
+                dash.row(&format!(
+                    "  \u{2026} {} more fallback model(s)",
+                    count - GROUP_CAP
+                ));
+            }
+        }
+
+        // A learned fact can outlive the mapping that produced it (the
+        // operator deletes the alias after a 400). Surface those too so
+        // nothing silently vanishes from the display; `c` clears them.
+        let orphans: Vec<(&str, String)> = registry
+            .entries()
+            .filter(|(model, _)| !rows.iter().any(|r| r.outbound.as_str() == *model))
+            .map(|(model, params)| (model, format_learned_params(params)))
+            .collect();
+        if !orphans.is_empty() {
+            dash.row(&labelled_rule("learned (no mapping row)", inner));
+            for (model, params) in orphans {
+                dash.row(&format!("  {:<60}{params}", truncate(model, 60)));
+            }
+        }
+
 
         // ---- Layout ----
         // The dashboard height is its own line count, **capped** at
@@ -796,12 +849,15 @@ impl TuiApp {
             })
             .collect();
         let title = if self.log.is_empty() {
-            "RECENT REQUESTS  (no requests yet)  [PgUp/PgDn to scroll]"
+            " RECENT REQUESTS  (no requests yet)   PgUp/PgDn \u{00b7} Home/End "
         } else {
-            "RECENT REQUESTS  (newest first)  [PgUp/PgDn, Home/End to scroll]"
+            " RECENT REQUESTS  (newest first)   PgUp/PgDn \u{00b7} Home/End "
         };
-        let list = List::new(items)
-            .block(Block::bordered().title(title))
+        let list = List::new(items).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(title),
+        )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .scroll_padding(1);
         // `List` mutates the state we hand it (it clamps the offset
@@ -842,7 +898,7 @@ impl TuiApp {
         };
         let footer_text = truncate(
             &format!(
-                "[a] add  [e] edit  [d] delete  [f] default  [s] save  [q] quit   |   log: {tail_note}   |   PgUp/PgDn scroll"
+                "[a] add  [e] edit  [d] delete  [f] fallback  [s] save  [c] clear learned  [q] quit   |   log: {tail_note}"
             ),
             area.width.saturating_sub(2) as usize,
         );
@@ -1189,17 +1245,118 @@ fn style_token_usage_line(text: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn format_token_total(model: &str, total: &TokenTotals) -> String {
+/// Placeholder for a cell with nothing to show yet. An em dash reads as
+/// "no data" where a zero would read as "zero tokens", which is a
+/// different (and misleading) claim for a model that has not been used.
+const DASH: &str = "\u{2014}";
+
+/// Render one row of the merged routing + token table.
+///
+/// Columns are fixed-width so the per-model rows, the header and the
+/// trailing summary rows all line up; `Panel::row` truncates the whole
+/// line if the terminal is narrower than the table.
+fn format_table_row(
+    selected: bool,
+    dirty: bool,
+    index: usize,
+    inbound: &str,
+    upstream: &str,
+    learned: &str,
+    total: Option<&TokenTotals>,
+) -> String {
+    let cursor = if selected { '>' } else { ' ' };
+    let dirty = if dirty { '*' } else { ' ' };
+    let (req, input, output, thinking, cache) = total.map_or_else(
+        || {
+            (
+                DASH.to_owned(),
+                DASH.to_owned(),
+                DASH.to_owned(),
+                DASH.to_owned(),
+                DASH.to_owned(),
+            )
+        },
+        |t| {
+            (
+                t.requests.to_string(),
+                format_token_count(t.input_tokens),
+                format_token_count(t.output_tokens),
+                format_token_count(t.reasoning_tokens),
+                format_cache_counts(t),
+            )
+        },
+    );
     format!(
-        "  {:<26} {:>6} req  in {:>10}  out {:>10}  cache {:>10}/{:<10}  reason {:>10}",
-        truncate(model, 26),
+        "  {cursor}{index:<2}{dirty} {inbound:<26} {upstream:<20} {learned:<12} {req:>5} {input:>7} {output:>7} {thinking:>7} {cache:>12}",
+        inbound = truncate(inbound, 26),
+        upstream = truncate(upstream, 20),
+        learned = truncate(learned, 12),
+    )
+}
+
+/// Render a trailing summary row. The label is padded into the space the
+/// mapping columns occupy so the numbers land under the table's numeric
+/// columns instead of drifting left.
+fn format_summary_row(label: &str, total: &TokenTotals) -> String {
+    format!(
+        "  {:<66}{:>5} {:>7} {:>7} {:>7} {:>12}",
+        truncate(label, 66),
         total.requests,
         format_token_count(total.input_tokens),
         format_token_count(total.output_tokens),
-        format_token_count(total.cache_read_input_tokens),
-        format_token_count(total.cache_creation_input_tokens),
         format_token_count(total.reasoning_tokens),
+        format_cache_counts(total),
     )
+}
+
+/// Prompt-cache traffic, compacted for the CACHE column as `{read}r/{write}w`.
+fn format_cache_counts(total: &TokenTotals) -> String {
+    format!(
+        "{}r/{}w",
+        format_token_count(total.cache_read_input_tokens),
+        format_token_count(total.cache_creation_input_tokens)
+    )
+}
+
+/// Compact rendering of the parameters learned to be unsupported for one
+/// upstream model, for the LEARNED column.
+fn format_learned_params(params: &[crate::capabilities::RequestParam]) -> String {
+    if params.is_empty() {
+        return DASH.to_owned();
+    }
+    params
+        .iter()
+        .map(|p| short_param_name(*p))
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Abbreviate a parameter name so the LEARNED column stays narrow.
+fn short_param_name(param: crate::capabilities::RequestParam) -> &'static str {
+    match param {
+        crate::capabilities::RequestParam::Temperature => "temp",
+        crate::capabilities::RequestParam::TopP => "top_p",
+    }
+}
+
+/// A rule with a label set into its left end, used to head the trailing
+/// totals groups: `-- ALL COMBINED -----------------------`.
+fn labelled_rule(label: &str, inner_width: usize) -> String {
+    let prefix = format!("\u{2500}\u{2500} {label} ");
+    let used = prefix.width();
+    if used >= inner_width {
+        return truncate_to_width(&prefix, inner_width);
+    }
+    format!("{prefix}{}", "\u{2500}".repeat(inner_width - used))
+}
+
+/// Grand total across both inbound and actual-fallback models.
+fn combined_totals(sections: &SessionStatsSnapshot) -> TokenTotals {
+    let mut combined = TokenTotals::default();
+    for total in sections.inbound.values().chain(sections.actual.values()) {
+        combined.add_totals(*total);
+    }
+    combined
 }
 
 /// Format a token count compactly for the dashboard.
@@ -1355,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn token_total_formats_every_token_field() {
+    fn summary_row_formats_every_token_field() {
         let total = TokenTotals {
             requests: 7,
             input_tokens: 1_000,
@@ -1365,10 +1522,88 @@ mod tests {
             reasoning_tokens: 1_000_000_000,
         };
 
+        let row = format_summary_row("model", &total);
+        assert!(row.contains("1.00k"), "input: {row}");
+        assert!(row.contains("1.00m"), "output: {row}");
+        assert!(row.contains("1.23kr/999w"), "cache: {row}");
+        assert!(row.contains("1.00b"), "reasoning: {row}");
+        // The label must not change the row width, or columns drift.
         assert_eq!(
-            format_token_total("model", &total),
-            "  model                           7 req  in      1.00k  out      1.00m  cache      1.23k/999         reason      1.00b"
+            row.len(),
+            format_summary_row("a much longer label here", &total).len()
         );
+    }
+
+    /// The table row, the header and the summary rows must all be the
+    /// same width, or the columns visibly drift apart.
+    #[test]
+    fn merged_table_rows_are_all_the_same_width() {
+        let header = format!(
+            "  {:<5}{:<26} {:<20} {:<12} {:>5} {:>7} {:>7} {:>7} {:>12}",
+            "#", "INBOUND MODEL", "UPSTREAM MODEL", "LEARNED", "REQ", "IN", "OUT", "THINK", "CACHE"
+        );
+        let total = TokenTotals {
+            requests: 42,
+            input_tokens: 1_200_000,
+            output_tokens: 340_000,
+            cache_read_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+            reasoning_tokens: 900_000,
+        };
+        let populated = format_table_row(
+            true,
+            true,
+            7,
+            "claude-opus-4-8",
+            "gpt-5.6-terra",
+            "temp+top_p",
+            Some(&total),
+        );
+        let empty = format_table_row(false, false, 8, "haiku", "gpt-5.6-luna", DASH, None);
+        let summary = format_summary_row("all models", &total);
+
+        for (name, line) in [
+            ("header", header),
+            ("populated", populated),
+            ("empty", empty),
+            ("summary", summary),
+        ] {
+            // Compare cells, not bytes: the em dash is three bytes but
+            // one column, and the empty row is full of them.
+            assert_eq!(
+                line.chars().count(),
+                110,
+                "{name} row width drifted: {line}"
+            );
+        }
+    }
+
+    /// A model with no traffic yet shows em dashes rather than zeros, so
+    /// "not used" is never mistaken for "used zero tokens".
+    #[test]
+    fn unused_model_row_shows_dashes_not_zeros() {
+        let row = format_table_row(false, false, 1, "haiku", "gpt-5.6-luna", DASH, None);
+        assert!(!row.contains('0'), "no zero counts for an unused model: {row}");
+        // One for LEARNED plus one per token column.
+        assert_eq!(row.matches(DASH).count(), 6, "one dash per empty cell");
+    }
+
+    #[test]
+    fn learned_params_are_abbreviated_for_the_table() {
+        use crate::capabilities::RequestParam;
+        assert_eq!(format_learned_params(&[]), DASH);
+        assert_eq!(format_learned_params(&[RequestParam::Temperature]), "temp");
+        assert_eq!(
+            format_learned_params(&[RequestParam::Temperature, RequestParam::TopP]),
+            "temp+top_p"
+        );
+    }
+
+    #[test]
+    fn labelled_rule_fills_the_inner_width() {
+        let rule = labelled_rule("ALL COMBINED", 112);
+        assert_eq!(rule.width(), 112);
+        assert!(rule.starts_with("\u{2500}\u{2500} ALL COMBINED "));
     }
 
     #[test]
@@ -1841,5 +2076,119 @@ mod tests {
         assert_eq!(r.height, 20);
         // Width is clamped to parent.width.
         assert_eq!(r.width, 40);
+    }
+
+    fn make_app_with_capabilities(
+        capabilities: std::sync::Arc<crate::capabilities::CapabilityStore>,
+    ) -> TuiApp {
+        TuiApp::new_with_stores(
+            make_store(),
+            std::sync::Arc::new(SessionStatsStore::new()),
+            capabilities,
+            None,
+            "0.0.0.0:8085".into(),
+            "http://localhost/v1".into(),
+        )
+    }
+
+    fn render_to_string(app: &mut TuiApp, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.render(frame, area);
+            })
+            .expect("draw failed");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(w as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn press(app: &mut TuiApp, ch: char) -> bool {
+        app.on_key(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    /// With an empty store nothing is learned, so no parameter names are
+    /// shown and no orphan group renders.
+    #[test]
+    fn no_learned_params_render_when_store_is_empty() {
+        let mut app = make_app_with_capabilities(std::sync::Arc::new(
+            crate::capabilities::CapabilityStore::new(),
+        ));
+        let rendered = render_to_string(&mut app, 140, 40);
+        assert!(
+            !rendered.contains("temp"),
+            "no parameter names with an empty store:\n{rendered}"
+        );
+        assert!(!rendered.contains("learned (no mapping row)"), "{rendered}");
+    }
+
+    /// A learned rejection appears in the LEARNED column of the mapping
+    /// row whose upstream model it belongs to.
+    #[test]
+    fn learned_params_show_in_the_table_for_a_mapped_model() {
+        let caps = std::sync::Arc::new(crate::capabilities::CapabilityStore::new());
+        caps.record_unsupported(
+            "gpt-5.6-luna",
+            crate::capabilities::RequestParam::Temperature,
+        );
+        caps.record_unsupported("gpt-5.6-luna", crate::capabilities::RequestParam::TopP);
+        let mut app = make_app_with_capabilities(caps);
+
+        let rendered = render_to_string(&mut app, 140, 40);
+        // The store is keyed by upstream model, so the fact belongs on
+        // the row(s) that resolve to gpt-5.6-luna.
+        assert!(rendered.contains("gpt-5.6-luna"), "{rendered}");
+        assert!(rendered.contains("temp+top_p"), "{rendered}");
+    }
+
+    /// A fact whose mapping has since been deleted would otherwise be
+    /// invisible; it is surfaced in its own trailing group.
+    #[test]
+    fn learned_facts_without_a_mapping_row_are_listed() {
+        let caps = std::sync::Arc::new(crate::capabilities::CapabilityStore::new());
+        caps.record_unsupported(
+            "gpt-6-astra",
+            crate::capabilities::RequestParam::Temperature,
+        );
+        let mut app = make_app_with_capabilities(caps);
+
+        let rendered = render_to_string(&mut app, 140, 40);
+        assert!(
+            rendered.replace(' ', "").contains("learned(nomappingrow)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("gpt-6-astra"), "{rendered}");
+    }
+
+    /// `c` clears the blacklist, which is the operator's way to force a
+    /// re-probe after an upstream change without restarting the proxy.
+    #[test]
+    fn clear_key_empties_the_learned_registry() {
+        let caps = std::sync::Arc::new(crate::capabilities::CapabilityStore::new());
+        caps.record_unsupported(
+            "gpt-6-astra",
+            crate::capabilities::RequestParam::Temperature,
+        );
+        let mut app = make_app_with_capabilities(caps.clone());
+        assert!(render_to_string(&mut app, 120, 40).contains("gpt-6-astra"));
+
+        assert!(!press(&mut app, 'c'), "clear must not quit the app");
+        assert_eq!(caps.load().model_count(), 0);
+        assert!(
+            !render_to_string(&mut app, 120, 40).contains("gpt-6-astra"),
+            "cleared facts must disappear from the dashboard"
+        );
     }
 }

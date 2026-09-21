@@ -1788,3 +1788,209 @@ async fn invalid_tool_input_triggers_corrective_retry() {
         "second request must carry a corrective tool result"
     );
 }
+
+/// An upstream that rejects one optional parameter (here `temperature`)
+/// must be retried once without it, and the fact must be remembered for
+/// the rest of the process so later requests never send it again.
+///
+/// Asserts on the exact bodies the fake upstream received, so it proves
+/// both halves of the feature: the one-shot retry, and the latch that
+/// keeps the doomed parameter off the wire afterwards.
+#[tokio::test]
+async fn unsupported_parameter_retries_without_it_and_remembers() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+
+    let ok_body = || {
+        r#"{
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .to_string()
+    };
+
+    // First upstream call rejects `temperature`; the second succeeds.
+    // Anything past that (the third call, which exercises the latch)
+    // falls through to `canned`.
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"Unsupported parameter: temperature is not supported with this model.","type":"invalid_request_error","code":"unsupported_parameter","param":"temperature"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(ok_body()),
+        },
+    ]);
+    *upstream.canned.lock().await = Some(ok_body());
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+    let client = reqwest::Client::new();
+
+    let request = r#"{"model":"gpt-6-astra","max_tokens":4,"temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"a"}]}"#;
+
+    // First client request: sent optimistically, rejected, retried.
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 2, "expected exactly one parameter-strip retry");
+    let first: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent[1]).unwrap();
+    assert!(
+        first.get("temperature").is_some(),
+        "the optimistic first attempt must carry the parameter"
+    );
+    assert!(second.get("temperature").is_none(), "the retry must drop it");
+    assert!(
+        second.get("top_p").is_some(),
+        "only the named parameter is dropped; top_p must survive"
+    );
+
+    // Second client request, same model: the latch means the 400 is not
+    // provoked again -- `temperature` is never put on the wire.
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent.len(),
+        3,
+        "a learned fact must avoid a second failed attempt"
+    );
+    let third: serde_json::Value = serde_json::from_slice(&sent[2]).unwrap();
+    assert!(
+        third.get("temperature").is_none(),
+        "the learned fact must be applied before the first send"
+    );
+    assert!(
+        third.get("top_p").is_some(),
+        "unrelated parameters stay intact"
+    );
+}
+
+/// A 400 that names a parameter but is a *value* problem, not a support
+/// problem, must pass straight through: no retry, one upstream call.
+/// This is the guard that stops the proxy silently stripping a
+/// parameter the model actually honours.
+#[tokio::test]
+async fn invalid_parameter_value_is_not_treated_as_unsupported() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_error.lock().await = Some((
+        StatusCode::BAD_REQUEST,
+        r#"{"message":"Invalid value for 'temperature': temperature must be between 0 and 2.","type":"invalid_request_error","code":"invalid_request_error","param":"temperature"}"#.to_string(),
+    ));
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+    let client = reqwest::Client::new();
+
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-5.4-mini","max_tokens":4,"temperature":9.5,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        upstream.received_all.lock().await.len(),
+        1,
+        "a value error must not trigger a parameter-strip retry"
+    );
+}
+
+/// The real-world always-reasoning shape: the upstream rejects
+/// `temperature` and then `top_p` on consecutive attempts. The proxy
+/// must strip each in turn and still deliver a successful response --
+/// a single shared retry budget would fail this request.
+#[tokio::test]
+async fn rejects_both_sampling_params_one_at_a_time() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+
+    let ok_body = || {
+        r#"{
+            "id": "resp_ok",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .to_string()
+    };
+
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"Unsupported parameter: temperature","code":"unsupported_parameter","param":"temperature"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"Unsupported parameter: top_p","code":"unsupported_parameter","param":"top_p"}"#.into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(ok_body()),
+        },
+    ]);
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-6-astra","max_tokens":4,"temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 3, "expected one retry per rejected parameter");
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert!(bodies[0].get("temperature").is_some() && bodies[0].get("top_p").is_some());
+    assert!(bodies[1].get("temperature").is_none() && bodies[1].get("top_p").is_some());
+    assert!(bodies[2].get("temperature").is_none() && bodies[2].get("top_p").is_none());
+}
