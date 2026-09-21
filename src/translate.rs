@@ -30,7 +30,7 @@ use crate::responses::{
     WebSearchTool,
 };
 use anyhow::{Context, Result, anyhow};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Hard cap on the length of the `user` field we send to the upstream
 /// OpenAI Responses API.
@@ -323,6 +323,23 @@ fn system_text(system: &SystemPrompt) -> String {
 ///    to express "any JSON value", but that's a Claude Code SDK
 ///    change we can't make. If a `type` is already present in any
 ///    form (string or array), we leave it alone.
+/// 8. If a schema node declares (or includes) `type: "array"`, make
+///    sure it carries an object-valued `items`. The strict validator
+///    requires `items` on every array schema — `array schema missing
+///    items` (live: Claude Code's `ArtifactData` tool declares
+///    `properties.query.properties.where.items` as a draft-2020-12
+///    fixed-length tuple, i.e. `type: "array"` with `prefixItems` and
+///    no `items`; that is legal JSON Schema but not legal strict).
+///    `prefixItems` is deliberately preserved — the gateway accepts it
+///    alongside `items` (verified against the live upstream), so the
+///    client's positional constraints survive and `items` governs only
+///    the elements beyond the tuple, exactly as the client intended.
+///    When there is no usable element schema (`items` absent, or a
+///    non-object `items` such as the draft-04 `items: [...]` list or a
+///    boolean), a permissive schema is synthesised, because the strict
+///    validator rejects every "empty" alternative: `items: {}` gives
+///    `schema must have a 'type' key`, and `items: true` gives `array
+///    schema items is not an object`.
 ///
 /// The recursion visits in **post-order**: every child is fully
 /// reconciled before its parent. That order matters because the
@@ -459,6 +476,28 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&V
                     );
                     map.insert("type".to_owned(), Value::String("string".into()));
                 }
+            }
+
+            // Rule 8: `items` is mandatory on array schemas. Runs
+            // after the type-injection rule so every node has a
+            // resolvable `type` by this point, and before the recursion
+            // so a synthesised `items` is walked (and repaired, if
+            // needed) like any other child schema.
+            if is_array_schema(map) && !matches!(map.get("items"), Some(Value::Object(_))) {
+                match map.get("items") {
+                    Some(existing) => tracing::warn!(
+                        items = ?existing,
+                        "replacing non-object `items` on an array schema; the Responses strict \
+                         validator requires `items` to be an object schema. See \
+                         sanitize_tool_schema doc comment in src/translate.rs."
+                    ),
+                    None => tracing::warn!(
+                        "adding a permissive `items` to an array schema that declares none; the \
+                         Responses strict validator rejects any `type: \"array\"` node without \
+                         `items`. See sanitize_tool_schema doc comment in src/translate.rs."
+                    ),
+                }
+                map.insert("items".to_owned(), permissive_array_items());
             }
 
             // Now recurse into child schemas. We do this AFTER the
@@ -672,6 +711,52 @@ const RECURSE_KEYWORDS: &[&str] = &[
 fn is_object_schema(map: &serde_json::Map<String, Value>) -> bool {
     matches!(map.get("type"), Some(Value::String(s)) if s == "object")
         || (map.get("type").is_none() && map.contains_key("properties"))
+}
+
+/// True if this schema node declares the JSON `array` type, either
+/// directly (`"type": "array"`) or as one member of a type union
+/// (`"type": ["array", "null"]`, the nullable form rule 5's
+/// `make_nullable` produces). The strict validator requires an
+/// object-valued `items` keyword on every such node (rule 8).
+fn is_array_schema(map: &serde_json::Map<String, Value>) -> bool {
+    match map.get("type") {
+        Some(Value::String(s)) => s == "array",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
+    }
+}
+
+/// The `items` schema rule 8 injects when the client supplies none.
+///
+/// It cannot be empty: the strict validator rejects `items: {}` with
+/// `schema must have a 'type' key` and `items: true` with `array schema
+/// items is not an object` (both confirmed against the live upstream).
+/// The member types of the union bring their own obligations under
+/// strict mode, so this value is built self-supporting at every level
+/// rather than relying on the recursive walk to repair it: the `object`
+/// member carries `additionalProperties: false` (the validator demands
+/// it on any object member of a union) and each `array` member carries
+/// its own `items`.
+///
+/// Two levels of nesting covers what a model realistically emits into
+/// an unconstrained array slot; below that the element degrades to
+/// `string`, the same fallback the type-injection rule already uses for
+/// untyped nodes. Note the unavoidable limitation: OpenAI's strict mode
+/// has no permissive `additionalProperties` form, so an object element
+/// can only be the empty object. That is still strictly better than the
+/// alternative, which is a guaranteed 400 for the whole request.
+fn permissive_array_items() -> Value {
+    json!({
+        "type": ["string", "number", "boolean", "object", "array", "null"],
+        "properties": {},
+        "additionalProperties": false,
+        "items": {
+            "type": ["string", "number", "boolean", "object", "array", "null"],
+            "properties": {},
+            "additionalProperties": false,
+            "items": {"type": "string"}
+        }
+    })
 }
 
 /// Reconcile the `required` array of an object schema against the
@@ -1711,6 +1796,157 @@ mod tests {
         let schema = json!({"type": "object"});
         let out = sanitize_tool_schema(schema, None);
         assert_eq!(out["properties"], json!({}));
+    }
+
+    /// Regression test for the `ArtifactData` 400. A client array with
+    /// no `items` used to reach the wire unchanged and the strict
+    /// validator rejected the whole request with `array schema missing
+    /// items`, so every tool call in the session failed.
+    #[test]
+    fn sanitize_tool_schema_adds_items_to_array_without_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"tags": {"type": "array"}},
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let items = &out["properties"]["tags"]["items"];
+        assert!(items.is_object(), "expected an object `items`, got {items}");
+        assert!(
+            items["type"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|v| v.as_str() == Some("array"))),
+            "the permissive `items` must itself permit arrays, or nested \
+             arrays stay unrepresentable: {items}"
+        );
+        // ...and since it permits arrays, it must satisfy rule 8 itself,
+        // otherwise the repair re-introduces the same 400 one level down.
+        assert!(
+            items["items"].is_object(),
+            "synthesised `items` must carry its own `items`: {items}"
+        );
+    }
+
+    /// The nullable form is what the wire actually carries for optional
+    /// properties (rule 5 unions the type), so the array rule has to
+    /// match a type *union* and not just the bare string.
+    #[test]
+    fn sanitize_tool_schema_adds_items_to_nullable_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"tags": {"type": ["array", "null"]}},
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(out["properties"]["tags"]["items"].is_object());
+        assert_eq!(out["properties"]["tags"]["type"], json!(["array", "null"]));
+    }
+
+    /// The exact tuple shape that failed in production: `prefixItems`
+    /// supplies the element schemas positionally and `items` is absent.
+    /// We must add `items` without discarding the client's
+    /// `prefixItems` — the gateway accepts the two together.
+    #[test]
+    fn sanitize_tool_schema_adds_items_to_prefixed_tuple_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "where": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "prefixItems": [
+                        {"type": "string"},
+                        {"type": "string", "enum": ["eq", "ne"]},
+                        {"type": "object"},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let where_node = &out["properties"]["where"];
+        assert!(
+            where_node["items"].is_object(),
+            "`items` missing: {where_node}"
+        );
+        assert_eq!(
+            where_node["prefixItems"].as_array().map(Vec::len),
+            Some(3),
+            "client `prefixItems` must survive: {where_node}"
+        );
+        assert_eq!(where_node["maxItems"], 10);
+    }
+
+    /// `items: {}` and `items: true` are both rejected by the upstream
+    /// (`schema must have a 'type' key` / `array schema items is not an
+    /// object`), and the draft-04 `items: [...]` tuple list is not an
+    /// object either — all are replaced rather than forwarded.
+    #[test]
+    fn sanitize_tool_schema_replaces_non_object_items() {
+        for bad in [json!({}), json!(true), json!(false), json!([])] {
+            let schema = json!({
+                "type": "object",
+                "properties": {"tags": {"type": "array", "items": bad}},
+            });
+            let out = sanitize_tool_schema(schema, None);
+            let items = &out["properties"]["tags"]["items"];
+            assert!(
+                items.is_object(),
+                "non-object `items` {bad} must be replaced, got {items}"
+            );
+        }
+    }
+
+    /// A valid client-supplied `items` must be left exactly as-is.
+    #[test]
+    fn sanitize_tool_schema_keeps_existing_object_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"tags": {"type": "array", "items": {"type": "string"}}},
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert_eq!(
+            out["properties"]["tags"]["items"],
+            json!({"type": "string"})
+        );
+    }
+
+    /// An array declared as an array's own element schema must be
+    /// repaired too, otherwise the fix would move the 400 one level
+    /// down the tree instead of removing it.
+    #[test]
+    fn sanitize_tool_schema_adds_items_to_nested_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "matrix": {"type": "array", "items": {"type": "array"}},
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let inner = &out["properties"]["matrix"]["items"];
+        assert_eq!(inner["type"], "array");
+        assert!(
+            inner["items"].is_object(),
+            "nested array left without `items`: {inner}"
+        );
+    }
+
+    /// The rule is array-only: no other type should grow an `items`.
+    #[test]
+    fn sanitize_tool_schema_leaves_non_array_types_without_items() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "meta": {"type": "object"},
+                "count": {"type": "integer"},
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        for key in ["name", "meta", "count"] {
+            assert!(
+                out["properties"][key].get("items").is_none(),
+                "`{key}` must not gain an `items`: {}",
+                out["properties"][key]
+            );
+        }
     }
 
     /// Regression test for the `Agent` tool 400: Claude Code emits
