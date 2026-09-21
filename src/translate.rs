@@ -249,8 +249,8 @@ fn system_text(system: &SystemPrompt) -> String {
 
 /// Make a tool's `parameters` schema acceptable to the strict Responses
 /// API validator. The strict validator is fully recursive: it descends
-/// into every `properties.*`, `items`, `additionalProperties` value,
-/// `oneOf` / `anyOf` / `allOf` / `not` branch, and applies the same
+/// into every `properties.*`, `items`, `additionalProperties` value and
+/// `anyOf` branch, and applies the same
 /// `strict: true` rules at every depth. Earlier versions of this
 /// function only ran the reconciliations at the top level of
 /// `parameters` — that was wrong, and the validator caught us when
@@ -260,7 +260,7 @@ fn system_text(system: &SystemPrompt) -> String {
 /// `Missing 'notes'` at the `additionalProperties` level.
 ///
 /// The function is now structured as a single recursive walk that
-/// applies five reconciliations at every object schema it visits:
+/// applies a set of reconciliations at every object schema it visits:
 ///
 /// 1. Strip `additionalProperties: {}` (the empty-object form Claude
 ///    Code emits on tools like `ExitPlanMode`) — strict validators
@@ -340,6 +340,40 @@ fn system_text(system: &SystemPrompt) -> String {
 ///    validator rejects every "empty" alternative: `items: {}` gives
 ///    `schema must have a 'type' key`, and `items: true` gives `array
 ///    schema items is not an object`.
+/// 9. Rewrite `oneOf` as `anyOf`. The strict validator refuses `oneOf`
+///    outright (`'oneOf' is not permitted`) while `anyOf` is permitted,
+///    and the only semantic difference is cardinality (exactly one vs
+///    at least one) - "at least one" is the safe relaxation, and it
+///    keeps the branch constraints that dropping the keyword outright
+///    would lose. When a node carries both, the `oneOf` branches are
+///    appended to the existing `anyOf`.
+/// 10. Drop the keywords the strict validator refuses outright, each
+///     confirmed against the live upstream. `allOf`, `if`, `contains`,
+///     `unevaluatedItems` and `unevaluatedProperties` all give
+///     `'<keyword>' is not permitted`, and `not` gives `Unsupported
+///     keywords ('not',)`. Every one of them is *restrictive*, so
+///     dropping them relaxes the schema - it can never start rejecting a
+///     value the client's own schema accepted. That is the same
+///     trade-off already made for `format` and `propertyNames`. The
+///     branches are deliberately NOT merged into the parent: a
+///     conjunction has no strict-mode equivalent, and merging
+///     conflicting branches (two different `pattern`s, say) would
+///     fabricate a constraint the client never asked for.
+/// 11. Drop a `pattern` whose regex the strict validator cannot
+///     compile. Two classes are rejected: lookaround (`(?=`, `(?!`,
+///     `(?<=`, `(?<!`) gives `regex lookaround is not supported`, and a
+///     Unicode property escape (`\p{...}`, `\P{...}`) gives
+///     `'<pattern>' is not a 'regex'` (live: Claude Code's `ArtifactData`
+///     declares its path patterns with negative lookahead).
+///     Backreferences, possessive quantifiers and atomic groups ARE
+///     accepted, so this is a targeted predicate rather than a
+///     `regex::Regex::new` compile test: the Rust engine also rejects
+///     constructs the upstream takes (which would drop working
+///     constraints) and accepts `\p{...}`, which the upstream rejects
+///     (which would miss a real failure). As with `format`, the model is
+///     the *producer* of these strings and the property's `description`
+///     still guides the shape. If a future upstream widens its dialect,
+///     narrow `pattern_is_unsupported` rather than removing the strip.
 ///
 /// The recursion visits in **post-order**: every child is fully
 /// reconciled before its parent. That order matters because the
@@ -387,8 +421,9 @@ fn reconcile_strict(v: &mut Value, original: Option<&Value>) {
 }
 
 /// Internal worker for [`reconcile_strict`]. `force_object` is true when
-/// the caller is recursing into a combinator branch (`anyOf`, `oneOf`,
-/// `allOf`, `not`, etc.). The OpenAI Responses strict validator treats
+/// the caller is recursing into an `anyOf` branch (the only combinator
+/// that can reach the wire - rule 9 rewrites `oneOf` into it and rule 10
+/// drops `allOf`). The OpenAI Responses strict validator treats
 /// every such branch as an object schema, so a typeless or
 /// `properties`-less branch must be coerced into an object schema with
 /// `additionalProperties: false`. Without this, a branch like
@@ -498,6 +533,58 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&V
                     ),
                 }
                 map.insert("items".to_owned(), permissive_array_items());
+            }
+
+            // Rule 9: `oneOf` is not permitted upstream, but `anyOf` is.
+            if let Some(one_of) = map.remove("oneOf") {
+                let branches = match one_of {
+                    Value::Array(branches) => branches,
+                    other => vec![other],
+                };
+                let branch_count = branches.len();
+                match map.get_mut("anyOf") {
+                    Some(Value::Array(existing)) => existing.extend(branches),
+                    _ => {
+                        map.insert("anyOf".to_owned(), Value::Array(branches));
+                    }
+                }
+                tracing::warn!(
+                    branches = branch_count,
+                    "rewriting `oneOf` as `anyOf` in tool schema; the Responses strict validator \
+                     refuses `oneOf` ('oneOf' is not permitted) but permits `anyOf`. See \
+                     sanitize_tool_schema doc comment in src/translate.rs."
+                );
+            }
+
+            // Rule 10: keywords the strict validator refuses outright.
+            // Dropped BEFORE the walks below so neither the combinator
+            // walk nor the recurse walk descends into a branch that is
+            // about to disappear (which is what used to turn an `allOf`
+            // branch of `pattern`s into a bogus `type: "object"`).
+            for keyword in UNSUPPORTED_KEYWORDS {
+                if map.remove(*keyword).is_some() {
+                    tracing::warn!(
+                        keyword = *keyword,
+                        "dropping a keyword the Responses strict validator refuses from a tool \
+                         schema; the keyword is restrictive, so dropping it only relaxes the \
+                         schema. See sanitize_tool_schema doc comment in src/translate.rs."
+                    );
+                }
+            }
+
+            // Rule 11: `pattern` regexes the strict validator cannot compile.
+            if map
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_some_and(pattern_is_unsupported)
+                && let Some(Value::String(pattern)) = map.remove("pattern")
+            {
+                tracing::warn!(
+                    pattern = %pattern,
+                    "dropping an unsupported `pattern` from a tool schema; the Responses strict \
+                     validator rejects regex lookaround and Unicode property escapes. See \
+                     sanitize_tool_schema doc comment in src/translate.rs."
+                );
             }
 
             // Now recurse into child schemas. We do this AFTER the
@@ -672,30 +759,66 @@ fn make_nullable(v: &mut Value) {
 /// treats as object schemas, requiring `additionalProperties: false`.
 /// These are walked separately so each branch is force-typed as an
 /// object before the ordinary [`RECURSE_KEYWORDS`] walk runs.
-const COMBINATOR_KEYWORDS: &[&str] = &["anyOf", "oneOf", "allOf"];
+///
+/// `anyOf` is the only combinator that can reach this walk: rule 9
+/// rewrites `oneOf` into it, and rule 10 drops `allOf` entirely.
+const COMBINATOR_KEYWORDS: &[&str] = &["anyOf"];
 
 /// JSON Schema keywords whose value is (or contains) a sub-schema
 /// that the strict Responses validator will recursively validate.
 /// Listed in the order we recurse; the order doesn't matter for
 /// correctness but a stable order makes the diff on `cargo fmt`
 /// reproducible.
+///
+/// `oneOf`, `allOf`, `not`, `if`, `then`, `else`, `contains`,
+/// `unevaluatedProperties` and `unevaluatedItems` are absent by
+/// design: the strict validator refuses them, so rule 10 (or rule 9)
+/// removes them from every node before this walk runs.
 const RECURSE_KEYWORDS: &[&str] = &[
     "additionalProperties", // the schema form, not the bool form
     "items",
-    "oneOf",
     "anyOf",
+    "propertyNames", // pre-stripped, but a no-op if absent
+    "prefixItems",
+    "additionalItems",
+];
+
+/// Keywords the strict validator refuses outright, so they must never
+/// reach the wire (rule 10). Each was confirmed against the live
+/// upstream: `allOf`, `if`, `contains`, `unevaluatedItems` and
+/// `unevaluatedProperties` all return `'<keyword>' is not permitted`,
+/// and `not` returns `Unsupported keywords ('not',)`. All of them are
+/// restrictive, so dropping them can only relax the schema.
+const UNSUPPORTED_KEYWORDS: &[&str] = &[
     "allOf",
     "not",
     "if",
     "then",
     "else",
     "contains",
-    "propertyNames", // pre-stripped, but a no-op if absent
-    "prefixItems",
-    "additionalItems",
-    "unevaluatedProperties",
     "unevaluatedItems",
+    "unevaluatedProperties",
 ];
+
+/// True if a JSON Schema `pattern` uses a regex construct the upstream
+/// strict validator cannot compile (rule 11).
+///
+/// Two classes are confirmed against the live upstream: lookaround
+/// groups (`(?=`, `(?!`, `(?<=`, `(?<!`) are rejected with `regex
+/// lookaround is not supported`, and Unicode property escapes
+/// (`\p{...}`, `\P{...}`) with `'<pattern>' is not a 'regex'`.
+///
+/// This is deliberately NOT a `regex::Regex::new` compile test. That
+/// engine also rejects backreferences, possessive quantifiers and
+/// atomic groups - all of which the upstream accepts, so the test
+/// would drop working constraints - and it accepts `\p{...}`, which
+/// the upstream rejects, so it would miss a real failure.
+fn pattern_is_unsupported(pattern: &str) -> bool {
+    const LOOKAROUND: [&str; 4] = ["(?=", "(?!", "(?<=", "(?<!"];
+    LOOKAROUND.iter().any(|group| pattern.contains(group))
+        || pattern.contains("\\p{")
+        || pattern.contains("\\P{")
+}
 
 /// True if this object schema declares itself to be a JSON `object`.
 /// Used to decide whether to inject `additionalProperties: false`
@@ -1949,6 +2072,206 @@ mod tests {
         }
     }
 
+    /// Rule 9: `oneOf` is refused upstream (`'oneOf' is not permitted`)
+    /// but `anyOf` is permitted, so the key is rewritten in place. The
+    /// branches survive, which dropping the keyword outright would lose.
+    #[test]
+    fn sanitize_tool_schema_rewrites_one_of_as_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "integer"},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["choice"];
+        assert!(node.get("oneOf").is_none(), "`oneOf` survived: {node}");
+        let branches = node["anyOf"]
+            .as_array()
+            .expect("branches must be rewritten to `anyOf`");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0]["type"], "string");
+        assert_eq!(branches[1]["type"], "integer");
+    }
+
+    /// Rule 9, mixed case: a node carrying both combinators keeps its
+    /// existing `anyOf` branches and gains the `oneOf` ones.
+    #[test]
+    fn sanitize_tool_schema_appends_one_of_branches_to_existing_any_of() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "anyOf": [{"type": "string"}],
+                    "oneOf": [{"type": "integer"}],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["choice"];
+        assert!(node.get("oneOf").is_none());
+        let branches = node["anyOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0]["type"], "string");
+        assert_eq!(branches[1]["type"], "integer");
+    }
+
+    /// Rule 10: every keyword the validator refuses outright is dropped.
+    /// Each entry was confirmed against the live upstream, either as
+    /// `'<keyword>' is not permitted` or as `Unsupported keywords`.
+    #[test]
+    fn sanitize_tool_schema_drops_unsupported_keywords() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "string",
+                    "allOf": [{"type": "string"}],
+                },
+                "b": {
+                    "type": "string",
+                    "not": {"type": "object"},
+                },
+                "c": {
+                    "type": "string",
+                    "if": {"type": "string"},
+                    "then": {"type": "string"},
+                    "else": {"type": "string"},
+                },
+                "d": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "contains": {"type": "string"},
+                },
+                "e": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "unevaluatedItems": false,
+                },
+                "f": {
+                    "type": "object",
+                    "unevaluatedProperties": false,
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        for (key, keyword) in [
+            ("a", "allOf"),
+            ("b", "not"),
+            ("c", "if"),
+            ("c", "then"),
+            ("c", "else"),
+            ("d", "contains"),
+            ("e", "unevaluatedItems"),
+            ("f", "unevaluatedProperties"),
+        ] {
+            let node = &out["properties"][key];
+            assert!(
+                node.get(keyword).is_none(),
+                "`{keyword}` must be dropped from `{key}`: {node}"
+            );
+        }
+    }
+
+    /// Rule 10 side effect worth pinning: an `allOf` of bare constraints
+    /// must not be force-objected on the way out. The old combinator walk
+    /// did exactly that, which is how Claude Code's `SendMessage` ended
+    /// up with a `type: "string"` node whose `allOf` branches claimed to
+    /// be objects - and made the dropped branches look like they had
+    /// semantics worth merging.
+    #[test]
+    fn sanitize_tool_schema_drops_all_of_without_force_objecting_branches() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "allOf": [
+                        {"pattern": r"^[^\n\r]*$"},
+                        {"pattern": r"^[\s\S]{0,300}$"},
+                    ],
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        let node = &out["properties"]["to"];
+        assert!(node.get("allOf").is_none(), "`allOf` survived: {node}");
+        // Nothing from the dropped branches may leak onto the parent.
+        assert!(node.get("properties").is_none(), "branch leaked: {node}");
+        assert!(node.get("additionalProperties").is_none());
+        // The parent keeps its own `type` untouched.
+        assert_eq!(node["type"], json!("string"));
+    }
+
+    /// Rule 11: lookaround is rejected as `regex lookaround is not
+    /// supported`, and it is the exact construct in Claude Code's
+    /// `ArtifactData` path patterns that blocked the session.
+    #[test]
+    fn sanitize_tool_schema_drops_lookaround_pattern() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "pattern": r"^(?!\.\.?(?:/|$))[A-Za-z0-9]{1,200}$",
+                },
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(
+            out["properties"]["path"].get("pattern").is_none(),
+            "lookaround `pattern` must be dropped: {}",
+            out["properties"]["path"]
+        );
+    }
+
+    /// Rule 11 must not over-reach. These all compile upstream, including
+    /// two constructs (`(a)\1` and `^a*+$`) that `regex::Regex::new`
+    /// rejects - which is why the gate is a targeted predicate rather
+    /// than a compile test.
+    #[test]
+    fn sanitize_tool_schema_keeps_supported_patterns() {
+        for good in [
+            r"^[a-z]+$",
+            r"^[^\n\r]*$",
+            r"^[\s\S]{0,300}$",
+            r"^wf_[a-z0-9-]{6,}$",
+            r"(a)\1",
+            r"^a*+$",
+        ] {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "pattern": good},
+                },
+            });
+            let out = sanitize_tool_schema(schema, None);
+            assert_eq!(
+                out["properties"]["value"]["pattern"], good,
+                "supported pattern `{good}` must be preserved"
+            );
+        }
+    }
+
+    /// Rule 11 also covers Unicode property escapes, which the upstream
+    /// rejects with a different message: `... is not a 'regex'`.
+    #[test]
+    fn sanitize_tool_schema_drops_unicode_property_pattern() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": r"\p{L}+"},
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(out["properties"]["name"].get("pattern").is_none());
+    }
+
     /// Regression test for the `Agent` tool 400: Claude Code emits
     /// `properties` with keys (e.g. `isolation`) but no `required`
     /// array. Strict mode requires every key in `properties` to also
@@ -2309,15 +2632,17 @@ mod tests {
         assert_eq!(out["properties"]["outer"]["additionalProperties"], false);
     }
 
-    /// `oneOf` / `anyOf` / `allOf` arrays carry sub-schemas that the
-    /// strict validator will recurse into. We must too.
+    /// `anyOf` arrays carry sub-schemas that the strict validator will
+    /// recurse into. We must too. (`oneOf` reaches this walk by way of
+    /// rule 9, which rewrites it to `anyOf` - see
+    /// `sanitize_tool_schema_rewrites_one_of_as_any_of`.)
     #[test]
-    fn sanitize_tool_schema_reconciles_required_inside_one_of_branches() {
+    fn sanitize_tool_schema_reconciles_required_inside_any_of_branches() {
         let schema = json!({
             "type": "object",
             "properties": {
                 "discriminated": {
-                    "oneOf": [
+                    "anyOf": [
                         {
                             "type": "object",
                             "properties": {
@@ -2337,7 +2662,7 @@ mod tests {
             },
         });
         let out = sanitize_tool_schema(schema, None);
-        let branches = out["properties"]["discriminated"]["oneOf"]
+        let branches = out["properties"]["discriminated"]["anyOf"]
             .as_array()
             .unwrap();
         assert_eq!(branches[0]["required"], json!(["kind", "value_a"]));
@@ -3797,9 +4122,12 @@ mod response_tests {
         );
     }
 
-    /// Same regression but for `oneOf` and `allOf` branches.
+    /// Branches the strict validator treats as objects get
+    /// `additionalProperties: false` (and an empty `properties` map).
+    /// `oneOf` reaches this walk by way of rule 9 (`oneOf` -> `anyOf`),
+    /// so both fixtures below exercise the same code path.
     #[test]
-    fn sanitize_tool_schema_force_objects_all_combinator_branches() {
+    fn sanitize_tool_schema_force_objects_combinator_branches() {
         let schema = json!({
             "type": "object",
             "properties": {
@@ -3809,14 +4137,14 @@ mod response_tests {
                     ],
                 },
                 "y": {
-                    "allOf": [
-                        {"description": "an allOf branch"},
+                    "anyOf": [
+                        {"description": "an anyOf branch"},
                     ],
                 },
             },
         });
         let out = sanitize_tool_schema(schema, None);
-        for path in ["properties/x/oneOf/0", "properties/y/allOf/0"] {
+        for path in ["properties/x/anyOf/0", "properties/y/anyOf/0"] {
             let node = out
                 .pointer(&format!("/{}", path))
                 .unwrap_or_else(|| panic!("missing path /{}", path));
