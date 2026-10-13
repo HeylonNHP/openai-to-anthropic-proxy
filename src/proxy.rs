@@ -210,6 +210,8 @@ async fn handle_messages(
         upstream_model = %outbound.model,
         stream = outbound.stream,
         tools = outbound.tools.as_ref().map_or(0, Vec::len),
+        inbound_thinking = ?req.thinking.as_ref().map(|t| t.r#type.as_str()),
+        inbound_effort = ?requested_effort,
         reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
         "→ upstream"
     );
