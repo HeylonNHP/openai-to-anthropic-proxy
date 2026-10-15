@@ -8,6 +8,7 @@ pub mod stream;
 pub mod anthropic;
 pub mod proxy;
 pub mod repair;
+mod schema_refs;
 mod translate;
 pub mod tui;
 

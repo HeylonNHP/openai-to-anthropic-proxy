@@ -94,6 +94,13 @@ fn validate_inner(value: &Value, schema: &Value, path: &str) -> Option<String> {
         return None;
     };
 
+    // A retained recursive `$ref` (every other one is inlined before the
+    // schema reaches the registry) is opaque to this validator: it does not
+    // follow references, so it accepts rather than guessing.
+    if obj.contains_key("$ref") {
+        return None;
+    }
+
     // Combinators.
     if let Some(arr) = obj.get("anyOf").and_then(Value::as_array) {
         if arr.iter().any(|b| validate_inner(value, b, path).is_none()) {
@@ -360,6 +367,12 @@ fn repair_inner(value: &mut Value, schema: &Value) {
     let Some(obj) = schema.as_object() else {
         return;
     };
+
+    // A retained recursive `$ref` is opaque: leave the value exactly as the
+    // model produced it rather than repairing against a typeless node.
+    if obj.contains_key("$ref") {
+        return;
+    }
 
     // Combinator nodes: try to make the value conform to one branch.
     if let Some(arr) = obj
@@ -644,6 +657,22 @@ mod tests {
         let out = repair(input, &original);
         assert_eq!(out, json!({"location": "SF"}));
         assert!(validate(&out, &original).is_none());
+    }
+
+    /// A retained recursive `$ref` has no `type`, so without the opaque
+    /// handling the repair would treat it as a typeless node and could
+    /// JSON-decode a string the model legitimately sent.
+    #[test]
+    fn retained_ref_nodes_are_opaque_to_validate_and_repair() {
+        let original = json!({
+            "type": "object",
+            "properties": {"tree": {"$ref": "#/$defs/Node"}},
+            "required": ["tree"],
+            "$defs": {"Node": {"type": "object", "properties": {}}},
+        });
+        let input = json!({"tree": "{\"a\": 1}"});
+        assert!(validate(&input, &original).is_none());
+        assert_eq!(repair(input.clone(), &original), input);
     }
 
     #[test]

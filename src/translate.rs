@@ -29,6 +29,7 @@ use crate::responses::{
     ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition,
     WebSearchTool,
 };
+use crate::schema_refs::resolve_local_refs;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
@@ -141,7 +142,7 @@ pub fn anthropic_to_responses(
     // (`crate::repair`). The registry is returned alongside the request
     // and threaded through both response paths by the proxy.
     let mut registry = crate::repair::ToolSchemaRegistry::new();
-    let tools = req.tools.as_ref().map(|tools| {
+    let mut tools: Option<Vec<ToolDefinition>> = req.tools.as_ref().map(|tools| {
         tools
             .iter()
             .filter_map(|t| {
@@ -158,7 +159,9 @@ pub fn anthropic_to_responses(
                     }));
                 }
 
-                let input_schema = t.input_schema.clone()?;
+                // Resolve `$ref`s first so the sanitizer below and the
+                // repair registry both see the real, fully-typed schema.
+                let input_schema = resolve_local_refs(t.input_schema.clone()?);
                 registry.insert(t.name.clone(), input_schema.clone());
                 let original = registry.get(&t.name);
                 Some(ToolDefinition::Function(ResponsesTool {
@@ -171,6 +174,9 @@ pub fn anthropic_to_responses(
             })
             .collect()
     });
+    if let Some(list) = tools.as_mut() {
+        enforce_strict_property_budget(list, STRICT_PROPERTY_BUDGET);
+    }
 
     let (tool_choice, parallel_tool_calls) = req.tool_choice.as_ref().map_or((None, None), |c| {
             let (tc, disable) = map_tool_choice(c);
@@ -245,6 +251,97 @@ fn system_text(system: &SystemPrompt) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
     }
+}
+
+/// Total object properties, across every strict tool in one request, that
+/// the upstream is asked to compile.
+///
+/// Strict mode makes the upstream compile each tool's schema, and it caps the
+/// total. OpenAI documents "up to 5000 object properties total". Past the
+/// cap this gateway does not return a schema error: it answers `status:
+/// "incomplete"`, `incomplete_details.reason: "max_output_tokens"`, an empty
+/// `output` and all-zero `usage`, which Claude Code renders as "response
+/// exceeded the output token maximum". Measured live (Airia gateway,
+/// `gpt-5.6-luna`, counting every key of every `properties` map): requests
+/// up to 6,164 properties completed and requests from 6,412 failed
+/// deterministically. 5,000 is the documented figure and leaves that
+/// observed cliff about 20% of headroom.
+///
+/// A budget on the *total* is what matters: the 207 MCP tools of one server
+/// (5,531 properties) work alone, and 182 ordinary tools work alone, but the
+/// two together (6,665) do not, although no single tool is at fault.
+const STRICT_PROPERTY_BUDGET: usize = 5_000;
+
+/// Count every key of every `properties` map in a schema (the unit the
+/// upstream's limit is expressed in). `enum`, `const` and `default` hold
+/// values rather than schemas, so they are not walked.
+fn count_schema_properties(schema: &Value) -> usize {
+    match schema {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, child)| match key.as_str() {
+                "enum" | "const" | "default" => 0,
+                "properties" => child.as_object().map_or(0, |props| {
+                    props.len() + props.values().map(count_schema_properties).sum::<usize>()
+                }),
+                _ => count_schema_properties(child),
+            })
+            .sum(),
+        Value::Array(items) => items.iter().map(count_schema_properties).sum(),
+        _ => 0,
+    }
+}
+
+/// Keep the strict tool schemas of one request within `budget` properties by
+/// sending the heaviest tools non-strict (`strict: false`).
+///
+/// A non-strict tool is not compiled by the upstream, so it stops counting
+/// against the budget, but it is not abandoned: the model still sees the
+/// full schema, and the proxy validates its tool calls against the client's
+/// original schema (`crate::repair`) exactly as it does for strict tools.
+/// What is lost is only the upstream's *guarantee* that the arguments match,
+/// and only for the fewest tools that bring the request back under budget.
+/// Demoting the heaviest first minimizes how many tools lose it. Tools that
+/// are already non-strict, and server tools, are left alone.
+fn enforce_strict_property_budget(tools: &mut [ToolDefinition], budget: usize) {
+    let mut weights: Vec<(usize, usize)> = tools
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tool)| match tool {
+            ToolDefinition::Function(function) if function.strict => {
+                Some((index, count_schema_properties(&function.parameters)))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut total: usize = weights.iter().map(|(_, weight)| weight).sum();
+    if total <= budget {
+        return;
+    }
+
+    // Heaviest first; ties keep request order so the choice is stable.
+    weights.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let before = total;
+    let mut demoted: Vec<String> = Vec::new();
+    for (index, weight) in weights {
+        if total <= budget {
+            break;
+        }
+        if let ToolDefinition::Function(function) = &mut tools[index] {
+            function.strict = false;
+            total -= weight;
+            demoted.push(format!("{} ({weight})", function.name));
+        }
+    }
+    tracing::warn!(
+        before,
+        after = total,
+        budget,
+        demoted = ?demoted,
+        "strict tool schemas exceed the upstream's compile budget; sending the heaviest tools \
+         non-strict so the request is not answered with an empty `incomplete` response. See \
+         STRICT_PROPERTY_BUDGET in src/translate.rs."
+    );
 }
 
 /// Make a tool's `parameters` schema acceptable to the strict Responses
@@ -364,11 +461,12 @@ fn system_text(system: &SystemPrompt) -> String {
 ///    keeps the branch constraints that dropping the keyword outright
 ///    would lose. When a node carries both, the `oneOf` branches are
 ///    appended to the existing `anyOf`.
-/// 10. Drop the keywords the strict validator refuses outright, each
-///     confirmed against the live upstream. `allOf`, `if`, `contains`,
-///     `unevaluatedItems` and `unevaluatedProperties` all give
-///     `'<keyword>' is not permitted`, and `not` gives `Unsupported
-///     keywords ('not',)`. Every one of them is *restrictive*, so
+/// 10. Drop the keywords the strict validator refuses outright (see
+///     [`UNSUPPORTED_KEYWORDS`] for which were confirmed live and which
+///     follow OpenAI's documented subset). `allOf`, `if`, `contains`,
+///     `unevaluatedItems`, `unevaluatedProperties` and `minProperties`
+///     all give `'<keyword>' is not permitted`, and `not` gives
+///     `Unsupported keywords ('not',)`. Every one of them is *restrictive*, so
 ///     dropping them relaxes the schema - it can never start rejecting a
 ///     value the client's own schema accepted. That is the same
 ///     trade-off already made for `format` and `propertyNames`. The
@@ -391,6 +489,16 @@ fn system_text(system: &SystemPrompt) -> String {
 ///     the *producer* of these strings and the property's `description`
 ///     still guides the shape. If a future upstream widens its dialect,
 ///     narrow `pattern_is_unsupported` rather than removing the strip.
+/// 12. Drop `examples`. It is annotation-only, so dropping it cannot change
+///     what the model may send; the live gateway has not been shown to
+///     accept it, and MCP generators emit it on every tool.
+///
+/// `$ref`s are NOT handled here. They are inlined before this function
+/// runs (`crate::schema_refs::resolve_local_refs`), so the walk sees the
+/// real definition at every use site. The one exception is a *recursive*
+/// definition, which stays behind as a bare `{"$ref": ...}` into a root
+/// `$defs` entry; the walk treats such a node as opaque and reconciles the
+/// retained `$defs` entries like any other schema.
 ///
 /// The recursion visits in **post-order**: every child is fully
 /// reconciled before its parent. That order matters because the
@@ -606,6 +714,17 @@ fn reconcile_strict(v: &mut Value, original: Option<&Value>) {
 /// threaded down the walk so optionality decisions (`make_nullable`)
 /// consult the real `required` arrays instead of the mutated ones.
 fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&Value>) {
+    // A bare `{"$ref": ...}` is a retained recursive reference (every other
+    // `$ref` was inlined by `schema_refs::resolve_local_refs` before this
+    // walk). It is opaque: giving it a `type`, `properties` or
+    // `additionalProperties` would contradict the definition it points at
+    // and add the sibling keywords the validator refuses.
+    if let Value::Object(map) = v
+        && map.contains_key("$ref")
+    {
+        return;
+    }
+
     if force_object && let Value::Object(map) = v {
         // Coerce a typeless or otherwise un-typed combinator branch
         // into an object schema. We don't strip existing keys (the
@@ -778,6 +897,22 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&V
                 }
             }
 
+            // Rule 12: annotation-only keywords the strict validator has not
+            // been shown to accept. `examples` is documentation with no
+            // effect on validation, so dropping it cannot change what the
+            // model may send. Debug level: MCP generators emit it on every
+            // tool, so a warn would be noise.
+            for keyword in ANNOTATION_ONLY_UNSUPPORTED_KEYWORDS {
+                if map.remove(*keyword).is_some() {
+                    tracing::debug!(
+                        keyword = *keyword,
+                        "dropping an annotation-only keyword from a tool schema; it has no \
+                         effect on validation. See sanitize_tool_schema doc comment in \
+                         src/translate.rs."
+                    );
+                }
+            }
+
             // Rule 11: `pattern` regexes the strict validator cannot compile.
             if map
                 .get("pattern")
@@ -824,6 +959,20 @@ fn reconcile_strict_inner(v: &mut Value, force_object: bool, original: Option<&V
                     let force = false;
                     let child_original = original.and_then(|o| o.get(*keyword));
                     reconcile_strict_inner(child, force, child_original);
+                }
+            }
+            // Retained recursive definitions live in `$defs` / `definitions`
+            // (see `schema_refs`); each is a schema the validator checks
+            // like any other, so reconcile them too.
+            for container in ["$defs", "definitions"] {
+                if let Some(Value::Object(defs)) = map.get_mut(container) {
+                    let orig_defs = original
+                        .and_then(|o| o.get(container))
+                        .and_then(Value::as_object);
+                    for (name, child) in defs.iter_mut() {
+                        let child_original = orig_defs.and_then(|d| d.get(name));
+                        reconcile_strict_inner(child, false, child_original);
+                    }
                 }
             }
             if let Some(Value::Object(props)) = map.get_mut("properties") {
@@ -944,6 +1093,7 @@ fn make_nullable(v: &mut Value) {
             // The node now expresses its type via anyOf; drop the
             // duplicated keywords (description stays as a hint).
             for k in [
+                "$ref",
                 "type",
                 "properties",
                 "required",
@@ -990,11 +1140,14 @@ const RECURSE_KEYWORDS: &[&str] = &[
 ];
 
 /// Keywords the strict validator refuses outright, so they must never
-/// reach the wire (rule 10). Each was confirmed against the live
-/// upstream: `allOf`, `if`, `contains`, `unevaluatedItems` and
-/// `unevaluatedProperties` all return `'<keyword>' is not permitted`,
-/// and `not` returns `Unsupported keywords ('not',)`. All of them are
-/// restrictive, so dropping them can only relax the schema.
+/// reach the wire (rule 10). Confirmed against the live upstream:
+/// `allOf`, `if`, `contains`, `unevaluatedItems`, `unevaluatedProperties`
+/// and `minProperties` all return `'<keyword>' is not permitted`, and
+/// `not` returns `Unsupported keywords ('not',)`. `maxProperties` and
+/// `uniqueItems` have not been seen refused live: they are dropped on the
+/// strength of OpenAI's documented subset (object and array keywords are
+/// limited to `minItems` / `maxItems`) and as `minProperties`' sibling.
+/// All of them are restrictive, so dropping them can only relax the schema.
 const UNSUPPORTED_KEYWORDS: &[&str] = &[
     "allOf",
     "not",
@@ -1004,7 +1157,16 @@ const UNSUPPORTED_KEYWORDS: &[&str] = &[
     "contains",
     "unevaluatedItems",
     "unevaluatedProperties",
+    "minProperties",
+    "maxProperties",
+    "uniqueItems",
 ];
+
+/// Annotation-only keywords dropped from every schema node (rule 12).
+/// Unlike [`UNSUPPORTED_KEYWORDS`] these were not confirmed refused by the
+/// live gateway; they are dropped because they carry no validation meaning,
+/// so the drop is free.
+const ANNOTATION_ONLY_UNSUPPORTED_KEYWORDS: &[&str] = &["examples"];
 
 /// True if a JSON Schema `pattern` uses a regex construct the upstream
 /// strict validator cannot compile (rule 11).
@@ -2276,6 +2438,347 @@ mod tests {
                 out["properties"][key]
             );
         }
+    }
+
+    /// Translate one tool and return its outbound `parameters` plus the
+    /// schema the repair registry kept for it.
+    fn translate_tool_schema(name: &str, schema: Value) -> (Value, Value) {
+        let mut req = fixture_request();
+        req.tools = Some(vec![Tool {
+            name: name.into(),
+            description: None,
+            input_schema: Some(schema),
+        }]);
+        let (out, registry) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let ToolDefinition::Function(tool) = out.tools.unwrap().remove(0) else {
+            panic!("expected a function tool");
+        };
+        (tool.parameters, registry.get(name).cloned().unwrap())
+    }
+
+    /// True if a `$ref` key appears anywhere in the value.
+    fn contains_ref_key(v: &Value) -> bool {
+        match v {
+            Value::Object(m) => m.contains_key("$ref") || m.values().any(contains_ref_key),
+            Value::Array(a) => a.iter().any(contains_ref_key),
+            _ => false,
+        }
+    }
+
+    /// Regression test for the live `mcp__rea__address_name` 400:
+    /// `Invalid schema for function 'mcp__rea__address_name': context=(),
+    /// $ref cannot have keywords {'description'}`. The schema is the exact
+    /// one Claude Code sent from the `rea` MCP server. `address` and
+    /// `document` are optional, so strict mode makes them nullable; the
+    /// `string` type must come from the *definition*, not from the
+    /// sanitizer's typeless default.
+    #[test]
+    fn ref_with_sibling_keywords_is_inlined_before_sanitizing() {
+        let schema = json!({
+            "$defs": {
+                "__schema0": {
+                    "$ref": "#/$defs/__schema1",
+                    "description": "The active target's provider document name; use open_binary to switch targets"
+                },
+                "__schema1": {"type": "string"},
+                "__schema2": {
+                    "description": "A provider-normalized address; default memory uses 0x-prefixed hexadecimal",
+                    "type": "string"
+                }
+            },
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false,
+            "examples": [{}],
+            "properties": {
+                "address": {
+                    "$ref": "#/$defs/__schema2",
+                    "description": "A provider-normalized address; default memory uses 0x-prefixed hexadecimal"
+                },
+                "document": {
+                    "$ref": "#/$defs/__schema0",
+                    "description": "The active target's provider document name; use open_binary to switch targets"
+                }
+            },
+            "type": "object"
+        });
+        let (params, original) = translate_tool_schema("mcp__rea__address_name", schema);
+
+        assert!(
+            !contains_ref_key(&params),
+            "no $ref may reach the wire: {params}"
+        );
+        assert!(params.get("$defs").is_none(), "{params}");
+        assert!(params.get("examples").is_none(), "{params}");
+        assert_eq!(
+            params["$schema"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["required"], json!(["address", "document"]));
+        for key in ["address", "document"] {
+            assert_eq!(
+                params["properties"][key]["type"],
+                json!(["string", "null"]),
+                "`{key}` must be the definition's string, made nullable: {params}"
+            );
+        }
+        assert_eq!(
+            params["properties"]["document"]["description"],
+            "The active target's provider document name; use open_binary to switch targets"
+        );
+
+        // The repair registry holds the resolved schema, not the raw one, so
+        // the null-sentinel repair sees real types.
+        assert!(!contains_ref_key(&original), "{original}");
+        assert_eq!(original["properties"]["address"]["type"], "string");
+    }
+
+    /// A recursive definition cannot be inlined, so it stays behind as a
+    /// bare `$ref` into a retained `$defs` entry - the form OpenAI documents
+    /// for recursive schemas. The retained entry must be sanitized like any
+    /// other schema, the bare reference must stay opaque, and an optional
+    /// recursive property becomes `anyOf: [{"$ref"}, {"type": "null"}]`.
+    #[test]
+    fn recursive_definition_is_retained_and_sanitized() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"tree": {"$ref": "#/$defs/Node"}},
+            "required": ["tree"],
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                        "next": {"$ref": "#/$defs/Node", "description": "the next node"}
+                    },
+                    "required": ["value"]
+                }
+            }
+        });
+        let (params, _original) = translate_tool_schema("walk", schema);
+
+        let node = &params["$defs"]["Node"];
+        assert_eq!(node["type"], "object");
+        assert_eq!(node["additionalProperties"], false);
+        assert_eq!(node["required"], json!(["value", "next"]));
+        // Optional + recursive: nullable union around the opaque reference.
+        assert_eq!(
+            node["properties"]["next"],
+            json!({"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]})
+        );
+        // Every `$ref` that survives is bare and points at the retained entry.
+        fn check(v: &Value) {
+            match v {
+                Value::Object(m) => {
+                    if let Some(r) = m.get("$ref") {
+                        assert_eq!(r, "#/$defs/Node");
+                        assert_eq!(m.len(), 1, "a retained $ref must be bare: {m:?}");
+                    }
+                    m.values().for_each(check);
+                }
+                Value::Array(a) => a.iter().for_each(check),
+                _ => {}
+            }
+        }
+        check(&params);
+    }
+
+    /// A function tool whose schema has `n` top-level string properties.
+    fn tool_with_props(name: &str, n: usize) -> ToolDefinition {
+        let props: serde_json::Map<String, Value> = (0..n)
+            .map(|i| (format!("p{i}"), json!({"type": "string"})))
+            .collect();
+        ToolDefinition::Function(ResponsesTool {
+            kind: "function".into(),
+            name: name.into(),
+            description: None,
+            strict: true,
+            parameters: json!({"type": "object", "properties": props}),
+        })
+    }
+
+    fn is_strict(tool: &ToolDefinition) -> bool {
+        matches!(tool, ToolDefinition::Function(f) if f.strict)
+    }
+
+    #[test]
+    fn count_schema_properties_counts_nested_keys_and_skips_data() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string", "default": {"properties": {"x": 1, "y": 2}}},
+                "b": {
+                    "type": "object",
+                    "properties": {"c": {"type": "string"}, "d": {"type": "string"}}
+                },
+                "e": {"type": "array", "items": {"type": "object", "properties": {"f": {}}}},
+                "g": {"enum": [{"properties": {"z": 1}}]}
+            }
+        });
+        // a, b, e, g at the top (4) + c, d (2) + f (1); `default` / `enum`
+        // contents are values, not schemas.
+        assert_eq!(count_schema_properties(&schema), 7);
+    }
+
+    /// Live finding: 207 + 182 tools each work alone, but together they
+    /// exceed the upstream's compile budget and the request comes back as an
+    /// empty `incomplete`. Demoting the single heaviest tool fixes it.
+    #[test]
+    fn strict_budget_demotes_only_the_heaviest_tool_needed() {
+        let mut tools = vec![
+            tool_with_props("small_a", 3),
+            tool_with_props("huge", 40),
+            tool_with_props("small_b", 4),
+        ];
+        // 47 total against a budget of 10: demoting `huge` (40) leaves 7.
+        enforce_strict_property_budget(&mut tools, 10);
+        assert!(is_strict(&tools[0]));
+        assert!(!is_strict(&tools[1]), "the heaviest tool is demoted");
+        assert!(is_strict(&tools[2]));
+    }
+
+    #[test]
+    fn strict_budget_demotes_in_weight_order_until_under_budget() {
+        let mut tools = vec![
+            tool_with_props("w5", 5),
+            tool_with_props("w9", 9),
+            tool_with_props("w7", 7),
+            tool_with_props("w2", 2),
+        ];
+        // 23 total, budget 8: drop 9 (14 left), drop 7 (7 left) and stop.
+        enforce_strict_property_budget(&mut tools, 8);
+        let strict: Vec<bool> = tools.iter().map(is_strict).collect();
+        assert_eq!(strict, vec![true, false, false, true]);
+    }
+
+    #[test]
+    fn strict_budget_leaves_tools_alone_when_within_budget() {
+        let mut tools = vec![tool_with_props("a", 4), tool_with_props("b", 6)];
+        enforce_strict_property_budget(&mut tools, 10);
+        assert!(tools.iter().all(is_strict));
+    }
+
+    #[test]
+    fn strict_budget_ignores_already_non_strict_and_server_tools() {
+        let mut tools = vec![
+            tool_with_props("loose", 50),
+            ToolDefinition::WebSearch(WebSearchTool {
+                kind: "web_search".into(),
+                max_uses: None,
+                search_context_size: None,
+                user_location: None,
+                allowed_domains: None,
+                blocked_domains: None,
+            }),
+            tool_with_props("tight", 5),
+        ];
+        if let ToolDefinition::Function(f) = &mut tools[0] {
+            f.strict = false;
+        }
+        // Only `tight` counts (5 <= 10); nothing else changes.
+        enforce_strict_property_budget(&mut tools, 10);
+        assert!(!is_strict(&tools[0]));
+        assert!(is_strict(&tools[2]));
+    }
+
+    /// End to end: an over-budget request still sends every tool, only the
+    /// heaviest is non-strict, and its sanitized schema is intact.
+    #[test]
+    fn over_budget_request_keeps_all_tools_and_demotes_the_heaviest() {
+        let big: serde_json::Map<String, Value> = (0..STRICT_PROPERTY_BUDGET + 10)
+            .map(|i| (format!("p{i}"), json!({"type": "string"})))
+            .collect();
+        let mut req = fixture_request();
+        req.tools = Some(vec![
+            Tool {
+                name: "tiny".into(),
+                description: None,
+                input_schema: Some(
+                    json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+                ),
+            },
+            Tool {
+                name: "enormous".into(),
+                description: None,
+                input_schema: Some(json!({"type": "object", "properties": big})),
+            },
+        ]);
+        let (out, registry) =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let tools = out.tools.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(is_strict(&tools[0]));
+        assert!(!is_strict(&tools[1]));
+        let ToolDefinition::Function(enormous) = &tools[1] else {
+            panic!("function tool");
+        };
+        assert_eq!(
+            enormous.parameters["properties"].as_object().unwrap().len(),
+            STRICT_PROPERTY_BUDGET + 10
+        );
+        // The repair registry still has both schemas, so tool calls to the
+        // demoted tool are validated and repaired as before.
+        assert!(registry.get("enormous").is_some());
+    }
+
+    /// Live 400: `Invalid schema for function 'mcp__rea__compare_web_captures':
+    /// In context=(), 'minProperties' is not permitted.` Rule 10 drops the
+    /// object-size and array-uniqueness keywords the validator does not
+    /// support, and leaves the ones it documents (`minItems`, `maxItems`).
+    #[test]
+    fn sanitize_tool_schema_drops_size_and_uniqueness_keywords() {
+        let schema = json!({
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 4,
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "uniqueItems": true,
+                    "minItems": 1,
+                    "maxItems": 3
+                }
+            },
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(out.get("minProperties").is_none(), "{out}");
+        assert!(out.get("maxProperties").is_none(), "{out}");
+        let tags = &out["properties"]["tags"];
+        assert!(tags.get("uniqueItems").is_none(), "{tags}");
+        assert_eq!(tags["minItems"], 1);
+        assert_eq!(tags["maxItems"], 3);
+    }
+
+    /// `examples` is annotation-only (rule 12): dropped from every node.
+    #[test]
+    fn sanitize_tool_schema_drops_examples() {
+        let schema = json!({
+            "type": "object",
+            "examples": [{}],
+            "properties": {"x": {"type": "string", "examples": ["a"]}},
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert!(out.get("examples").is_none(), "{out}");
+        assert!(out["properties"]["x"].get("examples").is_none(), "{out}");
+        assert_eq!(out["properties"]["x"]["type"], "string");
+    }
+
+    /// A bare `$ref` node is opaque to the sanitizer: it must not gain a
+    /// `type`, `properties` or `additionalProperties`, and the retained
+    /// `$defs` entry it points at is still sanitized.
+    #[test]
+    fn sanitize_tool_schema_leaves_bare_ref_nodes_opaque() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"n": {"$ref": "#/$defs/N"}},
+            "$defs": {"N": {"type": "object", "properties": {"v": {"type": "string"}}}},
+        });
+        let out = sanitize_tool_schema(schema, None);
+        assert_eq!(out["properties"]["n"], json!({"$ref": "#/$defs/N"}));
+        assert_eq!(out["$defs"]["N"]["additionalProperties"], false);
+        assert_eq!(out["$defs"]["N"]["required"], json!(["v"]));
     }
 
     /// Rule 9: `oneOf` is refused upstream (`'oneOf' is not permitted`)
