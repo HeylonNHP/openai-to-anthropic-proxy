@@ -16,7 +16,9 @@
 >   plan in **§12**.
 >
 > §§1-10 are the initial research. §11 corrects several of its estimates
-> and supersedes them where they conflict. Read §11 and §12 before building.
+> and supersedes them where they conflict. **§12's bypass design is challenged
+> and partly retracted by §13** — read §13 before building. §14 is the final
+> recommended sequencing.
 
 ---
 
@@ -956,6 +958,15 @@ type. This is the key to keeping the feature out of the shared wire types.
 
 ## 12. Implementation plan — modular, no new tech debt
 
+> ⚠️ **Partly retracted 2026-11-15.** §13's duplication audit found that the
+> `try_handle` bypass must copy ~290-330 lines of proxy policy (auth, alias,
+> caching, retries, fallback, stats, logs) — more than the 150-250-line
+> refactor it was designed to avoid — and that no existing test enters the
+> enabled path. §12.2/§12.3/§12.4/§12.7 are superseded by §13 and §14.
+> §11.3 (buffer, don't splice), §11.5 (one assistant message), §11.6
+> (`Raw(Value)`), §12.5 (module-local cheap config), §12.6 (test matrix) and
+> §12.8 (what not to build) still stand.
+
 ### 12.0 Design principles (non-negotiable)
 
 1. **Off by default.** When `enabled = false`, the request path is
@@ -1206,6 +1217,211 @@ keeping but the orchestration is not.
    A proxy cannot fix this; document it.
 4. **`tengu_sage_compass2` flag value** — remote, not statically resolvable,
    but an explicit advisor model bypasses it (§9.3).
+
+
+---
+
+## 13. Challenge: would refactoring the pipeline FIRST be cleaner? (2026-11-15)
+
+> Two read-only sub-agents audited §12's bypass design against HEAD `8d378cf`:
+> a **duplication audit** (what the bypass would have to copy) and a
+> **refactor verdict** (what a behaviour-preserving extraction looks like).
+> This section corrects §12. It is not a repudiation of the whole design —
+> §11.3 (buffer, don't splice), §11.5 (one assistant message) and §11.6
+> (the `Raw(Value)` extension point) all survive.
+
+### 13.1 The uncomfortable finding: the bypass is a second proxy
+
+§12.2 claimed ~6 lines of shared-code churn. That is **only true because
+~290-330 lines of proxy policy move into the private advisor module**. Every
+cross-cutting behaviour below lives in `handle_messages` / `handle_messages_inner`
+and would have to be replicated for the enabled path to behave the same:
+
+| behaviour | file:line | if omitted |
+|---|---|---|
+| `check_proxy_key` | `src/proxy.rs:169` | **security hole** — §12.2 puts the hook at `:160`, *before* auth |
+| inbound JSON parse + `BadRequest` | `:171-172` | §12.2 passes `&req`, which does not exist yet; must re-parse or move below |
+| `mappings.load_live()` snapshot | `:180` | a TUI edit mid-request tears the alias/fallback view |
+| alias `resolve` | `:190` | alias silently ignored |
+| unmapped-model warning + `log_safe` | `:195-224` | operator-visible warning vanishes; log-injection fix from `b0d5629` lost |
+| `reasoning_for_request` | `:237-240` | wrong/omitted effort |
+| `prompt_caching_for_model` | `:241` | **no cache breakpoints** → visible token cost |
+| `reasoning_replay_for_model` | `:242` | prior `thinking` blocks silently dropped |
+| `outbound.model` / `prompt_cache_key` | `:255`, `:260-262` | wrong model, no cache key |
+| `→ upstream` log + `replayed_chars` | `:266-281` | the source-reading guard test at `:1195` reads **the one** statement in `proxy.rs`; a copy is invisible to it |
+| TUI `Inbound` log | `:283-305` | empty log pane |
+| `capabilities.apply_known` | `:405-412`, `:548` | known-bad params re-sent, repeated 400s |
+| URL build + outer send loop + payload logs | `:381-432` | URL builder is private and **not** in §12.4's `pub(crate)` list |
+| `unsupported_parameter` strip retry | `:442-470` | 3 e2e tests pinned at `tests/proxy_e2e.rs:2457, 2557, 2591` |
+| `default_model` fallback (re-translates) | `:482-552` | **user-visible**: an *executor* model rejection would degrade to `unavailable` instead of being answered |
+| `map_upstream_error` | `:554`, `:1031-1055` | envelope parsing + `kind: message` lost |
+| hidden corrective retry | `:603-626` | `tests/proxy_e2e.rs:2341` |
+| stats + `stats_model` + `fallback_used` | `:629-638`, `:679-712` | TUI totals wrong |
+| `←` log + JSON response | `:639-674` | log format shared with `print_stream_stats` `:714-752` |
+
+§12.3 explicitly forbids `detect_model_rejection`, `default_model()` and
+`capabilities.*` (`:1084`) — but that rule was meant for the **advisor's own
+call**, not the executor's. §12.3 applies it to the whole session, so the
+executor loses its fallback. **§12 contradicts itself here.**
+
+Full parity would need **~106 preamble lines + ~180-220 inner lines =
+~290-330 duplicated lines**, plus `pub(crate)` on ~8 more private helpers
+(`:73`, `:679`, `:700`, `:706`, `:714`, `:1031`, `:1064`, `:1109`) — §12.4
+budgeted **3**. That **exceeds** the 150-250-line refactor estimate.
+
+**And the existing tests do not catch it.** All 37 e2e tests drive
+`proxy::router(...)` (`tests/proxy_e2e.rs:220-224`), so they do pass through
+`handle_messages`, but `try_handle` returns `None` when disabled and no test
+enables the advisor. §12.6 item 7 celebrating "all 355 + 37 existing tests
+still pass unchanged" is exactly the symptom: **they pass because they never
+enter the enabled path.**
+
+### 13.2 Evidence that duplication drifts in THIS codebase
+
+The policy is **already duplicated once** — first attempt `:229-262` vs the
+fallback re-translation `:496-544`. They currently agree only because every
+change was hand-applied twice:
+
+- `24f4805` added `reasoning_replay_for_model` to **both** call sites.
+- `f507d59` had to separately fix `reasoning_replay` → `&reasoning_replay`
+  **and** `fallback_reasoning_replay` → `&fallback_reasoning_replay`.
+- `b0d5629` manually rewrote the fallback's `reasoning_for_request` and
+  re-applied the `log_safe` injection fix there.
+- **Real asymmetry already shipped:** `8fde2d4` added `replayed_chars` only
+  to the first-attempt log; `:277-278` documents that a fallback's replay
+  counter is never reported.
+
+Three dedicated e2e tests exist **solely** to guard this one duplication:
+`fallback_recomputes_reasoning_for_default_model` (`:1650`),
+`fallback_recomputes_prompt_caching_for_default_model` (`:1726`),
+`fallback_recomputes_reasoning_replay_for_default_model` (`:1806`). A second
+pair is `:629-673` (JSON log) vs `print_stream_stats :714-752` (stream log).
+
+**So a third copy is not a theoretical concern — this repo has already paid
+for the second one.**
+
+### 13.3 The refactor is mechanical, not a rewrite
+
+A behaviour-preserving extraction is smaller than §11.2 implied:
+
+```rust
+struct Attempt {                 // the 7 values already moved at :307-315
+    state: AppState, headers: HeaderMap, req: CreateMessageRequest,
+    outbound: ResponsesRequest, registry: ToolSchemaRegistry,
+    start: Instant, mappings_snapshot: Arc<RuntimeMappings>,
+    fallback_used: bool, param_retries: usize, attempt: u8,
+}
+enum Outcome { Streaming(reqwest::Response), Buffered(ResponsesResponse) }
+
+fn build_outbound(req, config, model) -> Result<(ResponsesRequest, Registry, u64)>;
+async fn send_success(&mut self) -> Result<reqwest::Response, AppError>;
+async fn execute(&mut self) -> Result<Outcome, AppError>;
+async fn run(self) -> Result<Response, AppError>;
+```
+
+- `:229-249` + `:253-262` + `:496-544` collapse into **one** `build_outbound`
+  — which also **eliminates the existing duplication** and its 3 guard tests.
+- `:393-555` → `send_success`; `:594-626` → `execute` (composes the existing
+  `send_upstream_once` `:321` + `parse_upstream_body` `:348`).
+- `:560-592` → `render_streaming`; `:628-674` → `render_json`.
+- **§11.2's "`req` is moved at `:310`" objection is wrong**: `:496-503` and
+  `:532-538` already borrow `&req` for fallback re-translation. Store it once
+  in `Attempt`; no clone. (`CreateMessageRequest` is `Clone` but not
+  `Serialize`, `src/anthropic.rs:26`; `ResponsesRequest` is `Clone + Serialize`,
+  `src/responses.rs:30`.)
+- Keep the `→ upstream` log statement **in `proxy.rs`** — the test at `:1195`
+  does a source-level `rfind` for it.
+- Watch two lifetime details: `ReasoningReplay` holds `Cell<u64>`
+  (`src/config.rs:277-284`) so it is `!Sync` — read `replayed_chars` before
+  `run`; and `Outcome::Streaming` must return the **raw** `reqwest::Response`
+  so `bytes_stream()` still works (`src/proxy.rs:560-567`).
+
+Invariants to pin: the three bounded counters (`:400`, `:401`, `:603`), the
+one-shot `attempt == 1` fallback, `apply_known` before first send and after
+fallback only, validation retry being non-streaming-only and keeping the first
+success on retry error, `fallback_used` stats attribution, `Drop` stats, and
+the log order.
+
+### 13.4 Safety net — mostly adequate, with gaps
+
+14 in-file unit tests (`src/proxy.rs:1124-1309`) + 37 e2e tests. Retry order
+is pinned by `unsupported_parameter_retries_without_it_and_remembers` (`:2457`),
+`rejects_both_sampling_params_one_at_a_time` (`:2591`),
+`invalid_tool_input_triggers_corrective_retry` (`:2341`); fallback by
+`model_not_supported_falls_back_to_default` (`:792`),
+`fallback_model_also_rejected_returns_the_second_error` (`:1210`),
+`streaming_model_not_supported_falls_back_to_default` (`:1563`).
+
+**Enough for bodies/retry/fallback; not enough for a hot-path refactor.** Add
+FIRST, as characterization tests: (1) a `retry_order_matrix` diffing
+`received_all` through unsupported-param → fallback → success; (2) corrective
+retry after fallback keeping the first success; (3) fallback usage + log
+attribution via `router_with_stores` + captured `OutputSink`; (4) client
+disconnect after a terminal stream recording exactly once.
+
+### 13.5 The real trade-off, in plain terms
+
+| | A: refactor first | B: bypass (§12) |
+|---|---|---|
+| lines | 150-250 `proxy.rs` + 75-100 SSE + advisor loop | 600-800 module + ~290-330 **duplicated** policy lines |
+| blast radius | **every** request through `:362-676` | disabled path untouched |
+| future policy edit | **1 place** (and the existing 2 become 1) | **3+ places**; history shows paired edits drift |
+| delete on failure | remove advisor; `Attempt` remains as a net simplification | delete module + hook + revert `Raw(Value)`, `iterations`, `ContentBlockParam`, 6 `stream.rs` literals, TUI label, docs |
+
+A generic middleware/trait/chain is **over-engineering here**: there is exactly
+one real implementation of the request policy, and a trait would only obscure
+raw-response ownership and the `Drop` stats hook.
+
+### 13.6 Verdict — the answer depends on WHEN
+
+**Yes, refactoring is the cleaner end state. No, doing it FIRST does not
+reduce debt for this feature — because the feature is speculative.** The
+core assumption is still unproven: **will a cheap model like `beam` even emit
+`function_call{name:"advisor"}`?** (§12.9 item 1). If it never does, the whole
+orchestration is dead weight — and a 150-250-line refactor of the hottest
+function in the proxy, touching every user, would have been paid for nothing.
+
+One clean pipe is better architecture **if the feature survives**. A deletable
+experiment is better risk management **before it survives**. §12's mistake was
+not choosing the experiment — it was calling the experiment "no tech debt"
+when it is really **deferred, privately-owned debt**, and claiming 6 lines of
+integration when ~300 lines of policy were simply moved out of sight.
+
+---
+
+## 14. Final recommended sequencing
+
+1. **Spike the assumption OUTSIDE the proxy** (a 30-line script against a fake
+   upstream): does `beam` (cheap) emit a call to a zero-argument `advisor`
+   function tool when the `# Advisor Tool` instructions are present?
+   **If no → stop.** Nothing to build; keep the cheap-advisor notes (§7) and
+   the option-D fix (`df5d78e`).
+2. **If yes, add the 4 characterization tests** (§13.4). They are worth
+   having regardless of the advisor — they pin retry order, fallback
+   attribution and disconnect behaviour that are currently implicit.
+3. **Refactor `handle_messages_inner` with zero behaviour change**, producing
+   `Attempt` + `build_outbound` + `execute` (§13.3). This is **debt-reducing
+   on its own**: it deletes the existing first-attempt/fallback duplication
+   and its 3 guard tests. Gate: all 355 + 37 + 4 tests green, plus a
+   differential check of received bodies and log lines.
+4. **Fold the advisor in as 2-3 `Attempt::execute` calls** with per-attempt
+   overrides (advisor model, shorter timeout, no fallback, no capability
+   learning). One implementation of alias/effort/caching/retry/stats policy.
+   Keep §11.3's buffered-SSE shape and §11.6's `Raw(Value)` wire extension.
+5. **If a time-boxed bypass is genuinely needed** to validate step 1 inside
+   the proxy, give it a **deletion deadline**, keep it feature-gated, make no
+   permanent wire-type edits, and add the differential matrix (same requests
+   enabled vs disabled, diff received bodies + responses + logs). Do **not**
+   call it "consolidate later" — consolidate or delete at the deadline.
+
+**Change the answer if:** the spike proves the tool is called reliably **and**
+the feature will be enabled by default or maintained beyond one release —
+then refactor first, because duplication stops being a temporary experiment
+and becomes real long-term debt. Or, more simply: **if you already know you're
+keeping the advisor, refactor now.** If you're still finding out, spike first.
+
+*"Is a bypass cleaner?" → No. "Is it the right first move?" → Probably,
+but only as a time-boxed experiment.*
 
 ---
 
