@@ -17,8 +17,9 @@
 >
 > §§1-10 are the initial research. §11 corrects several of its estimates
 > and supersedes them where they conflict. **§12's bypass design is challenged
-> and partly retracted by §13** — read §13 before building. §14 is the final
-> recommended sequencing.
+> and partly retracted by §13** — read §13 before building. §14 is the
+> recommended sequencing; **§15 corrects who actually calls the tool** (the
+> executor, not `beam`) and removes the go/no-go framing. Read §15 too.
 
 ---
 
@@ -1392,11 +1393,13 @@ integration when ~300 lines of policy were simply moved out of sight.
 ## 14. Final recommended sequencing
 
 1. **Spike the assumption OUTSIDE the proxy** (a 30-line script against a fake
-   upstream): does `beam` (cheap) emit a call to a zero-argument `advisor`
+   upstream): does the **executor** emit a call to a zero-argument `advisor`
    function tool when the `# Advisor Tool` instructions are present?
-   **If no → stop.** Nothing to build; keep the cheap-advisor notes (§7) and
-   the option-D fix (`df5d78e`).
-2. **If yes, add the 4 characterization tests** (§13.4). They are worth
+   *(Corrected by §15: this is NOT a go/no-go gate, and `beam` is the
+   advisor, not the model being asked to call.)* A low invocation rate just
+   means choosing design B (always consult) over A (wait for a call). Keep
+   the cheap-advisor notes (§7) and the option-D fix (`df5d78e`).
+2. **Add the 4 characterization tests** (§13.4). They are worth
    having regardless of the advisor — they pin retry order, fallback
    attribution and disconnect behaviour that are currently implicit.
 3. **Refactor `handle_messages_inner` with zero behaviour change**, producing
@@ -1422,6 +1425,108 @@ keeping the advisor, refactor now.** If you're still finding out, spike first.
 
 *"Is a bypass cleaner?" → No. "Is it the right first move?" → Probably,
 but only as a time-boxed experiment.*
+
+---
+
+## 15. Clarification: who calls the tool, and what §12.9 / §14.1 got wrong (2026-11-15)
+
+Operator question: *"What do you mean by beam calling the tool? Beam doesn't
+need its own advisor implementation — we make the advisor implementation,
+and the model just calls it? Most agentic models use tools fine, and I might
+not always use beam."*
+
+**The operator is right. §12.9 and §14.1 conflated two different models.**
+
+### 15.1 The cast (three roles, only two of them are models)
+
+| role | who/what | job | does it call a tool? |
+|---|---|---|---|
+| **executor** | the model Claude Code's request resolves to | does the user's task; decides when to ask for help | **YES** — emits `function_call{name:"advisor"}` |
+| **advisor** | a second, cheap model — `beam` in §7 | writes one paragraph of advice | **NO** — just generates text |
+| **proxy** | our code | declares the tool, forwards the call, runs the advisor, feeds the advice back, emits the Anthropic blocks | n/a — it *implements* the tool |
+
+`beam` was recommended in §7 as the **advisor** (the consulted model). It
+never calls anything; it answers a plain text-generation request with no
+tools at all. §12.9's "will a cheap model like beam even emit
+`function_call{name:"advisor"}`" and "spike it with beam" wrongly attributed
+the executor's job to the advisor. The "spike it with beam" phrase meant
+"use beam to keep the whole test setup cheap", but read as — and was then
+reasoned about as — a claim about beam's tool-calling ability. That is the
+muddle.
+
+### 15.2 The corrected risk
+
+The executor **already calls ~12-16 function tools through this very proxy**
+(`Bash`, `Read`, `Edit`, …; measured in the corpus). Tool calling is not a
+novel capability being requested of it — the entire proxy depends on it.
+Adding one more zero-argument function tool is not a capability question.
+The operator's "most agentic models are smart enough" is correct, and stronger
+than that: it is a **proven, load-bearing assumption of the existing system**.
+
+What is genuinely uncertain is a **soft quality question, not a feasibility
+gate**: how *often* will the executor choose to consult, given the
+`# Advisor Tool` system-prompt section? That only decides **design A vs B**:
+
+- **A — detection loop:** wait for `function_call{name:"advisor"}`, then
+  consult. Depends on invocation rate.
+- **B — proactive review:** always run the advisor once before the turn,
+  then hand its advice to the executor. **Needs no tool call at all.**
+
+So a low invocation rate never means "nothing to build" — it means "use
+B". §12.9 already said this; §14.1's "**If no → stop**" contradicted it and
+was simply wrong. That over-dramatic gate was also what made §13.6 call the
+feature "speculative" enough to defer the refactor.
+
+### 15.3 The real work is on the proxy side, not the model's
+
+The concrete, model-independent work is translating the declaration.
+Claude Code sends **exactly three fields** (§3.1):
+
+```json
+{"type":"advisor_20260301","name":"advisor","model":"claude-opus-5-5"}
+```
+
+No `input_schema`, **no `description`**. `src/translate.rs:185` does
+`t.input_schema.clone()?` inside a `filter_map`, so **the declaration is
+dropped today** and never reaches the upstream. The proxy must synthesize an
+ordinary Responses function tool, e.g.:
+
+```json
+{"type":"function","name":"advisor",
+ "description":"Consult a reviewer model before substantive work. Takes no arguments.",
+ "strict":true,"parameters":{"type":"object","properties":{}}}
+```
+
+and confirm the empty schema survives `sanitize_tool_schema` + the upstream's
+strict validator. The "invitation" to consult is **Claude Code's
+`# Advisor Tool` system-prompt section** (kept in the enabled path by the
+`df5d78e` guard, which keys on the inbound tool name), not the tool
+description — though adding a description is a cheap belt-and-braces.
+This is a ~10-line proxy change, fully under our control, with **zero
+dependence on which model is behind the proxy**.
+
+### 15.4 What swapping models actually changes
+
+| knob | affects | does NOT affect |
+|---|---|---|
+| swap the **executor** (— may happen, per the operator) | how *reliably/often* the advisor tool gets called; general answer quality | whether the tool *can* be called |
+| swap the **advisor** (`beam` → something else) | advice quality + cost (§7) | tool-call behaviour, at all |
+
+A more capable executor tomorrow may consult more reliably — that is an
+argument **for** building the mechanism once, not against it.
+
+### 15.5 Effect on the §13 / §14 recommendation
+
+- §13's core finding stands and is unaffected: a bypass duplicates
+  ~290-330 lines of policy; one clean pipe is better. The refactor also
+  deletes the existing `:229-262` / `:496-544` duplication.
+- §13.6 / §14.1 overstated *why* to defer the refactor. The feature is not
+  technically speculative — tool calling is proven. What is actually
+  undecided is a **product decision the operator makes**: do you want this
+  feature kept (enabled by default / maintained)? If yes, §13.6's own
+  condition is already met — **refactor first**.
+- Revised step 1: a small spike is still worth it, but as a **measurement**
+  (invocation rate → A vs B), not a go/no-go gate. And B needs no spike.
 
 ---
 
