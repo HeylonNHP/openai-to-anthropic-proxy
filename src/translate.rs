@@ -127,7 +127,7 @@ pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
     reasoning_decision: Option<ReasoningDecision>,
     prompt_caching: &PromptCachingConfig,
-    replay: ReasoningReplay,
+    replay: &ReasoningReplay,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
@@ -1331,7 +1331,7 @@ fn append_message_translation(
     instructions: &mut String,
     msg: &MessageParam,
     prompt_caching: &PromptCachingConfig,
-    replay: ReasoningReplay,
+    replay: &ReasoningReplay,
 ) -> Result<()> {
     match msg.role {
         MessageRole::User => append_user_message(out, &msg.content, prompt_caching),
@@ -1565,10 +1565,44 @@ fn escape_thinking_fence(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('<') {
         return std::borrow::Cow::Borrowed(text);
     }
-    std::borrow::Cow::Owned(
-        text.replace("<thinking>", "&lt;thinking&gt;")
-            .replace("</thinking>", "&lt;/thinking&gt;"),
-    )
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut last = 0usize;
+    let mut idx = 0usize;
+    while idx < text.len() {
+        if !text.is_char_boundary(idx) {
+            idx += 1;
+            continue;
+        }
+        let Some(rest) = text[idx..].strip_prefix('<') else {
+            idx += 1;
+            continue;
+        };
+        // Case-insensitive, so `</THINKING>` and `</thinking >` are caught
+        // too — an upstream that matches the fence case-insensitively would
+        // otherwise still be confused.
+        let is_fence = starts_with_ignore_ascii_case(rest, "thinking")
+            || starts_with_ignore_ascii_case(rest, "/thinking");
+        if is_fence {
+            out.push_str(&text[last..idx]);
+            out.push_str("&lt;");
+            last = idx + 1;
+        }
+        idx += 1;
+    }
+    out.push_str(&text[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Does `haystack` start with `needle`, ignoring ASCII case?
+fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let mut h = haystack.chars();
+    for n in needle.chars() {
+        match h.next() {
+            Some(c) if c.eq_ignore_ascii_case(&n) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// A deterministic synthetic id for a replayed reasoning item.
@@ -1582,12 +1616,18 @@ fn escape_thinking_fence(text: &str) -> std::borrow::Cow<'_, str> {
 /// replays to the same id on every turn — that keeps the upstream's prompt
 /// cache stable. FNV-1a is used rather than `DefaultHasher` because the
 /// latter's output is not guaranteed stable across Rust releases.
-fn synthetic_reasoning_id(reasoning: &str) -> String {
+fn synthetic_reasoning_id(reasoning: &str, signature: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
-    for byte in reasoning.as_bytes() {
-        hash ^= u64::from(*byte);
+    let bytes = reasoning
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0u8))
+        .chain(signature.as_bytes().iter().copied());
+    for byte in bytes {
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("rs_proxy_{hash:016x}")
@@ -1596,7 +1636,7 @@ fn synthetic_reasoning_id(reasoning: &str) -> String {
 fn append_assistant_message(
     out: &mut Vec<InputItem>,
     content: &MessageContent,
-    replay: ReasoningReplay,
+    replay: &ReasoningReplay,
 ) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
@@ -1691,6 +1731,12 @@ fn append_assistant_message(
             // (reasoning first, then the visible answer) — one part, not
             // two, so a provider that only reads `content[0]` still sees the
             // answer.
+            if !reasoning.is_empty() {
+                replay
+                    .replayed_chars
+                    .set(replay.replayed_chars.get() + reasoning.chars().count() as u64);
+            }
+
             let body = match replay.mode {
                 ReasoningReplayMode::Text if !reasoning.is_empty() => {
                     let mut b = String::with_capacity(reasoning.len() + text.len() + 24);
@@ -1722,8 +1768,8 @@ fn append_assistant_message(
             {
                 // OpenAI pairs a reasoning item with the item that follows
                 // it, so the reasoning must come first. The upstream's own
-                // `rs_…` id is lost at the Anthropic wire boundary, so it
-                // is omitted.
+                // `rs_…` id is lost at the Anthropic wire boundary, so a
+                // stable synthetic one is used instead.
                 out.push(item);
             }
 
@@ -1768,8 +1814,10 @@ fn build_reasoning_item(reasoning: &str, signature: &str) -> Option<InputItem> {
     Some(InputItem::Reasoning {
         // The upstream's own id is unrecoverable, but OpenAI's schema marks
         // `id` as required on a reasoning item — a synthetic one is better
-        // than a missing one, and is stable across turns.
-        id: Some(synthetic_reasoning_id(reasoning)),
+        // than a missing one, and is stable across turns. It is derived
+        // from the reasoning text AND the signature, so two reasoning
+        // items that share text but differ in signature get different ids.
+        id: Some(synthetic_reasoning_id(reasoning, signature)),
         content: if reasoning.is_empty() {
             Vec::new()
         } else {
@@ -1940,7 +1988,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.model, "test-model");
@@ -2000,7 +2048,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2047,7 +2095,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         // user, assistant(message+text), assistant(function_call), user(function_call_output)
@@ -2129,7 +2177,11 @@ mod tests {
     }
 
     fn replay(mode: ReasoningReplayMode, max_chars: usize) -> ReasoningReplay {
-        ReasoningReplay { mode, max_chars }
+        ReasoningReplay {
+            mode,
+            max_chars,
+            replayed_chars: std::cell::Cell::new(0),
+        }
     }
 
     fn assistant_output_text(item: &InputItem) -> &str {
@@ -2153,7 +2205,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2179,7 +2231,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2198,7 +2250,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2219,7 +2271,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2236,7 +2288,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2286,7 +2338,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2310,7 +2362,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2324,7 +2376,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2344,7 +2396,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Off, 0),
+            &replay(ReasoningReplayMode::Off, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2377,7 +2429,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2409,7 +2461,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2426,7 +2478,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 10),
+            &replay(ReasoningReplayMode::Text, 10),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2465,7 +2517,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2531,7 +2583,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2543,11 +2595,42 @@ mod tests {
             "the reasoning fence was forged: {body:?}"
         );
         assert!(
-            body.contains("&lt;/thinking&gt;"),
+            body.contains("&lt;/thinking>"),
             "the forged fence was not escaped: {body:?}"
         );
         // The visible answer must still be there, after the fence.
         assert!(body.ends_with("the answer"), "{body:?}");
+    }
+
+    #[test]
+    fn a_case_insensitive_forged_fence_is_also_escaped() {
+        // `</THINKING>` and `</thinking >` must not slip past the fence.
+        for forged in ["</THINKING>", "</Thinking>", "</thinking >"] {
+            let req = request_with_thinking(
+                &format!("reasoning with {forged} close"),
+                "SIG",
+                "the answer",
+                None,
+            );
+            let (out, _reg) = anthropic_to_responses(
+                &req,
+                None,
+                &PromptCachingConfig::default(),
+                &replay(ReasoningReplayMode::Text, 0),
+            )
+            .unwrap();
+            let items = unwrap_items(out);
+            let body = assistant_output_text(&items[1]);
+            assert_eq!(
+                body.matches("</thinking>").count(),
+                1,
+                "the fence was forged by {forged:?}: {body:?}"
+            );
+            assert!(
+                body.contains("&lt;"),
+                "the forged fence {forged:?} was not escaped: {body:?}"
+            );
+        }
     }
 
     #[test]
@@ -2560,7 +2643,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap()
         .0;
@@ -2568,7 +2651,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap()
         .0;
@@ -2595,7 +2678,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Native, 0),
+            &replay(ReasoningReplayMode::Native, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2659,7 +2742,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            replay(ReasoningReplayMode::Text, 0),
+            &replay(ReasoningReplayMode::Text, 0),
         )
         .unwrap();
         let json = serde_json::to_string(&out).unwrap();
@@ -2700,7 +2783,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2760,7 +2843,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -2802,7 +2885,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         match out.tool_choice.unwrap() {
@@ -2817,7 +2900,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         match out.tool_choice.unwrap() {
@@ -2830,7 +2913,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         match out.tool_choice.unwrap() {
@@ -2846,7 +2929,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         match out.tool_choice.unwrap() {
@@ -2874,7 +2957,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.parallel_tool_calls, Some(false));
@@ -2893,7 +2976,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.parallel_tool_calls, Some(true));
@@ -2913,7 +2996,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.parallel_tool_calls, None);
@@ -2928,7 +3011,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert!(out.tool_choice.is_none());
@@ -2988,7 +3071,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert!(out.stream);
@@ -3004,7 +3087,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
@@ -3024,7 +3107,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert_eq!(out.user.as_deref(), Some(user_id.as_str()));
@@ -3046,7 +3129,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
@@ -3072,7 +3155,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
@@ -3090,7 +3173,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         assert!(out.user.is_none());
@@ -3130,7 +3213,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         // stop_sequences has no Responses equivalent; just don't error.
@@ -3146,7 +3229,7 @@ mod tests {
             &req,
             Some(ReasoningDecision::Effort("medium".into())),
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
@@ -3160,7 +3243,7 @@ mod tests {
             &req,
             Some(ReasoningDecision::Omit),
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let body = serde_json::to_value(&out).unwrap();
@@ -3383,7 +3466,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let ToolDefinition::Function(tool) = out.tools.unwrap().remove(0) else {
@@ -3643,7 +3726,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let tools = out.tools.unwrap();
@@ -4744,7 +4827,7 @@ mod tests {
             &req,
             None,
             &PromptCachingConfig::default(),
-            ReasoningReplay::default(),
+            &ReasoningReplay::default(),
         )
         .unwrap();
         let items = unwrap_items(out);
@@ -4777,7 +4860,7 @@ mod tests {
             ..PromptCachingConfig::default()
         };
         let (out, _reg) =
-            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
+            anthropic_to_responses(&req, None, &caching, &ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
@@ -4823,7 +4906,7 @@ mod tests {
             ..PromptCachingConfig::default()
         };
         let (out, _reg) =
-            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
+            anthropic_to_responses(&req, None, &caching, &ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {
@@ -4882,7 +4965,7 @@ mod tests {
             ..PromptCachingConfig::default()
         };
         let (out, _reg) =
-            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
+            anthropic_to_responses(&req, None, &caching, &ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {

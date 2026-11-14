@@ -345,10 +345,28 @@ there is nothing to replay.
 against the 2026-11-12 logs (`"type":"reasoning","summary":[{"type":"summary_text",…}]`,
 ~700–1000 chars; **0** items use `content`).
 
-The **streaming** path has the same gap and it is worse: `src/stream.rs` never reads
-`item.summary` at all (BUG 7), so a streamed thinking block carries an empty text and
-only the signature. Until BUG 7 lands, the fix is effective in the non-streaming path
-and partially effective (signature only) in the streaming path.
+The **streaming** path has a *different* gap: `src/stream.rs` **does** forward
+`response.reasoning_summary_text.delta` as a `thinking_delta` (`src/stream.rs:251`,
+`:795-818`), but it never reads `item.summary` — the final snapshot on
+`output_item.done`. So an upstream that delivers the reasoning only in the summary
+(never as deltas) loses the text in streaming mode. This is BUG 7.
+
+**Measured per upstream** (from the Claude Code transcripts in
+`~/.claude/projects/`, 1 143 thinking blocks):
+
+| upstream model | blocks with text | p50 length |
+|---|---|---|
+| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 102 chars |
+| `claude-sonnet-5-5` (→ `openai/gpt-5.6-luna`) | 46 / 437 | **0** |
+| `claude-haiku-5-5` | 0 / 78 | **0** |
+| `claude-opus-5-5` | 6 / 43 | **0** |
+
+⇒ Against `deepseek-v4.1-flash:1017` the fix is **fully effective on both transports**.
+Against `openai/gpt-5.6-luna` it is a **no-op** — that upstream generates no reasoning
+summary at all, so there is nothing to replay. This is the concrete instance of the
+"provider switch silently degrades the fix" risk, and it is why the `replayed_chars`
+field was added to the `→ upstream` log line: if it reads 0 on every request, the
+upstream is not producing reasoning.
 
 ---
 
@@ -835,24 +853,33 @@ never asked for.
 
 ---
 
-## BUG 7 — Streaming never forwards reasoning text; `reasoning_tokens` always 0
+## BUG 7 — Streaming drops the reasoning *summary*; `reasoning_tokens` always 0
 
-**Severity:** MEDIUM-HIGH — thinking is invisible in the UI; context accounting is wrong.
-**Files:** `src/stream.rs:597-618` (block start), `src/stream.rs:795-815` (summary delta),
+**Severity:** MEDIUM-HIGH — thinking can be invisible in the UI; context accounting is wrong.
+**Files:** `src/stream.rs:597-618` (block start), `src/stream.rs:795-818` (summary delta),
 `src/stream.rs:639-652` (signature), `src/translate.rs:4291-4307` (non-streaming path).
 **Status:** ❌ not fixed.
+
+> **Corrected 2026-11-14.** An earlier draft of this scratchpad described BUG 7 as
+> "streaming never forwards reasoning text". That was **wrong**: `src/stream.rs:251`
+> handles `response.reasoning_summary_text.delta` and emits a `thinking_delta`
+> (`:795-818`). The real defects are the two below. (A sub-agent review also claimed
+> the opposite — that streaming always works — which is wrong for the upstreams that
+> never send the delta. The measured truth is in the table.)
 
 ### Plain English
 
 Two separate defects:
 
 **(a)** `item.summary` is **never read** anywhere in `stream.rs` — the only mentions of
-`summary` are a log message and test helpers. So every upstream reasoning item becomes
-`content_block_start{thinking:"", signature:""}` immediately followed by
-`content_block_stop`. Claude Code renders a blank "Thinking" box every turn, and the
-model's reasoning is invisible.
+`summary` are a log message and test helpers. The streaming path therefore relies
+**entirely** on `response.reasoning_summary_text.delta` events for the reasoning text,
+and ignores the summary snapshot that arrives on `output_item.done`.
 
-The **non-streaming** path does the opposite (`src/translate.rs:4291-4307` joins the
+So for an upstream that delivers the reasoning **only** in the summary (and never as
+deltas), the streamed thinking block is `content_block_start{thinking:"", signature:""}`
+followed by `content_block_stop` — Claude Code renders a blank "Thinking" box. The
+**non-streaming** path does the opposite (`src/translate.rs:4291-4307` joins the
 summary into a real thinking block), so the *same upstream response* yields a full
 thinking block non-streaming and an empty one streaming. That's a straight parity bug.
 
@@ -860,13 +887,29 @@ thinking block non-streaming and an empty one streaming. That's a straight parit
 despite 60 real reasoning items with real summaries and ~700-byte signatures. Claude Code
 therefore under-counts context.
 
-A live capture from the real upstream (reasoning effort = high, no `reasoning.summary`
-requested) showed the upstream emits `output_item.added {type:"reasoning", summary:[]}`,
-**zero** `reasoning_summary_text.delta` events, and
-`output_item.done {type:"reasoning", summary:[], encrypted_content:"gAAAA…"}`.
-So for this deployment the reasoning text is simply **not available on the wire** — the
-fix for (a) is to carry `encrypted_content` as the signature and, when the upstream
-supplies a summary, emit it as `thinking_delta`.
+### Which upstreams are affected (measured, 2026-11-14)
+
+From the Claude Code transcripts in `~/.claude/projects/` — 1 143 thinking blocks the
+client actually received:
+
+| upstream model | blocks with text | p50 length |
+|---|---|---|
+| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 102 chars |
+| `claude-sonnet-5-5` (→ `openai/gpt-5.6-luna`) | 46 / 437 | **0** |
+| `claude-haiku-5-5` | 0 / 78 | **0** |
+| `claude-opus-5-5` | 6 / 43 | **0** |
+
+`deepseek-v4.1-flash:1017` sends the reasoning as deltas, so it works today.
+`openai/gpt-5.6-luna` generates **no** reasoning summary at all (a live capture showed
+`output_item.added {type:"reasoning", summary:[]}`, **zero**
+`reasoning_summary_text.delta` events, and
+`output_item.done {type:"reasoning", summary:[], encrypted_content:"gAAAA…"}`) — there
+the reasoning is simply **not available on the wire**, and no proxy-side fix can
+recover it.
+
+**Fix for (a):** read `item.summary` on `output_item.done` and emit the missing text as
+a `thinking_delta` (mirroring the non-streaming join), so an upstream that delivers
+the summary only is not silently blanked.
 
 ### Root cause
 

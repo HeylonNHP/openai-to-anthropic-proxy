@@ -186,7 +186,7 @@ async fn handle_messages(
         &req,
         Some(reasoning_decision),
         &prompt_caching,
-        reasoning_replay,
+        &reasoning_replay,
     )
     .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // `registry` is reassigned in the `should_retry` branch below when we
@@ -450,7 +450,7 @@ async fn handle_messages_inner(
                 &req,
                 Some(fallback_reasoning),
                 &fallback_prompt_caching,
-                fallback_reasoning_replay,
+                &fallback_reasoning_replay,
             )
             .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
             outbound = fb_outbound;

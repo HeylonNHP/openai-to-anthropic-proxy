@@ -261,12 +261,21 @@ impl Default for ReasoningReplayConfig {
 }
 
 /// The resolved reasoning-replay policy for one request.
-#[derive(Debug, Clone, Copy)]
+///
+/// Carries a per-request counter of how much reasoning text was actually
+/// replayed, so the proxy can report it on the "→ upstream" line. The
+/// counter is the operator's signal that the upstream is still producing
+/// reasoning: if it drops to zero across every request, the upstream has
+/// stopped populating its reasoning summary and the replay has silently
+/// become a no-op.
+#[derive(Debug, Clone)]
 pub struct ReasoningReplay {
     pub mode: ReasoningReplayMode,
     /// Max characters of reasoning text replayed per assistant turn.
     /// `0` means unlimited.
     pub max_chars: usize,
+    /// Characters of reasoning text replayed so far in this request.
+    pub replayed_chars: std::cell::Cell<u64>,
 }
 
 impl Default for ReasoningReplay {
@@ -275,6 +284,7 @@ impl Default for ReasoningReplay {
         Self {
             mode: ReasoningReplayMode::default(),
             max_chars: 0,
+            replayed_chars: std::cell::Cell::new(0),
         }
     }
 }
@@ -610,6 +620,7 @@ impl Config {
                 .copied()
                 .unwrap_or(self.reasoning_replay.default),
             max_chars: self.reasoning_replay.max_chars,
+            replayed_chars: std::cell::Cell::new(0),
         }
     }
 }
@@ -699,6 +710,12 @@ pub struct JsonConfig {
     pub prompt_caching: Option<JsonPromptCachingConfig>,
     /// How a prior turn's extended thinking is replayed upstream.
     /// See [`ReasoningReplayConfig`].
+    ///
+    /// `skip_serializing_if` matters: the TUI rewrites `proxy.json` from
+    /// this struct, and `JsonConfig` is `deny_unknown_fields`, so writing
+    /// a `reasoning_replay: null` key would make the PREVIOUS binary refuse
+    /// to start — a rollback hazard for anyone who saved from the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_replay: Option<JsonReasoningReplayConfig>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
@@ -1106,6 +1123,38 @@ mod tests {
             "reasoning_replay": {"defualt": "text"}
         }"#;
         assert!(JsonConfig::parse(json_raw).is_err());
+    }
+
+    #[test]
+    fn the_saved_config_does_not_carry_a_key_the_previous_binary_would_reject() {
+        // The TUI rewrites `proxy.json` from `JsonConfig`, and
+        // `JsonConfig` is `deny_unknown_fields`. If the save path wrote a
+        // `reasoning_replay: null` key, the PREVIOUS binary (which does
+        // not know the key) would refuse to start — a rollback hazard for
+        // anyone who saved from the TUI.
+        let saved = serde_json::to_string_pretty(&JsonConfig::default()).unwrap();
+        assert!(
+            !saved.contains("reasoning_replay"),
+            "the saved config carries a key the previous binary rejects: {saved}"
+        );
+        // ...but an explicitly-configured replay policy must survive the
+        // round-trip.
+        let parsed = JsonConfig::parse(
+            r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
+                "reasoning_replay":{"default":"native","models":{"m":"off"},"max_chars":42}}"#,
+        )
+        .expect("parse json");
+        let saved = serde_json::to_string_pretty(&parsed).unwrap();
+        assert!(saved.contains("reasoning_replay"), "{saved}");
+        let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(
+            reparsed.reasoning_replay.as_ref().and_then(|r| r.default),
+            Some(ReasoningReplayMode::Native)
+        );
+        assert_eq!(
+            reparsed.reasoning_replay.as_ref().and_then(|r| r.max_chars),
+            Some(42)
+        );
     }
 
     #[test]

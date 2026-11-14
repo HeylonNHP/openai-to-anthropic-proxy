@@ -198,7 +198,7 @@ Claude Code (and any Anthropic client) echoes the model's `thinking` blocks back
   - `"off"` — drop the thinking blocks (the old behaviour). Only useful if the extra input tokens are not worth paying for.
   - `"native"` — emit a Responses `reasoning` input item. This is OpenAI's documented replay mechanism and DeepSeek's Responses API *requires* it, but it is a provider-specific wire shape: OpenAI pairs a reasoning item with the item that immediately follows it, and some endpoints reject a reasoning item that has no `id` (the proxy cannot recover the upstream's `rs_…` id — the Anthropic `thinking` block has no id field). **Opt in per model and verify against your upstream first.**
 - `models` is a flat object of upstream model name → mode, overriding `default` for that model. Keys are the **alias-resolved upstream** names (the same convention as `prompt_caching.models`).
-- `max_chars` caps how many characters of reasoning text are replayed per assistant turn. **`0` means unlimited, not "replay nothing"** — it is the default. Replayed reasoning is re-sent on **every** subsequent turn and Claude Code echoes *every* prior thinking block, so the replayed text grows with the session. Set an explicit cap if the input-token cost matters to you. Note the cap applies to the reasoning *text* only; the opaque `signature` is forwarded in full in `"native"` mode.
+- `max_chars` caps how many characters of reasoning text are replayed **per assistant turn** — and a request replays *every* prior turn, so the effective cap is `turns × max_chars`. **`0` means unlimited, not "replay nothing"** — it is the default. Replayed reasoning is re-sent on **every** subsequent turn and Claude Code echoes *every* prior thinking block, so the replayed text grows with the session. Set an explicit cap if the input-token cost matters to you. Note the cap applies to the reasoning *text* only; the opaque `signature` is forwarded in full in `"native"` mode.
 
 ```json
 {
@@ -218,7 +218,29 @@ Notes:
 - A `redacted_thinking` block is an opaque Anthropic-encrypted blob with no readable text. It is never replayed upstream; the proxy logs a warning instead.
 - In `"text"` mode the reasoning is folded into the assistant message's **single** `output_text` part, so the visible answer is never displaced. Any `</thinking>` inside the reasoning is escaped, so quoted content cannot close the fence early and be read back as the assistant's own words.
 - The reasoning always precedes the visible answer, matching Anthropic's own ordering (`thinking` then `text`).
-- The streaming path currently receives an empty reasoning summary from most upstreams, so in practice the replayed text is empty until the upstream starts sending a reasoning summary. The mechanism is in place either way.
+- The replayed amount is reported on the `→ upstream` log line as `replayed_chars`. **If that number drops to zero across every request, the upstream has stopped producing reasoning** and the replay has silently become a no-op — that is the signal to look for after a provider change.
+- The proxy reads the upstream's reasoning from the `summary` field of its `reasoning` output item (non-streaming) and from `response.reasoning_summary_text.delta` events (streaming). **How much reasoning you actually get depends on the upstream**, and it varies a lot:
+
+  | upstream | thinking blocks with text |
+  |---|---|
+  | `deepseek-v4.1-flash:1017` | **60 / 60** (p50 ≈ 1 100 chars, max ≈ 17 000) |
+  | `openai/gpt-5.6-luna` | 46 / 437 (p50 = 0 — this upstream generates no reasoning summary) |
+
+  An upstream that puts the reasoning only in a `content` array (DeepSeek's *first-party* Responses API uses `content` with `reasoning_text` parts and generates no summary) would also deliver an empty thinking block. In every case the reasoning is dropped rather than replayed, so the fix is a no-op for that upstream — check `replayed_chars` before assuming it is working.
+
+### What it costs
+
+Measured against the 2026-11-12 production traffic (`deepseek-v4.1-flash` behind the
+airia gateway), whose reasoning summaries are 97–17 072 characters (p50 ≈ 1 050):
+
+| | before | after |
+|---|---|---|
+| reasoning replayed per request | 0 | 153 → 138 081 chars as the session grows |
+| extra input tokens per request | 0 | ≈ +23 700 average, ≈ +34 500 at end-of-session |
+| as a share of the prompt | — | ≈ +6.6 % average, ≈ +9.6 % at end-of-session (the upstream context was a median 358 726 tokens that day) |
+
+That is the price of the model keeping its own reasoning. Set `max_chars` if you want
+less of it — but remember the cap is per turn, so the real bound is `turns × max_chars`.
 
 ### `"native"` mode caveats
 

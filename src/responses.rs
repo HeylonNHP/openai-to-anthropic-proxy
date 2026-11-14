@@ -120,8 +120,12 @@ pub enum InputItem {
     /// `summary`, DeepSeek reads `content`); `encrypted_content` is the
     /// upstream's encrypted chain-of-thought.
     ///
-    /// `id` is omitted: the upstream's own `rs_…` item id is lost at the
-    /// Anthropic wire boundary (the `thinking` block has no id field).
+    /// `id` is a **synthetic** id derived from the reasoning content: the
+    /// upstream's own `rs_…` item id is lost at the Anthropic wire boundary
+    /// (the `thinking` block has no id field), but `id` is a required field
+    /// of a reasoning item and some endpoints reject the item without it.
+    /// The synthetic id is stable across turns, so the upstream's prompt
+    /// cache is not churned.
     Reasoning {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
