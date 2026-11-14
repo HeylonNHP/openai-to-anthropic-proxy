@@ -198,7 +198,7 @@ Claude Code (and any Anthropic client) echoes the model's `thinking` blocks back
   - `"off"` — drop the thinking blocks (the old behaviour). Only useful if the extra input tokens are not worth paying for.
   - `"native"` — emit a Responses `reasoning` input item. This is OpenAI's documented replay mechanism and DeepSeek's Responses API *requires* it, but it is a provider-specific wire shape: OpenAI pairs a reasoning item with the item that immediately follows it, and some endpoints reject a reasoning item that has no `id` (the proxy cannot recover the upstream's `rs_…` id — the Anthropic `thinking` block has no id field). **Opt in per model and verify against your upstream first.**
 - `models` is a flat object of upstream model name → mode, overriding `default` for that model. Keys are the **alias-resolved upstream** names (the same convention as `prompt_caching.models`).
-- `max_chars` caps how many characters of reasoning text are replayed per assistant turn. `0` (the default) means unlimited. Replayed reasoning is re-sent on **every** subsequent turn, so this is your throttle on the input-token cost.
+- `max_chars` caps how many characters of reasoning text are replayed per assistant turn. **`0` means unlimited, not "replay nothing"** — it is the default. Replayed reasoning is re-sent on **every** subsequent turn and Claude Code echoes *every* prior thinking block, so the replayed text grows with the session. Set an explicit cap if the input-token cost matters to you. Note the cap applies to the reasoning *text* only; the opaque `signature` is forwarded in full in `"native"` mode.
 
 ```json
 {
@@ -216,8 +216,18 @@ Notes:
 
 - The `signature` field of a thinking block carries the upstream's encrypted chain-of-thought. It is only meaningful to the upstream that issued it, so `"text"` mode drops it and `"native"` mode forwards it as `encrypted_content`.
 - A `redacted_thinking` block is an opaque Anthropic-encrypted blob with no readable text. It is never replayed upstream; the proxy logs a warning instead.
-- In `"text"` mode the reasoning is folded into the assistant message's **single** `output_text` part, so the visible answer is never displaced.
+- In `"text"` mode the reasoning is folded into the assistant message's **single** `output_text` part, so the visible answer is never displaced. Any `</thinking>` inside the reasoning is escaped, so quoted content cannot close the fence early and be read back as the assistant's own words.
+- The reasoning always precedes the visible answer, matching Anthropic's own ordering (`thinking` then `text`).
 - The streaming path currently receives an empty reasoning summary from most upstreams, so in practice the replayed text is empty until the upstream starts sending a reasoning summary. The mechanism is in place either way.
+
+### `"native"` mode caveats
+
+`"native"` is **experimental**. It emits a Responses `reasoning` input item, which is OpenAI's documented replay mechanism and is *required* by DeepSeek's Responses API — but it is a provider-specific wire shape. Before enabling it for a production model, send a real request through it and check the upstream accepts the result. Known limits:
+
+- The upstream's own `rs_…` item id cannot be recovered — the Anthropic `thinking` block carries no id — so the proxy sends a **synthetic** id derived from the reasoning content. It is stable across turns (so the upstream's prompt cache is not churned), but it is not the id the upstream originally issued.
+- Anthropic's *interleaved* thinking (one thinking block per tool call) is merged into a **single** reasoning item, because the Responses API pairs a reasoning item with the item that immediately follows it. The proxy logs a WARN when it merges more than one block.
+- The reasoning item always carries a `summary` field, even when empty, because the upstream's schema marks it required.
+- A reasoning item that carries only a signature (no text) is still emitted, with an empty `summary`. Some endpoints may reject it.
 
 ### Model aliases
 

@@ -127,7 +127,9 @@ pub enum InputItem {
         id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         content: Vec<ReasoningTextPart>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        // `summary` is NOT skipped when empty: it is a required field of a
+        // reasoning item, and omitting it makes the whole item invalid.
+        #[serde(default)]
         summary: Vec<ReasoningSummaryPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,

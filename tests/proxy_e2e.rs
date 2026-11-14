@@ -1079,6 +1079,64 @@ async fn thinking_block_is_replayed_to_the_upstream() {
     );
 }
 
+/// A wrong-typed field inside a thinking block must NOT fail the whole
+/// request. Before the block was recognised it fell into `Unknown` and was
+/// merely dropped; recognising it must not turn a tolerated block into a
+/// 400 for the entire conversation.
+#[tokio::test]
+async fn a_wrong_typed_thinking_field_does_not_fail_the_request() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 4,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": 123, "signature": "SIG"},
+                        {"type": "text", "text": "the answer"}
+                    ]}
+                ]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a wrong-typed thinking field must not 400 the whole request"
+    );
+    // The upstream must have been called.
+    assert!(
+        upstream.received.lock().await.is_some(),
+        "the upstream was never called"
+    );
+}
+
 /// `reasoning_replay: "off"` restores the old behaviour: the thinking
 /// block is dropped, and the upstream sees only the visible answer.
 #[tokio::test]

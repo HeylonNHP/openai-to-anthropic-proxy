@@ -48,13 +48,5 @@
   "prompt_caching": {
     "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
     "cache_key": "my-app"
-  },
-
-  "reasoning_replay": {
-    "default": "text",
-    "models": {
-      "gpt-5.6-luna": "native"
-    },
-    "max_chars": 4000
   }
 }

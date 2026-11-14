@@ -173,11 +173,11 @@ pub enum ContentBlockParam {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThinkingBlockParam {
     /// The model's reasoning text (a summary of its chain of thought).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "tolerant_text")]
     pub thinking: String,
     /// Opaque, provider-issued blob. In this proxy it carries the upstream
     /// Responses API's `reasoning.encrypted_content`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "tolerant_text")]
     pub signature: String,
 }
 
@@ -189,8 +189,30 @@ pub struct ThinkingBlockParam {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RedactedThinkingBlockParam {
     /// Opaque encrypted blob with no readable text.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "tolerant_text")]
     pub data: String,
+}
+
+/// Deserialize a text field, tolerating a wrong JSON type.
+///
+/// Without this, a block like `{"type":"thinking","thinking":123}` aborts
+/// the *entire* request with a 400: serde's `#[serde(other)]` fallback on
+/// `ContentBlockParam` only fires for an unmatched **tag**, not for a matched
+/// tag whose payload fails to deserialize. Before the thinking block was
+/// recognised, such a block fell into `Unknown` and was merely dropped.
+///
+/// A number or an object is rendered as its JSON text so no information is
+/// lost; `null` becomes the empty string.
+fn tolerant_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

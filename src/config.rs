@@ -1117,9 +1117,12 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/proxy.json.example"))
                 .expect("read proxy.json.example");
         let parsed = JsonConfig::parse(&raw).expect("proxy.json.example should parse");
-        // The example must not contain a secret-looking placeholder that the
-        // schema rejects.
-        assert!(parsed.reasoning_replay.is_some());
+        // The example deliberately does NOT set `reasoning_replay`: the
+        // default is already the safe mode, and `JsonConfig` is
+        // `deny_unknown_fields`, so a key in the example would make the
+        // PREVIOUS binary refuse to start — a rollback hazard for anyone
+        // who copied it.
+        assert!(parsed.reasoning_replay.is_none());
     }
 
     #[test]
