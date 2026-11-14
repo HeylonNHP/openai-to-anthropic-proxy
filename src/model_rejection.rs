@@ -22,7 +22,13 @@
 //! 3. The envelope is nested, so the flat Responses shape does not parse.
 //!
 //! The one strong signal the gateway *does* send — `type:
-//! "not_found_error"` — was never read.
+//! "not_found_error"` — was never read either. The detector below does
+//! not use it: it reads the **message** and the **code**, because those
+//! say what the upstream actually refused. (`type` is still parsed, and
+//! `ErrorEnvelope::kind` is available, but it is not a recognition
+//! channel — `not_found_error` is neither necessary nor sufficient: a
+//! bad path on the upstream is also a `not_found_error`, and a model
+//! rejection can arrive with any type.)
 //!
 //! # The asymmetry that shapes this module
 //!
@@ -45,8 +51,11 @@
 //!   error, and the client would be answered by another model.
 //! * **Check the subject.** `the web_search tool is not supported for
 //!   model claude-sonnet-5` mentions the model *and* says something
-//!   negative — but the subject is the tool. [`mentions_request_subject`]
-//!   is what separates the two.
+//!   negative — but the subject is the tool, and answering it with a
+//!   different model would be silent corruption. Two things separate
+//!   the two: the anchored pattern only accepts the **absence** words
+//!   ("not found", "does not exist"), and a short list of
+//!   request-subject words vetoes the rest.
 
 use std::sync::OnceLock;
 
@@ -76,6 +85,7 @@ const MODEL_PHRASES: &[&str] = &[
     "model not supported",
     "model not exist",
     "model not available",
+    "model unavailable",
     "model does not exist",
     "model doesn't exist",
     "model is deprecated",
@@ -94,10 +104,13 @@ const MODEL_PHRASES: &[&str] = &[
 /// Words that make an error about the **request** rather than the
 /// model.
 ///
-/// If the message names one of these, the error is about a tool, a
-/// parameter, a schema, a file — not about the model. This is what
-/// separates `the web_search tool is not supported for model X` (a tool
-/// rejection) from `model X is not supported` (a model rejection).
+/// This is a short list on purpose. It used to be a long one, and a
+/// long deny-list is a leak in both directions: it vetoed real
+/// rejections ("model X not found for this request" contains
+/// "request") while still missing new request subjects. The anchored
+/// pattern now carries the discrimination instead — see
+/// [`model_rejection_re`] — so this list only holds the words that
+/// cannot appear in a model rejection at all.
 ///
 /// Matched as whole tokens, so `requested` is not `request` and
 /// `web_search` is `web` + `search`.
@@ -111,42 +124,6 @@ const REQUEST_SUBJECT_WORDS: &[&str] = &[
     "parameters",
     "schema",
     "schemas",
-    "image",
-    "images",
-    "file",
-    "files",
-    "url",
-    "json",
-    "mode",
-    "modes",
-    "request",
-    "requests",
-    "requested",
-    "response",
-    "responses",
-    "output",
-    "outputs",
-    "input",
-    "inputs",
-    "temperature",
-    "top_p",
-    "top_k",
-    "max_tokens",
-    "max_output_tokens",
-    "reasoning",
-    "content",
-    "prompt",
-    "batch",
-    "job",
-    "quota",
-    "credit",
-    "credits",
-    "endpoint",
-    "endpoints",
-    "deployment",
-    "credential",
-    "credentials",
-    "api_key",
 ];
 
 /// Markers of a **transient** condition. A model that is temporarily
@@ -314,7 +291,17 @@ fn build_rejection(message: &str) -> ModelRejection {
 /// The name may be quoted (either quote character — the gateway has used
 /// both) or bare, in which case it must look like a model id: it has to
 /// contain a digit or a separator, so `the model output is not found`
-/// does not match while `model gpt-5.4-mini is not supported` does.
+/// does not match while `model gpt-5.4-mini not found` does.
+///
+/// The negative is restricted to the **absence** words — "not found",
+/// "does not exist". That is deliberate: "not supported" and "not
+/// available" are the words request-scoped errors use ("the web_search
+/// tool is not supported", "model X is not available for
+/// web_search"), and admitting them here would let a request error
+/// swap the model. A message where "model" sits *immediately* before
+/// the negative ("model not supported") is still recognised — that is
+/// the [`MODEL_PHRASES`] branch, where adjacency leaves no room for a
+/// different subject.
 fn model_rejection_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -329,10 +316,9 @@ fn model_rejection_re() -> &'static Regex {
             \s*
             (?:is|are|was|were|has\s+been|have\s+been)?
             \s*
-            (?:not\s+(?:found|supported|available|recognized|recognised|exist)
+            (?:not\s+(?:found|exist)
               | does\s*n[o']t\s+exist
               | don'?t\s+exist
-              | unavailable
               | deprecated
             )
             "#,
@@ -614,6 +600,96 @@ mod tests {
             let _ = detect_model_rejection(400, &json);
         }
         let _ = detect_model_rejection(400, &json);
+    }
+
+    /// Every request-scoped noun a review turned up. The error is about
+    /// the request, not the model, so the fallback must not fire — a
+    /// fallback answers the request with a *different model*, which is
+    /// silent corruption.
+    ///
+    /// Each is tried in both shapes: with the word "model" before the
+    /// name (so the anchored pattern could match) and without it.
+    #[test]
+    fn a_request_scoped_error_never_swaps_the_model() {
+        let nouns = [
+            "web_search",
+            "attachment",
+            "vector store",
+            "assistant",
+            "agent",
+            "thread",
+            "conversation",
+            "code",
+            "script",
+            "shell",
+            "command",
+            "syntax",
+            "regex",
+            "encoding",
+            "token limit",
+            "tokens",
+            "context",
+        ];
+        for noun in nouns {
+            for template in [
+                "model claude-sonnet-5 is not supported for the __NOUN__",
+                "claude-sonnet-5 is not supported for the __NOUN__",
+                "model claude-sonnet-5 is not available: __NOUN__ problem",
+                "the __NOUN__ is not supported by model claude-sonnet-5",
+            ] {
+                let body = template.replace("__NOUN__", noun);
+                let json =
+                    format!(r#"{{"error":{{"message":"{body}","type":"invalid_request_error"}}}}"#);
+                assert!(
+                    detect_model_rejection(400, &json).is_none(),
+                    "must not swap the model for: {body}"
+                );
+                assert!(
+                    detect_model_rejection(400, &body).is_none(),
+                    "must not swap the model for: {body}"
+                );
+            }
+        }
+    }
+
+    /// The absence negatives the gateway actually uses must still fire.
+    #[test]
+    fn the_absence_negatives_still_fire() {
+        for body in [
+            "model \"claude-sonnet-5\" not found",
+            "model 'claude-opus-5' not found",
+            "model claude-sonnet-5 not found",
+            "model claude-sonnet-5 does not exist",
+            "model claude-sonnet-5 doesn't exist",
+            "model claude-sonnet-5 is deprecated",
+        ] {
+            let json = format!(r#"{{"error":{{"message":"{body}","type":"not_found_error"}}}}"#);
+            assert!(
+                detect_model_rejection(404, &json).is_some(),
+                "must still fire for: {body}"
+            );
+        }
+    }
+
+    /// A message where "model" sits immediately before the negative has
+    /// no room for a different subject, so it is recognised.
+    #[test]
+    fn adjacent_model_phrases_still_fire() {
+        for body in [
+            "Model not found",
+            "MODEL NOT SUPPORTED",
+            "model not supported",
+            "model not available",
+            "model unavailable",
+            "Unknown model: foo",
+            "no such model",
+            "The requested model claude-sonnet-5 is not supported for the selected provider.",
+        ] {
+            assert!(
+                detect_model_rejection(400, body).is_some(),
+                "must still fire for: {body}"
+            );
+        }
     }
 
     #[test]

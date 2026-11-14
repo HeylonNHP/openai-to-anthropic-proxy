@@ -264,8 +264,8 @@ async fn handle_messages(
     // Serialize once, log a short summary, and stash the full body for
     // the error path. The body is the single most useful artifact when
     tracing::info!(
-        inbound_model = %req.model,
-        upstream_model = %outbound.model,
+        inbound_model = %log_safe(&req.model),
+        upstream_model = %log_safe(&outbound.model),
         stream = outbound.stream,
         tools = outbound.tools.as_ref().map_or(0, Vec::len),
         inbound_thinking = ?req.thinking.as_ref().map(|t| t.r#type.as_str()),
@@ -295,7 +295,12 @@ async fn handle_messages(
         kind: crate::tui::LogKind::Inbound,
         text: format!(
             "  → {} → {}  |  {} tools  |  {} messages{}{}",
-            req.model, outbound.model, tool_count, msg_count, stream_label, reasoning
+            log_safe(&req.model),
+            log_safe(&outbound.model),
+            tool_count,
+            msg_count,
+            stream_label,
+            reasoning
         ),
     });
 
