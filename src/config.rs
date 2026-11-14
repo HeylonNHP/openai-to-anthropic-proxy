@@ -99,9 +99,14 @@ pub struct Config {
 /// through unchanged.
 ///
 /// `default_model` is a safety net: if the upstream rejects an
-/// aliased or passed-through model with a "model not supported"
-/// error, the proxy retries the request once with this model. Every
-/// fallback is logged at WARN. `None` disables the safety net.
+/// aliased or passed-through model — the upstream's error body says
+/// the *model* is unknown, as opposed to the request being invalid —
+/// the proxy retries the request once with this model. Every
+/// fallback is logged at WARN, along with the upstream's own
+/// suggestion. `None` disables the safety net.
+///
+/// See [`crate::model_rejection`] for how a model rejection is told
+/// apart from an unrelated error.
 #[derive(Debug, Clone, Default)]
 pub struct ModelAliases {
     pub map: BTreeMap<String, String>,

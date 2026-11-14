@@ -6,6 +6,7 @@ pub mod responses;
 pub mod stream;
 
 pub mod anthropic;
+mod model_rejection;
 pub mod proxy;
 pub mod repair;
 mod schema_refs;

@@ -257,7 +257,12 @@ This object rewrites the model name Claude Code asks for into the model your ups
 
 - Matching is exact. There are no wildcards.
 - If a model is not listed, the proxy passes it through unchanged.
-- `default_model` is a safety net. If the upstream rejects a model, the proxy retries once with this fallback and logs at WARN.
+- `default_model` is a safety net. If the upstream rejects the **model** (as opposed to the request), the proxy retries once with this fallback and logs at WARN.
+  - The proxy recognises a model rejection from the upstream's error body: a `not_found_error` whose message is about a model (`model "claude-sonnet-5" not found. Try glm-5.3-flash:cloud.`), or an error code such as `model_not_found` / `model_not_supported`. It deliberately does **not** fire on unrelated errors — a tool rejection (`the web_search tool is not supported`) or a bad request is passed straight through.
+  - The retry happens **before** any bytes reach the client, so it is safe for streaming and non-streaming alike. Exactly one retry: if the fallback model is rejected too, the client gets that second error.
+  - If the fallback model is the same one that was just rejected, no retry happens.
+  - The WARN carries the upstream's own suggestion as `suggested_model`. That is **telemetry only** — the proxy never routes to it, because it is untrusted input and it may name a model your alias map does not use. But it is the most useful line in the log: it tells you exactly which alias to add.
+- An inbound model name that is **not** in `map` is passed through to the upstream unchanged. That is sometimes right — the upstream may serve the name itself — but it is also how a request ends up 404ing. The proxy warns about it once per distinct name, in the log and in the TUI's log pane.
 - **Important:** renaming a model can confuse Claude Code's context-window detection. Claude Code estimates when to auto-compact from the model name, not from the API response, and an unknown name falls back to 200K. If your upstream supports a larger window, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in your environment or `~/.claude/settings.json` (see [REFERENCE.md](./REFERENCE.md#context-window-workaround)).
 
 In the redacted example:

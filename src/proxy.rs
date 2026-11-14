@@ -24,13 +24,13 @@ use crate::anthropic::{CreateMessageRequest, StreamEvent};
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
+use crate::model_rejection::{self, ModelRejection};
 use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
 use crate::tui::MappingsStore;
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
-use serde_json::Value;
 
 /// Shared state passed to every handler.
 ///
@@ -52,17 +52,16 @@ pub struct AppState {
     /// upstream rejections (see [`crate::capabilities`]). Shared across
     /// every request so a fact learned once is applied everywhere.
     pub capabilities: Arc<CapabilityStore>,
-}
-
-// Per-request stash of the JSON body we sent upstream. Used only on
-// the error path: when the upstream rejects, we log the sent body
-// alongside the error so postmortem debugging is one log line away.
-//
-// Lives in a `task_local!` (not a file) so two concurrent requests
-// can't trample each other's bodies — `task_local!` storage is scoped
-// to the current task, and each axum request is its own task.
-tokio::task_local! {
-    static LAST_SENT_BODY: String;
+    /// Inbound model names seen that are **not** in the alias map, so
+    /// the operator can be told about them once each.
+    ///
+    /// A model that is not in `model_aliases.map` is passed through to the
+    /// upstream unchanged. That is sometimes right (the upstream may serve
+    /// the name itself) and sometimes the reason a request 404s — and it
+    /// used to happen *silently*, which is how eleven upstream 404s went
+    /// unremarked. This set makes the passthrough visible without
+    /// flooding the log with one line per request.
+    pub unmapped_models: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Build the axum router.
@@ -117,6 +116,7 @@ pub fn router_with_stores(
         config,
         mappings,
         client,
+        unmapped_models: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         output,
         stats,
         capabilities,
@@ -164,6 +164,32 @@ async fn handle_messages(
     // seed, while `mappings_snapshot` is what the operator sees when
     // they hit `e` in the TUI.
     let upstream_model = mappings_snapshot.resolve(&req.model);
+    // An inbound name that is not in the alias map is passed through
+    // unchanged. That is legitimate when the upstream serves the name
+    // itself, but it is also exactly how a request ends up 404ing — and
+    // it used to happen silently. Say so, once per distinct name.
+    if !mappings_snapshot.map.contains_key(&req.model) {
+        let first_time = state
+            .unmapped_models
+            .lock()
+            .map(|mut seen| seen.insert(req.model.clone()))
+            .unwrap_or(false);
+        if first_time {
+            tracing::warn!(
+                inbound_model = %req.model,
+                upstream_model = %upstream_model,
+                "inbound model is not in the alias map; passing it through unchanged"
+            );
+            state.output.emit(crate::tui::LogLine {
+                kind: crate::tui::LogKind::Warning,
+                text: format!(
+                    "  \u{26a0} {} is not in the alias map — add it to model_aliases.map \
+                     (sent to the upstream as {})",
+                    req.model, upstream_model
+                ),
+            });
+        }
+    }
     // Resolve the reasoning intent from the client's explicit signals
     // (output_config.effort, thinking.type = "disabled") against the
     // configured effort/thinking-disabled maps, falling back to the
@@ -205,11 +231,6 @@ async fn handle_messages(
 
     // Serialize once, log a short summary, and stash the full body for
     // the error path. The body is the single most useful artifact when
-    // debugging an upstream rejection, so we keep it in a task_local!
-    // scoped to this handler — see LAST_SENT_BODY above.
-    let body_json = serde_json::to_string(&outbound)
-        .map_err(|e| AppError::Internal(format!("serialize outbound body: {e}")))?;
-
     tracing::info!(
         inbound_model = %req.model,
         upstream_model = %outbound.model,
@@ -246,20 +267,16 @@ async fn handle_messages(
         ),
     });
 
-    LAST_SENT_BODY
-        .scope(
-            body_json,
-            handle_messages_inner(
-                state,
-                headers,
-                req,
-                outbound,
-                registry,
-                start,
-                mappings_snapshot,
-            ),
-        )
-        .await
+    handle_messages_inner(
+        state,
+        headers,
+        req,
+        outbound,
+        registry,
+        start,
+        mappings_snapshot,
+    )
+    .await
 }
 
 /// One POST to the upstream with the shared headers. Extracted from the
@@ -363,10 +380,12 @@ async fn handle_messages_inner(
             break resp;
         }
         let body = resp.text().await.unwrap_or_default();
-        // The first call to the upstream for a given request, sent
-        // through this same task — pulled from the task-local, not
-        // from disk, so concurrent requests don't trample each other.
-        let sent = LAST_SENT_BODY.try_with(|b| b.clone()).unwrap_or_default();
+        // The body of the request that actually failed. Serialised from
+        // `outbound` right here, so it reflects *this* attempt — including
+        // a `default_model` fallback and any parameter the capability
+        // store stripped. (The old code read a task-local captured before
+        // the loop, which meant the log showed the pre-fallback body.)
+        let sent = serde_json::to_string(&outbound).unwrap_or_default();
         tracing::warn!(%status, body = %body, "← upstream error");
         tracing::warn!(
             target: "upstream_payload",
@@ -419,14 +438,24 @@ async fn handle_messages_inner(
         // retry; the loop ends after attempt 2 regardless. The
         // fallback name comes from the runtime snapshot, so an edit
         // made via the TUI is honoured just like an alias edit is.
+        //
+        // `outbound.model` is the *alias-resolved* upstream name — the
+        // same name the fallback would carry — so comparing the two is
+        // exactly right.
+        let rejection =
+            model_rejection::detect_model_rejection(status.as_u16(), &body, &outbound.model);
         let should_retry = attempt == 1
-            && is_model_not_supported(status, &body)
+            && rejection.is_some()
             && mappings_snapshot
                 .default_model()
                 .is_some_and(|fb| fb != outbound.model);
 
         if should_retry {
             let fallback = mappings_snapshot.default_model().unwrap();
+            let rejection = rejection.unwrap_or_else(|| ModelRejection {
+                rejected: None,
+                suggested: None,
+            });
             let requested_effort = req
                 .output_config
                 .as_ref()
@@ -442,8 +471,17 @@ async fn handle_messages_inner(
             let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
             let fallback_reasoning_replay = state.config.reasoning_replay_for_model(fallback);
             tracing::warn!(
-                inbound_model = %outbound.model,
+                // The model the *client* asked for.
+                inbound_model = %req.model,
+                // The upstream name that was rejected.
+                rejected_model = %outbound.model,
                 fallback_model = %fallback,
+                // What the upstream said it would serve instead. Telemetry
+                // only — we do NOT route to it (it is untrusted input and
+                // it bypasses the operator's model policy), but it is the
+                // most actionable thing in the log: it tells the operator
+                // exactly which alias to add.
+                suggested_model = ?rejection.suggested,
                 "upstream rejected model; falling back to default_model"
             );
 
@@ -672,58 +710,6 @@ fn print_stream_stats(
         kind: crate::tui::LogKind::Response,
         text: line,
     });
-}
-
-/// Heuristic for "the upstream doesn't know this model". Matches on
-/// (a) status in `[400, 404]` and (b) either a structured error code
-/// (`code: "model_not_found"` / `model_not_supported`) or a body
-/// containing one of the well-known phrases. Conservative by design:
-/// false negatives are fine (the operator sees the original error),
-/// false positives would mask unrelated 400s.
-fn is_model_not_supported(status: StatusCode, body: &str) -> bool {
-    if !matches!(status.as_u16(), 400 | 404) {
-        return false;
-    }
-
-    // Structured codes first: upstreams may return a generic message
-    // text while putting the real reason in `code` (flat Responses
-    // envelope) or `error.code` (Chat Completions envelope).
-    if let Some(code) = extract_model_error_code(body)
-        && matches!(code.as_str(), "model_not_found" | "model_not_supported")
-    {
-        return true;
-    }
-
-    const PHRASES: &[&str] = &[
-        "model_not_found",
-        "model not found",
-        "model not supported",
-        "not supported for the selected provider",
-        "unknown model",
-    ];
-    let lower = body.to_ascii_lowercase();
-    PHRASES.iter().any(|p| lower.contains(p))
-}
-
-/// Extract the `code` field from a structured error envelope. Returns
-/// `None` if the body isn't JSON or has no recognized code shape.
-fn extract_model_error_code(body: &str) -> Option<String> {
-    // Responses API errors are flat: { "code": "...", "message": "..." }
-    if let Ok(err) = serde_json::from_str::<responses::ResponsesError>(body)
-        && let Some(Value::String(s)) = err.code
-    {
-        return Some(s);
-    }
-    // Chat Completions style errors are wrapped: { "error": { "code": "...", "message": "..." } }
-    if let Ok(v) = serde_json::from_str::<Value>(body)
-        && let Some(code) = v
-            .get("error")
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str())
-    {
-        return Some(code.to_owned());
-    }
-    None
 }
 
 // ─── Streaming bridge ─────────────────────────────────────────────────────
@@ -1004,36 +990,31 @@ fn event_kind(event: &StreamEvent) -> &'static str {
 // ─── Upstream error mapping ───────────────────────────────────────────────
 
 fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
-    if let Ok(env) = serde_json::from_str::<responses::ResponsesError>(body) {
-        // Responses errors are flat: `{ "message": "...", "type": "...", ... }`.
-        // The Responses API doesn't wrap in an `error: {...}` envelope like
-        // Chat Completions did, so we just read the fields directly.
-        let kind = if env.kind.is_empty() {
-            "upstream_error"
-        } else {
-            env.kind.as_str()
-        };
-        AppError::Upstream {
-            status,
-            body: format!("{kind}: {}", env.message),
-        }
-    } else {
-        AppError::Upstream {
+    // Upstreams use two envelopes: the flat Responses shape
+    // (`{"message": "...", "type": "..."}`) and the nested one
+    // (`{"error": {"message": "...", "type": "..."}}`) that the gateway in
+    // production actually sends. Parsing only the flat one meant the
+    // client received the raw JSON blob as its error message.
+    let env = model_rejection::parse_error_envelope(body);
+    if env.message.is_empty() && env.kind.is_empty() && !env.is_json {
+        // Not JSON at all — hand the body over verbatim.
+        return AppError::Upstream {
             status,
             body: body.to_string(),
-        }
+        };
+    }
+    let kind = if env.kind.is_empty() {
+        "upstream_error"
+    } else {
+        env.kind.as_str()
+    };
+    AppError::Upstream {
+        status,
+        body: format!("{kind}: {}", env.message),
     }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
-
-// TODO(model-fallback-streaming): a streaming "model not supported"
-// rejection arriving after we've already shipped message_start to the
-// client is not retryable with the current design. Today the
-// streaming branch skips the fallback loop and surfaces the 4xx
-// directly. Revisit if it shows up in practice; the right fix is
-// probably "buffer the upstream body before opening our response,
-// inspect status, then start streaming the (possibly fallback) body".
 
 /// Synthesize an Anthropic-shaped message id for streaming responses.
 /// Uses nanoseconds since the UNIX epoch, hex-encoded, plus a sanitized
@@ -1134,73 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn is_model_not_supported_matches_known_phrases() {
-        // Phrases the airia / OpenAI / Anthropic envelopes use when
-        // a model is unknown. The matcher is case-insensitive.
-        let cases = [
-            (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":{"code":"model_not_found","message":"..."}}"#,
-            ),
-            (StatusCode::NOT_FOUND, "Model not found"),
-            (
-                StatusCode::BAD_REQUEST,
-                "The requested model X is not supported for the selected provider.",
-            ),
-            (StatusCode::BAD_REQUEST, "Unknown model: foo"),
-            (StatusCode::BAD_REQUEST, "MODEL NOT SUPPORTED"),
-        ];
-        for (status, body) in cases {
-            assert!(
-                is_model_not_supported(status, body),
-                "expected true for status={status} body={body:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn is_model_not_supported_rejects_unrelated_errors() {
-        // 500s, 429s, and 400s about other things (rate limits,
-        // bad params, missing API key) must not be classified as
-        // model-not-supported — the fallback path would mask the
-        // real problem.
-        let cases = [
-            (StatusCode::INTERNAL_SERVER_ERROR, "upstream exploded"),
-            (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded"),
-            (StatusCode::UNAUTHORIZED, "invalid api key"),
-            (StatusCode::BAD_REQUEST, "max_tokens is too high"),
-            (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
-        ];
-        for (status, body) in cases {
-            assert!(
-                !is_model_not_supported(status, body),
-                "expected false for status={status} body={body:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn is_model_not_supported_detects_flat_responses_code() {
-        // Responses API errors are flat: { "code": "...", ... }.
-        // We must trigger fallback on model_not_supported / model_not_found
-        // even when the message text is generic.
-        let body = r#"{"message":"Bad request","type":"invalid_request_error","code":"model_not_supported"}"#;
-        assert!(is_model_not_supported(StatusCode::BAD_REQUEST, body));
-    }
-
-    #[test]
-    fn is_model_not_supported_detects_wrapped_chat_completions_code() {
-        // Chat Completions-style errors wrap the code inside `error`.
-        let body = r#"{"error":{"message":"Not found","type":"invalid_request_error","code":"model_not_found"}}"#;
-        assert!(is_model_not_supported(StatusCode::BAD_REQUEST, body));
-    }
-
-    #[test]
-    fn extract_model_error_code_returns_none_for_non_json() {
-        assert_eq!(extract_model_error_code("not json"), None);
-    }
-
-    #[test]
     fn stats_model_groups_mapped_requests_by_inbound_name() {
         assert_eq!(
             stats_model("claude-sonnet", "gpt-sonnet", false),
@@ -1221,24 +1135,6 @@ mod tests {
         assert_eq!(
             stats_model("claude-unknown", "claude-unknown", false),
             "claude-unknown"
-        );
-    }
-
-    #[test]
-    fn extract_model_error_code_prefers_flat_code() {
-        let body = r#"{"code":"model_not_supported","message":"Bad request"}"#;
-        assert_eq!(
-            extract_model_error_code(body).as_deref(),
-            Some("model_not_supported")
-        );
-    }
-
-    #[test]
-    fn extract_model_error_code_falls_back_to_wrapped_code() {
-        let body = r#"{"error":{"code":"model_not_found","message":"Not found"}}"#;
-        assert_eq!(
-            extract_model_error_code(body).as_deref(),
-            Some("model_not_found")
         );
     }
 

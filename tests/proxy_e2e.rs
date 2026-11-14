@@ -121,6 +121,53 @@ fn build_fake_response(resp: FakeResponse) -> Response {
     }
 }
 
+/// The error body the production gateway actually sends when it does not
+/// know a model. Taken verbatim from `proxy.log.2026-11-12`:
+///
+/// ```text
+/// ← upstream error status=404 Not Found body={"error":{"message":"model \"claude-sonnet-5\" not found. Try glm-5.3-flash:cloud.","type":"not_found_error","param":null,"code":null}}
+/// ```
+///
+/// Note the **nested** envelope, the model name sitting *between* "model"
+/// and "not found", and `code: null` — none of which the old detector
+/// could see.
+const REAL_GATEWAY_MODEL_404: &str = r#"{"error":{"message":"model \"claude-sonnet-5\" not found. Try glm-5.3-flash:cloud.","type":"not_found_error","param":null,"code":null}}"#;
+
+/// The same rejection as the gateway sent it on 2026-08-16 — **single**
+/// quotes, and no "Try" hint.
+const REAL_GATEWAY_MODEL_404_SINGLE_QUOTED: &str = r#"{"error":{"message":"model 'claude-opus-5' not found","type":"not_found_error","param":null,"code":null}}"#;
+
+/// A real non-model upstream error (2026-09-29). It contains the words
+/// "not supported", so a detector that matched those loosely would fire
+/// the model fallback on a *tool* rejection.
+const REAL_GATEWAY_WEB_SEARCH_400: &str = r#"{"error":{"message":"the web_search tool is not supported (ref: 490f64b3-1e45-4671-aaef-8e7ff3a71f4b)","type":"invalid_request_error","param":null,"code":null}}"#;
+
+/// A proxy config with an inbound→upstream alias map and a
+/// `default_model`, for the model-fallback tests.
+fn make_config_with_default_model(
+    upstream_addr: SocketAddr,
+    map: BTreeMap<String, String>,
+    default_model: Option<&str>,
+) -> Arc<Config> {
+    Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "test-key".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        reasoning_replay: Default::default(),
+        model_aliases: ModelAliases {
+            map,
+            default_model: default_model.map(str::to_owned),
+        },
+        prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
+    })
+}
+
 async fn start_fake_upstream() -> (SocketAddr, FakeUpstream) {
     let state = FakeUpstream::default();
     let app = Router::new()
@@ -749,10 +796,9 @@ async fn model_not_supported_falls_back_to_default() {
     // fallback model were valid.
     *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
         FakeResponse {
-            status: StatusCode::BAD_REQUEST,
-            body: Some(
-                r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
-            ),
+            // The real gateway rejection, verbatim.
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404.into()),
         },
         FakeResponse {
             status: StatusCode::OK,
@@ -827,10 +873,8 @@ async fn model_not_supported_falls_back_to_default() {
 async fn model_not_supported_without_default_passes_error_through() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
-        status: StatusCode::BAD_REQUEST,
-        body: Some(
-            r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error"}"#.into(),
-        ),
+        status: StatusCode::NOT_FOUND,
+        body: Some(REAL_GATEWAY_MODEL_404.into()),
     }]);
 
     let config = Arc::new(Config {
@@ -864,14 +908,14 @@ async fn model_not_supported_without_default_passes_error_through() {
     // The upstream rejection passes through to the client. We
     // don't fabricate a 502 here — the operator should see the
     // actual upstream status and body.
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let body: serde_json::Value = res.json().await.unwrap();
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("not supported for the selected provider"),
-        "expected upstream body, got {body}"
+            .contains("claude-sonnet-5"),
+        "expected the upstream message, got {body}"
     );
 
     // Crucially: only one upstream call, no retry.
@@ -927,6 +971,213 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let sent_bodies = upstream.received_all.lock().await.clone();
     assert_eq!(sent_bodies.len(), 1, "no retry should have been attempted");
+}
+
+/// A model rejection whose name is **single-quoted** — the shape the
+/// gateway used on 2026-08-16. A detector that hard-codes double quotes
+/// misses every one of those eight events.
+#[tokio::test]
+async fn model_not_found_with_single_quoted_name_falls_back_to_default() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404_SINGLE_QUOTED.into()),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o-mini",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback ok", "annotations": []}]
+                    }],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::new(),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-opus-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2, "expected exactly one retry");
+}
+
+/// A real upstream **tool** rejection. The body contains the words "not
+/// supported", so a loose detector would fire the model fallback on it
+/// and silently answer the request with a different model.
+#[tokio::test]
+async fn corpus_web_search_400_is_not_a_fallback_trigger() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+        status: StatusCode::BAD_REQUEST,
+        body: Some(REAL_GATEWAY_WEB_SEARCH_400.into()),
+    }]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::new(),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent_bodies.len(),
+        1,
+        "a tool rejection must not trigger the model fallback"
+    );
+}
+
+/// A 404 that is NOT about a model — a bad path on the upstream. It uses
+/// the same `not_found_error` type but never mentions a model, so it
+/// must not trigger the fallback.
+#[tokio::test]
+async fn non_model_404_does_not_fall_back() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+        status: StatusCode::NOT_FOUND,
+        body: Some(
+            r#"{"error":{"message":"Not Found","type":"not_found_error","param":null,"code":null}}"#
+                .into(),
+        ),
+    }]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::new(),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 1, "a non-model 404 must not retry");
+}
+
+/// If the **fallback** model is rejected too, the client gets that
+/// second error — and there is no third attempt.
+#[tokio::test]
+async fn fallback_model_also_rejected_returns_the_second_error() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404.into()),
+        },
+        FakeResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Some(
+                r#"{"error":{"message":"model \"gpt-4o-mini\" not found","type":"not_found_error","param":null,"code":null}}"#
+                    .into(),
+            ),
+        },
+    ]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::new(),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = res.json().await.unwrap();
+    // The client must see a readable message, not the raw JSON blob.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("gpt-4o-mini"),
+        "expected the upstream's own message, got {body}"
+    );
+    assert!(
+        !message.contains("{\"error\""),
+        "the raw JSON body must not be pasted into the message: {body}"
+    );
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2, "there must be no third attempt");
+}
+
+/// Retrying with the model that was just rejected would be pointless, so
+/// the fallback is skipped.
+#[tokio::test]
+async fn default_model_equal_to_rejected_model_does_not_retry() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+        status: StatusCode::NOT_FOUND,
+        body: Some(REAL_GATEWAY_MODEL_404.into()),
+    }]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::from([("claude-sonnet-5".to_string(), "gpt-4o-mini".to_string())]),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent_bodies.len(),
+        1,
+        "retrying with the same model would be pointless"
+    );
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    assert_eq!(first["model"], "gpt-4o-mini");
 }
 
 /// Tools in the outbound Responses request must include
@@ -1217,10 +1468,9 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
 
     *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
         FakeResponse {
-            status: StatusCode::BAD_REQUEST,
-            body: Some(
-                r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}"#.into(),
-            ),
+            // The real gateway rejection, verbatim.
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404.into()),
         },
         FakeResponse {
             status: StatusCode::OK,
