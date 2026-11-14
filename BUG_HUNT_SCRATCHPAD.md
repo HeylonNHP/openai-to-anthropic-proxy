@@ -406,6 +406,12 @@ prefix matching anywhere in the crate**. Every new Anthropic model name
 (`claude-sonnet-5-5`, `claude-opus-5`, `claude-fable-5-1`, …) must be hand-added to
 `proxy.json` or the request 404s.
 
+**The 404s were exactly the case the net is documented for.** All 11 had
+`inbound_model == upstream_model` — the operator had *not* mapped those names, so the
+gateway rejected the verbatim passthrough. `src/config.rs:100-104` says the safety net
+covers *"an aliased **or passed-through** model"*. The passthrough case is precisely what
+broke, and the net is inert.
+
 ### Root cause
 
 `src/proxy.rs:670-700`:
@@ -455,32 +461,214 @@ Corpus-wide `proxy: upstream rejected model` (the fallback WARN) → **0**.
 phrase `not supported for the selected provider` — a shape the real gateway never sends.
 That test is a false negative, not a passing guard.
 
-### Fix sketch
+### Verified evidence (2026-11-14) — two sub-agents, corpus + compiled detector
 
-1. Make `is_model_not_supported` understand the real nested envelope:
-   - parse `{"error":{…}}` and check `error.type == "not_found_error"` / `error.message`
-     contains `not found` / `does not exist` / `is not supported`;
-   - treat `model "<name>" not found` as model-not-supported (regex or a looser
-     "model" + "not found" co-occurrence check within a short window).
-2. Consider extracting the suggested model from the message (`Try glm-5.3-flash:cloud.`)
-   and honouring it before falling back to `default_model`.
-3. Add a **family/prefix fallback** for unmapped inbound names, e.g.
-   `claude-sonnet-*` → the configured sonnet alias, `claude-opus-*` → opus alias.
-   Or at minimum **log a WARN when an inbound model is not in the alias map** so the
-   operator knows to add it — currently it passes through completely silently.
-4. **Fix the e2e test** `tests/proxy_e2e.rs:741` to use the real nested body shape, and
-   add a case for `model "X" not found`.
+**The bug is genuine and worse than first written.** The detector was compiled and run
+over **every** upstream error body in the corpus: **0 of 138 caught.**
+
+#### The complete upstream-error inventory (138 events, 9 distinct shapes)
+
+| # | status | error `type` | error `code` | message | n |
+|---|---|---|---|---|---|
+| 1 | 402 | *(absent)* | `402` (number) | `This request would exceed your available credits given your current in-flight requests…` | 108 |
+| 2 | 400 | `invalid_request_error` | `null` | `invalid reasoning value: "xhigh" (must be "high", "medium", "low", "max", or "none")` | 7 |
+| 3 | 400 | `invalid_request_error` | `null` | `the web_search tool is not supported` | 7 |
+| 4 | 400 | *(absent)* | `400` (number) | `Provider returned error` (+ nested `metadata.raw` = `Invalid schema for function 'SendMessage': … 'allOf' is not permitted.`) | 2 |
+| 5 | 404 | `not_found_error` | `null` | `model 'claude-opus-5' not found` | 8 |
+| 6 | 404 | `not_found_error` | `null` | `model "claude-fable-5-1" not found` | 2 |
+| 7 | 404 | `not_found_error` | `null` | `model "claude-sonnet-5" not found. Try glm-5.3-flash:cloud.` | 1 |
+| 8 | 502 | — | — | *(empty body)* | 2 |
+| 9 | 503 | — | — | *(empty body)* | 1 |
+
+#### Why the current detector catches none of them
+
+- **The phrase is broken by the quoted model name.** `model not found` requires the two
+  words adjacent; the body has `model "claude-sonnet-5" not found`.
+- **The quote character is not stable.** 8 events use **single** quotes (2026-08-16), 3 use
+  **double** (2026-09-18 and 2026-11-12). A fix that hard-codes one quote style misses
+  most of them.
+- **`code` is `null`** in all 11, so the structured path fails; and `extract_model_error_code`
+  only accepts a **string** code, so the numeric `402` / `400` codes are invisible to it too.
+- **The one strong signal the gateway sends is never read:** `type: "not_found_error"` is
+  present in all 11 model-404s.
+- **The flat `ResponsesError` parse fails** because the nested body has no top-level
+  `message`.
+
+#### ⚠️ A trap for whoever writes the fix
+
+The detector receives the **raw** body text, in which the quotes are JSON-escaped:
+
+```
+raw body bytes   :  model \"claude-sonnet-5\" not found. Try glm-5.3-flash:cloud
+raw contains     :  model "claude-sonnet-5" not found   →  FALSE
+parsed message   :  model "claude-sonnet-5" not found   →  TRUE
+```
+
+So a substring test for `model "X" not found` **fails on the raw body** and only works on
+the JSON-parsed `error.message`. The fix must parse, not substring.
+
+#### ⚠️ The false-positive trap
+
+A detector that merely looks for the substring **`"not supported"`** would catch the 7
+`the web_search tool is not supported` 400s — **7 false positives** — and would still miss
+the 10 404s that have no "not supported" text. A detector keyed on
+**`type == "not_found_error"`** catches exactly the 11 model-404s and **nothing else** in
+the corpus. **The fix must key on the *model* nature of the error, never on bare
+"not supported".**
+
+#### The 404s were PASSTHROUGHS, not bad mappings — this is the crux
+
+All 11 model-404s have `inbound_model == upstream_model`: the operator had **not** mapped
+those names, and the gateway rejected the verbatim passthrough. On 2026-08-16
+`claude-opus-5` was sent verbatim 8× and 404'd 8×; 44 seconds later the operator's alias
+took effect (`→ minimax-m3:cloud`) and the errors stopped. On 2026-11-12 `claude-sonnet-5`
+404'd once while `claude-sonnet-5-5` was mapped to `deepseek-v4.1-flash:1017` and worked
+307× that day.
+
+`src/config.rs:100-104` says the safety net covers *"an aliased **or passed-through**
+model"*. **It is exactly the passthrough case the net is documented for, and it is inert.**
+
+#### The e2e tests pass for the wrong reason
+
+`tests/proxy_e2e.rs:751-756` feeds a **flat** body with a **400** status and the message
+`The requested model claude-sonnet-5 is not supported for the selected provider.` and
+`code: "model_not_supported"`. Every single field differs from what the gateway sends
+(envelope, status, message, `code`, `type`). The test exercises the detector's *own
+phrase list*, not reality. All four fallback e2e tests use synthetic bodies; **no fixture
+in the repo reproduces a real gateway body.**
+
+#### Other findings in the same code path
+
+- **`Config::upstream_model_for` (`src/config.rs:575-581`) is dead code** — zero production
+  call sites (only a doc link and three unit tests). The live resolution is
+  `RuntimeMappings::resolve` (`src/tui/runtime.rs:59-64`): an exact, case-sensitive
+  `BTreeMap` lookup with **no normalisation** and a verbatim passthrough on a miss.
+- **There is no model-family notion anywhere in the crate** — `grep -rn "sonnet|opus|haiku|fable" src/`
+  hits only test fixtures, TUI display strings and stats-bucket names.
+- **The stale `TODO(model-fallback-streaming)` at `src/proxy.rs:1029-1036`** claims the
+  streaming branch skips the fallback loop. That is **false** — the loop is at
+  `src/proxy.rs:355-478` and the streaming branch is chosen at `:483`, *after* it. Streaming
+  does fall back.
+- **The fallback WARN misnames its field**: `inbound_model = %outbound.model` logs the
+  **upstream** name, not the inbound one.
+- **`LAST_SENT_BODY` holds the first attempt's body**, so after a fallback the
+  `upstream_payload` log line shows the pre-fallback body.
+- **The upstream's suggestion (`glm-5.3-flash:cloud`) is not a model the operator's map
+  uses** — the map uses `glm-5.3-flash` (no `:cloud` suffix), and the corpus's own ids carry
+  suffixes (`:cloud`, `:1017`, `:free`). Trusting the suggestion verbatim would introduce a
+  second naming convention the alias map does not know.
+- **The parameter-strip retry path has also never fired** (`"upstream rejected request
+  parameter; retrying without it"` → 0 hits corpus-wide) despite
+  `the web_search tool is not supported` (7×) and `invalid reasoning value: "xhigh"` (7×)
+  being exactly the failures it should learn from — a second instance of the same class.
+
+### Fix sketch (validated against the corpus — 11/11 caught, 0/127 false positives)
+
+**Design: hybrid — structured first, narrow phrase fallback, parse the body.**
+
+New module `src/model_rejection.rs`:
+
+1. **`parse_error_envelope(body)`** — flatten both envelopes into one
+   `{message, kind, code, param, is_json}`:
+   - nested `{"error":{…}}` → the inner fields (**this is what the gateway sends**);
+   - flat `{"message":…,"code":…}` → the top-level fields;
+   - `{"error":"…"}` (bare string) → the string;
+   - not JSON at all → the whole body becomes the message (so plain-text upstreams
+     still work).
+   - `code` must accept a **number** as well as a string — the real bodies carry
+     `"code": 402` / `"code": 400`, which the old code (string-only) could not see.
+2. **`detect_model_rejection(status, body, sent_model)`** — status gate `400 | 404`
+   (unchanged), then, in order:
+   - **transient guard** — `temporar|overload|rate limit|retry after|capacity|throttl`
+     ⇒ never a model rejection (a temporarily-unavailable model is an outage, not a
+     rejection; retrying elsewhere would paper over it);
+   - **structured code** — `code` ∈ {`model_not_found`, `model_not_supported`,
+     `model_not_exist`, `unknown_model`, `invalid_model`};
+   - **`type == "not_found_error"` AND the message is about a model** — this is the
+     branch that catches all 11 real corpus 404s, with **zero** false positives;
+   - **anchored regex** — `\bmodels?\b` + a quoted name or an id-shaped name + a
+     negative (`not found|not supported|not available|not valid|does not exist|
+     don't exist|unavailable|invalid|deprecated`), case-insensitive, tolerating
+     either quote character and an optional `Try …` hint. The id-shaped alternative
+     must contain a digit or a `- . : / @` separator, so `the model output is not found`
+     does not match;
+   - **narrow phrase list** — every entry contains the word *model*; **bare
+     "not supported" is deliberately absent** (that is the `web_search` false positive);
+   - **sent-name corroboration** — the message names the exact model we sent AND says
+     something negative about it within ~80 chars. Used as a *corroborating* signal
+     only, never as a requirement (the upstream may name the model differently).
+
+   The corpus 404s are caught by **two independent branches**, so a future change to
+   either one cannot silently re-break the net.
+
+3. **Do NOT route to the upstream's suggestion.** The suggestion is untrusted input, it
+   bypasses the operator's model policy, and it uses a naming convention the alias map
+   does not know (`glm-5.3-flash:cloud` vs the map's `glm-5.3-flash`). **Log it instead**
+   (`suggested_model=…` on the fallback WARN) — that is the single most actionable line
+   for the operator, because it tells them exactly which alias to add. Routing to it can
+   become a later, opt-in, config-gated feature that requires the suggestion to already
+   be a value in the operator's alias map.
+
+4. **WARN on an unmapped inbound model.** The passthrough is currently *completely
+   silent*, which is what hid all 11 of these. At minimum log it; ideally also emit one
+   de-duplicated line in the operator's log pane.
+
+5. **Do NOT add family/wildcard alias matching in this commit.** It silently changes
+   which model answers a request (cost, context window, tool behaviour), breaks the
+   documented *"Matching is exact. There are no wildcards."* contract, and hides the
+   operator's mistake. It is a **feature**, not a bug fix — ship it separately, opt-in.
+
+6. **Fix the misleading things in the same path:** the fallback WARN's
+   `inbound_model` field actually holds the *upstream* name; `LAST_SENT_BODY` shows the
+   pre-fallback body; the stale `TODO(model-fallback-streaming)` is factually wrong; and
+   `map_upstream_error` parses only the flat envelope so the client receives the raw
+   JSON blob as the error message.
+
+7. **Rewrite the tests onto the real bodies.** The current e2e fixtures are synthetic;
+   no fixture in the repo reproduces a real gateway body.
 
 ### Regression test plan
 
-- `tests/proxy_e2e.rs`: fake upstream returns 404 with the real nested body →
-  assert the proxy retries with `default_model` and the client gets a 200.
-- Unit test in `src/proxy.rs` tests: `is_model_not_supported(404, real_body) == true`
-  and `extract_model_error_code(real_body) == None` (assert the current wrong answers
-  first, then flip).
-- Guard against false positives: a 400 that is *not* about the model must not trigger the
-  fallback (there is already `unrelated_upstream_400_is_not_a_fallback_trigger` at
-  `tests/proxy_e2e.rs:881` — keep it passing).
+**Unit tests** (new `src/model_rejection.rs` test module — 33 assertions validated):
+
+| Test | Input | Expect |
+|---|---|---|
+| `real_gateway_body_is_a_model_rejection` | the **exact** production body, status 404 | `Some`; `rejected == Some("claude-sonnet-5")`, `suggested == Some("glm-5.3-flash:cloud")` |
+| `real_gateway_body_single_quoted` | `model 'claude-opus-5' not found` | `Some` |
+| `real_gateway_body_double_quoted` | `model "claude-fable-5-1" not found` | `Some` |
+| `flat_responses_body_is_a_model_rejection` | the existing flat e2e body | `Some` |
+| `nested_code_is_a_model_rejection` | `{"error":{"code":"model_not_found",…}}` | `Some` |
+| `plain_text_body_is_a_model_rejection` | `"Model not found"` (not JSON) | `Some` |
+| `corpus_non_model_errors_are_not_model_rejections` | the 4 real non-model corpus bodies (web_search 400, xhigh 400, schema 400, 402 credits) | all `None` |
+| `empty_502_and_503_are_not_model_rejections` | `("", 502)`, `("", 503)` | `None` |
+| `non_model_404_is_not_a_model_rejection` | `{"error":{"message":"Not Found","type":"not_found_error"}}` (bad path) | `None` |
+| `transient_outage_is_not_a_model_rejection` | `"claude-sonnet-5 is temporarily unavailable"` | `None` |
+| `model_word_in_an_unrelated_message_is_not_a_model_rejection` | `"the model output is not found"` | `None` |
+| `model_name_prefixed_to_an_unrelated_400_is_not_a_model_rejection` | `"claude-sonnet-5: invalid value for temperature"` | `None` |
+| `suggestion_must_look_like_a_model_id` | `Try another model.` / `Try https://evil.example/x` / `Try the default.` | `suggested == None` |
+
+**e2e tests** (`tests/proxy_e2e.rs`):
+
+| Test | Action |
+|---|---|
+| `model_not_supported_falls_back_to_default` | **change the body to the real nested 404** (status 404, not 400) |
+| `model_not_found_with_quoted_name_falls_back_to_default` | **new** — the single-quoted shape |
+| `model_not_supported_without_default_passes_error_through` | change the body to the real nested shape; assert 404 to the client and **1** upstream request |
+| `unrelated_upstream_400_is_not_a_fallback_trigger` | **keep as is** (must keep passing) |
+| `corpus_web_search_400_is_not_a_fallback_trigger` | **new** — the real `the web_search tool is not supported` body ⇒ 400 to the client, **1** request |
+| `non_model_404_does_not_fall_back` | **new** — a bad-path 404 ⇒ 404 to the client, **1** request |
+| `fallback_model_also_rejected_returns_the_second_error` | **new** — the fallback 404s too ⇒ client gets 404, **exactly 2** requests (no third) |
+| `default_model_equal_to_rejected_model_does_not_retry` | **new** ⇒ 404, **1** request |
+| `client_asking_for_the_default_model_does_not_retry` | **new** ⇒ 404, **1** request |
+| `streaming_model_not_supported_falls_back_to_default` | **change the body to the real nested 404** — streaming must still fall back |
+
+**Corpus fixture (recommended):** `tests/fixtures/upstream_errors.jsonl` — one
+`{"status":…,"body":…,"expect_model_rejection":true|false}` per line, pinning the 9 real
+shapes into the repo so the next gateway phrasing change fails `cargo test` rather than
+production.
+
+**Guard against false positives:** the `unrelated_upstream_400_is_not_a_fallback_trigger`
+test must keep passing, and the corpus-derived tests above cover the rest.
 
 ---
 
