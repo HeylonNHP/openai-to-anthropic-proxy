@@ -240,7 +240,7 @@ The 884 `server_tool_use` hits are the user's own **proxy Rust source**, read
 by Claude Code and echoed into the request body. There is no Anthropic
 server-tool traffic in the corpus at all.
 
-### 4.2 A live inconsistency the corpus does prove
+### 4.2 A live inconsistency the corpus does prove — **FIXED 2026-11-14**
 
 In real Aug-2026 traffic, the upstream request body carried the `# Advisor
 Tool` instructions in `instructions` (15,121 chars) while the `tools` array
@@ -249,10 +249,29 @@ Tool` instructions in `instructions` (15,121 chars) while the `tools` array
 `instructions`, so the executor was told *"call advisor BEFORE substantive
 work"* while the tool did not exist.
 
-**⇒ A proxy that does not implement the advisor should strip the
-`# Advisor Tool` block from the instructions it forwards.** Claude Code's own
-removal string is `"The advisor tool is no longer available; disregard the
-earlier advisor instructions."` (binary offset 291,758,3xx).
+**This is now fixed.** The corpus contains **84** such `instructions` strings
+(all in `proxy.log.2026-08-23`), every one with the identical opener
+`You have access to an \`advisor\` tool…`. In 79 the section ends at the next
+`<system-reminder>`; in 5 the reminder tags are absent and it ends at the
+line `The following skills are available for use with the Skill tool:`. In all
+84 the section starts at line 16 of the assembled prompt and is followed by
+other content, so a heading-to-next-heading strip would have eaten the
+skills list and the `## Auto Mode Active` section.
+
+The fix (`src/translate.rs`, `strip_advisor_tool_instructions`) removes only
+from a line-start `# Advisor Tool` heading up to the first
+`<system-reminder>` / skills line, and only when no tool named `advisor` is
+present. It does **not** append Claude Code's own `"The advisor tool is no
+longer available; disregard the earlier advisor instructions."` (binary
+offset 291,758,3xx): the executor never saw a working advisor through this
+proxy, so there is nothing to retract.
+
+Verified three ways: 5 unit tests (both corpus variants, a present advisor
+tool, inline-quote and no-advisor no-ops), a replay of all 84 real strings
+through the same algorithm (0 problems), and an end-to-end request through
+the real binary with a real corpus `system` prompt (15,121 → 13,103 chars;
+`# Advisor Tool`, `Call advisor BEFORE`, `advisor()` all absent; git context,
+skills reminder and `## Auto Mode Active` all present).
 
 ### 4.3 The client accepts the blocks
 
@@ -594,10 +613,10 @@ client-side, so a proxy cannot fix it — only the user can.
 
 ## 10. Recommendation
 
-1. **Do this first (option D, ~15 lines):** strip the `# Advisor Tool` block
-   from the instructions the proxy forwards, or append Claude Code's own
-   "the advisor tool is no longer available" string. Today the executor is
-   told to call a tool that does not exist.
+1. **DONE (option D, 2026-11-14):** strip the `# Advisor Tool` block from the
+   instructions the proxy forwards. See §4.2 for the implementation and its
+   verification. The executor is no longer told to call a tool that does not
+   exist.
 2. **Then decide between option A and option B.** Option B (~350 lines, no
    streaming splice) answers "do I want a second opinion on every task?" for
    a fraction of the cost and risk; option A answers "do I want Anthropic's

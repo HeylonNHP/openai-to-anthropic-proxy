@@ -144,6 +144,20 @@ pub fn anthropic_to_responses(
         instructions.clear();
     }
 
+    // Claude Code may include a `# Advisor Tool` system section describing
+    // the Anthropic server-side advisor tool. This proxy cannot offer that
+    // tool: the declaration has no `input_schema` and is dropped by the
+    // filter_map below, so forwarding the instructions would tell the model
+    // to call a tool that does not exist. Strip the section (and only the
+    // section) when no advisor tool is actually being sent upstream.
+    let has_advisor_tool = req
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == "advisor"));
+    if !has_advisor_tool {
+        strip_advisor_tool_instructions(&mut instructions);
+    }
+
     // Remember the *original* (client-supplied) tool schemas so the
     // response path can invert the strict sanitization below
     // (`crate::repair`). The registry is returned alongside the request
@@ -258,6 +272,61 @@ fn system_text(system: &SystemPrompt) -> String {
             .collect::<Vec<_>>()
             .join("\n\n"),
     }
+}
+
+/// Remove Claude Code's `# Advisor Tool` section from the assembled
+/// `instructions`, leaving every byte before and after it untouched.
+///
+/// Claude Code injects this section into the system prompt whenever the
+/// advisor is enabled. It is a markdown section ending immediately before
+/// the next `<system-reminder>`, or — in the variant where Claude Code has
+/// already inlined the skills reminder as plain text — before the line
+/// `The following skills are available for use with the Skill tool:`.
+/// It is never the last thing in the prompt in real traffic, but we also
+/// handle a section that runs to the end of the string.
+///
+/// We deliberately do NOT replace it with the "advisor tool is no longer
+/// available" notice Claude Code itself uses: the executor never saw a
+/// working advisor through this proxy, so there is no earlier instruction
+/// to retract. Deleting the section is the least surprising outcome.
+fn strip_advisor_tool_instructions(instructions: &mut String) {
+    const HEADING: &str = "# Advisor Tool";
+    const SKILLS: &str = "The following skills are available for use with the Skill tool:";
+
+    // Find a heading that starts a line. Prose quoting the string inline
+    // must not be treated as a section boundary.
+    let mut search_from = 0;
+    let mut start = None;
+    while let Some(rel) = instructions[search_from..].find(HEADING) {
+        let at = search_from + rel;
+        if at == 0 || instructions.as_bytes()[at - 1] == b'\n' {
+            start = Some(at);
+            break;
+        }
+        search_from = at + HEADING.len();
+    }
+    let Some(start) = start else {
+        return;
+    };
+
+    let tail = &instructions[start..];
+    // The section ends where the next injected block begins. In real
+    // traffic that is a `<system-reminder>`; in the variant where Claude
+    // Code has already inlined the skills reminder it is the SKILLS line.
+    let end_rel = tail
+        .find("<system-reminder>")
+        .or_else(|| tail.find(SKILLS))
+        .unwrap_or(tail.len());
+    let end = start + end_rel;
+    if end <= start + HEADING.len() {
+        return; // heading only / malformed — leave it alone
+    }
+    let removed = end - start;
+    instructions.replace_range(start..end, "");
+    tracing::debug!(
+        removed_bytes = removed,
+        "stripped the '# Advisor Tool' instructions; this proxy does not offer the advisor server tool"
+    );
 }
 
 /// Total object properties, across every strict tool in one request, that
@@ -1980,6 +2049,103 @@ mod tests {
             Input::Items(items) => items,
             Input::Text(_) => panic!("expected Items, got Text"),
         }
+    }
+
+    /// The real Claude Code `# Advisor Tool` section, as captured in
+    /// proxy.log.2026-08-23 (84 occurrences, all identical). Kept here as a
+    /// fixture so the strip is verified against the actual text, not a
+    /// paraphrase.
+    const ADVISOR_SECTION: &str = "# Advisor Tool\n\n\
+You have access to an `advisor` tool backed by a stronger reviewer model. It takes NO parameters -- when you call advisor(), your entire conversation history is automatically forwarded. They see the task, every tool call you've made, every result you've seen.\n\n\
+Call advisor BEFORE substantive work -- before writing, before committing to an interpretation, before building on an assumption. If the task requires orientation first (finding files, fetching a source, seeing what's there), do that, then call advisor. Orientation is not substantive work. Writing, editing, and declaring an answer are.\n\n\
+Also call advisor:\n\
+- When you believe the task is complete. BEFORE this call, make your deliverable durable: write the file, save the result, commit the change. The advisor call takes time; if the session ends during it, a durable result persists and an unwritten one doesn't.\n\
+- When stuck -- errors recurring, approach not converging, results that don't fit.\n\
+- When considering a change of approach.\n\n\
+On tasks longer than a few steps, call advisor at least once before committing to an approach and once before declaring done. On short reactive tasks where the next action is dictated by tool output you just read, you don't need to keep calling -- the advisor adds most of its value on the first call, before the approach crystallizes.\n\n\
+Give the advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence that contradicts a specific claim (the file says X, the paper states Y), adapt. A passing self-test is not evidence the advice is wrong -- it's evidence your test doesn't check what the advice is checking.\n\n\
+If you've already retrieved data pointing one way and the advisor points another: don't silently switch. Surface the conflict in one more advisor call -- \"I found X, you suggest Y, which constraint breaks the tie?\" The advisor saw your evidence but may have underweighted it; a reconcile call is cheaper than committing to the wrong branch.\n";
+
+    fn translate_system(system: &str, tools: Option<Vec<Tool>>) -> Option<String> {
+        let mut req = fixture_request();
+        req.system = Some(SystemPrompt::Text(system.to_owned()));
+        req.tools = tools;
+        anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+        )
+        .unwrap()
+        .0
+        .instructions
+    }
+
+    #[test]
+    fn advisor_instructions_are_stripped_when_tool_is_absent() {
+        // The corpus shape: git status, advisor section, skills reminder.
+        let system = format!(
+            "Git user: heylon\n\nStatus:\n(clean)\n\nRecent commits:\n694f4b7 feat(repair)\n\n{ADVISOR_SECTION}<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n- dataviz: …\n</system-reminder>\n<system-reminder>\nAvailable agent types …\n</system-reminder>"
+        );
+        let out = translate_system(&system, None).unwrap();
+        assert!(!out.contains("# Advisor Tool"));
+        assert!(!out.contains("Call advisor BEFORE substantive work"));
+        assert!(!out.contains("advisor()"));
+        // Everything before and after must survive, in order.
+        assert!(out.starts_with("Git user: heylon"));
+        assert!(out.contains("694f4b7 feat(repair)"));
+        assert!(out.contains("<system-reminder>\nThe following skills"));
+        assert!(out.contains("Available agent types …"));
+        // Exactly one blank line where the section used to be.
+        assert!(out.contains("694f4b7 feat(repair)\n\n<system-reminder>"));
+    }
+
+    #[test]
+    fn advisor_instructions_are_stripped_in_the_inlined_skills_variant() {
+        // 5 of the 84 corpus occurrences had the `<system-reminder>` tags
+        // stripped, leaving the skills text as a plain line.
+        let system = format!(
+            "Git user: heylon\n\n{ADVISOR_SECTION}The following skills are available for use with the Skill tool:\n\n- dataviz: …\n"
+        );
+        let out = translate_system(&system, None).unwrap();
+        assert!(!out.contains("# Advisor Tool"));
+        assert!(!out.contains("advisor()"));
+        assert!(out.contains("Git user: heylon"));
+        assert!(out.contains("The following skills are available"));
+        assert!(out.contains("- dataviz: …"));
+    }
+
+    #[test]
+    fn advisor_instructions_survive_when_an_advisor_tool_is_present() {
+        // The proxy cannot currently offer a server-side advisor, but if a
+        // tool named `advisor` is present the instructions must not be
+        // touched — otherwise a future implementation would be kneecapped.
+        let system =
+            format!("prefix\n\n{ADVISOR_SECTION}<system-reminder>\nskills\n</system-reminder>");
+        let tools = vec![Tool {
+            name: "advisor".into(),
+            description: None,
+            input_schema: Some(json!({"type": "object", "properties": {}})),
+        }];
+        let out = translate_system(&system, Some(tools)).unwrap();
+        assert!(out.contains("# Advisor Tool"));
+        assert!(out.contains("Call advisor BEFORE substantive work"));
+        assert!(out.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn advisor_strip_leaves_unrelated_text_and_inline_quotes_alone() {
+        // A quoted mention inside a paragraph is not a section heading.
+        let system = "Mentioned the \"# Advisor Tool\" doc in prose.\n\nKeep this paragraph.";
+        assert_eq!(translate_system(system, None).as_deref(), Some(system));
+
+        // A heading with no body is left alone (malformed / truncated).
+        let bare = "prefix\n\n# Advisor Tool";
+        assert_eq!(translate_system(bare, None).as_deref(), Some(bare));
+
+        // No advisor text at all: byte-for-byte unchanged.
+        let plain = "You are helpful.\n\n## Auto Mode Active\n\nDo things.";
+        assert_eq!(translate_system(plain, None).as_deref(), Some(plain));
     }
 
     #[test]
