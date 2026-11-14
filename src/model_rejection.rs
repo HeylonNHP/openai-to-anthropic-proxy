@@ -54,8 +54,8 @@
 //!   negative — but the subject is the tool, and answering it with a
 //!   different model would be silent corruption. Two things separate
 //!   the two: the anchored pattern only accepts the **absence** words
-//!   ("not found", "does not exist"), and a short list of
-//!   request-subject words vetoes the rest.
+//!   ("not found", "does not exist", "doesn't exist", "deprecated"),
+//!   and a short list of request-subject words vetoes the rest.
 
 use std::sync::OnceLock;
 
@@ -75,9 +75,14 @@ const MODEL_ERROR_CODES: &[&str] = &[
 
 /// Narrow phrases that mean the upstream is talking about a **model**.
 ///
-/// Every entry names the model as the *subject* of the negative. A bare
-/// "not supported" is deliberately absent — that is the `web_search`
-/// false positive.
+/// Every entry puts the word "model" immediately before the negative,
+/// which leaves no room for a different subject to sit between them. A
+/// bare "not supported" is deliberately absent — that is the
+/// `web_search` false positive.
+///
+/// The test is a plain substring search, so a *modifier* before the
+/// word slips through ("the embedding model not found" fires). The
+/// upstream would have to say exactly that for it to matter.
 const MODEL_PHRASES: &[&str] = &[
     "model_not_found",
     "model_not_supported",
@@ -110,7 +115,11 @@ const MODEL_PHRASES: &[&str] = &[
 /// "request") while still missing new request subjects. The anchored
 /// pattern now carries the discrimination instead — see
 /// [`model_rejection_re`] — so this list only holds the words that
-/// cannot appear in a model rejection at all.
+/// name a tool, a function, a parameter or a schema.
+///
+/// It is still a deny-list, so it can veto a genuine rejection that
+/// happens to mention one of them ("model X not found for the schema").
+/// That is the safe direction to be wrong in.
 ///
 /// Matched as whole tokens, so `requested` is not `request` and
 /// `web_search` is `web` + `search`.
@@ -290,15 +299,15 @@ fn build_rejection(message: &str) -> ModelRejection {
 ///
 /// The name may be quoted (either quote character — the gateway has used
 /// both) or bare, in which case it must look like a model id: it has to
-/// contain a digit or a separator, so `the model output is not found`
-/// does not match while `model gpt-5.4-mini not found` does.
+/// contain a digit, so `the model output is not found` does not match
+/// while `model gpt-5.4-mini not found` does.
 ///
 /// The negative is restricted to the **absence** words — "not found",
-/// "does not exist". That is deliberate: "not supported" and "not
-/// available" are the words request-scoped errors use ("the web_search
-/// tool is not supported", "model X is not available for
-/// web_search"), and admitting them here would let a request error
-/// swap the model. A message where "model" sits *immediately* before
+/// "does not exist", "doesn't exist", "deprecated". That is
+/// deliberate: "not supported" and "not available" are the words
+/// request-scoped errors use ("the web_search tool is not supported",
+/// "model X is not available for web_search"), and admitting them here
+/// would let a request error swap the model. A message where "model" sits *immediately* before
 /// the negative ("model not supported") is still recognised — that is
 /// the [`MODEL_PHRASES`] branch, where adjacency leaves no room for a
 /// different subject.
@@ -329,9 +338,9 @@ fn model_rejection_re() -> &'static Regex {
 
 /// Match the anchored pattern, validating the captured name.
 ///
-/// A **bare** name has to look like a model id — it must contain a digit
-/// or a separator — so `the model output is not found` does not match
-/// while `model gpt-5.4-mini is not supported` does. The `regex` crate
+/// A **bare** name has to look like a model id — see
+/// [`looks_like_model_id`] — so `the model output is not found` does not
+/// match while `model gpt-5.4-mini not found` does. The `regex` crate
 /// has no look-ahead, so that check happens here rather than in the
 /// pattern.
 fn match_model_rejection(message: &str) -> Option<PatternMatch> {
@@ -369,6 +378,12 @@ fn mentions_request_subject(lower: &str) -> bool {
 }
 
 /// Does this token look like a model id rather than prose?
+///
+/// A bare name has to contain a digit **and** be either long enough or
+/// separated enough to read as an id. The digit alone is not enough:
+/// `model 2fa not found` and `model 404 not found` are prose that the
+/// digit heuristic would otherwise accept, and accepting them would swap
+/// the model over a 2FA error.
 fn looks_like_model_id(token: &str) -> bool {
     if token.is_empty() || token.len() > 128 {
         return false;
@@ -382,7 +397,10 @@ fn looks_like_model_id(token: &str) -> bool {
     {
         return false;
     }
-    token.chars().any(|c| c.is_ascii_digit()) || token.contains(['-', '.', ':', '/', '@'])
+    if !token.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    token.chars().count() >= 4 || token.contains(['-', '.', ':', '/', '@'])
 }
 
 /// Parse the upstream's "Try <model>." suggestion.
@@ -649,6 +667,24 @@ mod tests {
                     "must not swap the model for: {body}"
                 );
             }
+        }
+    }
+
+    /// Prose that happens to contain a digit must not read as a model id.
+    /// `model 2fa not found` is a two-factor error, not a model rejection.
+    #[test]
+    fn digit_prose_is_not_a_model_id() {
+        for body in [
+            "model 2fa not found",
+            "model x1 not found",
+            "model 404 not found",
+            "model a1 not found",
+        ] {
+            let json = format!(r#"{{"error":{{"message":"{body}","type":"not_found_error"}}}}"#);
+            assert!(
+                detect_model_rejection(404, &json).is_none(),
+                "digit prose must not read as a model: {body}"
+            );
         }
     }
 
