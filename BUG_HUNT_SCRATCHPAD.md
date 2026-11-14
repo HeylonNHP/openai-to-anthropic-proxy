@@ -136,7 +136,7 @@ Test modules: `src/anthropic.rs:470`, `src/capabilities.rs:367`, `src/config.rs:
 
 | # | Bug | Status | Commit | Notes |
 |---|---|---|---|---|
-| 1 | Thinking blocks dropped on the way back in | ✅ FIXED | `24f4805` + `a340989` | 3 review rounds; see [§ BUG 1 — resolution](#bug-1--resolution) |
+| 1 | Thinking blocks dropped on the way back in | ✅ FIXED | `24f4805`, `a340989`, `f507d59`, `8fde2d4` | 4 review rounds; see [§ BUG 1 — resolution](#bug-1--resolution) |
 | 2 | `default_model` fallback is dead code → hard 404 | ⬜ TODO | | |
 | 3 | Parallel tool calls → interleaved blocks → corrupted JSON | ⬜ TODO | | |
 | 4 | Malformed upstream SSE event dropped wholesale | ⬜ TODO | | |
@@ -277,8 +277,15 @@ Quantitative proof the dropped blocks are the reasoning ones:
 
 ## BUG 1 — resolution
 
-**Status: FIXED** in `24f4805` (the fix) + `a340989` (the hardening that
-followed three rounds of sub-agent review).
+**Status: FIXED** in `24f4805` (the fix), `a340989` + `f507d59` + `8fde2d4`
+(the hardening that followed four rounds of sub-agent review).
+
+| Commit | What it did |
+|---|---|
+| `24f4805` | The fix: typed `Thinking`/`RedactedThinking` variants + the three `reasoning_replay` modes |
+| `a340989` | Hardening: tolerant deserializer (a wrong-typed field no longer 400s the request), fence escaping (no more self-issued prompt injection), synthetic reasoning id + always-present `summary`, `proxy.json.example` no longer sets the new key |
+| `f507d59` | Hardening: the TUI save path no longer writes a key the previous binary rejects; case-insensitive fence escape; the synthetic id hashes text+signature; `replayed_chars` counter |
+| `8fde2d4` | `replayed_chars` actually reported on the "→ upstream" line (it had been documented but never wired); corrected the measured numbers in the docs |
 
 ### What changed
 
