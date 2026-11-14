@@ -4,11 +4,19 @@
 > `advisor_tool` server tool in this proxy?"*
 >
 > Started 2026-11-14. Repo: `/home/heylon/git/openai-to-anthropic-proxy`.
-> Commits at the time of writing: `4b101ac` (BUG 2 scratchpad).
+> Baseline for §11 onward: HEAD `df5d78e` (the orphaned-instructions fix).
+> Commits on this branch: `671dabc` (initial research), `df5d78e` (option D).
 >
-> Researched by three sub-agents: **protocol** (docs + binary + corpus),
-> **architecture** (the proxy's code), **wire evidence** (binary offsets +
-> corpus). Their disagreements are resolved in §9.
+> Researched in two waves by seven sub-agents:
+> - **wave 1:** protocol (docs + binary + corpus), architecture (proxy code),
+>   wire evidence (binary offsets + corpus). Disagreements resolved in §9.
+> - **wave 2 (2026-11-14, for the modular-implementation question):** pipeline
+>   seams, streaming feasibility, config/state/usage/failure patterns, and
+>   exact protocol boundaries. Recorded in **§11**, with the implementation
+>   plan in **§12**.
+>
+> §§1-10 are the initial research. §11 corrects several of its estimates
+> and supersedes them where they conflict. Read §11 and §12 before building.
 
 ---
 
@@ -626,6 +634,579 @@ client-side, so a proxy cannot fix it — only the user can.
    executor's, **use a cheap model** (§7), and never let the advisor call fall
    back to `default_model`.
 
+> **Superseded by §12.** The wave-2 research found a materially cheaper and
+> safer design than option A/B: force a non-streaming upstream call, run the
+> consultation as an explicit outer loop, and emit one synthetic SSE message.
+> It also found that the whole thing can be done without touching `stream.rs`,
+> `config.rs`, `AppState`, or the `Tool` struct. See §11 and §12.
+
+---
+
+## 11. Wave-2 research: the seams (2026-11-14)
+
+Four sub-agents, all read-only against HEAD `df5d78e`. Every finding below is
+from the actual source, with file:line. **Line numbers are for `df5d78e`** —
+the §1-10 references to `translate.rs:149` / `responses_to_anthropic:5057`
+were against `671dabc`; add +17 / +166.
+
+### 11.1 What the codebase actually looks like
+
+`src/lib.rs` is 22 lines. There is **one** sub-module directory in the repo
+(`src/tui/`, `mod.rs` + 6 files). Everything else is a flat `src/<name>.rs`
+with a `//!` doc block, a narrow `pub` API, private helpers, and an inline
+`#[cfg(test)] mod tests`. **That flat-file shape is the house style** for a
+single-purpose unit; `src/tui/` is the precedent only if a module grows past
+~700 lines.
+
+The three existing extension patterns, cheapest first:
+
+| pattern | precedent | integration cost |
+|---|---|---|
+| **pure helper, private `mod`, takes primitives** | `src/model_rejection.rs`, `src/schema_refs.rs` | 1 `lib.rs` line, 1-2 call sites, 0 `Config`/`AppState` changes |
+| **per-request state as an explicit parameter** | `src/repair.rs` (`ToolSchemaRegistry` returned in a tuple from the translator) | 0 `AppState` changes, but every signature on the path |
+| **process-lifetime `Arc<Store>` in `AppState`** | `src/capabilities.rs` | 1 field, 1 literal, 1 new delegating router constructor, 2 `main.rs` args, TUI threading |
+
+`model_rejection.rs` (commit `86b6a4a`) is the closest analogue: **1 private
+`mod` line, 4 public items, 2 call sites in `proxy.rs`, zero `Config` fields,
+21 in-file unit tests + rewritten e2e fixtures**. Its commit *deleted* ~200
+lines of inline detector from `proxy.rs` — the integration was a net
+simplification. That is the standard to aim at.
+
+### 11.2 The two narrow hook points — and why they are not enough
+
+- **Outbound augmentation:** `src/proxy.rs:262-263`, the blank line after
+  `outbound.prompt_cache_key = …` and before the `tracing::info!("→ upstream")`
+  at `:266`. `&mut ResponsesRequest`, `&AppState`, `&CreateMessageRequest` and
+  the mappings snapshot are all in scope. The proxy already mutates `outbound`
+  here (`:255` model, `:260` cache key) and later at `:404` (`apply_known`).
+- **Final-`Message` post-processing:** `src/proxy.rs:628-629`, between
+  `let anth = translate::responses_to_anthropic(...)` and the stats block.
+  `Json(anth).into_response()` at `:680` is the only consumer, so `let mut anth`
+  + one call is enough. **Caveat:** the stats block at `:629-638` reads
+  `upstream_resp_body.usage`, not `anth.usage` — usage mutations here are
+  invisible to `state.stats`.
+
+**But a real advisor needs to re-run the executor**, which neither hook can
+do. `handle_messages_inner` (`src/proxy.rs:362-681`, ~320 lines) is one
+function owning the send loop (`:413-556`), the streaming/non-streaming split
+(`:559`), the validation retry (`:603-626`), translation (`:628`), stats
+(`:629-639`), logging (`:641-679`) and the response (`:680`). There is **no**
+"send this `ResponsesRequest` and give me a parsed `ResponsesResponse`"
+helper: `send_upstream_once` (`:321`) deliberately returns a raw
+`reqwest::Response` so the streaming branch can consume `.bytes_stream()`.
+`parse_upstream_body` (`:348`) is separate and never composed with it.
+
+Retry loops, in order (all inside `handle_messages_inner`):
+
+| # | what | lines | bound |
+|---|---|---|---|
+| 0 | `capabilities.apply_known(&mut outbound)` | `:404` | once before attempt 1 |
+| 1 | outer `loop { send_upstream_once … }` | `:413-556` | — |
+| 1a | `unsupported_parameter` → strip `temperature`/`top_p` | `:438-470` | `RequestParam::ALL.len() == 2` |
+| 1b | `default_model` fallback (re-translates the whole request) | `:484-552` | `attempt == 1` only |
+| 1c | `map_upstream_error` | `:554` | fatal |
+| — | success split on **`outbound.stream`** | `:559` | — |
+| 2 | `parse_upstream_body` | `:594` | non-streaming only |
+| 3 | hidden validation/corrective retry | `:603-626` | `validation_retries < 1` |
+| 4 | `responses_to_anthropic` | `:628` | — |
+
+**There is no `xhigh` effort-downgrade loop.** Effort is resolved once by
+`Config::reasoning_for_request` and forwarded verbatim; `src/translate.rs:114`
+explicitly says "no per-request 'downgrade'" (correcting an earlier guess in
+this document).
+
+The **unavoidable refactor**: an outer loop needs an `AttemptState` holding
+`outbound`, `registry`, `fallback_used`, `param_retries`, `attempt`, `start`
+(6 locals at `:393-401`), plus a ~150-line `send_and_classify` extracted from
+`:414-556` returning `Streaming(reqwest::Response)` /
+`NonStreaming(ResponsesResponse)` / `Err(AppError)`. `req` is **moved** into
+`handle_messages_inner` at `:310`, so re-translating after advice requires
+keeping it available. Estimated **150-250 lines of `proxy.rs` restructure** —
+this is the single largest cost and it is the same for every design option.
+
+### 11.3 The streaming decision — buffer, do not splice
+
+`TranslatorStream` (`src/proxy.rs:762-780`) polls **only** an upstream SSE
+`S` and a `StreamTranslator`; it holds no future. `poll_next` (`:874-994`) is a
+hand-rolled state machine with 6 `encode_sse_events` call sites and 3 error
+paths. `StreamTranslator::finish(mut self)` **consumes** the translator
+(`src/stream.rs:349`), `feed_event` hard-stops on `self.finished`
+(`src/stream.rs:185-187`), and `capture_terminal` → `finalize` sets
+`finished = true` (`:817-857`, `:905-921`). Splicing a second upstream
+response means adding a `resume()` to `StreamTranslator`, changing
+`finish(self)` → `&mut self`, and turning `poll_next` into a two-stream +
+in-flight-future state machine: **~350-400 lines across `stream.rs` and
+`proxy.rs`**, on the hot path for **every** streaming request, with 31
+`stream.rs` unit tests and 37 e2e tests pinned to the current one-terminal
+invariants. Risk to non-advisor users: **HIGH**.
+
+**The better option:** force `outbound.stream = false` when the advisor is
+enabled, run the whole chain through the **existing** non-streaming pipeline
+(`:594-628`), then convert the final `Message` into a synthetic SSE sequence.
+This is not a fidelity compromise — Anthropic's own advisor **does not stream**
+the sub-inference; the executor's stream pauses and the result arrives whole
+in one `content_block_start` event (§11.5). Pieces that already exist:
+
+- `StreamEvent` and all 8 variants (`src/anthropic.rs:453-480`)
+- `encode_sse_events(&[StreamEvent]) -> Bytes` (`src/proxy.rs:1000-1014`) —
+  a pure free function, **zero coupling** to `TranslatorStream`; needs only
+  `fn` → `pub(crate) fn` (1 word)
+- `Body::from_stream(...)` (`:585`), `futures_util::stream::iter` (`:21`)
+- the non-streaming stats/logging block at `:629-673` (so no `Drop` hook is
+  needed)
+
+What is **missing** is a `message_to_events(&Message) -> Vec<StreamEvent>`
+adapter (~55-75 lines), because there is no `Vec<ResponseContentBlock>` →
+`StreamEvent` conversion anywhere. Streaming delta: **~75-100 production lines
++ ~80-120 test lines, 3-4 files, `src/stream.rs` untouched.**
+
+Gotchas, all verified: (a) hard-code `Content-Type: text/event-stream` — the
+upstream answered `application/json`, and copying `:561-565` verbatim would
+forward the wrong header; (b) carry `stop_reason`/`stop_sequence` into
+`message_delta` (mandatory); (c) `usage` in `message_start` and the final
+`message_delta`; (d) thinking blocks need `signature_delta` immediately before
+`content_block_stop` (`src/stream.rs:878-903`); (e) no `[DONE]` sentinel;
+(f) `StreamEvent::Ping` is never constructed in production, and buffered
+output has no idle gap — **do not emit `message_start` early**, or you need a
+keepalive state machine; (g) TTFT becomes the full 3-call chain, and three
+sequential calls each get their own `request_timeout`.
+
+**Option 3 (answer `stream:true` with a JSON body) is simply wrong.** No
+precedent exists: `src/translate.rs:132` is the only place `stream` is read,
+and `:560` branches on `outbound.stream`. Claude Code's SDK expects an SSE
+async iterable; `BUG_HUNT_SCRATCHPAD.md:847-859` documents the exact failure
+(a normal-looking successful turn containing nothing). The buffered option
+honours the client contract — it only changes the *upstream* decision.
+
+| | buffer + synthetic SSE | true incremental splice | `stream:true` → JSON |
+|---|---|---|---|
+| streaming delta | ~75-100 prod + ~80-120 tests | ~350-400 | ~5-10 |
+| `stream.rs` risk | **zero** | 31 tests + all streaming users | — |
+| TTFT | full 3-call chain (burst at end) | best | none |
+| verdict | **take this** | revisit only if measured | never |
+
+### 11.4 Config, state, usage, failure — the house patterns
+
+- **`Config` is expensive and has a cycle.** `src/config.rs:38-86` is a
+  *resolved*, non-`Deserialize`, no-`Default` struct with 13 fields; the JSON
+  mirror `JsonConfig` (`:702`) has **`deny_unknown_fields`**; there are **17
+  full `Config { … }` literals** (15 in `tests/proxy_e2e.rs`, 2 in
+  `src/proxy.rs`). Adding `pub advisor: AdvisorConfig` costs **~125-150 lines
+  across 6 files** plus 16 one-line fixture fixups, and creates a
+  `config.rs → advisor → Config` dependency cycle with **no precedent** (every
+  sub-config type lives in `config.rs` today). Also: `JsonConfig` is rewritten
+  wholesale by the TUI, so a new field **must** have `skip_serializing_if` or
+  an older binary refuses to start (`src/config.rs:719-725`).
+  **⇒ Keep advisor config in the advisor module** (its own file/env, loaded
+  into a `OnceLock`, `enabled: false` by default). Zero `config.rs` edits,
+  zero fixture fixups. This is a new convention; document it.
+- **`AppState` is cheap to change** (1 field, 1 literal, 1 delegating router
+  constructor, 2 `main.rs` args) — but **no new state is needed**. Use
+  `state.client.clone()` (a cheap internal-`Arc` clone) and add
+  `.timeout(cfg.timeout)` on the `RequestBuilder`; `reqwest` documents that
+  this overrides the client-level timeout for that request only. No second
+  client, no startup wiring.
+- **Bypass alias resolution.** `AdvisorConfig.model` should be an explicit
+  **upstream** model name, written directly into the advisor's own
+  `ResponsesRequest.model`. `RuntimeMappings::resolve` (`src/tui/runtime.rs:57`)
+  runs on *inbound client* names at `src/proxy.rs:190`, **before** translation;
+  an advisor model is not client-supplied. This also decouples from
+  `MappingsStore`, `mappings_snapshot`, and the entire fallback path.
+- **Skip `capabilities.rs` entirely.** `RequestParam::ALL = [Temperature,
+  TopP]`; the advisor request carries neither, so `apply_known` is a no-op,
+  `param.is_set(&outbound)` is false, and `record_unsupported` can never fire.
+  §5.5's "reuse, do not extend" recommendation is **unnecessary** — confirmed
+  from `src/capabilities.rs:83-97, 136-151` and `src/proxy.rs:442-445`. Zero
+  edits, zero coupling.
+- **Fail closed.** `detect_model_rejection` (`src/model_rejection.rs:245`) is
+  deliberately conservative because a false positive *silently retries with a
+  different model* (`:33-40`). The fallback at `src/proxy.rs:532-538`
+  re-translates the **executor's** `CreateMessageRequest`, sets
+  `fallback_used = true`, and consumes the executor's one-shot `attempt == 1`
+  budget. Applying it to an advisor call would (i) turn the second opinion
+  into a self-review, (ii) discard the advisor's own prompt, (iii) corrupt
+  stats attribution, (iv) burn the executor's fallback. **The precedent for an
+  upstream call that must not fall back is the hidden validation retry
+  (`src/proxy.rs:603-626`):** a separate `send_upstream_once` outside the loop,
+  its own bounded counter, `break` and keep the already-good response on
+  non-2xx, structured `tracing::warn!`. Copy that shape exactly.
+- **Error handling:** there is **no** graceful-degradation helper and no
+  non-fatal `Result` convention. `AppError` is exclusively fatal. The house
+  pattern is `tracing::warn!` with structured fields + a best-effort value +
+  continue (10 examples, e.g. `src/translate.rs:5235-5242`, `src/proxy.rs:619-623`).
+  `state.output.emit(LogLine { kind: Warning, … })` is synchronous, safe from
+  async, and used once-per-fact at `:457-465`. **Never `?`-propagate an
+  `AppError` from the advisor.**
+- **Usage:** `Usage` (`src/anthropic.rs:392-410`) has no `Default`, no
+  `iterations`, and **6** explicit literals (`src/stream.rs:362, 461, 474,
+  1050`; `src/translate.rs:5258, 5283`). Adding
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  `iterations: Option<Vec<IterationUsage>>` is ~20-30 lines + 6 one-line
+  fixups. Advisor tokens must **not** be folded into top-level totals; Claude
+  Code reads `iterations` to exclude `advisor_message` from context-size math.
+  TUI attribution: `state.stats.record_actual(advisor_model, usage)` is 1 line
+  and lands in "ALL COMBINED", but the TUI labels that bucket *"actual fallback
+  models"* (`src/tui/app.rs:757`) — semantically wrong. A proper third bucket
+  is ~40 lines; **rename the label to "actual / advisor models"** (1 line) is
+  the honest 80/20.
+- **Tests:** 355 in-file `#[test]`s + 37 `#[tokio::test]`s in the single
+  `tests/proxy_e2e.rs`. `FakeUpstream` (`tests/proxy_e2e.rs:27-122`) already
+  has **`canned_per_attempt`, `received_all` and `delay`** — exactly what a
+  3-call advisor chain and a timeout/fail-closed test need. No new test
+  infrastructure.
+
+### 11.5 The protocol, corrected and pinned
+
+The biggest correction to §§1-10: **one consultation is ONE assistant
+message, not two.** `server_tool_use` and `advisor_tool_result` are contiguous
+blocks in the **same** `content[]`, with optional executor text on both sides,
+and `stop_reason: "end_turn"`. `usage.iterations[]` is a list of **sampling
+iterations inside one API request**, not a list of messages. Streaming is
+**one** `message_start` … **one** `message_stop`; the advisor sub-inference
+does not stream; its result arrives whole in a single `content_block_start`
+with **no deltas**. `pause_turn` is only for a *dangling* `server_tool_use`
+with no result — **a proxy must never emit it**.
+
+Verbatim wire shape (Anthropic docs, response-structure example):
+
+```json
+{"role":"assistant","content":[
+  {"type":"text","text":"Let me consult the advisor on this."},
+  {"type":"server_tool_use","id":"srvtoolu_abc123","name":"advisor","input":{}},
+  {"type":"advisor_tool_result","tool_use_id":"srvtoolu_abc123",
+   "content":{"type":"advisor_result","text":"Use a channel-based coordination pattern…"}},
+  {"type":"text","text":"Here's the implementation…"}],
+ "stop_reason":"end_turn"}
+```
+
+Corrections and confirmations:
+
+| item | §1-10 said | wave 2 established |
+|---|---|---|
+| messages per consult | unclear / "later turn" | **one**; both blocks in the same `content[]` |
+| `stop_reason` | `pause_turn` suspected | **`end_turn`** (or `tool_use` iff a *client* tool is pending) |
+| `iterations[]` | billing, separate | **sampling iterations in one request**; on final `usage` + `message_delta.usage` |
+| beta header | `advisor-tool-2026-03-01` ✓ | ✓ **request** header; `advisor_20260301` is the tool `type` |
+| response beta echo | unknown | **none needed** (proven by exhaustive absence) |
+| inbound echo | assumed | **PROVEN**: Claude Code echoes both blocks verbatim; `ContentBlockParam::Unknown` currently drops them |
+| `srvtoolu_` prefix | unknown | real prefix; Claude Code does **no** format validation — only non-empty + equal `tool_use_id` |
+| error codes | 6 client-known | ✓ plus `model_not_found` in SDK, which renders `unknown`; **use `unavailable`** |
+| `advisor_stripped` | unknown | a Claude Code **internal attachment**, not a wire block — do not emit |
+
+**Claude Code's renderer is per-block, not per-message-index** (binary byte
+321650852): `server_tool_use` → "Advising …", `advisor_result` → "✓ Advisor has
+reviewed the conversation …" (Ctrl+O to read), error → `Advisor unavailable
+(<error_code>)`, `stop_reason:"refusal"` → "Advisor declined to advise". It
+tracks pairing via **id string sets**, not positions — but the **API** requires
+the pair contiguous in one assistant message (real 400s in Claude Code issues
+#62885, #95406, #56515, #60523: *"Each `advisor_tool_result` block must have a
+corresponding `server_tool_use` block before it"*).
+
+**Never return a 400 naming `advisor-tool-2026-03-01`, `advisor_20260301`, or
+`Input tag 'advisor_…'`** — Claude Code latches the advisor **off for the whole
+process** (binary bytes 296188621 / 294902915). This makes the generic
+`unavailable` degradation not just graceful but mandatory.
+
+**Inbound echo is the one hard wire-type change.** The SDK TypedDicts are:
+`BetaServerToolUseBlockParam{id, input, name, type, cache_control?, caller?}`,
+`BetaAdvisorToolResultBlockParam{content, tool_use_id, type, cache_control?}`,
+where `content` is a 3-way union (`advisor_result{text,stop_reason?}`,
+`advisor_redacted_result{encrypted_content,stop_reason?}`,
+`advisor_tool_result_error{error_code}`). Keep `content` as an opaque
+`serde_json::Value` so all variants and future fields round-trip byte-for-byte.
+
+### 11.6 A verified trick that removes most wire-type churn
+
+`ResponseContentBlock` (`src/anthropic.rs:310-343`), `ContentBlockKind`
+(`:484-513`) and `StreamEvent` are **`Serialize`-only** internally-tagged
+enums. A probe compiled against this repo's serde version confirmed that an
+`#[serde(untagged)] Raw(Value)` variant on an internally-tagged enum
+serialises a raw JSON object **verbatim**, including its own `type` field:
+
+```rust
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponseContentBlock {
+    Text { text: String },
+    // …
+    #[serde(untagged)] Raw(Value),
+}
+```
+
+serialises to `{"type":"advisor_tool_result","tool_use_id":"…",
+"content":{…}}` exactly. **⇒ Add ONE generic, permanent extension point to
+each enum** (2 lines × 2 enums) and the advisor module constructs its own
+blocks as `Value`. No per-feature enum variants, no new match arms in
+`translate.rs`/`stream.rs`, and no future churn for the next Anthropic block
+type. This is the key to keeping the feature out of the shared wire types.
+
+### 11.7 Where the earlier estimates were wrong
+
+| §1-10 estimate | corrected |
+|---|---|
+| option A ~1,000 lines, 6-7 files, streaming splice | the splice is **avoidable**; the real cost is the 150-250-line `proxy.rs` loop extraction + ~75-100-line SSE adapter |
+| `src/config.rs` ~90 lines for advisor config | ~125-150 across 6 files; **avoid entirely** with module-local config |
+| `Usage.iterations` ~110 lines in `anthropic.rs` + 6 fixups | ~20-30 lines + 6 one-line fixups (or 0 with a raw-`Value` envelope) |
+| capabilities: "reuse, do not extend" | **skip entirely** — nothing learnable |
+| `Tool` gains `type`/`model` (4 fixture fixups) | **not needed** if the module intercepts by `name == "advisor"` |
+| 2 messages per consultation | **1 message** |
+| "the advisor must be injected into the upstream prompt itself" | true, but we can do it in the module's own `ResponsesRequest`, not in `translate.rs` |
+
+---
+
+## 12. Implementation plan — modular, no new tech debt
+
+### 12.0 Design principles (non-negotiable)
+
+1. **Off by default.** When `enabled = false`, the request path is
+   byte-for-byte what it is today: no extra call, no field change, no log
+   line. The only shared-code edits are a single early branch and a
+   `pub(crate)` visibility word.
+2. **One private module.** `mod advisor;` in `src/lib.rs` (the
+   `model_rejection.rs` precedent). Public API takes plain data / existing
+   types, returns plain data. No `pub use` unless e2e tests need it.
+3. **No `Config`, no `AppState`, no `Tool` changes.** Module-local config in a
+   `OnceLock`; `state.client.clone()`; intercept the tool by name.
+4. **No `stream.rs` changes.** Force non-streaming upstream; emit synthetic
+   SSE from the final `Message`.
+5. **Fail closed and bounded.** Own timeout, own `max_uses` counter, no
+   `default_model`, never `?`-propagate `AppError`; degrade to
+   `advisor_tool_result_error{"unavailable"}` on **any** failure.
+6. **Two-layer tests** (in-file unit + `tests/proxy_e2e.rs`), following the
+   house pattern; pin the test count in the commit message.
+
+### 12.1 Module layout
+
+```
+src/advisor/
+  mod.rs        //! docs: off-by-default, fail-closed, single-message protocol
+                pub(crate) fn enabled() -> bool
+                pub(crate) fn try_handle(...) -> Option<Response>   // THE one hook
+                pub use {Config, Outcome};
+  config.rs     AdvisorConfig { enabled:false, model, effort, max_uses:2,
+                timeout_secs:45, max_tokens:2048 } + load() -> OnceLock
+                (own file / ADVISOR_* env; NOT proxy.json — deny_unknown_fields)
+  protocol.rs   pure wire constructors: advisor_tool(), server_tool_use(),
+                advisor_tool_result(), error_result(), iteration_usage(),
+                srvtoolu_id(); all as serde_json::Value
+  prompt.rs     build the advisor's ResponsesRequest: system role, the
+                transcript as one user message, no tools, stream:false,
+                temperature/top_p:None, model = explicit upstream name
+  upstream.rs   consult(client, cfg, base_url, api_key, request)
+                -> Result<Advice, AdvisorError>; one POST with .timeout()
+  session.rs    the outer loop: executor#1 → detect advisor call → consult →
+                inject advice into the transcript → executor#2; bounded by
+                max_uses; fail-closed
+  sse.rs        message_to_events(&Message) -> Vec<StreamEvent> (the ~70-line
+                adapter), using the Raw(Value) extension point
+  tests.rs      inline #[cfg(test)] mod tests (or per-file inline modules)
+```
+
+Why a directory here (unlike the flat-file house style): 6-7 focused files,
+~600-800 lines total, each with a single responsibility. `src/tui/mod.rs` is
+the precedent for the `mod.rs` + `pub use` shape. If it stays under ~400 lines,
+collapse to one flat `src/advisor.rs` instead — do not create a directory for
+its own sake.
+
+### 12.2 The ONE integration hook
+
+`src/proxy.rs`, at the top of `handle_messages` (`:160`), **before** the
+translation and before `handle_messages_inner`:
+
+```rust
+if let Some(resp) = crate::advisor::try_handle(&state, &headers, &body, &req).await {
+    return resp;                 // Ok(Response) | Err(AppError)
+}
+// … existing path, completely unchanged …
+```
+
+`try_handle` returns `None` immediately when disabled or when the request has
+no tool named `advisor`. This is the **entire** shared-code footprint: one
+branch, plus `pub(crate)` on `encode_sse_events`, `send_upstream_once` and
+`parse_upstream_body` (3 words), plus `mod advisor;` (1 line). The existing
+retry/fallback/validation/capability machinery is **not modified** — the
+advisor session owns its own simpler loop, modelled on
+`src/proxy.rs:603-626`.
+
+`try_handle` reuses `translate::anthropic_to_responses` and
+`translate::responses_to_anthropic` via a small `pub(crate)` wrapper (or by
+making those two functions `pub(crate)` — they are already `pub` inside a
+private `mod translate`, so this is free). It builds its own `ResponsesRequest`
+for the advisor and calls the same `send_upstream_once`.
+
+### 12.3 Session state machine (the core)
+
+State is **per-request**, held in one struct — no `AppState`, no global mutable
+state beyond the immutable `OnceLock<Config>`:
+
+```rust
+struct Session<'a> {
+    state: &'a AppState,
+    inbound: &'a CreateMessageRequest,
+    outbound: ResponsesRequest,           // executor's, translated once
+    registry: ToolSchemaRegistry,
+    cfg: &'static AdvisorConfig,
+    consultations: usize,
+    iterations: Vec<Value>,               // usage.iterations[]
+    blocks: Vec<Value>,                  // advisor blocks for final content[]
+}
+```
+
+Loop, bounded by `cfg.max_uses`:
+
+1. **Executor attempt.** `send_upstream_once` (non-streaming; `outbound.stream
+   = false`), `parse_upstream_body`. On any failure, degrade: append
+   `error_result("unavailable")` and **return the last good executor answer**.
+2. **Detect a consultation** in `ResponsesResponse.output`: an
+   `OutputItem::FunctionCall { name: "advisor", .. }`. If none → done.
+3. **Emit the pair.** `srvtoolu_id()` → `server_tool_use` +
+   `advisor_tool_result` (advice text, or `unavailable` on failure). Both are
+   `Value` blocks appended to `Session.blocks`, contiguous.
+4. **Consult.** Build the advisor's own `ResponsesRequest` (explicit upstream
+   model, `.timeout(cfg.timeout)`, no tools, no sampling params, `stream:false`),
+   POST, parse, extract the first `output_text`. On **any** error:
+   `tracing::warn!(error = %e, advisor_model = %cfg.model, "…")` +
+   `error_result("unavailable")`, then **continue** to the final executor call.
+5. **Inject the advice into the executor's context** — this is the part the
+   Responses API cannot do server-side. Append one `InputItem::Message` with
+   the advice text (system-role instructions are folded by the translator, so
+   use a plain transcript message) to `outbound.input`, then re-send.
+6. **Accumulate usage** into `iterations`: `message` (executor) /
+   `advisor_message` (with `model`) / `message` (final executor), keeping the
+   advisor's tokens **out** of the top-level totals.
+7. **Final response** = `responses_to_anthropic(final_response, &registry)`
+   with `content` = `[…executor text…, advisor blocks…, …final text…]` and
+   `usage.iterations = Some(iterations)`, `stop_reason: end_turn`.
+8. If the client asked for `stream: true`, convert with
+   `sse::message_to_events` and return `text/event-stream`; otherwise return
+   `Json(message)`.
+
+**Never** call `detect_model_rejection`, `mappings_snapshot.default_model()`,
+`capabilities.*`, or set `fallback_used`. A 404 on the advisor model is an
+advice failure, not a routing decision.
+
+### 12.4 Shared wire-type edits (the minimal set)
+
+| file | edit | lines |
+|---|---|---|
+| `src/lib.rs` | `mod advisor;` | 1 |
+| `src/proxy.rs` | the early `try_handle` branch; `pub(crate)` × 3 on `encode_sse_events`, `send_upstream_once`, `parse_upstream_body` | ~6 |
+| `src/anthropic.rs` | `#[serde(untagged)] Raw(Value)` on `ResponseContentBlock` **and** `ContentBlockKind` (generic extension point — verified to work in §11.6) | 4 |
+| `src/anthropic.rs` | `iterations: Option<Vec<Value>>` on `Usage` + `#[serde(default, skip_serializing_if = …)]` | 2 |
+| `src/stream.rs` | **6** `iterations: None,` one-line fixups on the `AnthropicUsage {}` literals (`:362, 461, 474, 1050`) | 6 |
+| `src/translate.rs` | **2** `iterations: None,` (`:5258, 5283`); 1 match arm for `Raw(Value)` if any exhaustively matches these enums; **keep the name `advisor`** so HEAD's `strip_advisor_tool_instructions` guard (`:153-159`) preserves the instructions; update that helper's now-stale doc comment | ~6 |
+| `src/anthropic.rs` | `ContentBlockParam::{ServerToolUse, AdvisorToolResult}` with opaque `Value` + `#[serde(flatten)]` catch-all, so inbound echo round-trips verbatim | ~14 |
+| `src/translate.rs` | **no new `filter_map` arm needed** — session intercepts by name; but verify the declaration is not forwarded upstream as an unknown tool type | 0-2 |
+| `src/tui/app.rs` | rename `"actual fallback models"` → `"actual / advisor models"` | 1 |
+| `proxy.json-guide.md` | document the separate advisor config file + `ADVISOR_*` env | ~20 |
+
+**Total shared-code churn: ~40-60 lines across 7 files**, all of it either a
+one-line field, a visibility word, or a generic extension point. No control
+flow in `handle_messages_inner`, `TranslatorStream`, `StreamTranslator`, or
+`Config::load` is touched. The advisor module itself is ~600-800 lines +
+~250 lines of tests.
+
+### 12.5 Config shape (module-local, off by default)
+
+```json
+// advisor.json — NOT proxy.json (JsonConfig has deny_unknown_fields)
+{
+  "enabled": false,
+  "model": "beam",              // explicit UPSTREAM name; cheap (§7)
+  "effort": "medium",
+  "max_uses": 2,
+  "max_tokens": 2048,
+  "timeout_secs": 45
+}
+```
+
+`ADVISOR_ENABLED`, `ADVISOR_MODEL`, … override the file, same **env > file >
+default** precedence as `Config::load` (`src/config.rs:679-681`). Load once
+into `OnceLock<AdvisorConfig>`. **`enabled: false` means zero wire-field
+changes** — the §12.2 branch returns `None` before anything is built.
+Document that `proxy.json` must **not** contain an `advisor` key (an unedited
+binary would refuse to start).
+
+Use **`beam`** while reverse engineering (§7): $0.125/M in, $0.40/M out, 25×
+cheaper on output than `kimi-k3.1-pro`, and it accepts `xhigh` natively.
+
+### 12.6 Verification plan (house two-layer pattern)
+
+**In-file unit tests (`src/advisor/`):** config default/precedence; disabled →
+`try_handle` returns `None`; `build_advisor_request` asserts no `temperature`,
+no `top_p`, `stream:false`, explicit model, no tools; all 3 result-content
+variants + `unavailable` error; id pairing; `iteration_usage` shape;
+`max_uses` bound; every `AdvisorError` → `unavailable`; `message_to_events`
+asserts exactly one `message_start`, contiguous indices, `message_delta` with
+`stop_reason`, one `message_stop`, no `[DONE]`, hard-coded SSE content type.
+
+**E2E (`tests/proxy_e2e.rs`, using existing `canned_per_attempt` /
+`received_all` / `delay`):**
+1. disabled → identical request/response to today, **0 extra POSTs**;
+2. happy path → 3 POSTs (executor, advisor, executor), assert each body's
+   `model`, the advice text injected into attempt 3, and the final `content[]`
+   block order + `usage.iterations`;
+3. `stream:true` → `Content-Type: text/event-stream`, full event sequence,
+   upstream saw `stream:false`;
+4. advisor 404 / timeout (`delay` > `timeout_secs`) → executor's answer still
+   arrives, `error_code:"unavailable"` present, **no `default_model` POST**;
+5. `max_uses` cap → no 4th POST;
+6. next-turn echo → inbound `server_tool_use` + `advisor_tool_result` survive
+   translation (the `ContentBlockParam` change);
+7. a non-advisor request → all 355 + 37 existing tests still pass unchanged.
+
+Also replay the 84 real corpus `instructions` strings from §4.2 to confirm the
+enabled path **preserves** the `# Advisor Tool` section (the guard keys on the
+inbound tool name).
+
+### 12.7 Build order / risk gates
+
+| step | deliverable | gate |
+|---|---|---|
+| 1 | `src/advisor/{mod,config,protocol}.rs` + wire extension points; `try_handle` returns `None` always | full suite green; **zero behaviour change** |
+| 2 | `prompt.rs` + `upstream.rs`, non-streaming happy path (1 consult) behind `enabled` | e2e tests 1-2; no streaming yet |
+| 3 | `sse.rs` + `message_to_events`, `stream:true` support | e2e test 3; Claude Code smoke test with `--advisor opus` |
+| 4 | failure paths, `max_uses`, `usage.iterations`, TUI label | e2e tests 4-6 |
+| 5 | inbound echo (`ContentBlockParam`) + next-turn smoke test | e2e test 6; multi-turn Claude Code session |
+| 6 | docs, `proxy.json.example` note, clean `cargo clippy` baseline | review |
+
+Each step is a separate commit. **Stop after step 3** if the smoke test shows
+Claude Code does not render the consultation — the block plumbing is worth
+keeping but the orchestration is not.
+
+### 12.8 What this design deliberately does NOT do
+
+- No true incremental streaming across two upstream responses (§11.3).
+- No `default_model` fallback for the advisor, ever (§11.4).
+- No `advisor_redacted_result` — the `encrypted_content` blob is
+  Anthropic-server-encrypted and cannot be manufactured (§3.3).
+- No `pause_turn` (§11.5).
+- No `anthropic-beta` forwarding to the **upstream** (it is not Anthropic), and
+  no 400 that names the beta/tool (would latch the feature off client-side).
+- No `Config`/`AppState`/`Tool`/`stream.rs` control-flow changes.
+- No capability learning for the advisor (nothing learnable).
+
+### 12.9 Open items to settle before step 2
+
+1. **Does the executor model reliably emit a `function_call{name:"advisor"}`?**
+   The advisor declaration must be forwarded as a zero-argument function tool,
+   with a description that invites consultation. Cheap-model behaviour here is
+   unproven — spike it with `beam` before building the loop. If the model never
+   calls it, use option B (proactive pre-turn review) instead: same module,
+   simpler session (no detection, always one consult).
+2. **How to inject advice into the executor's transcript.** The Responses API
+   cannot resume a generation. `append_corrective_input`
+   (`src/repair.rs:570`) is the existing precedent for appending a synthetic
+   input item; mirror its shape. Confirm the upstream accepts an extra
+   `message` item after a `function_call` without a matching
+   `function_call_output` — if it rejects, emit a synthetic
+   `function_call_output` first (the advisor's advice as the tool result).
+3. **Claude Code's `--advisor` gate** (§9.2): the standby advisor needs
+   `api.anthropic.com`, so the operator **must set the advisor explicitly**.
+   A proxy cannot fix this; document it.
+4. **`tengu_sage_compass2` flag value** — remote, not statically resolvable,
+   but an explicit advisor model bypasses it (§9.3).
+
 ---
 
 ## Sources
@@ -644,7 +1225,22 @@ client-side, so a proxy cannot fix it — only the user can.
 - [ollama-tps] Ollama Cloud pricing mirror — https://ollamatps.com/pricing/
 - [sovyron] Ollama Cloud models & pricing — https://sovyron.com/providers/ollama-cloud/
 
+**Wave-2 additions (2026-11-14)**
+- [8] Server tools — Claude Platform Docs — https://platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools
+- [9] Streaming messages — Claude Platform Docs — https://platform.claude.com/docs/en/build-with-claude/streaming
+- [10] Anthropic TypeScript SDK `helpers.md` — https://github.com/anthropics/anthropic-sdk-typescript/blob/main/helpers.md
+- [11] Advisor tool (docs mirror) — https://doc.jarvisuni.com/claude/api/en/agents-and-tools/tool-use/advisor-tool
+- [12] `beta_advisor_tool_result_block_param.py`, `beta_advisor_result_block_param.py`, `beta_advisor_redacted_result_block_param.py`, `beta_advisor_tool_result_error_param.py`, `beta_server_tool_use_block_param.py`, `beta_iterations_usage.py`, `beta_usage.py`, `beta_message_delta_usage.py` — https://github.com/anthropics/anthropic-sdk-python/tree/main/src/anthropic/types/beta/
+- [13] Claude Code issue #62885 (orphaned `advisor_tool_result` 400) — https://github.com/anthropics/claude-code/issues/62885
+- [14] Claude Code issue #95406 — https://github.com/anthropics/claude-code/issues/95406
+- [15] Claude Code issue #56515 — https://github.com/anthropics/claude-code/issues/56515
+- [16] Claude Code issue #60523 — https://github.com/anthropics/claude-code/issues/60523
+- [17] `reqwest::Client` docs (cheap to clone) — https://docs.rs/reqwest/latest/reqwest/struct.Client.html
+- [18] `reqwest::RequestBuilder::timeout` docs — https://docs.rs/reqwest/latest/reqwest/struct.RequestBuilder.html
+
 **Local evidence**
 - Claude Code binary `/opt/claude-code/bin/claude` (2.1.322) — byte offsets cited inline
 - Proxy corpus `/tmp/proxylogs/` — 27 files, 539 MB, 2026-08-15 → 2026-11-12
 - Ollama `POST https://ollama.com/api/show` (public, no auth) — per-model `thinking` vocabulary
+- Repo at HEAD `df5d78e` — all §11/§12 `file:line` references are against this commit
+- Serde `#[serde(untagged)] Raw(Value)` probe — compiled against this repo's serde version; scratch at `/home/heylon/.cache/serde-probe/`
