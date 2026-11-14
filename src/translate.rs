@@ -23,11 +23,11 @@ use crate::anthropic::{
     StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::config::{PromptCachingConfig, ReasoningDecision};
+use crate::config::{PromptCachingConfig, ReasoningDecision, ReasoningReplay, ReasoningReplayMode};
 use crate::responses::{
-    Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig, ResponsesRequest,
-    ResponsesResponse, ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition,
-    WebSearchTool,
+    Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig,
+    ReasoningSummaryPart, ReasoningTextPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
+    ToolChoice as ResponsesToolChoice, ToolDefinition, WebSearchTool,
 };
 use crate::schema_refs::resolve_local_refs;
 use anyhow::{Context, Result, anyhow};
@@ -117,10 +117,17 @@ fn truncate_user_id(s: String) -> String {
 /// - `stream: true` → `stream: true` (no `stream_options`; Responses carries
 ///   usage on the terminal `Completed` event).
 /// - `stop_sequences` dropped with a warn (Responses has no `stop` field).
+/// - `thinking` blocks in an assistant turn → replayed upstream according to
+///   `replay`. In [`ReasoningReplayMode::Text`] the reasoning text is folded
+///   into the assistant message's single `output_text` part (reasoning
+///   first, then the visible answer); in [`ReasoningReplayMode::Native`] a
+///   Responses `reasoning` input item is emitted immediately before the
+///   assistant message; in [`ReasoningReplayMode::Off`] the block is dropped.
 pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
     reasoning_decision: Option<ReasoningDecision>,
     prompt_caching: &PromptCachingConfig,
+    replay: ReasoningReplay,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
@@ -130,7 +137,7 @@ pub fn anthropic_to_responses(
     let mut instructions = req.system.as_ref().map(system_text).unwrap_or_default();
 
     for msg in &req.messages {
-        append_message_translation(&mut items, &mut instructions, msg, prompt_caching)?;
+        append_message_translation(&mut items, &mut instructions, msg, prompt_caching, replay)?;
     }
 
     if instructions.is_empty() {
@@ -1324,10 +1331,11 @@ fn append_message_translation(
     instructions: &mut String,
     msg: &MessageParam,
     prompt_caching: &PromptCachingConfig,
+    replay: ReasoningReplay,
 ) -> Result<()> {
     match msg.role {
         MessageRole::User => append_user_message(out, &msg.content, prompt_caching),
-        MessageRole::Assistant => append_assistant_message(out, &msg.content),
+        MessageRole::Assistant => append_assistant_message(out, &msg.content, replay),
         MessageRole::System => append_system_message(instructions, &msg.content),
     }
 }
@@ -1404,6 +1412,23 @@ fn append_user_message(
                         return Err(anyhow!(
                             "user message contains a tool_use block; the assistant produced this in a prior turn"
                         ));
+                    }
+                    ContentBlockParam::Thinking(th) => {
+                        // A `thinking` block belongs in an assistant turn.
+                        // Folding the model's own reasoning into the *user's*
+                        // voice would make the model attribute its prior
+                        // chain-of-thought to the user, so drop it.
+                        tracing::warn!(
+                            chars = th.thinking.len(),
+                            "dropping thinking block from user message \
+                             (thinking blocks belong in assistant turns)"
+                        );
+                    }
+                    ContentBlockParam::RedactedThinking(rt) => {
+                        tracing::warn!(
+                            bytes = rt.data.len(),
+                            "dropping redacted_thinking block from user message"
+                        );
                     }
                     ContentBlockParam::Unknown => {
                         tracing::warn!("dropping unknown user content block type");
@@ -1517,7 +1542,18 @@ fn tool_result_output(tr: &ToolResultBlockParam) -> String {
     }
 }
 
-fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) -> Result<()> {
+/// Separator placed around replayed reasoning when it is folded into the
+/// assistant message (`ReasoningReplayMode::Text`). The markers make the
+/// boundary between the model's prior reasoning and its visible answer
+/// explicit to the upstream.
+const THINKING_PREFIX: &str = "<thinking>\n";
+const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
+
+fn append_assistant_message(
+    out: &mut Vec<InputItem>,
+    content: &MessageContent,
+    replay: ReasoningReplay,
+) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
             out.push(InputItem::Message {
@@ -1528,6 +1564,8 @@ fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) 
         }
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut signature = String::new();
             let mut calls: Vec<(String, String, String)> = Vec::new(); // (id, name, arguments)
             for block in blocks {
                 match block {
@@ -1542,6 +1580,44 @@ fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) 
                             .context("serialize tool_use input to JSON string")?;
                         calls.push((tu.id.clone(), tu.name.clone(), arguments));
                     }
+                    ContentBlockParam::Thinking(th) => {
+                        // The client's echoed thinking block. Dropping it
+                        // (the pre-fix behaviour) destroys the model's memory
+                        // of its own prior reasoning, so replay it.
+                        if replay.mode == ReasoningReplayMode::Off {
+                            tracing::debug!(
+                                chars = th.thinking.len(),
+                                "dropping thinking block from assistant message \
+                                 (reasoning replay is disabled for this model)"
+                            );
+                            continue;
+                        }
+                        let trimmed = th.thinking.trim();
+                        if !trimmed.is_empty() {
+                            if !reasoning.is_empty() {
+                                reasoning.push('\n');
+                            }
+                            reasoning.push_str(trimmed);
+                        }
+                        // The signature is the upstream's encrypted
+                        // chain-of-thought. It is only meaningful to the
+                        // upstream that issued it, so only `Native` mode
+                        // forwards it.
+                        if !th.signature.is_empty() {
+                            signature = th.signature.clone();
+                        }
+                    }
+                    ContentBlockParam::RedactedThinking(rt) => {
+                        // Anthropic-encrypted blob with no readable text. It
+                        // is NOT the upstream's `encrypted_content`, so
+                        // replaying it as one would fail upstream
+                        // verification.
+                        tracing::warn!(
+                            bytes = rt.data.len(),
+                            "dropping redacted_thinking block from assistant message \
+                             (opaque Anthropic blob; not replayable upstream)"
+                        );
+                    }
                     ContentBlockParam::Image(_)
                     | ContentBlockParam::ToolResult(_)
                     | ContentBlockParam::Unknown => {
@@ -1549,16 +1625,58 @@ fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) 
                     }
                 }
             }
-            if !text.is_empty() || calls.is_empty() {
+
+            // Bound the replayed reasoning so a pathological summary cannot
+            // blow up the upstream context window.
+            let reasoning = if replay.max_chars > 0 && reasoning.chars().count() > replay.max_chars
+            {
+                tracing::warn!(
+                    chars = reasoning.chars().count(),
+                    limit = replay.max_chars,
+                    "truncating replayed reasoning text"
+                );
+                reasoning.chars().take(replay.max_chars).collect()
+            } else {
+                reasoning
+            };
+
+            // Assemble the assistant's visible text. In `Text` mode the
+            // replayed reasoning is folded into the SAME `output_text` part
+            // (reasoning first, then the visible answer) — one part, not
+            // two, so a provider that only reads `content[0]` still sees the
+            // answer.
+            let body = match replay.mode {
+                ReasoningReplayMode::Text if !reasoning.is_empty() => {
+                    let mut b = String::with_capacity(reasoning.len() + text.len() + 24);
+                    b.push_str(THINKING_PREFIX);
+                    b.push_str(&reasoning);
+                    b.push_str(THINKING_SUFFIX);
+                    b.push_str(&text);
+                    b
+                }
+                _ => text.clone(),
+            };
+
+            if replay.mode == ReasoningReplayMode::Native
+                && let Some(item) = build_reasoning_item(&reasoning, &signature)
+            {
+                // OpenAI pairs a reasoning item with the item that follows
+                // it, so the reasoning must come first. The upstream's own
+                // `rs_…` id is lost at the Anthropic wire boundary, so it
+                // is omitted.
+                out.push(item);
+            }
+
+            if !body.is_empty() || calls.is_empty() {
                 // Always emit a Message item for the text (even if empty)
                 // so that the assistant turn is well-formed when there
                 // are no tool calls.
                 out.push(InputItem::Message {
                     role: "assistant".into(),
-                    content: if text.is_empty() {
+                    content: if body.is_empty() {
                         Vec::new()
                     } else {
-                        vec![InputContentPart::OutputText { text }]
+                        vec![InputContentPart::OutputText { text: body }]
                     },
                 });
             }
@@ -1574,6 +1692,45 @@ fn append_assistant_message(out: &mut Vec<InputItem>, content: &MessageContent) 
     }
 }
 
+/// Build a Responses `reasoning` input item for a replayed thinking block.
+///
+/// The Anthropic `thinking` block carries only the reasoning *text* and the
+/// upstream's `encrypted_content`; the upstream's own `rs_…` item id is lost
+/// at the Anthropic wire boundary, so `id` is omitted.
+///
+/// Both `content` and `summary` carry the text: OpenAI's Responses API reads
+/// `summary`, DeepSeek's reads `content`. `encrypted_content` is forwarded
+/// only when the upstream actually issued it.
+fn build_reasoning_item(reasoning: &str, signature: &str) -> Option<InputItem> {
+    if reasoning.is_empty() && signature.is_empty() {
+        return None;
+    }
+    Some(InputItem::Reasoning {
+        id: None,
+        content: if reasoning.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReasoningTextPart {
+                kind: "reasoning_text".into(),
+                text: reasoning.to_owned(),
+            }]
+        },
+        summary: if reasoning.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReasoningSummaryPart {
+                kind: "summary_text".into(),
+                text: reasoning.to_owned(),
+            }]
+        },
+        encrypted_content: if signature.is_empty() {
+            None
+        } else {
+            Some(signature.to_owned())
+        },
+    })
+}
+
 fn append_system_message(instructions: &mut String, content: &MessageContent) -> Result<()> {
     let text = match content {
         MessageContent::Text(s) => s.clone(),
@@ -1581,6 +1738,20 @@ fn append_system_message(instructions: &mut String, content: &MessageContent) ->
             .iter()
             .filter_map(|b| match b {
                 ContentBlockParam::Text(t) => Some(t.text.as_str()),
+                ContentBlockParam::Thinking(th) => {
+                    tracing::warn!(
+                        chars = th.thinking.len(),
+                        "dropping thinking block from system message"
+                    );
+                    None
+                }
+                ContentBlockParam::RedactedThinking(rt) => {
+                    tracing::warn!(
+                        bytes = rt.data.len(),
+                        "dropping redacted_thinking block from system message"
+                    );
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1643,10 +1814,11 @@ fn map_tool_choice(choice: &ToolChoice) -> (ResponsesToolChoice, Option<bool>) {
 mod tests {
     use super::*;
     use crate::anthropic::{
-        CacheControl, ImageBlockParam, MessageParam, TextBlockParam, Tool, ToolResultBlockParam,
-        ToolUseBlockParam,
+        CacheControl, ImageBlockParam, MessageParam, RedactedThinkingBlockParam, TextBlockParam,
+        ThinkingBlockParam, Tool, ToolResultBlockParam, ToolUseBlockParam,
     };
     use crate::config::PromptCachingConfig;
+    use crate::responses::ReasoningSummaryText;
     use serde_json::json;
 
     /// Build a minimal request with a system prompt, one user message, and
@@ -1691,8 +1863,13 @@ mod tests {
     #[test]
     fn basic_request_translates_cleanly() {
         let req = fixture_request();
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.model, "test-model");
         assert_eq!(out.max_output_tokens, Some(256));
         assert!(!out.stream);
@@ -1746,8 +1923,13 @@ mod tests {
                 cache_control: None,
             },
         ]));
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(
             out.instructions.as_deref(),
             Some("Be concise.\n\nUse examples.")
@@ -1788,8 +1970,13 @@ mod tests {
             },
         ];
 
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         // user, assistant(message+text), assistant(function_call), user(function_call_output)
         let items = unwrap_items(out);
         assert_eq!(items.len(), 4);
@@ -1826,6 +2013,455 @@ mod tests {
         }
     }
 
+    // ── Reasoning replay (BUG 1) ───────────────────────────────────────────
+    //
+    // The proxy used to drop the client's echoed `thinking` blocks outright
+    // (`ContentBlockParam` had no `Thinking` variant, so they landed in
+    // `Unknown` and were discarded with a warning). That destroyed the
+    // model's memory of its own prior reasoning on every single turn.
+
+    /// Build a request whose assistant turn carries a `thinking` block,
+    /// mirroring what Claude Code echoes back.
+    fn request_with_thinking(
+        thinking: &str,
+        signature: &str,
+        text: &str,
+        tool_use: Option<ToolUseBlockParam>,
+    ) -> CreateMessageRequest {
+        let mut blocks = vec![ContentBlockParam::Thinking(ThinkingBlockParam {
+            thinking: thinking.into(),
+            signature: signature.into(),
+        })];
+        if !text.is_empty() {
+            blocks.push(ContentBlockParam::Text(TextBlockParam {
+                text: text.to_string(),
+                cache_control: None,
+            }));
+        }
+        if let Some(tu) = tool_use {
+            blocks.push(ContentBlockParam::ToolUse(tu));
+        }
+        let mut req = fixture_request();
+        req.messages = vec![
+            MessageParam {
+                role: MessageRole::User,
+                content: MessageContent::Text("What's the weather in SF?".into()),
+            },
+            MessageParam {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(blocks),
+            },
+        ];
+        req
+    }
+
+    fn replay(mode: ReasoningReplayMode, max_chars: usize) -> ReasoningReplay {
+        ReasoningReplay { mode, max_chars }
+    }
+
+    fn assistant_output_text(item: &InputItem) -> &str {
+        match item {
+            InputItem::Message { role, content } => {
+                assert_eq!(role, "assistant");
+                match &content[0] {
+                    InputContentPart::OutputText { text } => text,
+                    _ => panic!("expected output_text part for assistant message"),
+                }
+            }
+            _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn thinking_block_is_replayed_to_the_upstream_in_text_mode() {
+        // THE regression test: the reasoning text must reach the upstream.
+        let req = request_with_thinking("step 1: look up SF", "SIG", "Let me check.", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        // user + assistant. The item count must not change — replaying the
+        // reasoning must not introduce a new input-item type.
+        assert_eq!(items.len(), 2, "replay must not add input items");
+        let body = assistant_output_text(&items[1]);
+        assert!(
+            body.contains("step 1: look up SF"),
+            "reasoning text missing from the upstream body: {body:?}"
+        );
+        // The reasoning comes FIRST, then the visible answer.
+        let r = body.find("step 1: look up SF").unwrap();
+        let a = body.find("Let me check.").unwrap();
+        assert!(r < a, "reasoning must precede the visible answer: {body:?}");
+    }
+
+    #[test]
+    fn thinking_block_keeps_the_assistant_message_at_exactly_one_output_text_part() {
+        // A provider that only reads `content[0]` must still see the answer.
+        let req = request_with_thinking("reasoning here", "SIG", "the answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        match &items[1] {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content.len(), 1, "expected exactly one content part");
+            }
+            _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn text_mode_does_not_emit_a_reasoning_item() {
+        let req = request_with_thinking("reasoning here", "SIG", "answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert!(
+            items
+                .iter()
+                .all(|i| !matches!(i, InputItem::Reasoning { .. })),
+            "text mode must not introduce a reasoning input item"
+        );
+    }
+
+    #[test]
+    fn text_mode_drops_the_opaque_signature() {
+        // The signature is the upstream's encrypted chain-of-thought; it is
+        // meaningless to an upstream that did not issue it.
+        let req = request_with_thinking("reasoning here", "SECRET-SIG", "answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("SECRET-SIG"),
+            "signature must not be forwarded in text mode: {json}"
+        );
+    }
+
+    #[test]
+    fn native_mode_emits_a_reasoning_item_before_the_assistant_message() {
+        let req = request_with_thinking("the plan", "SIG", "the answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Native, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        // user, reasoning, assistant message
+        assert_eq!(items.len(), 3);
+        match &items[1] {
+            InputItem::Reasoning {
+                id,
+                content,
+                summary,
+                encrypted_content,
+            } => {
+                assert!(id.is_none(), "the upstream's rs_ id is not recoverable");
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].kind, "reasoning_text");
+                assert_eq!(content[0].text, "the plan");
+                assert_eq!(summary.len(), 1);
+                assert_eq!(summary[0].kind, "summary_text");
+                assert_eq!(summary[0].text, "the plan");
+                assert_eq!(encrypted_content.as_deref(), Some("SIG"));
+            }
+            _ => panic!("expected a reasoning input item"),
+        }
+        // The reasoning item must come first — OpenAI pairs a reasoning item
+        // with the item that immediately follows it.
+        assert_eq!(assistant_output_text(&items[2]), "the answer");
+    }
+
+    #[test]
+    fn native_mode_emits_the_reasoning_item_before_the_function_call() {
+        // A tool-call-only turn has no assistant message, so the reasoning
+        // item must be adjacent to the function_call it belongs to.
+        let req = request_with_thinking(
+            "the plan",
+            "SIG",
+            "",
+            Some(ToolUseBlockParam {
+                id: "toolu_01".into(),
+                name: "get_weather".into(),
+                input: json!({"location": "SF"}),
+            }),
+        );
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Native, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        // user, reasoning, function_call
+        assert_eq!(items.len(), 3);
+        assert!(
+            matches!(&items[1], InputItem::Reasoning { .. }),
+            "expected reasoning item at index 1"
+        );
+        assert!(
+            matches!(&items[2], InputItem::FunctionCall { .. }),
+            "expected function_call at index 2, got {:?}",
+            items[2]
+        );
+    }
+
+    #[test]
+    fn native_mode_does_not_fold_the_reasoning_into_the_message() {
+        let req = request_with_thinking("the plan", "SIG", "the answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Native, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(assistant_output_text(&items[2]), "the answer");
+    }
+
+    #[test]
+    fn native_mode_omits_the_reasoning_item_when_there_is_nothing_to_replay() {
+        let req = request_with_thinking("", "", "just the answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Native, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|i| !matches!(i, InputItem::Reasoning { .. })),
+            "an empty thinking block must not produce a reasoning item"
+        );
+    }
+
+    #[test]
+    fn off_mode_drops_the_thinking_block() {
+        let req = request_with_thinking("reasoning here", "SIG", "answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Off, 0),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 2);
+        assert_eq!(assistant_output_text(&items[1]), "answer");
+        assert!(!json.contains("reasoning here"));
+        assert!(!json.contains("SIG"));
+    }
+
+    #[test]
+    fn redacted_thinking_is_dropped_and_never_forwarded() {
+        // The blob is Anthropic-encrypted and is NOT the upstream's
+        // `encrypted_content`, so replaying it would fail upstream
+        // verification.
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlockParam::RedactedThinking(RedactedThinkingBlockParam {
+                    data: "OPAQUE-BLOB".into(),
+                }),
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "the answer".into(),
+                    cache_control: None,
+                }),
+            ]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Native, 0),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 1);
+        assert_eq!(assistant_output_text(&items[0]), "the answer");
+        assert!(!json.contains("OPAQUE-BLOB"));
+    }
+
+    #[test]
+    fn thinking_block_in_a_user_message_is_dropped() {
+        // Folding the model's own reasoning into the user's voice would make
+        // the model attribute its prior chain-of-thought to the user.
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlockParam::Thinking(ThinkingBlockParam {
+                    thinking: "model reasoning".into(),
+                    signature: "SIG".into(),
+                }),
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "user text".into(),
+                    cache_control: None,
+                }),
+            ]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 1);
+        assert!(!json.contains("model reasoning"));
+        assert!(json.contains("user text"));
+    }
+
+    #[test]
+    fn replayed_reasoning_is_truncated_to_max_chars() {
+        let req = request_with_thinking("0123456789ABCDEF", "SIG", "answer", None);
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 10),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        let body = assistant_output_text(&items[1]);
+        assert!(
+            body.contains("0123456789"),
+            "truncated reasoning missing: {body:?}"
+        );
+        assert!(
+            !body.contains("ABCDEF"),
+            "reasoning was not truncated: {body:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_thinking_blocks_are_joined_in_order() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlockParam::Thinking(ThinkingBlockParam {
+                    thinking: "first".into(),
+                    signature: String::new(),
+                }),
+                ContentBlockParam::Thinking(ThinkingBlockParam {
+                    thinking: "second".into(),
+                    signature: String::new(),
+                }),
+                ContentBlockParam::Text(TextBlockParam {
+                    text: "answer".into(),
+                    cache_control: None,
+                }),
+            ]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        let body = assistant_output_text(&items[0]);
+        let f = body.find("first").unwrap();
+        let s = body.find("second").unwrap();
+        assert!(f < s, "thinking blocks must keep source order: {body:?}");
+    }
+
+    #[test]
+    fn reasoning_round_trips_through_the_anthropic_thinking_block() {
+        // The full loop: an upstream `reasoning` output item becomes an
+        // Anthropic `thinking` block, the client echoes it back, and the
+        // proxy must put it back in front of the upstream.
+        let resp = ResponsesResponse {
+            id: "resp_1".into(),
+            object: "response".into(),
+            created_at: 0,
+            model: "test-model".into(),
+            status: "completed".into(),
+            output: vec![OutputItem::Reasoning {
+                id: Some("rs_1".into()),
+                summary: vec![ReasoningSummaryText {
+                    kind: Some("summary_text".into()),
+                    text: "thinking out loud".into(),
+                }],
+                encrypted_content: "opaque-sig-blob".into(),
+            }],
+            usage: None,
+            incomplete_details: None,
+            error: None,
+        };
+        let msg = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+        let thinking_block = msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ResponseContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => Some((thinking.clone(), signature.clone())),
+                _ => None,
+            })
+            .expect("expected a thinking block");
+        assert_eq!(thinking_block.0, "thinking out loud");
+        assert_eq!(thinking_block.1, "opaque-sig-blob");
+
+        // Now feed the block back in, exactly as a client would.
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlockParam::Thinking(
+                ThinkingBlockParam {
+                    thinking: thinking_block.0,
+                    signature: thinking_block.1,
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            replay(ReasoningReplayMode::Text, 0),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.contains("thinking out loud"),
+            "the reasoning did not survive the round-trip: {json}"
+        );
+    }
+
     #[test]
     fn user_mixed_text_and_tool_results_preserves_order() {
         let mut req = fixture_request();
@@ -1853,8 +2489,13 @@ mod tests {
             ]),
         }];
 
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let items = unwrap_items(out);
         // user("Here's what I got:") + function_call_output(first) + user("and:") + function_call_output(second)
         assert_eq!(items.len(), 4);
@@ -1908,8 +2549,13 @@ mod tests {
                 }),
             ]),
         }];
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let items = unwrap_items(out);
         // user(text + image) — both in one message
         assert_eq!(items.len(), 1);
@@ -1945,8 +2591,13 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
             _ => panic!("expected simple tool_choice"),
@@ -1955,16 +2606,26 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: None,
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "required"),
             _ => panic!("expected simple 'required'"),
         }
 
         req.tool_choice = Some(ToolChoice::None {});
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Simple(s) => assert_eq!(s, "none"),
             _ => panic!("expected simple 'none'"),
@@ -1974,8 +2635,13 @@ mod tests {
             name: "get_weather".into(),
             disable_parallel_tool_use: None,
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         match out.tool_choice.unwrap() {
             ResponsesToolChoice::Function { kind, name } => {
                 assert_eq!(kind, "function");
@@ -1997,8 +2663,13 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: Some(true),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.parallel_tool_calls, Some(false));
     }
 
@@ -2011,8 +2682,13 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Any {
             disable_parallel_tool_use: Some(false),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.parallel_tool_calls, Some(true));
     }
 
@@ -2026,8 +2702,13 @@ mod tests {
         req.tool_choice = Some(ToolChoice::Auto {
             disable_parallel_tool_use: None,
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.parallel_tool_calls, None);
     }
 
@@ -2036,8 +2717,13 @@ mod tests {
         // No `tool_choice` on the inbound request at all — leave both
         // fields `None` so the upstream's defaults apply.
         let req = fixture_request();
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert!(out.tool_choice.is_none());
         assert_eq!(out.parallel_tool_calls, None);
     }
@@ -2091,8 +2777,13 @@ mod tests {
     fn stream_true_sets_flag() {
         let mut req = fixture_request();
         req.stream = Some(true);
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert!(out.stream);
     }
 
@@ -2102,8 +2793,13 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some("user-123".into()),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.user.as_deref(), Some("user-123"));
     }
 
@@ -2117,8 +2813,13 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert_eq!(out.user.as_deref(), Some(user_id.as_str()));
         assert_eq!(out.user.as_ref().map(String::len), Some(USER_ID_MAX_LEN));
     }
@@ -2134,8 +2835,13 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         // The leading prefix (the most operationally meaningful part
@@ -2155,8 +2861,13 @@ mod tests {
         req.metadata = Some(crate::anthropic::Metadata {
             user_id: Some(user_id.clone()),
         });
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let out_user = out.user.as_deref().expect("user should be present");
         assert_eq!(out_user.len(), USER_ID_MAX_LEN);
         assert_eq!(out_user, &user_id[..USER_ID_MAX_LEN]);
@@ -2168,8 +2879,13 @@ mod tests {
     #[test]
     fn user_id_absent_stays_none() {
         let req = fixture_request();
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         assert!(out.user.is_none());
     }
 
@@ -2203,8 +2919,13 @@ mod tests {
     fn stop_sequences_are_dropped() {
         let mut req = fixture_request();
         req.stop_sequences = Some(vec!["\n\nHuman:".into(), "###END###".into()]);
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         // stop_sequences has no Responses equivalent; just don't error.
         // (We can't assert against an absent field easily here, but the
         // function completing without error is the contract.)
@@ -2218,6 +2939,7 @@ mod tests {
             &req,
             Some(ReasoningDecision::Effort("medium".into())),
             &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
         )
         .unwrap();
         let reasoning = out.reasoning.as_ref().expect("reasoning set");
@@ -2231,6 +2953,7 @@ mod tests {
             &req,
             Some(ReasoningDecision::Omit),
             &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
         )
         .unwrap();
         let body = serde_json::to_value(&out).unwrap();
@@ -2449,8 +3172,13 @@ mod tests {
             description: None,
             input_schema: Some(schema),
         }]);
-        let (out, registry) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, registry) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let ToolDefinition::Function(tool) = out.tools.unwrap().remove(0) else {
             panic!("expected a function tool");
         };
@@ -2704,8 +3432,13 @@ mod tests {
                 input_schema: Some(json!({"type": "object", "properties": big})),
             },
         ]);
-        let (out, registry) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, registry) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let tools = out.tools.unwrap();
         assert_eq!(tools.len(), 2);
         assert!(is_strict(&tools[0]));
@@ -3800,8 +4533,13 @@ mod tests {
                 }),
             })]),
         }];
-        let (out, _reg) =
-            anthropic_to_responses(&req, None, &PromptCachingConfig::default()).unwrap();
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            ReasoningReplay::default(),
+        )
+        .unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
@@ -3831,7 +4569,8 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => match &content[0] {
@@ -3876,7 +4615,8 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {
@@ -3934,7 +4674,8 @@ mod tests {
             models: vec!["test-model".to_string()],
             ..PromptCachingConfig::default()
         };
-        let (out, _reg) = anthropic_to_responses(&req, None, &caching).unwrap();
+        let (out, _reg) =
+            anthropic_to_responses(&req, None, &caching, ReasoningReplay::default()).unwrap();
         let items = unwrap_items(out);
         match &items[0] {
             InputItem::Message { content, .. } => {

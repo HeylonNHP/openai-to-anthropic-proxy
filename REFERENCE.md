@@ -156,7 +156,9 @@ Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4
 - Assistant text plus `tool_use` blocks become an assistant message with `tool_calls`.
 - `tool_use.input` is serialized to JSON for OpenAI `arguments`.
 - `tools[]` is mapped through with JSON Schema parameters preserved.
-- `tool_choice`, `temperature`, `top_p`, `max_tokens`, and `stop_sequences` are forwarded.
+- `tool_choice`, `temperature`, `top_p`, and `max_tokens` are forwarded.
+- `stop_sequences` are **not** forwarded — the Responses API has no `stop` field. The proxy logs a warning when it drops them.
+- Assistant `thinking` blocks (extended thinking) are replayed upstream according to `[reasoning_replay]`: by default the reasoning text is folded into the assistant message, so the model keeps its memory of its own prior reasoning. See [proxy.json-guide.md](./proxy.json-guide.md#reasoning-replay).
 - `stream: true` also enables usage reporting from the upstream.
 - `cache_control` on user/system text and image blocks is translated to OpenAI `prompt_cache_breakpoint` when `[prompt_caching]` is enabled.
 - `cache_control` on system prompts, tools, and assistant content is currently not translated; OpenAI caches eligible prefixes automatically.
@@ -183,11 +185,17 @@ upstream SSE/response -> translate::response or ::stream (OpenAI -> Anthropic) -
 ## Out of scope
 
 - Vision / image inputs
-- Extended thinking blocks
 - Tool-level and assistant-level prompt-cache control markers
 - Server-side tools (`web_search`, `web_fetch`, `code_execution`)
 - `/v1/models` listing
 - TLS termination
+
+> Extended thinking blocks **are** supported on the response side (the proxy
+> generates them from the upstream's `reasoning` output item) and are replayed
+> back upstream on the next request — see
+> [Reasoning replay](./proxy.json-guide.md#reasoning-replay). What is *not*
+> supported is the Anthropic-specific `redacted_thinking` blob, which cannot be
+> re-encoded for a non-Anthropic upstream and is dropped with a warning.
 
 ## License
 

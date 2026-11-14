@@ -145,6 +145,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         reasoning: Default::default(),
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     })
@@ -545,6 +546,7 @@ async fn per_model_reasoning_effort_lookup() {
         },
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -631,6 +633,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         },
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -709,6 +712,7 @@ async fn model_alias_rewrites_inbound_model() {
             default_model: None,
         },
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -784,6 +788,7 @@ async fn model_not_supported_falls_back_to_default() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -839,6 +844,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         // Note: no default_model — fallback disabled.
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -900,6 +906,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -999,6 +1006,137 @@ async fn tools_get_strict_and_additional_properties_false() {
     );
 }
 
+/// A client's echoed `thinking` block must reach the upstream. The proxy
+/// used to drop it outright (no `Thinking` variant in the inbound enum),
+/// which destroyed the model's memory of its own prior reasoning on every
+/// turn — 10,467 drops on 2026-11-12 alone.
+#[tokio::test]
+async fn thinking_block_is_replayed_to_the_upstream() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 4,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "the model reasoned about this", "signature": "SIG"},
+                        {"type": "text", "text": "the answer"}
+                    ]}
+                ]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let body = upstream.received.lock().await.clone().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let input = body["input"].as_array().expect("input is array");
+    let assistant = input
+        .iter()
+        .find(|i| i["role"] == "assistant")
+        .expect("assistant message in the upstream body");
+    let text = assistant["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("the model reasoned about this"),
+        "the reasoning did not reach the upstream: {text:?}"
+    );
+    assert!(text.contains("the answer"));
+    // Text mode must not introduce a new input-item type — only
+    // `message` / `function_call` / `function_call_output` are ever sent,
+    // because those are the only shapes proven to work against an
+    // upstream we know nothing about.
+    assert!(
+        input.iter().all(|i| matches!(
+            i["type"].as_str(),
+            Some("message" | "function_call" | "function_call_output")
+        )),
+        "unexpected input item types: {input:?}"
+    );
+}
+
+/// `reasoning_replay: "off"` restores the old behaviour: the thinking
+/// block is dropped, and the upstream sees only the visible answer.
+#[tokio::test]
+async fn reasoning_replay_off_drops_the_thinking_block() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+            }],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.reasoning_replay.default = openai_to_anthropic_proxy::config::ReasoningReplayMode::Off;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 4,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "the model reasoned about this", "signature": "SIG"},
+                        {"type": "text", "text": "the answer"}
+                    ]}
+                ]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let body = upstream.received.lock().await.clone().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let input = body["input"].as_array().expect("input is array");
+    let assistant = input
+        .iter()
+        .find(|i| i["role"] == "assistant")
+        .expect("assistant message in the upstream body");
+    let text = assistant["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "the answer");
+    assert!(!text.contains("the model reasoned about this"));
+}
+
 /// Streaming requests are also eligible for `default_model` fallback.
 /// The retry happens before any SSE bytes are written to the client,
 /// so the client only sees the successful fallback stream.
@@ -1045,6 +1183,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -1137,6 +1276,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
             default_model: Some("gpt-4o-mini".into()),
         },
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -1199,6 +1339,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         request_timeout: Duration::from_secs(10),
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
+        reasoning_replay: Default::default(),
         model_aliases: ModelAliases {
             map: BTreeMap::new(),
             default_model: Some("gpt-4o-mini".into()),
@@ -1238,6 +1379,101 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
             .get("prompt_cache_breakpoint")
             .is_none()
     );
+}
+
+/// The `default_model` fallback rebuilds the request from scratch, so the
+/// fallback model's reasoning-replay policy must be re-resolved — the
+/// first model's policy must not leak into the retry.
+#[tokio::test]
+async fn fallback_recomputes_reasoning_replay_for_default_model() {
+    use openai_to_anthropic_proxy::config::ReasoningReplayMode;
+
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(
+                r#"{"message":"model not supported","type":"invalid_request_error","code":"model_not_supported"}"#
+                    .into(),
+            ),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-4o-mini",
+                    "output": [],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        reasoning_effort: Some("none".into()),
+        reasoning: Default::default(),
+        reasoning_replay: openai_to_anthropic_proxy::config::ReasoningReplayConfig {
+            default: ReasoningReplayMode::Text,
+            models: BTreeMap::from([("gpt-4o-mini".into(), ReasoningReplayMode::Off)]),
+            max_chars: 0,
+        },
+        model_aliases: ModelAliases {
+            map: BTreeMap::new(),
+            default_model: Some("gpt-4o-mini".into()),
+        },
+        prompt_caching: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
+    });
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model":"claude-sonnet-5",
+                "max_tokens":4,
+                "messages":[
+                    {"role":"user","content":"x"},
+                    {"role":"assistant","content":[
+                        {"type":"thinking","thinking":"the model reasoned about this","signature":"SIG"},
+                        {"type":"text","text":"the answer"}
+                    ]}
+                ]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2, "expected a fallback retry");
+    let first: serde_json::Value = serde_json::from_slice(&sent_bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+
+    // The primary model uses the default (`text`) mode: the reasoning is
+    // folded into the assistant message.
+    let first_text = first["input"][1]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        first_text.contains("the model reasoned about this"),
+        "first attempt lost the reasoning: {first_text:?}"
+    );
+
+    // The fallback model is configured `off`: the reasoning must be gone.
+    let second_text = second["input"][1]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(second_text, "the answer");
 }
 
 /// disconnected from request handling: TUI edits to model aliases
@@ -1281,6 +1517,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         reasoning: Default::default(),
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -1373,6 +1610,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         reasoning: Default::default(),
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });
@@ -1458,6 +1696,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         reasoning: Default::default(),
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
     });

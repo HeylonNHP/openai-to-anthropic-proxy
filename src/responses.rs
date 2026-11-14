@@ -109,9 +109,56 @@ pub enum InputItem {
     /// The result of a function call, fed back to the model. `output` is
     /// always a string.
     FunctionCallOutput { call_id: String, output: String },
+    /// A reasoning item replayed from a previous turn.
+    ///
+    /// The Responses API accepts `type: "reasoning"` items in `input`:
+    /// OpenAI's canonical replay is to echo the previous response's `output`
+    /// back, and DeepSeek's Responses API *requires* the reasoning item to be
+    /// passed back whenever the request carries `tools`.
+    ///
+    /// `summary` and `content` both carry the reasoning text (OpenAI reads
+    /// `summary`, DeepSeek reads `content`); `encrypted_content` is the
+    /// upstream's encrypted chain-of-thought.
+    ///
+    /// `id` is omitted: the upstream's own `rs_…` item id is lost at the
+    /// Anthropic wire boundary (the `thinking` block has no id field).
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ReasoningTextPart>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<ReasoningSummaryPart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     /// Reference to a previously-stored response item. We don't generate
     /// these but we accept them on deserialization for round-tripping.
     ItemReference { id: String },
+}
+
+/// Plain-text reasoning content part of a `reasoning` input item.
+///
+/// Serialises as `{"type":"reasoning_text","text":"…"}`. This is the shape
+/// DeepSeek's Responses API reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningTextPart {
+    /// Always `"reasoning_text"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+/// OpenAI-style summary part of a `reasoning` input item.
+///
+/// Serialises as `{"type":"summary_text","text":"…"}`. This is the shape
+/// OpenAI's Responses API reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningSummaryPart {
+    /// Always `"summary_text"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

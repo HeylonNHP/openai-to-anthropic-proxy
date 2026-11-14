@@ -181,9 +181,14 @@ async fn handle_messages(
             .config
             .reasoning_for_request(&upstream_model, requested_effort, thinking_disabled);
     let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let (mut outbound, registry) =
-        translate::anthropic_to_responses(&req, Some(reasoning_decision), &prompt_caching)
-            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    let reasoning_replay = state.config.reasoning_replay_for_model(&upstream_model);
+    let (mut outbound, registry) = translate::anthropic_to_responses(
+        &req,
+        Some(reasoning_decision),
+        &prompt_caching,
+        reasoning_replay,
+    )
+    .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // `registry` is reassigned in the `should_retry` branch below when we
     // rebuild the outbound request for the fallback model. The `mut` on
     // the second destructure is load-bearing for that branch.
@@ -429,6 +434,7 @@ async fn handle_messages_inner(
                     .config
                     .reasoning_for_request(fallback, requested_effort, thinking_disabled);
             let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
+            let fallback_reasoning_replay = state.config.reasoning_replay_for_model(fallback);
             tracing::warn!(
                 inbound_model = %outbound.model,
                 fallback_model = %fallback,
@@ -444,6 +450,7 @@ async fn handle_messages_inner(
                 &req,
                 Some(fallback_reasoning),
                 &fallback_prompt_caching,
+                fallback_reasoning_replay,
             )
             .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
             outbound = fb_outbound;
@@ -1247,6 +1254,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(60),
             reasoning_effort: None,
             reasoning: crate::config::ReasoningConfig::default(),
+            reasoning_replay: crate::config::ReasoningReplayConfig::default(),
             model_aliases: crate::config::ModelAliases::default(),
             prompt_caching: crate::config::PromptCachingConfig::default(),
             log_to_disk: false,

@@ -65,6 +65,9 @@ pub struct Config {
     /// markers and sets the top-level `prompt_cache_key`. Models not in the list
     /// get no prompt-caching fields.
     pub prompt_caching: PromptCachingConfig,
+    /// How a prior turn's extended thinking is replayed back to the
+    /// upstream. See [`ReasoningReplayConfig`] for the modes.
+    pub reasoning_replay: ReasoningReplayConfig,
     /// Shared secret required on the inbound `X-Proxy-Key` header.
     /// `None` means no client authentication (current behavior); a
     /// warning is printed at startup. `Some(_)` means every request
@@ -202,6 +205,80 @@ pub struct PromptCachingConfig {
     pub cache_key: Option<String>,
 }
 
+/// How the proxy replays a prior turn's extended thinking back to the upstream.
+///
+/// Anthropic clients (Claude Code) echo the model's `thinking` blocks back on
+/// the next request. The upstream, however, is an OpenAI-Responses-API
+/// endpoint, which has no equivalent of the Anthropic `thinking` block. Three
+/// encodings are possible:
+///
+/// * [`ReasoningReplayMode::Off`] — drop the blocks. This is the pre-fix
+///   behaviour and it silently destroys the model's memory of its own
+///   reasoning, so it is not the default.
+/// * [`ReasoningReplayMode::Text`] — fold the reasoning *text* into the
+///   assistant message. Safe for **every** upstream: it is ordinary
+///   assistant text, so it cannot introduce a new input-item type and
+///   therefore cannot trip an upstream's unknown-item rejection. This is the
+///   default.
+/// * [`ReasoningReplayMode::Native`] — emit a Responses `reasoning` input
+///   item. This is OpenAI's documented replay mechanism and DeepSeek's
+///   Responses API requires it, but it is a provider-specific wire shape
+///   (OpenAI pairs a reasoning item with the item that follows it, and some
+///   endpoints reject a reasoning item without an `id`). Opt in per model
+///   and verify against your upstream first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplayMode {
+    Off,
+    #[default]
+    Text,
+    Native,
+}
+
+/// Reasoning-replay settings.
+///
+/// `models` holds per-upstream-model overrides keyed by the **alias-resolved
+/// upstream** model name (the same convention as `prompt_caching.models`).
+/// `default` applies to every upstream model not listed.
+#[derive(Debug, Clone)]
+pub struct ReasoningReplayConfig {
+    pub default: ReasoningReplayMode,
+    pub models: BTreeMap<String, ReasoningReplayMode>,
+    /// Max characters of reasoning text replayed per assistant turn.
+    /// `0` means unlimited. Replaying reasoning costs input tokens on every
+    /// subsequent turn, so this is the operator's throttle.
+    pub max_chars: usize,
+}
+
+impl Default for ReasoningReplayConfig {
+    fn default() -> Self {
+        Self {
+            default: ReasoningReplayMode::Text,
+            models: BTreeMap::new(),
+            max_chars: 0,
+        }
+    }
+}
+
+/// The resolved reasoning-replay policy for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct ReasoningReplay {
+    pub mode: ReasoningReplayMode,
+    /// Max characters of reasoning text replayed per assistant turn.
+    /// `0` means unlimited.
+    pub max_chars: usize,
+}
+
+impl Default for ReasoningReplay {
+    /// The safe default: fold the reasoning text into the assistant message.
+    fn default() -> Self {
+        Self {
+            mode: ReasoningReplayMode::default(),
+            max_chars: 0,
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from the environment and optional `proxy.json`.
     pub fn load() -> Result<Self> {
@@ -329,6 +406,21 @@ impl Config {
             cache_key: prompt_cache_key,
         };
 
+        // `reasoning_replay`: how a prior turn's extended thinking is sent
+        // back to the upstream. Default is `Text` (fold the reasoning into
+        // the assistant message) — the only mode that is safe for an
+        // upstream we know nothing about.
+        let reasoning_replay = {
+            let json = file.and_then(|f| f.reasoning_replay.as_ref());
+            ReasoningReplayConfig {
+                default: json
+                    .and_then(|r| r.default)
+                    .unwrap_or(ReasoningReplayMode::Text),
+                models: json.map(|r| r.models.clone()).unwrap_or_default(),
+                max_chars: json.and_then(|r| r.max_chars).unwrap_or(0),
+            }
+        };
+
         // `proxy_key`: env wins over file, then blank values mean no client auth.
         // Treat whitespace-only values as unset so `PROXY_KEY=` cannot
         // accidentally enable an empty authentication secret.
@@ -355,6 +447,7 @@ impl Config {
             reasoning,
             model_aliases,
             prompt_caching,
+            reasoning_replay,
             proxy_key,
             log_to_disk,
         })
@@ -502,6 +595,23 @@ impl Config {
             cache_key: self.prompt_caching.cache_key.clone(),
         }
     }
+
+    /// Reasoning-replay policy for a given upstream model.
+    ///
+    /// `models` wins; anything not listed falls back to `default` (which is
+    /// [`ReasoningReplayMode::Text`] unless the operator changed it).
+    #[must_use]
+    pub fn reasoning_replay_for_model(&self, model: &str) -> ReasoningReplay {
+        ReasoningReplay {
+            mode: self
+                .reasoning_replay
+                .models
+                .get(model)
+                .copied()
+                .unwrap_or(self.reasoning_replay.default),
+            max_chars: self.reasoning_replay.max_chars,
+        }
+    }
 }
 
 /// Environment-variable values relevant to the proxy. Captured once at load
@@ -587,6 +697,9 @@ pub struct JsonConfig {
     pub model_aliases: Option<JsonModelAliases>,
     /// Prompt-caching settings. See [`PromptCachingConfig`].
     pub prompt_caching: Option<JsonPromptCachingConfig>,
+    /// How a prior turn's extended thinking is replayed upstream.
+    /// See [`ReasoningReplayConfig`].
+    pub reasoning_replay: Option<JsonReasoningReplayConfig>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).
@@ -665,6 +778,22 @@ pub struct JsonPromptCachingConfig {
     #[serde(default)]
     pub models: Option<Vec<String>>,
     pub cache_key: Option<String>,
+}
+
+/// JSON shape of `reasoning_replay`.
+///
+/// - `default` — mode for upstream models not listed in `models`.
+///   One of `"off"`, `"text"` (default), `"native"`.
+/// - `models` — flat upstream-model-name → mode object.
+/// - `max_chars` — max characters of reasoning text replayed per assistant
+///   turn. `0` (the default) means unlimited.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JsonReasoningReplayConfig {
+    pub default: Option<ReasoningReplayMode>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ReasoningReplayMode>,
+    pub max_chars: Option<usize>,
 }
 
 impl JsonConfig {
@@ -896,6 +1025,101 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(cfg.default_model(), Some("claude-haiku-4-5"));
+    }
+
+    // ── Reasoning replay (BUG 1) ───────────────────────────────────────────
+
+    #[test]
+    fn reasoning_replay_defaults_to_text() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key": "k"
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(cfg.reasoning_replay.default, ReasoningReplayMode::Text);
+        // A model that is not listed gets the default.
+        let for_model = cfg.reasoning_replay_for_model("some-unlisted-model");
+        assert_eq!(for_model.mode, ReasoningReplayMode::Text);
+        assert_eq!(for_model.max_chars, 0);
+    }
+
+    #[test]
+    fn reasoning_replay_model_override_wins() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key": "k",
+            "reasoning_replay": {
+                "default": "off",
+                "models": {"gpt-5.6-luna": "native"},
+                "max_chars": 512
+            }
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(
+            cfg.reasoning_replay_for_model("gpt-5.6-luna").mode,
+            ReasoningReplayMode::Native
+        );
+        assert_eq!(
+            cfg.reasoning_replay_for_model("other-model").mode,
+            ReasoningReplayMode::Off
+        );
+        assert_eq!(cfg.reasoning_replay_for_model("other-model").max_chars, 512);
+    }
+
+    #[test]
+    fn reasoning_replay_off_is_honoured() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key": "k",
+            "reasoning_replay": {"default": "off"}
+        }"#;
+        let parsed = JsonConfig::parse(json_raw).expect("parse json");
+        let cfg = Config::resolve(Some(&parsed), &EnvInputs::default()).unwrap();
+        assert_eq!(
+            cfg.reasoning_replay_for_model("any-model").mode,
+            ReasoningReplayMode::Off
+        );
+    }
+
+    #[test]
+    fn reasoning_replay_rejects_an_unknown_mode() {
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key": "k",
+            "reasoning_replay": {"default": "nonsense"}
+        }"#;
+        assert!(
+            JsonConfig::parse(json_raw).is_err(),
+            "expected an unknown reasoning_replay mode to be rejected"
+        );
+    }
+
+    #[test]
+    fn reasoning_replay_rejects_an_unknown_key() {
+        // `JsonConfig` is `deny_unknown_fields`, so a typo must not be
+        // silently ignored.
+        let json_raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key": "k",
+            "reasoning_replay": {"defualt": "text"}
+        }"#;
+        assert!(JsonConfig::parse(json_raw).is_err());
+    }
+
+    #[test]
+    fn the_shipped_example_config_parses() {
+        // `proxy.json.example` is the template operators copy. `JsonConfig`
+        // is `deny_unknown_fields`, so a key the example uses but the schema
+        // does not declare would make the example unusable.
+        let raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/proxy.json.example"))
+                .expect("read proxy.json.example");
+        let parsed = JsonConfig::parse(&raw).expect("proxy.json.example should parse");
+        // The example must not contain a secret-looking placeholder that the
+        // schema rejects.
+        assert!(parsed.reasoning_replay.is_some());
     }
 
     #[test]

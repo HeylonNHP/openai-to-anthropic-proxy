@@ -187,6 +187,38 @@ Environment variable: `PROMPT_CACHING_MODELS` — a comma-separated list (e.g. `
 
 Because unknown JSON fields are silently ignored by most OpenAI-compatible endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM upstreams. Those endpoints will simply ignore the extra fields.
 
+### Reasoning replay
+
+`reasoning_replay` controls how the proxy sends a prior turn's **extended thinking** back to the upstream.
+
+Claude Code (and any Anthropic client) echoes the model's `thinking` blocks back on the next request. The upstream, however, is an OpenAI-Responses-API endpoint, which has no equivalent of the Anthropic `thinking` block — so the proxy has to re-encode it. Before this option existed, the proxy **dropped those blocks entirely**, which meant the model never saw any of its own prior reasoning.
+
+- `default` is the mode for every upstream model not listed in `models`. One of:
+  - `"text"` (default) — fold the reasoning **text** into the assistant message, wrapped in `<thinking>` markers, ahead of the visible answer. This is ordinary assistant text, so it is safe for *any* upstream: it cannot introduce a new input-item type, and therefore cannot trip an upstream's unknown-item rejection.
+  - `"off"` — drop the thinking blocks (the old behaviour). Only useful if the extra input tokens are not worth paying for.
+  - `"native"` — emit a Responses `reasoning` input item. This is OpenAI's documented replay mechanism and DeepSeek's Responses API *requires* it, but it is a provider-specific wire shape: OpenAI pairs a reasoning item with the item that immediately follows it, and some endpoints reject a reasoning item that has no `id` (the proxy cannot recover the upstream's `rs_…` id — the Anthropic `thinking` block has no id field). **Opt in per model and verify against your upstream first.**
+- `models` is a flat object of upstream model name → mode, overriding `default` for that model. Keys are the **alias-resolved upstream** names (the same convention as `prompt_caching.models`).
+- `max_chars` caps how many characters of reasoning text are replayed per assistant turn. `0` (the default) means unlimited. Replayed reasoning is re-sent on **every** subsequent turn, so this is your throttle on the input-token cost.
+
+```json
+{
+  "reasoning_replay": {
+    "default": "text",
+    "models": {
+      "gpt-5.6-luna": "native"
+    },
+    "max_chars": 4000
+  }
+}
+```
+
+Notes:
+
+- The `signature` field of a thinking block carries the upstream's encrypted chain-of-thought. It is only meaningful to the upstream that issued it, so `"text"` mode drops it and `"native"` mode forwards it as `encrypted_content`.
+- A `redacted_thinking` block is an opaque Anthropic-encrypted blob with no readable text. It is never replayed upstream; the proxy logs a warning instead.
+- In `"text"` mode the reasoning is folded into the assistant message's **single** `output_text` part, so the visible answer is never displaced.
+- The streaming path currently receives an empty reasoning summary from most upstreams, so in practice the replayed text is empty until the upstream starts sending a reasoning summary. The mechanism is in place either way.
+
 ### Model aliases
 
 This object rewrites the model name Claude Code asks for into the model your upstream actually serves.
