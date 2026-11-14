@@ -1558,9 +1558,8 @@ const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
 /// region, where the upstream reads it as the assistant's own words: quoted
 /// content becomes a self-issued instruction, persisted on every later turn.
 ///
-/// Escaping the fence tokens keeps the boundary unambiguous. `<thinking>`
-/// and `</thinking>` do not overlap, so the order of the two replacements
-/// does not matter.
+/// Escaping the fence tokens keeps the boundary unambiguous. Only the `<`
+/// is replaced, so the rest of the quoted text is left intact.
 fn escape_thinking_fence(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('<') {
         return std::borrow::Cow::Borrowed(text);
@@ -1612,10 +1611,12 @@ fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 /// required field of a reasoning input item, and some endpoints reject the
 /// item outright when it is missing.
 ///
-/// The id is derived from the reasoning content so that the same reasoning
-/// replays to the same id on every turn — that keeps the upstream's prompt
-/// cache stable. FNV-1a is used rather than `DefaultHasher` because the
-/// latter's output is not guaranteed stable across Rust releases.
+/// The id is derived from the reasoning text AND its signature, so that the
+/// same block replays to the same id on every turn (keeping the upstream's
+/// prompt cache stable) while two blocks that share text but differ in
+/// signature still get distinct ids. FNV-1a is used rather than
+/// `DefaultHasher` because the latter's output is not guaranteed stable
+/// across Rust releases.
 fn synthetic_reasoning_id(reasoning: &str, signature: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1802,7 +1803,7 @@ fn append_assistant_message(
 ///
 /// The Anthropic `thinking` block carries only the reasoning *text* and the
 /// upstream's `encrypted_content`; the upstream's own `rs_…` item id is lost
-/// at the Anthropic wire boundary, so `id` is omitted.
+/// at the Anthropic wire boundary, so a synthetic id is used instead.
 ///
 /// Both `content` and `summary` carry the text: OpenAI's Responses API reads
 /// `summary`, DeepSeek's reads `content`. `encrypted_content` is forwarded
@@ -2525,6 +2526,42 @@ mod tests {
         let f = body.find("first").unwrap();
         let s = body.find("second").unwrap();
         assert!(f < s, "thinking blocks must keep source order: {body:?}");
+    }
+
+    #[test]
+    fn the_replayed_character_count_is_the_sum_over_the_assistant_turns() {
+        // This counter is what the "→ upstream" log line reports. If it
+        // reads 0 on every request, the upstream has stopped producing a
+        // reasoning summary and the replay has silently become a no-op.
+        let mut req = fixture_request();
+        req.messages = vec![
+            MessageParam {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlockParam::Thinking(
+                    ThinkingBlockParam {
+                        thinking: "abcde".into(),
+                        signature: String::new(),
+                    },
+                )]),
+            },
+            MessageParam {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlockParam::Thinking(
+                    ThinkingBlockParam {
+                        thinking: "fghij".into(),
+                        signature: String::new(),
+                    },
+                )]),
+            },
+        ];
+        let replay = replay(ReasoningReplayMode::Text, 0);
+        let _ =
+            anthropic_to_responses(&req, None, &PromptCachingConfig::default(), &replay).unwrap();
+        assert_eq!(
+            replay.replayed_chars.get(),
+            10,
+            "the counter must be the sum over the assistant turns"
+        );
     }
 
     #[test]

@@ -218,6 +218,12 @@ async fn handle_messages(
         inbound_thinking = ?req.thinking.as_ref().map(|t| t.r#type.as_str()),
         inbound_effort = ?requested_effort,
         reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
+        // How many characters of prior reasoning were replayed upstream in
+        // this request. Reads 0 on every request once the upstream stops
+        // producing a reasoning summary — at that point the replay has
+        // silently become a no-op. This is the first attempt's count; a
+        // `default_model` fallback re-translates into its own counter.
+        replayed_chars = reasoning_replay.replayed_chars.get(),
         "→ upstream"
     );
 
@@ -1243,6 +1249,33 @@ mod tests {
             proxy_key: key.map(String::from),
             ..test_config_minimal()
         })
+    }
+
+    /// The operator-facing docs (the config guide, the scratchpad) tell the
+    /// operator to watch `replayed_chars` on the "→ upstream" line. This
+    /// guards against that field being documented but never actually added
+    /// to the log statement — which is exactly what happened once already.
+    #[test]
+    fn the_upstream_log_line_reports_the_replayed_reasoning_count() {
+        let source = std::fs::read_to_string(file!()).expect("read proxy.rs");
+        let marker = "\"→ upstream\"";
+        let marker_at = source.rfind(marker).expect("the → upstream log statement");
+        // The fields of a `tracing::info!` sit between its opening paren
+        // and the message, so the statement is the text from the last
+        // `tracing::info!(` before the marker up to the marker itself.
+        let before = &source[..marker_at];
+        let statement = before
+            .rfind("tracing::info!(")
+            .map(|at| &before[at..])
+            .expect("the → upstream tracing::info! statement");
+        assert!(
+            statement.contains("replayed_chars"),
+            "the → upstream log line does not report replayed_chars"
+        );
+        assert!(
+            statement.contains("reasoning_replay.replayed_chars.get()"),
+            "the → upstream log line does not read the replayed counter"
+        );
     }
 
     fn test_config_minimal() -> Config {

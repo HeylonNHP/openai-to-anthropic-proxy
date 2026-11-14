@@ -124,8 +124,9 @@ pub enum InputItem {
     /// upstream's own `rs_…` item id is lost at the Anthropic wire boundary
     /// (the `thinking` block has no id field), but `id` is a required field
     /// of a reasoning item and some endpoints reject the item without it.
-    /// The synthetic id is stable across turns, so the upstream's prompt
-    /// cache is not churned.
+    /// The synthetic id is derived from the reasoning text and its
+    /// signature, and is stable across turns, so the upstream's prompt cache
+    /// is not churned.
     Reasoning {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,

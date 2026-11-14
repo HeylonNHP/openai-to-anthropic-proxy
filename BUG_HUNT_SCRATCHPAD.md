@@ -79,7 +79,7 @@ its template, so no symptom in the corpus is an artefact of a newer build.
 
 | # | Template | All logs | 2026-11-12 | First → last | Active at HEAD? |
 |---|---|---|---|---|---|
-| 1 | dropping unsupported block from assistant message | 80,302 | **10,467** | 08-16 → 11-12 | **YES** |
+| 1 | dropping unsupported block from assistant message | 80,321 | **10,467** | 08-16 → 11-12 | **YES** |
 | 2 | extending schema `required` array … | 215,505 | **5,640** | 08-15 → 11-12 | YES (deliberate) |
 | 3 | stripping `propertyNames` keys … | 8,508 | **376** | 08-15 → 11-12 | YES |
 | 4 | adding a permissive `items` … | 842 | **376** | 09-29 → 11-12 | YES (rule added 09-21) |
@@ -227,7 +227,9 @@ Log (2026-11-12), **10,467 occurrences** — 59 % of all translate lines that da
 ```
 
 Quantitative proof the dropped blocks are the reasoning ones:
-- On 2026-11-12 the upstream produced **60** `reasoning` items.
+- On 2026-11-12 the upstream produced **60** `reasoning` items **in the streaming path**
+  (`handle_output_item_added … item=Reasoning`); the non-streaming path added **19**
+  more in the raw upstream bodies — 79 in total that day.
 - The identity **`drops(request n) == 24 + (# upstream reasoning items emitted before request n)`**
   holds for **188 / 188** requests. (Offset 24 = assistant turns already in the resumed session's history.)
 - The drop count is **monotonically non-decreasing across all 187 steps**, 24 → 84.
@@ -330,7 +332,9 @@ followed three rounds of sub-agent review).
 - `deny_unknown_fields` fails loudly on a typo in `reasoning_replay`.
 - The policy is resolved per **alias-resolved upstream** model, and the `default_model`
   fallback recomputes it (the first model's policy does not leak into the retry).
-- The reasoning text is **never logged** (only lengths).
+- The reasoning text is never logged *by the replay path itself* (only lengths). It does
+  still appear inside the `sent_body=` dump the proxy writes when the upstream rejects a
+  request — that is the pre-existing behaviour for all message content, not new.
 
 ### 📋 Follow-up (not fixed — belongs to BUG 7's family)
 
@@ -352,11 +356,13 @@ The **streaming** path has a *different* gap: `src/stream.rs` **does** forward
 (never as deltas) loses the text in streaming mode. This is BUG 7.
 
 **Measured per upstream** (from the Claude Code transcripts in
-`~/.claude/projects/`, 1 143 thinking blocks):
+`~/.claude/projects/` — **618** assistant-side thinking blocks, i.e. the blocks the
+client actually *received*; a further 525 appear in the client's `api-request-blob`
+records as the *echoed* copies it sent back):
 
 | upstream model | blocks with text | p50 length |
 |---|---|---|
-| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 102 chars |
+| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 054 chars (median) |
 | `claude-sonnet-5-5` (→ `openai/gpt-5.6-luna`) | 46 / 437 | **0** |
 | `claude-haiku-5-5` | 0 / 78 | **0** |
 | `claude-opus-5-5` | 6 / 43 | **0** |
@@ -889,12 +895,13 @@ therefore under-counts context.
 
 ### Which upstreams are affected (measured, 2026-11-14)
 
-From the Claude Code transcripts in `~/.claude/projects/` — 1 143 thinking blocks the
-client actually received:
+From the Claude Code transcripts in `~/.claude/projects/` — **618** assistant-side
+thinking blocks (what the client received; another 525 are the echoed copies in the
+client's `api-request-blob` request records):
 
 | upstream model | blocks with text | p50 length |
 |---|---|---|
-| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 102 chars |
+| `deepseek-v4.1-flash:1017` | **60 / 60** | 1 054 chars (median) |
 | `claude-sonnet-5-5` (→ `openai/gpt-5.6-luna`) | 46 / 437 | **0** |
 | `claude-haiku-5-5` | 0 / 78 | **0** |
 | `claude-opus-5-5` | 6 / 43 | **0** |

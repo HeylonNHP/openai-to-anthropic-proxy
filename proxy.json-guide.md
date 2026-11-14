@@ -198,7 +198,7 @@ Claude Code (and any Anthropic client) echoes the model's `thinking` blocks back
   - `"off"` — drop the thinking blocks (the old behaviour). Only useful if the extra input tokens are not worth paying for.
   - `"native"` — emit a Responses `reasoning` input item. This is OpenAI's documented replay mechanism and DeepSeek's Responses API *requires* it, but it is a provider-specific wire shape: OpenAI pairs a reasoning item with the item that immediately follows it, and some endpoints reject a reasoning item that has no `id` (the proxy cannot recover the upstream's `rs_…` id — the Anthropic `thinking` block has no id field). **Opt in per model and verify against your upstream first.**
 - `models` is a flat object of upstream model name → mode, overriding `default` for that model. Keys are the **alias-resolved upstream** names (the same convention as `prompt_caching.models`).
-- `max_chars` caps how many characters of reasoning text are replayed **per assistant turn** — and a request replays *every* prior turn, so the effective cap is `turns × max_chars`. **`0` means unlimited, not "replay nothing"** — it is the default. Replayed reasoning is re-sent on **every** subsequent turn and Claude Code echoes *every* prior thinking block, so the replayed text grows with the session. Set an explicit cap if the input-token cost matters to you. Note the cap applies to the reasoning *text* only; the opaque `signature` is forwarded in full in `"native"` mode.
+- `max_chars` caps how many characters of reasoning text are replayed **per assistant turn** — and a request replays *every* prior turn, so the effective cap is `turns × max_chars`. It is a **single global value**, not per-model: you cannot give one upstream a tighter cap than another. **`0` means unlimited, not "replay nothing"** — it is the default. Replayed reasoning is re-sent on **every** subsequent turn and Claude Code echoes *every* prior thinking block, so the replayed text grows with the session. Set an explicit cap if the input-token cost matters to you. Note the cap applies to the reasoning *text* only; the opaque `signature` is forwarded in full in `"native"` mode.
 
 ```json
 {
@@ -231,13 +231,13 @@ Notes:
 ### What it costs
 
 Measured against the 2026-11-12 production traffic (`deepseek-v4.1-flash` behind the
-airia gateway), whose reasoning summaries are 97–17 072 characters (p50 ≈ 1 050):
+airia gateway), whose reasoning summaries are 97–17 072 characters (median 1 054):
 
 | | before | after |
 |---|---|---|
 | reasoning replayed per request | 0 | 153 → 138 081 chars as the session grows |
 | extra input tokens per request | 0 | ≈ +23 700 average, ≈ +34 500 at end-of-session |
-| as a share of the prompt | — | ≈ +6.6 % average, ≈ +9.6 % at end-of-session (the upstream context was a median 358 726 tokens that day) |
+| as a share of the prompt | — | ≈ +6.6 % of the session's median context (358 726 tokens) — ≈ +6.5 % at the largest context seen that day (530 794 tokens) |
 
 That is the price of the model keeping its own reasoning. Set `max_chars` if you want
 less of it — but remember the cap is per turn, so the real bound is `turns × max_chars`.
