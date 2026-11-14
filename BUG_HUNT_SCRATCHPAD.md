@@ -137,7 +137,7 @@ Test modules: `src/anthropic.rs:470`, `src/capabilities.rs:367`, `src/config.rs:
 | # | Bug | Status | Commit | Notes |
 |---|---|---|---|---|
 | 1 | Thinking blocks dropped on the way back in | ✅ FIXED | `24f4805`, `a340989`, `f507d59`, `8fde2d4` | 4 review rounds; see [§ BUG 1 — resolution](#bug-1--resolution) |
-| 2 | `default_model` fallback is dead code → hard 404 | ⬜ TODO | | |
+| 2 | `default_model` fallback is dead code → hard 404 | ✅ FIXED | `86b6a4a`, `b0d5629`, `afa5ca5`, `5ee53cc` | 4 review rounds; see [§ BUG 2 — resolution](#bug-2--resolution) |
 | 3 | Parallel tool calls → interleaved blocks → corrupted JSON | ⬜ TODO | | |
 | 4 | Malformed upstream SSE event dropped wholesale | ⬜ TODO | | |
 | 5 | Native `web_search` tool → 400 kills the whole request | ⬜ TODO | | |
@@ -380,6 +380,77 @@ summary at all, so there is nothing to replay. This is the concrete instance of 
 "provider switch silently degrades the fix" risk, and it is why the `replayed_chars`
 field was added to the `→ upstream` log line: if it reads 0 on every request, the
 upstream is not producing reasoning.
+
+---
+
+## BUG 2 — resolution
+
+**Status: FIXED** in `86b6a4a` (the fix), `b0d5629` + `afa5ca5` + `5ee53cc` (the
+hardening that followed four rounds of sub-agent review).
+
+| Commit | What it did |
+|---|---|
+| `86b6a4a` | New `src/model_rejection.rs`; the detector parses the error envelope instead of substringing the raw body; the fallback fires; the unmapped-model warning; `map_upstream_error` flattens the nested envelope; the `sent_body` log line reflects the attempt that failed |
+| `b0d5629` | Fixed a char-boundary **panic** in the detector (the client got no response at all); fixed two **false positives** where a request-scoped error swapped the model; fixed `map_upstream_error` losing the upstream's text; made `default_model` alias-resolved; sanitised the model name in the new log lines |
+| `afa5ca5` | Restricted the anchored pattern to the **absence** words ("not found", "does not exist", "doesn't exist", "deprecated"). "not supported" / "not available" are what request-scoped errors use, and admitting them let those errors swap the model |
+| `5ee53cc` | The bare-name heuristic no longer accepts digit prose (`model 2fa not found`); four doc corrections |
+
+### How it works now
+
+```
+detect_model_rejection(status, body):
+  1. status must be 400 or 404     (402 credits and 5xx are outages, not rejections)
+  2. code ∈ {model_not_found, model_not_supported, model_not_exist,
+             unknown_model, invalid_model}        -> REJECTION
+  3. transient guard (temporarily unavailable, overloaded, rate limited, ...)
+  4. request-subject veto (tool, function, parameter, schema, ...)
+  5. anchored pattern:  model <name> <absence word>
+  6. phrase list:       "model not found", "unknown model", "model not supported", ...
+```
+
+The two asymmetries that shaped it:
+
+- **A false negative means the client sees the upstream's 404** — the status quo, and
+  visible. **A false positive means the request is answered by a model the operator
+  never chose**, silently. So the detector is deliberately conservative.
+- **Parse, never substring.** The detector sees the *raw* body, where the quotes are
+  JSON-escaped (`model \"claude-sonnet-5\" not found`). A substring test for
+  `model "X" not found` fails on the raw text and only works on the parsed
+  `error.message`.
+
+### Verified
+
+| Check | Result |
+|---|---|
+| The 11 corpus model rejections | **11 / 11 caught** (the old detector: **0 / 11**) |
+| The 127 corpus non-model errors | **0 caught** — 402 credits x108, `xhigh` x7, `web_search` x7, tool-schema x2, empty 502/503 x3 |
+| Realistic upstream error catalogue (OpenAI / Anthropic / Gemini / OpenRouter / Azure / Ollama / one-api, 56 messages x 3 envelopes) | **0 false positives** |
+| Request-scoped matrix (25 messages x 3 envelopes x 2 statuses = 150) | **0 false positives**, proven end-to-end (no model swap) |
+| The fallback fires before any byte reaches the client | yes, streaming and non-streaming |
+| Outbound request bodies vs. the pre-fix binary | **byte-identical** for requests that do not involve a model rejection |
+| Alias resolution | unchanged — still an exact match, no family/prefix matching |
+| The panic (55/210 adversarial bodies crashed the old build) | **0 / 216** |
+
+### Known residual (safe direction)
+
+- `output model not found`, `the embedding model not found` still fire — the phrase
+  branch is a substring search. **Pre-existing**: the old detector fired on these too,
+  and the proxy never sends embedding or moderation requests.
+- `model claude-sonnet-5 not found for the schema` is vetoed by the request-subject
+  list — a false negative.
+- The upstream's own error body is still logged verbatim, so a hostile upstream can
+  still put control bytes in the log file. The *model name* is sanitised everywhere.
+
+### Not done, on purpose
+
+- **Honouring the upstream's `Try <model>.` suggestion.** It is untrusted input, it
+  bypasses the operator's model policy, and it uses a naming convention the alias map
+  does not know (`glm-5.3-flash:cloud` vs the map's `glm-5.3-flash`). It is **logged**
+  as `suggested_model` — the most actionable line in the log, because it names the
+  alias to add — but never routed to.
+- **Family / wildcard alias matching.** A feature, not a bug fix: it silently changes
+  which model answers a request and breaks the documented *"Matching is exact. There
+  are no wildcards."* contract.
 
 ---
 
