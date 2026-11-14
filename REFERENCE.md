@@ -78,7 +78,7 @@ For multiple custom headers, separate them with newlines (a single line is enoug
   representation (e.g. `reasoning.effort = "none"`). Disabled thinking
   takes precedence over `output_config.effort` and the fixed config.
 - The `model_aliases` object maps inbound model names to upstream model names.
-- `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model. The proxy recognises a model rejection from the upstream's error body (a `not_found_error` naming a model, or a `model_not_found` / `model_not_supported` code) and retries once, before any bytes reach the client. Unrelated rejections — a tool the upstream does not support, a bad request — are never retried.
+- `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model. The proxy recognises a model rejection from the upstream's error body (a `not_found_error` naming a model, or a `model_not_found` / `model_not_supported` code) and retries once, before any bytes reach the client. Unrelated rejections — a tool the upstream does not support, a bad request, a schema error — are not retried, including ones that merely mention the model in passing.
 - The `prompt_caching` object lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
 - `prompt_caching.models` defaults to `[]`; when empty, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
 - `prompt_caching.cache_key` is optional and forwarded as `prompt_cache_key`.

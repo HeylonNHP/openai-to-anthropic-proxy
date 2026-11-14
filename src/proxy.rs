@@ -24,7 +24,7 @@ use crate::anthropic::{CreateMessageRequest, StreamEvent};
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
-use crate::model_rejection::{self, ModelRejection};
+use crate::model_rejection;
 use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
@@ -63,6 +63,30 @@ pub struct AppState {
     /// flooding the log with one line per request.
     pub unmapped_models: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
+
+/// Make a client-controlled string safe to put in a log line.
+///
+/// Model names come from the client, so they can carry newlines, ANSI
+/// escapes, or anything else that would forge a log record or repaint
+/// the operator's terminal. Control characters are dropped and the
+/// length is capped.
+fn log_safe(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\u{7f}')
+        .take(120)
+        .collect();
+    if cleaned.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// How many distinct unmapped inbound model names we remember before
+/// stopping tracking new ones. A client could otherwise send an unbounded
+/// number of them.
+const MAX_TRACKED_UNMAPPED_MODELS: usize = 256;
 
 /// Build the axum router.
 pub fn router(
@@ -172,12 +196,19 @@ async fn handle_messages(
         let first_time = state
             .unmapped_models
             .lock()
-            .map(|mut seen| seen.insert(req.model.clone()))
+            .map(|mut seen| {
+                // Bounded: a client could otherwise send an unbounded
+                // number of distinct model names.
+                if seen.len() >= MAX_TRACKED_UNMAPPED_MODELS {
+                    return false;
+                }
+                seen.insert(req.model.clone())
+            })
             .unwrap_or(false);
         if first_time {
             tracing::warn!(
-                inbound_model = %req.model,
-                upstream_model = %upstream_model,
+                inbound_model = %log_safe(&req.model),
+                upstream_model = %log_safe(&upstream_model),
                 "inbound model is not in the alias map; passing it through unchanged"
             );
             state.output.emit(crate::tui::LogLine {
@@ -185,7 +216,8 @@ async fn handle_messages(
                 text: format!(
                     "  \u{26a0} {} is not in the alias map — add it to model_aliases.map \
                      (sent to the upstream as {})",
-                    req.model, upstream_model
+                    log_safe(&req.model),
+                    log_safe(&upstream_model)
                 ),
             });
         }
@@ -442,20 +474,20 @@ async fn handle_messages_inner(
         // `outbound.model` is the *alias-resolved* upstream name — the
         // same name the fallback would carry — so comparing the two is
         // exactly right.
-        let rejection =
-            model_rejection::detect_model_rejection(status.as_u16(), &body, &outbound.model);
+        let rejection = model_rejection::detect_model_rejection(status.as_u16(), &body);
+        // `default_model` may be written as an inbound name or as an
+        // upstream name; resolving it through the alias map makes both
+        // work, and makes the comparison below like-for-like (both sides
+        // are then alias-resolved upstream names).
+        let fallback = mappings_snapshot
+            .default_model()
+            .map(|fb| mappings_snapshot.resolve(fb));
         let should_retry = attempt == 1
             && rejection.is_some()
-            && mappings_snapshot
-                .default_model()
-                .is_some_and(|fb| fb != outbound.model);
+            && fallback.as_deref().is_some_and(|fb| fb != outbound.model);
 
         if should_retry {
-            let fallback = mappings_snapshot.default_model().unwrap();
-            let rejection = rejection.unwrap_or_else(|| ModelRejection {
-                rejected: None,
-                suggested: None,
-            });
+            let fallback = fallback.unwrap_or_default();
             let requested_effort = req
                 .output_config
                 .as_ref()
@@ -467,21 +499,23 @@ async fn handle_messages_inner(
             let fallback_reasoning =
                 state
                     .config
-                    .reasoning_for_request(fallback, requested_effort, thinking_disabled);
-            let fallback_prompt_caching = state.config.prompt_caching_for_model(fallback);
-            let fallback_reasoning_replay = state.config.reasoning_replay_for_model(fallback);
+                    .reasoning_for_request(&fallback, requested_effort, thinking_disabled);
+            let fallback_prompt_caching = state.config.prompt_caching_for_model(&fallback);
+            let fallback_reasoning_replay = state.config.reasoning_replay_for_model(&fallback);
             tracing::warn!(
                 // The model the *client* asked for.
-                inbound_model = %req.model,
+                inbound_model = %log_safe(&req.model),
                 // The upstream name that was rejected.
-                rejected_model = %outbound.model,
-                fallback_model = %fallback,
+                rejected_model = %log_safe(&outbound.model),
+                fallback_model = %log_safe(&fallback),
+                // The name the upstream itself used, when it named one.
+                upstream_named_model = ?rejection.as_ref().and_then(|r| r.rejected.as_deref()),
                 // What the upstream said it would serve instead. Telemetry
                 // only — we do NOT route to it (it is untrusted input and
                 // it bypasses the operator's model policy), but it is the
                 // most actionable thing in the log: it tells the operator
                 // exactly which alias to add.
-                suggested_model = ?rejection.suggested,
+                suggested_model = ?rejection.as_ref().and_then(|r| r.suggested.as_deref()),
                 "upstream rejected model; falling back to default_model"
             );
 
@@ -996,8 +1030,9 @@ fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
     // production actually sends. Parsing only the flat one meant the
     // client received the raw JSON blob as its error message.
     let env = model_rejection::parse_error_envelope(body);
-    if env.message.is_empty() && env.kind.is_empty() && !env.is_json {
-        // Not JSON at all — hand the body over verbatim.
+    if env.message.is_empty() {
+        // Nothing extractable — hand the body over verbatim so the client
+        // never loses the upstream's text.
         return AppError::Upstream {
             status,
             body: body.to_string(),

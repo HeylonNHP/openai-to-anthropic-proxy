@@ -1025,6 +1025,116 @@ async fn model_not_found_with_single_quoted_name_falls_back_to_default() {
     assert_eq!(sent_bodies.len(), 2, "expected exactly one retry");
 }
 
+/// A rejection that mentions the model but whose **subject** is a tool
+/// or a parameter must NOT trigger the fallback. The fallback answers
+/// the request with a *different model*, so firing it on a request-scoped
+/// error silently substitutes a model the operator never chose — and
+/// masks the real error.
+#[tokio::test]
+async fn a_request_scoped_error_naming_the_model_is_not_a_fallback_trigger() {
+    let bodies = [
+        // The tool is the subject; the model is mentioned in passing.
+        r#"{"error":{"message":"the web_search tool is not supported for model claude-sonnet-5","type":"invalid_request_error"}}"#,
+        // The subject comes first.
+        r#"{"error":{"message":"claude-sonnet-5 is not supported for the web_search tool","type":"invalid_request_error"}}"#,
+        // A parameter, not the model.
+        r#"{"error":{"message":"temperature is not supported by claude-sonnet-5","type":"invalid_request_error"}}"#,
+        // A function, not the model.
+        r#"{"error":{"message":"function calling is unsupported by claude-sonnet-5","type":"invalid_request_error"}}"#,
+        // The model's *output* was not found — not the model.
+        r#"{"error":{"message":"the model output is not found","type":"not_found_error"}}"#,
+    ];
+    for body in bodies {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        *upstream.canned_per_attempt.lock().await = VecDeque::from([FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(body.into()),
+        }]);
+        let proxy_addr = start_proxy(make_config_with_default_model(
+            upstream_addr,
+            BTreeMap::new(),
+            Some("gpt-4o-mini"),
+        ))
+        .await;
+
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(
+                r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body was {body}");
+        let sent_bodies = upstream.received_all.lock().await.clone();
+        assert_eq!(
+            sent_bodies.len(),
+            1,
+            "a request-scoped error must not trigger the model fallback: {body}"
+        );
+    }
+}
+
+/// `default_model` may be written as an **inbound** name. It has to go
+/// through the alias map like any other model, or the retry would send
+/// the alias key to the upstream and 404 again.
+#[tokio::test]
+async fn default_model_is_resolved_through_the_alias_map() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404.into()),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(
+                r#"{
+                    "id": "resp_ok",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "model": "gpt-5.4-mini",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback ok", "annotations": []}]
+                    }],
+                    "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }"#
+                .into(),
+            ),
+        },
+    ]);
+    // `default_model` is the INBOUND name `claude-opus-5`, which the alias
+    // map sends to `gpt-5.4-mini`.
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::from([("claude-opus-5".to_string(), "gpt-5.4-mini".to_string())]),
+        Some("claude-opus-5"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent_bodies = upstream.received_all.lock().await.clone();
+    assert_eq!(sent_bodies.len(), 2);
+    let second: serde_json::Value = serde_json::from_slice(&sent_bodies[1]).unwrap();
+    assert_eq!(
+        second["model"], "gpt-5.4-mini",
+        "the fallback must be alias-resolved, not sent as the alias key"
+    );
+}
+
 /// A real upstream **tool** rejection. The body contains the words "not
 /// supported", so a loose detector would fire the model fallback on it
 /// and silently answer the request with a different model.

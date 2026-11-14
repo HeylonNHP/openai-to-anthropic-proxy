@@ -105,8 +105,9 @@ pub struct Config {
 /// fallback is logged at WARN, along with the upstream's own
 /// suggestion. `None` disables the safety net.
 ///
-/// See [`crate::model_rejection`] for how a model rejection is told
-/// apart from an unrelated error.
+/// The proxy tells a model rejection apart from an unrelated error by
+/// inspecting the upstream's error body — see the `model_rejection`
+/// module.
 #[derive(Debug, Clone, Default)]
 pub struct ModelAliases {
     pub map: BTreeMap<String, String>,

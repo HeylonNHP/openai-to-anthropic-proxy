@@ -24,7 +24,16 @@
 //! The one strong signal the gateway *does* send — `type:
 //! "not_found_error"` — was never read.
 //!
-//! Two traps for anyone who rewrites this:
+//! # The asymmetry that shapes this module
+//!
+//! A **false negative** means the client sees the upstream's 404 — the
+//! status quo, and visible. A **false positive** means the proxy
+//! silently retries with a *different model*, answering the request with
+//! a model the operator never chose and masking the real error. So this
+//! detector is deliberately **conservative**: every branch below has to
+//! be quite sure the upstream is talking about the model.
+//!
+//! Three traps for anyone who rewrites this:
 //!
 //! * **Parse, don't substring.** The detector sees the *raw* body, in
 //!   which the quotes are JSON-escaped: `model \\"claude-sonnet-5\\" not
@@ -33,7 +42,11 @@
 //! * **Never key on a bare "not supported".** The corpus contains
 //!   `the web_search tool is not supported` — a *tool* rejection. A
 //!   detector that matched it would fire the model fallback on the wrong
-//!   error. Every phrase below is about a *model*.
+//!   error, and the client would be answered by another model.
+//! * **Check the subject.** `the web_search tool is not supported for
+//!   model claude-sonnet-5` mentions the model *and* says something
+//!   negative — but the subject is the tool. [`mentions_request_subject`]
+//!   is what separates the two.
 
 use std::sync::OnceLock;
 
@@ -53,15 +66,16 @@ const MODEL_ERROR_CODES: &[&str] = &[
 
 /// Narrow phrases that mean the upstream is talking about a **model**.
 ///
-/// Every entry names a model. A bare "not supported" is deliberately
-/// absent — that is the `web_search` false positive.
+/// Every entry names the model as the *subject* of the negative. A bare
+/// "not supported" is deliberately absent — that is the `web_search`
+/// false positive.
 const MODEL_PHRASES: &[&str] = &[
     "model_not_found",
     "model_not_supported",
     "model not found",
     "model not supported",
+    "model not exist",
     "model not available",
-    "model unavailable",
     "model does not exist",
     "model doesn't exist",
     "model is deprecated",
@@ -69,53 +83,89 @@ const MODEL_PHRASES: &[&str] = &[
     "unknown model",
     "unsupported model",
     "no such model",
+    "invalid model",
     "not supported for the selected provider",
+    // OpenRouter's wording when no provider serves the requested model.
+    "no endpoints found that match",
+    // OpenAI's wording when the model exists but is not accessible.
+    "does not exist or you do not have access",
 ];
 
-/// Negative-polarity words, used only to **corroborate** that a message
-/// is about a model.
+/// Words that make an error about the **request** rather than the
+/// model.
 ///
-/// Deliberately shorter than the anchored pattern's list: "invalid",
-/// "not valid", "not allowed" and "not permitted" are excluded because
-/// they routinely describe a *request* ("invalid value for temperature",
-/// "'allOf' is not permitted"), not a model.
-const NEGATIVE_WORDS: &[&str] = &[
-    "not found",
-    "not exist",
-    "no such",
-    "not available",
-    "unavailable",
-    "not supported",
-    "unsupported",
-    "unknown",
-    "not recognized",
-    "not recognised",
-    "deprecated",
+/// If the message names one of these, the error is about a tool, a
+/// parameter, a schema, a file — not about the model. This is what
+/// separates `the web_search tool is not supported for model X` (a tool
+/// rejection) from `model X is not supported` (a model rejection).
+///
+/// Matched as whole tokens, so `requested` is not `request` and
+/// `web_search` is `web` + `search`.
+const REQUEST_SUBJECT_WORDS: &[&str] = &[
+    "tool",
+    "tools",
+    "tool_choice",
+    "function",
+    "functions",
+    "parameter",
+    "parameters",
+    "schema",
+    "schemas",
+    "image",
+    "images",
+    "file",
+    "files",
+    "url",
+    "json",
+    "mode",
+    "modes",
+    "request",
+    "requests",
+    "requested",
+    "response",
+    "responses",
+    "output",
+    "outputs",
+    "input",
+    "inputs",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "max_output_tokens",
+    "reasoning",
+    "content",
+    "prompt",
+    "batch",
+    "job",
+    "quota",
+    "credit",
+    "credits",
+    "endpoint",
+    "endpoints",
+    "deployment",
+    "credential",
+    "credentials",
+    "api_key",
 ];
 
 /// Markers of a **transient** condition. A model that is temporarily
 /// unavailable is not a model rejection — retrying elsewhere would paper
 /// over an outage instead of reporting it.
+///
+/// Deliberately limited to *availability* words. Generic advice like
+/// "please try again later" is excluded: it follows all kinds of error,
+/// including a genuine "model not found".
 const TRANSIENT_MARKERS: &[&str] = &[
     "temporar",
     "overload",
     "rate limit",
     "rate-limit",
     "too many requests",
-    "try again later",
-    "retry after",
     "capacity",
     "throttl",
     "server is busy",
 ];
-
-/// How far from the model name a negative word may sit and still count
-/// as being "about that model".
-const NEGATIVE_WINDOW: usize = 80;
-
-/// The minimum length of a model name we are willing to look for inside
-/// an error message. Short names would match far too much prose.
-const MIN_NAME_LEN: usize = 4;
 
 /// A flattened upstream error, whichever envelope it arrived in.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -205,13 +255,8 @@ pub struct ModelRejection {
 }
 
 /// Detect that an upstream rejected the model rather than the request.
-///
-/// `sent_model` is the upstream model name the proxy asked for. It is
-/// used only as a **corroborating** signal — never as a requirement,
-/// because an upstream may name the model differently from the way it
-/// was sent.
 #[must_use]
-pub fn detect_model_rejection(status: u16, body: &str, sent_model: &str) -> Option<ModelRejection> {
+pub fn detect_model_rejection(status: u16, body: &str) -> Option<ModelRejection> {
     // Only 400 and 404 mean "bad request" / "not found". A 402 (credits)
     // or a 5xx is an outage or a billing problem, not a model rejection.
     if !matches!(status, 400 | 404) {
@@ -222,55 +267,46 @@ pub fn detect_model_rejection(status: u16, body: &str, sent_model: &str) -> Opti
     let message = env.message.trim();
     let lower = message.to_ascii_lowercase();
 
-    // A temporarily-unavailable model is an outage, not a rejection.
-    if TRANSIENT_MARKERS.iter().any(|m| lower.contains(m)) {
-        return None;
-    }
-
-    let rejected = extract_rejected_model(message);
-    let suggested = parse_suggested_model(message);
-    let hit = || {
-        Some(ModelRejection {
-            rejected: rejected.clone(),
-            suggested: suggested.clone(),
-        })
-    };
-
-    // 1. A structured code that is unambiguously about a model.
+    // 1. A structured code that is unambiguously about a model. Checked
+    //    first: it is the strongest signal, and it survives a message that
+    //    happens to mention a tool.
     if MODEL_ERROR_CODES
         .iter()
         .any(|c| env.code.eq_ignore_ascii_case(c))
     {
-        return hit();
+        return Some(build_rejection(message));
     }
 
-    let model_related = mentions_model(&lower) || names_model(message, sent_model);
-
-    // 2. `not_found_error` AND the message is about a model. This is the
-    //    branch that catches every model rejection in the corpus, with
-    //    no false positives: a bad-path 404 says "Not Found" and never
-    //    mentions a model.
-    if env.kind.eq_ignore_ascii_case("not_found_error") && model_related {
-        return hit();
+    // 2. A temporarily-unavailable model is an outage, not a rejection.
+    if TRANSIENT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
     }
 
-    // 3. The anchored pattern: "model <name> <negative>".
+    // 3. The error is about the request, not the model.
+    if mentions_request_subject(&lower) {
+        return None;
+    }
+
+    // 4. The anchored pattern: "model <name> <negative>".
     if match_model_rejection(message).is_some() {
-        return hit();
+        return Some(build_rejection(message));
     }
 
-    // 4. A narrow phrase that names a model.
-    if model_related && MODEL_PHRASES.iter().any(|p| lower.contains(p)) {
-        return hit();
-    }
-
-    // 5. The message names the exact model we sent AND says something
-    //    negative about it nearby.
-    if names_model(message, sent_model) && negative_near(&lower, sent_model) {
-        return hit();
+    // 5. A narrow phrase that names the model as the subject.
+    if MODEL_PHRASES.iter().any(|p| lower.contains(p)) {
+        return Some(build_rejection(message));
     }
 
     None
+}
+
+/// Build the rejection, extracting the name the upstream used and any
+/// suggestion it made.
+fn build_rejection(message: &str) -> ModelRejection {
+    ModelRejection {
+        rejected: extract_rejected_model(message),
+        suggested: parse_suggested_model(message),
+    }
 }
 
 /// The anchored "model <name> <negative>" pattern.
@@ -305,11 +341,6 @@ fn model_rejection_re() -> &'static Regex {
     })
 }
 
-/// A match of the anchored pattern, and the model name it captured.
-struct PatternMatch {
-    name: Option<String>,
-}
-
 /// Match the anchored pattern, validating the captured name.
 ///
 /// A **bare** name has to look like a model id — it must contain a digit
@@ -333,79 +364,22 @@ fn match_model_rejection(message: &str) -> Option<PatternMatch> {
     })
 }
 
+/// A match of the anchored pattern, and the model name it captured.
+struct PatternMatch {
+    name: Option<String>,
+}
+
 /// Extract the model name the upstream said it did not know.
 fn extract_rejected_model(message: &str) -> Option<String> {
     match_model_rejection(message).and_then(|m| m.name)
 }
 
-/// Does the message contain the word "model" (or "models") as a token?
-fn mentions_model(lower: &str) -> bool {
+/// Does the message name something that makes it about the *request*
+/// rather than the model?
+fn mentions_request_subject(lower: &str) -> bool {
     lower
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| word == "model" || word == "models")
-}
-
-/// Does the message name the exact model we sent?
-fn names_model(message: &str, sent_model: &str) -> bool {
-    if sent_model.len() < MIN_NAME_LEN {
-        return false;
-    }
-    message
-        .to_ascii_lowercase()
-        .contains(&sent_model.to_ascii_lowercase())
-}
-
-/// Is there a negative word close to the model name?
-fn negative_near(lower: &str, sent_model: &str) -> bool {
-    let sent_lower = sent_model.to_ascii_lowercase();
-    let mut from = 0usize;
-    while let Some(rel) = lower[from..].find(&sent_lower) {
-        let at = from + rel;
-        let start = at.saturating_sub(NEGATIVE_WINDOW);
-        let end = (at + sent_lower.len() + NEGATIVE_WINDOW).min(lower.len());
-        let window = &lower[start..end];
-        if NEGATIVE_WORDS.iter().any(|w| window.contains(w)) {
-            return true;
-        }
-        from = at + sent_lower.len();
-        if from >= lower.len() {
-            break;
-        }
-    }
-    false
-}
-
-/// Parse the upstream's "Try <model>." suggestion.
-///
-/// The suggestion is telemetry only — see [`ModelRejection::suggested`].
-/// It is validated so that prose ("Try another model.") and URLs
-/// ("Try https://example/x") are not mistaken for model ids.
-fn parse_suggested_model(message: &str) -> Option<String> {
-    let lower = message.to_ascii_lowercase();
-    let mut from = 0usize;
-    while let Some(rel) = lower[from..].find("try") {
-        let at = from + rel;
-        let after = at + 3;
-        let next = message[after..].chars().next();
-        // "try" must be a whole word followed by whitespace.
-        if next.is_some_and(char::is_whitespace) {
-            let token = message[after..].split_whitespace().next()?;
-            let token = token.trim_matches(|c: char| {
-                matches!(
-                    c,
-                    '.' | ',' | ';' | ':' | ')' | '(' | '"' | '\'' | '`' | '[' | ']'
-                )
-            });
-            if looks_like_model_id(token) {
-                return Some(token.to_owned());
-            }
-        }
-        from = at + 3;
-        if from >= lower.len() {
-            break;
-        }
-    }
-    None
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| REQUEST_SUBJECT_WORDS.contains(&word))
 }
 
 /// Does this token look like a model id rather than prose?
@@ -425,6 +399,60 @@ fn looks_like_model_id(token: &str) -> bool {
     token.chars().any(|c| c.is_ascii_digit()) || token.contains(['-', '.', ':', '/', '@'])
 }
 
+/// Parse the upstream's "Try <model>." suggestion.
+///
+/// The suggestion is telemetry only — see [`ModelRejection::suggested`].
+/// It is validated strictly: a suggestion has to contain a **digit**, so
+/// prose ("Try another model."), paths ("Try /usr/local/bin") and
+/// addresses ("Try user@example.com") are all rejected.
+fn parse_suggested_model(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("try") {
+        let at = from + rel;
+        let after = at + 3;
+        let next = message[after..].chars().next();
+        // "try" must be a whole word followed by whitespace.
+        if next.is_some_and(char::is_whitespace) {
+            let token = message[after..].split_whitespace().next()?;
+            let token = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '.' | ',' | ';' | ':' | ')' | '(' | '"' | '\'' | '`' | '[' | ']'
+                )
+            });
+            if looks_like_model_suggestion(token) {
+                return Some(token.to_owned());
+            }
+        }
+        from = at + 3;
+        if from >= lower.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Does this token look like a model id we could log as a suggestion?
+///
+/// Stricter than [`looks_like_model_id`]: it must contain a digit, so
+/// "another", "the default" and "e.g" are all rejected.
+fn looks_like_model_suggestion(token: &str) -> bool {
+    if token.is_empty() || token.len() > 128 {
+        return false;
+    }
+    if token.contains("//") || token.to_ascii_lowercase().starts_with("http") {
+        return false;
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':' | '@' | '+'))
+    {
+        return false;
+    }
+    token.chars().any(|c| c.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,15 +466,15 @@ mod tests {
 
     #[test]
     fn real_gateway_body_is_a_model_rejection() {
-        let rejection = detect_model_rejection(404, REAL_404, "claude-sonnet-5")
-            .expect("the real gateway body must be detected");
+        let rejection =
+            detect_model_rejection(404, REAL_404).expect("the real gateway body must be detected");
         assert_eq!(rejection.rejected.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(rejection.suggested.as_deref(), Some("glm-5.3-flash:cloud"));
     }
 
     #[test]
     fn real_gateway_body_single_quoted() {
-        let rejection = detect_model_rejection(404, REAL_404_SINGLE_QUOTED, "claude-opus-5")
+        let rejection = detect_model_rejection(404, REAL_404_SINGLE_QUOTED)
             .expect("the single-quoted gateway body must be detected");
         assert_eq!(rejection.rejected.as_deref(), Some("claude-opus-5"));
         assert_eq!(rejection.suggested, None);
@@ -454,7 +482,7 @@ mod tests {
 
     #[test]
     fn real_gateway_body_double_quoted() {
-        let rejection = detect_model_rejection(404, REAL_404_DOUBLE_QUOTED, "claude-fable-5-1")
+        let rejection = detect_model_rejection(404, REAL_404_DOUBLE_QUOTED)
             .expect("the double-quoted gateway body must be detected");
         assert_eq!(rejection.rejected.as_deref(), Some("claude-fable-5-1"));
     }
@@ -462,18 +490,18 @@ mod tests {
     #[test]
     fn flat_responses_body_is_a_model_rejection() {
         let body = r#"{"message":"The requested model claude-sonnet-5 is not supported for the selected provider.","type":"invalid_request_error","code":"model_not_supported"}"#;
-        assert!(detect_model_rejection(400, body, "claude-sonnet-5").is_some());
+        assert!(detect_model_rejection(400, body).is_some());
     }
 
     #[test]
     fn nested_code_is_a_model_rejection() {
         let body = r#"{"error":{"code":"model_not_found","message":"nope"}}"#;
-        assert!(detect_model_rejection(404, body, "claude-sonnet-5").is_some());
+        assert!(detect_model_rejection(404, body).is_some());
     }
 
     #[test]
     fn plain_text_body_is_a_model_rejection() {
-        assert!(detect_model_rejection(400, "Model not found", "claude-sonnet-5").is_some());
+        assert!(detect_model_rejection(400, "Model not found").is_some());
     }
 
     #[test]
@@ -501,7 +529,7 @@ mod tests {
         ];
         for (status, body) in bodies {
             assert!(
-                detect_model_rejection(status, body, "claude-sonnet-5").is_none(),
+                detect_model_rejection(status, body).is_none(),
                 "must not treat as a model rejection: {body}"
             );
         }
@@ -509,32 +537,83 @@ mod tests {
 
     #[test]
     fn empty_502_and_503_are_not_model_rejections() {
-        assert!(detect_model_rejection(502, "", "claude-sonnet-5").is_none());
-        assert!(detect_model_rejection(503, "", "claude-sonnet-5").is_none());
+        assert!(detect_model_rejection(502, "").is_none());
+        assert!(detect_model_rejection(503, "").is_none());
     }
 
     #[test]
     fn non_model_404_is_not_a_model_rejection() {
         // A bad path on the upstream: "Not Found" with no model mentioned.
         let body = r#"{"error":{"message":"Not Found","type":"not_found_error","param":null,"code":null}}"#;
-        assert!(detect_model_rejection(404, body, "claude-sonnet-5").is_none());
+        assert!(detect_model_rejection(404, body).is_none());
     }
 
     #[test]
     fn transient_outage_is_not_a_model_rejection() {
         let body = r#"{"error":{"message":"claude-sonnet-5 is temporarily unavailable","type":"invalid_request_error"}}"#;
-        assert!(detect_model_rejection(404, body, "claude-sonnet-5").is_none());
+        assert!(detect_model_rejection(404, body).is_none());
     }
 
     #[test]
     fn model_word_in_an_unrelated_message_is_not_a_model_rejection() {
-        assert!(detect_model_rejection(404, "the model output is not found", "x").is_none());
+        assert!(detect_model_rejection(404, "the model output is not found").is_none());
+        // ...and the same sentence inside a JSON envelope, which is the
+        // shape that actually matters.
+        let body =
+            r#"{"error":{"message":"the model output is not found","type":"not_found_error"}}"#;
+        assert!(detect_model_rejection(404, body).is_none());
     }
 
     #[test]
     fn model_name_prefixed_to_an_unrelated_400_is_not_a_model_rejection() {
         let body = r#"{"error":{"message":"claude-sonnet-5: invalid value for temperature","type":"invalid_request_error"}}"#;
-        assert!(detect_model_rejection(400, body, "claude-sonnet-5").is_none());
+        assert!(detect_model_rejection(400, body).is_none());
+    }
+
+    /// A rejection that mentions the model but whose **subject** is
+    /// something else — a tool, a parameter, a schema. These must never
+    /// fire the fallback, because firing it answers the request with a
+    /// model the operator never chose.
+    #[test]
+    fn a_rejection_about_something_else_is_not_a_model_rejection() {
+        let bodies = [
+            "the web_search tool is not supported for model claude-sonnet-5",
+            "claude-sonnet-5 is not supported for the web_search tool",
+            "Invalid request for model claude-sonnet-5: images are not supported in this mode",
+            "function calling is unsupported by claude-sonnet-5",
+            "unknown parameter for claude-sonnet-5",
+            "temperature is not supported by claude-sonnet-5",
+            "the schema for model claude-sonnet-5 is invalid",
+        ];
+        for body in bodies {
+            let json =
+                format!(r#"{{"error":{{"message":"{body}","type":"invalid_request_error"}}}}"#);
+            assert!(
+                detect_model_rejection(400, &json).is_none(),
+                "must not treat a request-scoped error as a model rejection: {body}"
+            );
+            // ...and the same body as plain text.
+            assert!(
+                detect_model_rejection(400, body).is_none(),
+                "must not treat a request-scoped error as a model rejection: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_message_does_not_panic() {
+        // The window arithmetic in an earlier draft sliced at a byte
+        // offset that was not a char boundary, which killed the request.
+        let body = "模型 claude-sonnet-5 不可用：请求参数不受支持，这是很长的一个句子用来推动偏移量越过字符边界";
+        let json = format!(r#"{{"error":{{"message":"{body}","type":"invalid_request_error"}}}}"#);
+        for offset in 0..40 {
+            let mut padded = body.to_string();
+            padded.push_str(&"x".repeat(offset));
+            let json =
+                format!(r#"{{"error":{{"message":"{padded}","type":"invalid_request_error"}}}}"#);
+            let _ = detect_model_rejection(400, &json);
+        }
+        let _ = detect_model_rejection(400, &json);
     }
 
     #[test]
@@ -543,8 +622,11 @@ mod tests {
             "model \"x\" not found. Try another model.",
             "model \"x\" not found. Try https://evil.example/x",
             "model \"x\" not found. Try the default.",
+            "model \"x\" not found. Try /usr/local/bin",
+            "model \"x\" not found. Try user@example.com",
+            "model \"x\" not found. Try e.g. something",
         ] {
-            let rejection = detect_model_rejection(404, prose, "x");
+            let rejection = detect_model_rejection(404, prose);
             assert_eq!(
                 rejection.and_then(|r| r.suggested),
                 None,
