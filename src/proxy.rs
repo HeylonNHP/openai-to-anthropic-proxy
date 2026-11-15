@@ -19,8 +19,11 @@ use axum::routing::{get, post};
 use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures_util::{Stream, StreamExt};
+use std::time::Duration;
 
-use crate::anthropic::{CreateMessageRequest, StreamEvent};
+use crate::anthropic::{
+    CreateMessageRequest, Message, ResponseContentBlock, StopReason, StreamEvent,
+};
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
@@ -310,11 +313,17 @@ async fn handle_messages(
 
 /// One POST to the upstream with the shared headers. Extracted from the
 /// retry loop so the hidden validation-retry path can reuse it.
-async fn send_upstream_once(
+///
+/// `timeout` is optional and overrides the client-level `request_timeout`
+/// for THIS request only (reqwest documents that behaviour). The advisor's
+/// own consultation uses it to keep a hung reviewer model from stalling the
+/// whole turn; ordinary executor calls pass `None`.
+pub(crate) async fn send_upstream_once(
     state: &AppState,
     url: &str,
     headers: &HeaderMap,
     outbound: &responses::ResponsesRequest,
+    timeout: Option<Duration>,
 ) -> Result<reqwest::Response, AppError> {
     let mut upstream_req = state
         .client
@@ -322,6 +331,9 @@ async fn send_upstream_once(
         .header(header::CONTENT_TYPE, "application/json")
         .bearer_auth(&state.config.upstream_api_key)
         .json(outbound);
+    if let Some(timeout) = timeout {
+        upstream_req = upstream_req.timeout(timeout);
+    }
 
     // Forward a few select headers if the client set them (e.g. tracing
     // identifiers). We don't blindly forward — that risks leaking
@@ -337,7 +349,7 @@ async fn send_upstream_once(
 
 /// Read and parse a non-streaming upstream body. Extracted so the
 /// hidden validation-retry loop can re-read a fresh response.
-async fn parse_upstream_body(
+pub(crate) async fn parse_upstream_body(
     resp: reqwest::Response,
 ) -> Result<responses::ResponsesResponse, AppError> {
     let bytes = resp.bytes().await?;
@@ -354,11 +366,11 @@ async fn parse_upstream_body(
 /// One reusable request-execution unit: everything the request handler
 /// used to own as locals. Keeping the policy in one struct means a future
 /// caller can re-run the whole pipe without duplicating the preamble.
-struct Attempt {
-    state: AppState,
-    headers: HeaderMap,
+pub(crate) struct Attempt {
+    pub(crate) state: AppState,
+    pub(crate) headers: HeaderMap,
     req: CreateMessageRequest,
-    outbound: responses::ResponsesRequest,
+    pub(crate) outbound: responses::ResponsesRequest,
     // Original (client-supplied) tool schemas captured at request
     // translation; threaded to both response paths so tool-call
     // arguments can be repaired before shipping. Rebuilt by the
@@ -386,7 +398,7 @@ struct Attempt {
 /// The successful upstream response, split on `outbound.stream`.
 /// `Streaming` owns the RAW `reqwest::Response` so the caller can still
 /// consume `.bytes_stream()`; `Buffered` carries the parsed JSON body.
-enum Outcome {
+pub(crate) enum Outcome {
     Streaming(reqwest::Response),
     Buffered(responses::ResponsesResponse),
 }
@@ -430,11 +442,19 @@ fn build_outbound(
     if !prompt_caching.models.is_empty() {
         outbound.prompt_cache_key = prompt_caching.cache_key;
     }
+
+    // The advisor's three-field declaration has no input_schema, so the
+    // translator's filter_map drops it. Synthesize an ordinary zero-argument
+    // Responses function tool here instead of special-casing translate.rs.
+    // Both the first attempt AND a default_model fallback re-translation go
+    // through this function, so neither can lose the tool or accidentally
+    // re-enable upstream streaming.
+    crate::advisor::prepare(req, &mut outbound, &config.advisor);
     Ok((outbound, registry, reasoning_replay))
 }
 
 impl Attempt {
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!(
             "{}{}",
             self.state.config.upstream_base_url.trim_end_matches('/'),
@@ -461,7 +481,8 @@ impl Attempt {
             );
         }
         loop {
-            let resp = send_upstream_once(&self.state, url, &self.headers, &self.outbound).await?;
+            let resp =
+                send_upstream_once(&self.state, url, &self.headers, &self.outbound, None).await?;
             let status = resp.status();
             if status.is_success() {
                 break Ok(resp);
@@ -597,7 +618,11 @@ impl Attempt {
 
     /// Send and classify. The hidden validation retry is non-streaming
     /// only: streaming bytes are already flowing at that point.
-    async fn execute(&mut self, url: &str) -> Result<Outcome, AppError> {
+    /// `pub(crate)` so the advisor session can re-run the WHOLE pipe
+    /// (including capabilities / fallback / corrective retry) without
+    /// duplicating any of it. See `src/advisor/session.rs` for why this is
+    /// architecture choice (a) rather than a second loop in `proxy.rs`.
+    pub(crate) async fn execute(&mut self, url: &str) -> Result<Outcome, AppError> {
         let upstream_resp = self.send_success(url).await?;
         let status = upstream_resp.status();
         debug_assert!(status.is_success(), "loop above only breaks on success");
@@ -631,7 +656,8 @@ impl Attempt {
                 &upstream_resp_body,
                 &violations,
             );
-            let resp = send_upstream_once(&self.state, url, &self.headers, &self.outbound).await?;
+            let resp =
+                send_upstream_once(&self.state, url, &self.headers, &self.outbound, None).await?;
             if !resp.status().is_success() {
                 // Upstream error on the retry: keep the original
                 // (already-successful) response body for error mapping.
@@ -646,6 +672,20 @@ impl Attempt {
 
     async fn run(mut self) -> Result<Response, AppError> {
         let url = self.url();
+        // Off by default AND detection-triggered: with `advisor.enabled =
+        // false` (the shipped default) this branch is never taken, so every
+        // ordinary request follows the exact same path as before.
+        if crate::advisor::active(self.state.config.as_ref(), &self.req) {
+            let cfg = self.state.config.advisor.clone();
+            return match crate::advisor::session::run(&mut self, &cfg).await? {
+                crate::advisor::session::SessionOutcome::UnexpectedStreaming(resp) => {
+                    render_streaming(self, resp)
+                }
+                crate::advisor::session::SessionOutcome::Complete(result) => {
+                    render_advisor(&self, *result)
+                }
+            };
+        }
         // Retries are issued here -- before any response bytes are written,
         // so the streaming path is safe too (see TODO at the end of this
         // file): once per sampling parameter the upstream says it does not
@@ -709,6 +749,81 @@ fn render_json(
     upstream_resp_body: responses::ResponsesResponse,
 ) -> Result<Response, AppError> {
     let anth = translate::responses_to_anthropic(&upstream_resp_body, &attempt.registry);
+    record_json_stats(attempt, &upstream_resp_body);
+    Ok(Json(anth).into_response())
+}
+
+/// Render the assembled advisor turn. The advisor path buffers the whole
+/// chain (`prepare` forced upstream `stream:false`), so a client that asked
+/// for SSE gets ONE synthetic Anthropic event sequence — one
+/// `message_start`, one `message_stop`, no `[DONE]` (§§11.3, 11.5).
+///
+/// The Content-Type is HARD-CODED: the upstream answered `application/json`,
+/// so forwarding its header (as `render_streaming` does) would be wrong.
+fn render_advisor(
+    attempt: &Attempt,
+    result: crate::advisor::session::SessionResult,
+) -> Result<Response, AppError> {
+    let crate::advisor::session::SessionResult {
+        final_resp,
+        blocks,
+        iterations,
+    } = result;
+
+    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
+
+    // Claude Code must see `server_tool_use` (a Raw block), not a client
+    // `tool_use` named "advisor". Drop only that name.
+    anth.content.retain(
+        |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "advisor"),
+    );
+
+    // Insert the accumulated pairs at the FRONT, in consultation order.
+    // `splice` keeps each pair contiguous; the executor's final text follows.
+    anth.content
+        .splice(0..0, blocks.into_iter().map(ResponseContentBlock::Raw));
+
+    // NEVER `pause_turn` (§11.5): that is only for a dangling
+    // server_tool_use with no result, which we never emit.
+    let has_client_tool_use = anth
+        .content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    anth.stop_reason = Some(if has_client_tool_use {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    });
+
+    // Billing lives in iterations[], not the top-level totals. Advisor
+    // tokens were never folded into `final_resp.usage`.
+    anth.usage.iterations = Some(iterations);
+
+    // Same stats/log block as the ordinary buffered path: reads the LAST
+    // executor response's authoritative usage exactly once.
+    record_json_stats(attempt, &final_resp);
+
+    if attempt.req.stream == Some(true) {
+        let events = crate::advisor::sse::message_to_events(anth);
+        let chunks = events
+            .into_iter()
+            .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .map_err(|e| AppError::Internal(format!("build advisor streaming response: {e}")));
+    }
+    Ok(Json(anth).into_response())
+}
+
+/// Stats + operator log line for a buffered response. Extracted verbatim
+/// from `render_json` so the advisor path cannot drift from the ordinary
+/// path. Reads the RESPONSES body's usage (not `anth.usage`), so mutating
+/// `usage.iterations` above is invisible here by design.
+fn record_json_stats(attempt: &Attempt, upstream_resp_body: &responses::ResponsesResponse) {
     if is_countable_response_status(&upstream_resp_body.status)
         && let Some(usage) = upstream_resp_body.usage.as_ref()
     {
@@ -757,11 +872,10 @@ fn render_json(
         kind: crate::tui::LogKind::Response,
         text: line,
     });
-    Ok(Json(anth).into_response())
 }
 
 /// Print a response stats line from a `StreamStats` (used by the streaming path).
-fn token_usage(usage: &responses::ResponsesUsage) -> crate::tui::TokenUsage {
+pub(crate) fn token_usage(usage: &responses::ResponsesUsage) -> crate::tui::TokenUsage {
     crate::tui::TokenUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -1082,7 +1196,7 @@ where
     }
 }
 
-fn encode_sse_events(events: &[StreamEvent]) -> Bytes {
+pub(crate) fn encode_sse_events(events: &[StreamEvent]) -> Bytes {
     let mut out = Vec::new();
     for event in events {
         let kind = event_kind(event);

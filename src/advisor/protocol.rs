@@ -71,19 +71,45 @@ pub fn advisor_result(id: &str, text: &str) -> Value {
     })
 }
 
-/// The fail-closed `advisor_tool_result` block. Always uses the generic
-/// `unavailable` error code so Claude Code renders a known message instead
-/// of latching the advisor off for a 400 that names the tool.
+/// A fail-closed `advisor_tool_result` block with a specific client-known
+/// error code. See [`unavailable`] for the usual choice.
 #[must_use]
-pub fn unavailable(id: &str) -> Value {
+pub fn error_result(id: &str, error_code: &str) -> Value {
+    // An unknown code renders "Advisor unavailable (unknown)" in Claude
+    // Code (§3.3). Keeping the client-known list referenced here also
+    // catches a future code accidentally added to the SDK-only list.
+    debug_assert!(
+        ADVISOR_ERROR_CODES.contains(&error_code),
+        "advisor error code must be one Claude Code knows"
+    );
+    debug_assert_ne!(
+        error_code, ERROR_CODE_MODEL_NOT_FOUND,
+        "Claude Code does not know the SDK-only model_not_found code"
+    );
     json!({
         "type": "advisor_tool_result",
         "tool_use_id": id,
         "content": {
             "type": "advisor_tool_result_error",
-            "error_code": ERROR_CODE_UNAVAILABLE,
+            "error_code": error_code,
         },
     })
+}
+
+/// The fail-closed `advisor_tool_result` block. Always uses the generic
+/// `unavailable` error code so Claude Code renders a known message instead
+/// of latching the advisor off for a 400 that names the tool.
+#[must_use]
+pub fn unavailable(id: &str) -> Value {
+    error_result(id, ERROR_CODE_UNAVAILABLE)
+}
+
+/// The cap-hit `advisor_tool_result` block. When the executor keeps asking
+/// for advice past `max_uses`, the client should say "too many consultations"
+/// rather than the generic "unavailable".
+#[must_use]
+pub fn max_uses_exceeded(id: &str) -> Value {
+    error_result(id, ERROR_CODE_MAX_USES_EXCEEDED)
 }
 
 /// Collision-resistant id for one consultation. `srvtoolu_` is the real
@@ -233,6 +259,19 @@ mod tests {
         assert!(
             ADVISOR_ERROR_CODES.contains(&v["content"]["error_code"].as_str().unwrap()),
             "the fail-closed code must be one the client renders"
+        );
+    }
+
+    #[test]
+    fn max_uses_exceeded_is_a_known_error_code() {
+        let v = max_uses_exceeded("srvtoolu_cap");
+        assert_eq!(v["content"]["type"], "advisor_tool_result_error");
+        assert_eq!(v["content"]["error_code"], "max_uses_exceeded");
+        assert_eq!(v["tool_use_id"], "srvtoolu_cap");
+        assert!(ADVISOR_ERROR_CODES.contains(&v["content"]["error_code"].as_str().unwrap()));
+        assert_eq!(
+            v,
+            error_result("srvtoolu_cap", ERROR_CODE_MAX_USES_EXCEEDED)
         );
     }
 

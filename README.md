@@ -62,10 +62,15 @@ If you launch via the helper scripts (`scripts/start-claude-code.sh` / `.ps1`) a
 
 ### Enabling the advisor tool
 
-The proxy's advisor support is being implemented; see
-[`ADVISOR_TOOL_RESEARCH.md`](./ADVISOR_TOOL_RESEARCH.md). Once `advisor.enabled`
-is turned on in `proxy.json`, Claude Code also needs a **persistent** advisor
-model in its user settings. Add these two keys to `~/.claude/settings.json`
+The proxy implements the advisor server-side when `advisor.enabled` is turned
+on in `proxy.json`; see
+[`ADVISOR_TOOL_RESEARCH.md`](./ADVISOR_TOOL_RESEARCH.md) and the `### Advisor`
+section of [`proxy.json-guide.md`](./proxy.json-guide.md). It is **off by
+default** and detection-triggered: a consultation runs only when the executor
+model actually calls the declared `advisor` tool, and a failed consultation
+degrades to an `advisor_tool_result_error` (`unavailable`) instead of failing
+the request. Claude Code also needs a **persistent** advisor model in its user
+settings. Add these two keys to `~/.claude/settings.json`
 (`%USERPROFILE%\.claude\settings.json` on Windows). Merge into the existing
 `env` block rather than replacing it — that block already holds
 `ANTHROPIC_BASE_URL` and your keys:
@@ -98,9 +103,11 @@ or set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` (that wins over everything).
 
 > **Status caveat.** Until `advisor.enabled` is on in `proxy.json`, setting
 > this makes Claude Code declare the advisor tool and send its beta header,
-> but the proxy has no advisor to run yet, so no consultation occurs. Leave
-> `advisorModel` unset (or set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`) if you do
-> not want that interim state.
+> but the proxy takes the ordinary (non-advisor) path, so no consultation
+> occurs. Leave `advisorModel` unset (or set
+> `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`) if you do not want that interim
+> state. The proxy has only been verified against its in-process fake
+> upstream; no live advisor model has been exercised.
 
 Gateway note: never return a 400/422 naming `advisor_20260301` or
 `advisor-tool-2026-03-01`. Claude Code treats that as "the server doesn't know

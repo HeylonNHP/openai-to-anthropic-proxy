@@ -93,8 +93,9 @@ pub struct Config {
     /// `LOG_TO_DISK=1` in the env.
     pub log_to_disk: bool,
     /// Advisor (server-side second opinion) policy. Off by default; see
-    /// [`AdvisorConfig`]. This is resolved config only — the advisor
-    /// feature is not wired into the request pipeline yet.
+    /// [`AdvisorConfig`] and `crate::advisor`. When `enabled` is false the
+    /// request pipeline behaves exactly as it did before the advisor feature
+    /// existed (no extra upstream call, no synthesized tool, no wire fields).
     pub advisor: AdvisorConfig,
 }
 
@@ -103,7 +104,8 @@ pub struct Config {
 /// The feature is **off by default**: `enabled: false` means the proxy
 /// makes no advisor calls and emits no advisor wire fields. Enabling it
 /// requires an explicit `"enabled": true` in `proxy.json` (or
-/// `ADVISOR_ENABLED=1`).
+/// `ADVISOR_ENABLED=1`) AND an inbound tool declaration named `advisor`.
+/// The consultation loop lives in `crate::advisor::session`.
 ///
 /// **`model` is an explicit UPSTREAM model name, not an inbound alias.**
 /// It is written directly into the advisor's own upstream request; it is
