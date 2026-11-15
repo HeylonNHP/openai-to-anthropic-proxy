@@ -61,11 +61,35 @@ pub mod sse;
 /// deliberately do not invent a second name here.
 const ADVISOR_TOOL_NAME: &str = "advisor";
 
-/// Whether the client declared the (three-field, schema-less) advisor tool.
+/// Tokens that must NEVER reach the client in an error body on the advisor
+/// path: Claude Code reads them as "the server does not know the advisor
+/// tool" and latches the feature off for the whole process (§18.4). Applied
+/// to every `AppError` body leaving `Attempt::run` on an advisor-active turn.
+const FORBIDDEN_ERROR_TOKENS: [&str; 3] =
+    ["advisor_20260301", "advisor-tool-2026-03-01", "Input tag"];
+
+/// Replace every advisor-identifying token with a neutral marker.
+#[must_use]
+pub fn scrub_error_body(body: &str) -> String {
+    let mut out = body.to_owned();
+    for token in FORBIDDEN_ERROR_TOKENS {
+        if out.contains(token) {
+            out = out.replace(token, "[redacted]");
+        }
+    }
+    out
+}
+
+/// Whether the client declared the real Claude Code advisor tool: a tool
+/// named `advisor` with NO `input_schema` (the three-field, schema-less
+/// declaration). An ordinary function tool that happens to be called
+/// `advisor` has a schema and must NOT activate this pipeline.
 fn has_advisor_tool(req: &CreateMessageRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.name == ADVISOR_TOOL_NAME))
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| t.name == ADVISOR_TOOL_NAME && t.input_schema.is_none())
+    })
 }
 
 /// Whether this request must take the advisor pipeline. Guarding the whole
@@ -102,10 +126,17 @@ pub fn prepare(
         return false;
     }
 
-    outbound
-        .tools
-        .get_or_insert_with(Vec::new)
-        .push(ToolDefinition::Function(ResponsesTool {
+    // A function tool named `advisor` may already be present (e.g. an
+    // ordinary client tool with a schema, or a previous prepare on the same
+    // outbound). Never push a duplicate: OpenAI's strict validators reject
+    // two tools with the same name.
+    let tools = outbound.tools.get_or_insert_with(Vec::new);
+    let already_present = tools.iter().any(|t| match t {
+        ToolDefinition::Function(f) => f.name == ADVISOR_TOOL_NAME,
+        ToolDefinition::WebSearch(_) => false,
+    });
+    if !already_present {
+        tools.push(ToolDefinition::Function(ResponsesTool {
             kind: "function".to_owned(),
             name: ADVISOR_TOOL_NAME.to_owned(),
             description: Some(
@@ -118,6 +149,7 @@ pub fn prepare(
                 "additionalProperties": false,
             }),
         }));
+    }
 
     // §11.3: run the whole consultation chain through the existing buffered
     // pipeline, then synthesize SSE for a streaming client. Splicing a second
@@ -245,6 +277,63 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert_eq!(serde_json::to_value(&tools[0]).unwrap()["name"], "Bash");
         assert_eq!(serde_json::to_value(&tools[1]).unwrap()["name"], "advisor");
+    }
+
+    #[test]
+    fn activation_requires_the_schema_less_declaration_shape() {
+        let cfg = AdvisorConfig {
+            enabled: true,
+            ..AdvisorConfig::default()
+        };
+        // Real Claude Code declaration: name only, no input_schema.
+        assert!(active_cfg(&cfg, &req_with_advisor_decl()));
+        // An ordinary function tool also named `advisor` (with a schema)
+        // must NOT activate the advisor pipeline.
+        let mut req = req_with_advisor_decl();
+        req.tools = Some(vec![Tool {
+            name: "advisor".into(),
+            description: Some("an ordinary client tool".into()),
+            input_schema: Some(json!({"type": "object", "properties": {}})),
+        }]);
+        assert!(!active_cfg(&cfg, &req));
+        let mut outbound = empty_outbound();
+        assert!(!prepare(&req, &mut outbound, &cfg));
+        assert!(outbound.stream, "normal streaming is preserved");
+    }
+
+    #[test]
+    fn prepare_does_not_duplicate_an_existing_advisor_function_tool() {
+        let req = req_with_advisor_decl();
+        let mut outbound = empty_outbound();
+        outbound.tools = Some(vec![ToolDefinition::Function(ResponsesTool {
+            kind: "function".into(),
+            name: "advisor".into(),
+            description: None,
+            strict: true,
+            parameters: json!({"type": "object", "properties": {}}),
+        })]);
+        let cfg = AdvisorConfig {
+            enabled: true,
+            ..AdvisorConfig::default()
+        };
+        assert!(prepare(&req, &mut outbound, &cfg));
+        assert!(!outbound.stream, "still forced to buffer");
+        let tools = outbound.tools.unwrap();
+        assert_eq!(tools.len(), 1, "no duplicate advisor function tool");
+    }
+
+    #[test]
+    fn scrub_error_body_removes_all_three_latching_tokens() {
+        let body = "400: advisor_20260301 / advisor-tool-2026-03-01 / Input tag 'advisor_20260301'";
+        let scrubbed = scrub_error_body(body);
+        for token in FORBIDDEN_ERROR_TOKENS {
+            assert!(!scrubbed.contains(token), "{token} must be gone");
+        }
+        assert!(scrubbed.contains("[redacted]"));
+        assert_eq!(
+            scrub_error_body("plain upstream error"),
+            "plain upstream error"
+        );
     }
 
     #[test]

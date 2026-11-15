@@ -36,6 +36,26 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Replace every string in the error with the advisor's beta/tool
+    /// tokens scrubbed out. Called on the advisor-active path before an
+    /// `AppError` is returned to the client: a 400 mentioning
+    /// `advisor_20260301` / `advisor-tool-2026-03-01` / `Input tag` latches
+    /// the feature off in Claude Code for the whole process (§18.4).
+    /// Only the client-visible bodies are touched; log messages keep their
+    /// original text.
+    pub(crate) fn scrub_advisor_error(err: Self) -> Self {
+        let scrub = crate::advisor::scrub_error_body;
+        match err {
+            Self::BadRequest(msg) => Self::BadRequest(scrub(&msg)),
+            Self::Unauthorized => Self::Unauthorized,
+            Self::Upstream { status, body } => Self::Upstream {
+                status,
+                body: scrub(&body),
+            },
+            Self::Internal(msg) => Self::Internal(scrub(&msg)),
+        }
+    }
+
     fn anthropic_error_body(&self) -> serde_json::Value {
         let (kind, message) = match self {
             Self::BadRequest(msg) => ("invalid_request_error", msg.clone()),

@@ -31,12 +31,19 @@
 //! warning is emitted for the whole turn, and the executor's transcript is
 //! still given a `function_call_output` so the upstream never sees an orphan
 //! `function_call`. The loop is bounded by `AdvisorConfig::max_uses`.
+//!
+//! After the FIRST successful executor response, a failure on a re-run is
+//! ALSO fail-closed: the last good executor response is rendered and an
+//! `unavailable` pair is appended. No `AppError` from a re-run can reach the
+//! client — a 400 naming the advisor beta/tool would latch the feature off
+//! in Claude Code for the whole process (§18.4).
 
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::advisor::protocol;
+use crate::advisor::{protocol, scrub_error_body};
+use crate::anthropic::ResponseContentBlock;
 use crate::config::AdvisorConfig;
 use crate::proxy::{
     AppState, Attempt, Outcome, parse_upstream_body, send_upstream_once, token_usage,
@@ -45,6 +52,7 @@ use crate::responses::{
     Input, InputContentPart, InputItem, OutputContentPart, OutputItem, ReasoningConfig,
     ResponsesRequest, ResponsesResponse, ResponsesUsage,
 };
+use crate::translate;
 use crate::tui::{LogKind, LogLine};
 
 /// What the consultation loop produced.
@@ -60,11 +68,15 @@ pub enum SessionOutcome {
 }
 
 /// The buffered result of the whole turn: the LAST executor response, the
-/// ordered advisor content blocks, and the per-iteration billing entries.
+/// ordered content produced BEFORE it, and the per-iteration billing entries.
 pub struct SessionResult {
     pub final_resp: ResponsesResponse,
-    /// Contiguous `server_tool_use` / `advisor_tool_result` pairs, in order.
-    pub blocks: Vec<Value>,
+    /// Ordered prefix: translated content of every INTERMEDIATE executor
+    /// sampling (minus `tool_use{name:"advisor"}`) interleaved with the
+    /// contiguous `server_tool_use` / `advisor_tool_result` pairs, in the
+    /// order they actually happened. Spliced in front of `final_resp`'s
+    /// content during rendering.
+    pub prefix_blocks: Vec<ResponseContentBlock>,
     pub iterations: Vec<Value>,
 }
 
@@ -74,6 +86,20 @@ pub struct SessionResult {
 /// review happened.
 const NO_ADVICE: &str =
     "Advisor is temporarily unavailable. Continue the task without a second opinion.";
+
+/// Text injected when the executor tried to consult more times than the
+/// operator allowed. Also deliberately does NOT look like advice.
+const NO_MORE_ADVICE: &str =
+    "Advisor consultation limit reached. Continue the task without another second opinion.";
+
+/// Clamp the advisor's own per-request timeout to the operator's global
+/// `request_timeout`. reqwest's per-request `.timeout()` OVERRIDES the
+/// client-level one, so a large `advisor.timeout_secs` must not be allowed
+/// to EXTEND the operator's bound (§11.4).
+#[must_use]
+fn advisor_timeout(cfg: &AdvisorConfig, request_timeout: Duration) -> Duration {
+    Duration::from_secs(cfg.timeout_secs).min(request_timeout)
+}
 
 /// Build the separate, tool-free advisor request. `model` is the explicit
 /// UPSTREAM name from `proxy.json` — alias resolution is intentionally
@@ -155,6 +181,19 @@ fn extract_advice(resp: &ResponsesResponse) -> Option<String> {
     })
 }
 
+/// Pure status + text guard for one advisor response. A 200 whose body says
+/// `status:"failed"` / `"incomplete"` is NOT a successful review: it must
+/// not be injected into the executor's prompt or billed as advice.
+fn advice_from_response(
+    resp: &ResponsesResponse,
+) -> Result<(String, Option<ResponsesUsage>), String> {
+    if resp.status != "completed" {
+        return Err(format!("advisor response status is {}", resp.status));
+    }
+    let text = extract_advice(resp).ok_or_else(|| "advisor returned no text".to_owned())?;
+    Ok((text, resp.usage.clone()))
+}
+
 /// One standalone advisor POST. Every failure is a `String`, never an
 /// `AppError`: the caller degrades instead of failing the client.
 async fn consult(
@@ -169,7 +208,7 @@ async fn consult(
         &url,
         &attempt.headers,
         &outbound,
-        Some(Duration::from_secs(cfg.timeout_secs)),
+        Some(advisor_timeout(cfg, attempt.state.config.request_timeout)),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -178,31 +217,46 @@ async fn consult(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let body: String = body.chars().take(300).collect();
-        return Err(format!("upstream returned {status}: {body}"));
+        return Err(format!(
+            "upstream returned {status}: {}",
+            scrub_error_body(&body)
+        ));
     }
 
     let parsed = parse_upstream_body(resp).await.map_err(|e| e.to_string())?;
-    let text = extract_advice(&parsed).ok_or_else(|| "advisor returned no text".to_owned())?;
-    Ok((text, parsed.usage))
+    advice_from_response(&parsed)
 }
 
-/// Structured warning + at most ONE operator-visible line per turn.
+/// The gate behind `warn_once`: exactly ONE warning per turn, covering
+/// BOTH the `tracing::warn!` and the operator-visible TUI line.
+fn should_warn(warned: &mut bool) -> bool {
+    if *warned {
+        false
+    } else {
+        *warned = true;
+        true
+    }
+}
+
+/// Structured warning + at most ONE operator-visible line per turn. Both the
+/// `tracing::warn!` and the TUI line are gated — the first failure is the
+/// useful one, repeats are noise.
 fn warn_once(state: &AppState, warned: &mut bool, cfg: &AdvisorConfig, error: &str) {
+    if !should_warn(warned) {
+        return;
+    }
     tracing::warn!(
         error = %error,
         advisor_model = %cfg.model,
         "advisor consultation failed; continuing without advice"
     );
-    if !*warned {
-        *warned = true;
-        state.output.emit(LogLine {
-            kind: LogKind::Warning,
-            text: format!(
-                "  \u{26a0} advisor ({}) unavailable — continuing without advice",
-                cfg.model
-            ),
-        });
-    }
+    state.output.emit(LogLine {
+        kind: LogKind::Warning,
+        text: format!(
+            "  \u{26a0} advisor ({}) unavailable — continuing without advice",
+            cfg.model
+        ),
+    });
 }
 
 /// Canonical Responses shape for feeding a tool result back to the executor
@@ -223,30 +277,111 @@ fn inject(attempt: &mut Attempt, call_id: &str, arguments: &str, output: &str) {
     }
 }
 
-/// Run the whole detection-triggered turn. Executor failures are propagated
-/// (they are ordinary upstream failures); advisor failures are not.
+/// Translated content of one executor sampling, minus the internal advisor
+/// `tool_use`. Kept in order so intermediate text + sibling client tool uses
+/// survive to the final Anthropic message.
+fn intermediate_blocks(resp: &ResponsesResponse, attempt: &Attempt) -> Vec<ResponseContentBlock> {
+    let mut blocks = translate::responses_to_anthropic(resp, &attempt.registry).content;
+    blocks.retain(
+        |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "advisor"),
+    );
+    blocks
+}
+
+/// The response we keep as `last_good` when the loop CONTINUES: its content
+/// has already been spliced into `prefix_blocks`, so rendering it verbatim
+/// on a later failure would duplicate it. Keep the metadata (id, model,
+/// status, usage, stop-reason inputs) and drop only `output`.
+fn without_output(resp: &ResponsesResponse) -> ResponsesResponse {
+    let mut clone = resp.clone();
+    clone.output.clear();
+    clone
+}
+
+/// Append a fresh `server_tool_use` / `unavailable` pair (or close a
+/// dangling `server_tool_use` with its result). Used when a re-run of the
+/// executor fails AFTER a consultation: the client must still see a
+/// contiguous, id-matched pair and a known error code.
+fn append_degraded_pair(prefix: &mut Vec<ResponseContentBlock>) {
+    let id = match prefix.last() {
+        Some(ResponseContentBlock::Raw(v))
+            if v["type"] == "server_tool_use" && v["id"].is_string() =>
+        {
+            v["id"].as_str().unwrap_or("").to_owned()
+        }
+        _ => protocol::new_id(),
+    };
+    if !prefix
+        .last()
+        .is_some_and(|b| matches!(b, ResponseContentBlock::Raw(v) if v["type"] == "server_tool_use" && v["id"] == id))
+    {
+        prefix.push(ResponseContentBlock::Raw(protocol::server_tool_use(&id)));
+    }
+    prefix.push(ResponseContentBlock::Raw(protocol::unavailable(&id)));
+}
+
+fn complete(
+    final_resp: ResponsesResponse,
+    prefix_blocks: Vec<ResponseContentBlock>,
+    iterations: Vec<Value>,
+) -> Result<SessionOutcome, crate::error::AppError> {
+    Ok(SessionOutcome::Complete(Box::new(SessionResult {
+        final_resp,
+        prefix_blocks,
+        iterations,
+    })))
+}
+
+/// Run the whole detection-triggered turn. The FIRST executor failure is an
+/// ordinary upstream failure and propagates (the caller scrubs any advisor
+/// beta/tool tokens from the body before it reaches the client); every LATER
+/// executor failure degrades to the last good response. Advisor failures
+/// never propagate.
 pub async fn run(
     attempt: &mut Attempt,
     cfg: &AdvisorConfig,
 ) -> Result<SessionOutcome, crate::error::AppError> {
     let url = attempt.url();
-    let mut blocks: Vec<Value> = Vec::new();
+    let mut prefix_blocks: Vec<ResponseContentBlock> = Vec::new();
     let mut iterations: Vec<Value> = Vec::new();
     let mut warned = false;
     let mut uses = 0usize;
     let cap = usize::try_from(cfg.max_uses).unwrap_or(usize::MAX);
+    // Once set, the very next executor response is TERMINAL: no more
+    // consultations and no more re-runs. This bounds the whole chain even
+    // when the executor keeps asking for advice.
+    let mut cap_reached = false;
+    // The last successfully buffered executor response. Once present, ANY
+    // later `execute` error renders THIS instead of failing the client.
+    let mut last_good: Option<ResponsesResponse> = None;
 
     loop {
         // The executor's own pipe: capabilities, parameter-strip retry,
         // one-shot default_model fallback, error mapping, corrective retry.
-        let resp = match attempt.execute(&url).await? {
-            Outcome::Buffered(body) => body,
-            Outcome::Streaming(raw) => {
+        let resp = match attempt.execute(&url).await {
+            Ok(Outcome::Buffered(body)) => body,
+            Ok(Outcome::Streaming(raw)) => {
                 tracing::warn!(
                     advisor_model = %cfg.model,
                     "advisor path expected a buffered response; rendering the upstream stream directly"
                 );
                 return Ok(SessionOutcome::UnexpectedStreaming(raw));
+            }
+            Err(err) => {
+                let Some(last) = last_good.take() else {
+                    // First executor attempt: an ordinary upstream failure.
+                    // `Attempt::run` scrubs the body before it reaches the
+                    // client; no last-good response exists to degrade to.
+                    return Err(err);
+                };
+                warn_once(&attempt.state, &mut warned, cfg, &err.to_string());
+                // A consultation was pending when the re-run failed → add
+                // the `unavailable` pair. At the cap no consultation is
+                // pending, so just render the last good response.
+                if !cap_reached {
+                    append_degraded_pair(&mut prefix_blocks);
+                }
+                return complete(last, prefix_blocks, iterations);
             }
         };
 
@@ -256,32 +391,40 @@ pub async fn run(
         }
 
         let Some((call_id, arguments)) = find_advisor_call(&resp.output) else {
-            return Ok(SessionOutcome::Complete(Box::new(SessionResult {
-                final_resp: resp,
-                blocks,
-                iterations,
-            })));
+            return complete(resp, prefix_blocks, iterations);
         };
 
-        let id = protocol::new_id();
-        blocks.push(protocol::server_tool_use(&id));
+        // An advisor call was emitted. Everything the executor said in this
+        // sampling is an INTERMEDIATE block: keep all of it except the
+        // internal advisor tool_use.
+        prefix_blocks.extend(intermediate_blocks(&resp, attempt));
 
-        if uses >= cap {
-            warn_once(
-                &attempt.state,
-                &mut warned,
-                cfg,
-                "advisor max_uses exceeded",
-            );
-            blocks.push(protocol::max_uses_exceeded(&id));
-            // Do NOT consult and do NOT re-run the executor: this is the
-            // hard loop bound. The dangling advisor tool_use is removed
-            // during final assembly.
-            return Ok(SessionOutcome::Complete(Box::new(SessionResult {
-                final_resp: resp,
-                blocks,
-                iterations,
-            })));
+        let id = protocol::new_id();
+        prefix_blocks.push(ResponseContentBlock::Raw(protocol::server_tool_use(&id)));
+
+        // Terminal cap path: inject a FunctionCallOutput for the pending
+        // call and re-run the executor ONE last time for a real answer.
+        // That extra re-run is terminal — if it calls `advisor` again we
+        // strip that tool_use and render without consulting.
+        if uses >= cap || cap_reached {
+            if !cap_reached {
+                warn_once(
+                    &attempt.state,
+                    &mut warned,
+                    cfg,
+                    "advisor max_uses exceeded",
+                );
+                prefix_blocks.push(ResponseContentBlock::Raw(protocol::max_uses_exceeded(&id)));
+                inject(attempt, &call_id, &arguments, NO_MORE_ADVICE);
+                cap_reached = true;
+                last_good = Some(without_output(&resp));
+                continue;
+            }
+            // The terminal extra re-run still asked for advice. Do NOT
+            // consult again and do NOT POST again. Close the pair and
+            // render (the advisor tool_use is filtered out below).
+            prefix_blocks.push(ResponseContentBlock::Raw(protocol::max_uses_exceeded(&id)));
+            return complete(resp, prefix_blocks, iterations);
         }
         uses += 1;
 
@@ -297,20 +440,23 @@ pub async fn run(
                         .stats
                         .record_actual(cfg.model.clone(), token_usage(u));
                 }
-                blocks.push(protocol::advisor_result(&id, &text));
+                prefix_blocks.push(ResponseContentBlock::Raw(protocol::advisor_result(
+                    &id, &text,
+                )));
                 text
             }
             Err(error) => {
                 warn_once(&attempt.state, &mut warned, cfg, &error);
-                blocks.push(protocol::unavailable(&id));
+                prefix_blocks.push(ResponseContentBlock::Raw(protocol::unavailable(&id)));
                 NO_ADVICE.to_owned()
             }
         };
 
         // Server-side advice injection: emitting the Anthropic block alone
         // is NOT enough — the executor must see the text in its own prompt
-        // (§3.4). Cap hit is the only path that skips this.
+        // (§3.4).
         inject(attempt, &call_id, &arguments, &advice);
+        last_good = Some(without_output(&resp));
     }
 }
 
@@ -328,6 +474,21 @@ mod tests {
             max_tokens: 64,
             timeout_secs: 2,
         }
+    }
+
+    fn response(status: &str, text: Option<&str>) -> ResponsesResponse {
+        let mut v = json!({
+            "id": "resp_a", "object": "response", "created_at": 1,
+            "status": status, "model": "beam", "output": [],
+            "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+        });
+        if let Some(text) = text {
+            v["output"] = json!([{
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]
+            }]);
+        }
+        serde_json::from_value(v).unwrap()
     }
 
     #[test]
@@ -358,6 +519,50 @@ mod tests {
         c.effort = None;
         let v = serde_json::to_value(advisor_request(&c, "t")).unwrap();
         assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn should_warn_gates_tracing_and_tui_warnings_to_once_per_turn() {
+        let mut warned = false;
+        assert!(should_warn(&mut warned));
+        assert!(!should_warn(&mut warned), "second failure must not warn");
+        assert!(!should_warn(&mut warned), "third failure must not warn");
+        let mut fresh = false;
+        assert!(should_warn(&mut fresh), "a new turn warns again");
+    }
+
+    #[test]
+    fn advisor_timeout_is_clamped_to_the_global_request_timeout() {
+        let mut c = cfg();
+        c.timeout_secs = 5;
+        assert_eq!(
+            advisor_timeout(&c, Duration::from_millis(300)),
+            Duration::from_millis(300)
+        );
+        c.timeout_secs = 1;
+        assert_eq!(
+            advisor_timeout(&c, Duration::from_secs(30)),
+            Duration::from_secs(1)
+        );
+        c.timeout_secs = 0;
+        assert_eq!(advisor_timeout(&c, Duration::from_secs(30)), Duration::ZERO);
+    }
+
+    #[test]
+    fn advice_from_response_requires_completed_status() {
+        let ok = advice_from_response(&response("completed", Some("Use a channel."))).unwrap();
+        assert_eq!(ok.0, "Use a channel.");
+        assert_eq!(ok.1.unwrap().input_tokens, 7);
+        for bad in ["failed", "incomplete", "in_progress", "queued", "cancelled"] {
+            let err = advice_from_response(&response(bad, Some("Not real advice."))).unwrap_err();
+            assert!(err.contains("status is"), "{bad}: {err}");
+        }
+        // Even a completed response with no text is a failure.
+        assert!(
+            advice_from_response(&response("completed", None))
+                .unwrap_err()
+                .contains("no text")
+        );
     }
 
     #[test]

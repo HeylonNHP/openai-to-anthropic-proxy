@@ -293,6 +293,14 @@ async fn handle_messages(
         ),
     });
 
+    // The number of input items produced by the ORIGINAL translation.
+    // Anything appended after that (advisor advice injection, corrective
+    // retry input) must survive a `default_model` re-translation.
+    let baseline_input_len = match &outbound.input {
+        responses::Input::Items(items) => items.len(),
+        responses::Input::Text(_) => 0,
+    };
+
     Attempt {
         state,
         headers,
@@ -301,6 +309,7 @@ async fn handle_messages(
         registry,
         start,
         mappings_snapshot,
+        baseline_input_len,
         fallback_used: false,
         param_retries: 0,
         attempt: 1,
@@ -376,7 +385,7 @@ pub(crate) struct Attempt {
     // arguments can be repaired before shipping. Rebuilt by the
     // fallback-model path so its repaired-input path stays bound to
     // that attempt's tools.
-    registry: crate::repair::ToolSchemaRegistry,
+    pub(crate) registry: crate::repair::ToolSchemaRegistry,
     start: Instant,
     // Snapshot of the runtime mappings taken at handler entry. Used
     // for the `default_model` fallback so an edit made mid-request
@@ -393,6 +402,10 @@ pub(crate) struct Attempt {
     // Policy inputs, resolved once from the client's explicit signals.
     requested_effort: Option<String>,
     thinking_disabled: bool,
+    /// Input-item count of the original translation. Used by the
+    /// `default_model` fallback to carry over items the advisor session (or
+    /// a corrective retry) appended to `outbound.input` since then.
+    baseline_input_len: usize,
 }
 
 /// The successful upstream response, split on `outbound.stream`.
@@ -435,6 +448,20 @@ fn build_outbound(
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
     outbound.model = model.to_owned();
+
+    // B9: the translator's name-based check preserves the `# Advisor Tool`
+    // section whenever an inbound tool is named `advisor`, but the
+    // schema-less declaration is DROPPED on translation. With the shipped
+    // default (`advisor.enabled = false`) that left the executor told to
+    // call a tool it does not have. Strip the section here whenever the
+    // advisor pipeline is not actually active; keep it when it is (so the
+    // synthesized tool is usable). This is applied AFTER translation, on
+    // `outbound.instructions`, with no signature change to translate.rs.
+    if !crate::advisor::active(config, req)
+        && let Some(instructions) = outbound.instructions.as_mut()
+    {
+        translate::strip_advisor_tool_instructions(instructions);
+    }
 
     // If the operator configured a prompt-cache key, forward it. This
     // is done after translation so the key is independent of the
@@ -594,13 +621,33 @@ impl Attempt {
                 // repaired-input path stays bound to this attempt's tools.
                 // The fallback's replay counter is intentionally never
                 // reported today — only the first attempt logs `replayed_chars`.
-                let (fb_outbound, fb_registry, _) = build_outbound(
+                //
+                // The advisor session ACCUMULATES input items (the injected
+                // `function_call`/`function_call_output` pairs) on
+                // `self.outbound` between executor re-runs. Rebuilding from
+                // the original `req` would silently drop them. Capture the
+                // items appended after the ORIGINAL translation and append
+                // them to the freshly rebuilt input, preserving the
+                // advisor's advice across a default_model fallback.
+                let baseline_len = self.baseline_input_len;
+                let appended_input = match &self.outbound.input {
+                    responses::Input::Items(items) if items.len() > baseline_len => {
+                        Some(items[baseline_len..].to_vec())
+                    }
+                    _ => None,
+                };
+                let (mut fb_outbound, fb_registry, _) = build_outbound(
                     &self.req,
                     self.state.config.as_ref(),
                     &fallback,
                     self.requested_effort.as_deref(),
                     self.thinking_disabled,
                 )?;
+                if let (Some(extra), responses::Input::Items(items)) =
+                    (appended_input, &mut fb_outbound.input)
+                {
+                    items.extend(extra);
+                }
                 self.outbound = fb_outbound;
                 self.registry = fb_registry;
                 // The rebuilt request carries the client's full parameter
@@ -677,13 +724,18 @@ impl Attempt {
         // ordinary request follows the exact same path as before.
         if crate::advisor::active(self.state.config.as_ref(), &self.req) {
             let cfg = self.state.config.advisor.clone();
-            return match crate::advisor::session::run(&mut self, &cfg).await? {
-                crate::advisor::session::SessionOutcome::UnexpectedStreaming(resp) => {
+            // B1: even the FIRST executor error can carry an upstream 400
+            // naming the advisor beta/tool. Scrub those tokens from ANY
+            // error body that could reach the client on this path so Claude
+            // Code cannot latch the feature off for the whole process.
+            return match crate::advisor::session::run(&mut self, &cfg).await {
+                Ok(crate::advisor::session::SessionOutcome::UnexpectedStreaming(resp)) => {
                     render_streaming(self, resp)
                 }
-                crate::advisor::session::SessionOutcome::Complete(result) => {
+                Ok(crate::advisor::session::SessionOutcome::Complete(result)) => {
                     render_advisor(&self, *result)
                 }
+                Err(err) => Err(AppError::scrub_advisor_error(err)),
             };
         }
         // Retries are issued here -- before any response bytes are written,
@@ -766,38 +818,52 @@ fn render_advisor(
 ) -> Result<Response, AppError> {
     let crate::advisor::session::SessionResult {
         final_resp,
-        blocks,
+        prefix_blocks,
         iterations,
     } = result;
 
     let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
 
     // Claude Code must see `server_tool_use` (a Raw block), not a client
-    // `tool_use` named "advisor". Drop only that name.
+    // `tool_use` named "advisor". Drop only that name. This also strips the
+    // orphan tool_use from the terminal cap re-run if it asked again (B3).
     anth.content.retain(
         |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "advisor"),
     );
 
-    // Insert the accumulated pairs at the FRONT, in consultation order.
-    // `splice` keeps each pair contiguous; the executor's final text follows.
-    anth.content
-        .splice(0..0, blocks.into_iter().map(ResponseContentBlock::Raw));
+    // B6: splice the accumulated intermediate executor content plus
+    // contiguous consultation pairs at the FRONT, in real turn order.
+    // The executor's final text follows.
+    anth.content.splice(0..0, prefix_blocks);
 
-    // NEVER `pause_turn` (§11.5): that is only for a dangling
-    // server_tool_use with no result, which we never emit.
+    // B7: preserve any TERMINAL stop reason that came from
+    // `responses_to_anthropic` (notably max_tokens / refusal /
+    // stop_sequence). Only override when a client tool_use remains, or
+    // when the reason is absent / EndTurn. NEVER emit PauseTurn. Never
+    // let a terminal reason be clobbered to EndTurn.
     let has_client_tool_use = anth
         .content
         .iter()
         .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
-    anth.stop_reason = Some(if has_client_tool_use {
-        StopReason::ToolUse
-    } else {
-        StopReason::EndTurn
-    });
+    if has_client_tool_use {
+        anth.stop_reason = Some(StopReason::ToolUse);
+    } else if !matches!(
+        anth.stop_reason,
+        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::StopSequence)
+    ) {
+        // None, EndTurn, ToolUse (with no tool left) and the streaming-only
+        // PauseTurn all collapse to EndTurn for a buffered advisor turn.
+        anth.stop_reason = Some(StopReason::EndTurn);
+    }
 
-    // Billing lives in iterations[], not the top-level totals. Advisor
-    // tokens were never folded into `final_resp.usage`.
-    anth.usage.iterations = Some(iterations);
+    // B10: billing lives in iterations[], not the top-level totals. A turn
+    // with no usage should have NO `iterations` field at all so the wire is
+    // byte-identical to the non-advisor path.
+    anth.usage.iterations = if iterations.is_empty() {
+        None
+    } else {
+        Some(iterations)
+    };
 
     // Same stats/log block as the ordinary buffered path: reads the LAST
     // executor response's authoritative usage exactly once.

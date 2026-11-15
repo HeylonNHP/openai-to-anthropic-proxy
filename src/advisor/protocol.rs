@@ -144,7 +144,8 @@ fn token_counts(usage: &ResponsesUsage) -> (u32, u32, u32, u32) {
 
 /// An `advisor_message` entry for `usage.iterations[]`. Advisor tokens are
 /// billed at the advisor model's rate and must NOT be folded into the
-/// top-level totals (§3.5).
+/// top-level totals (§3.5). `cache_creation` is the explicit `null` Claude
+/// Code sees on the wire for an advisor iteration.
 #[must_use]
 pub fn advisor_iteration(model: &str, usage: &ResponsesUsage) -> Value {
     let (input, output, cache_read, cache_creation) = token_counts(usage);
@@ -155,6 +156,7 @@ pub fn advisor_iteration(model: &str, usage: &ResponsesUsage) -> Value {
         "output_tokens": output,
         "cache_read_input_tokens": cache_read,
         "cache_creation_input_tokens": cache_creation,
+        "cache_creation": null,
     })
 }
 
@@ -346,8 +348,10 @@ mod tests {
                 "output_tokens": 1612,
                 "cache_read_input_tokens": 7,
                 "cache_creation_input_tokens": 11,
+                "cache_creation": null,
             })
         );
+        assert!(v["cache_creation"].is_null());
         assert_eq!(
             serde_json::from_str::<Value>(&serde_json::to_string(&v).unwrap()).unwrap(),
             v

@@ -145,11 +145,14 @@ pub fn anthropic_to_responses(
     }
 
     // Claude Code may include a `# Advisor Tool` system section describing
-    // the Anthropic server-side advisor tool. This proxy cannot offer that
-    // tool: the declaration has no `input_schema` and is dropped by the
-    // filter_map below, so forwarding the instructions would tell the model
-    // to call a tool that does not exist. Strip the section (and only the
-    // section) when no advisor tool is actually being sent upstream.
+    // the Anthropic server-side advisor tool. The schema-less declaration
+    // has no `input_schema` and is dropped by the filter_map below, so
+    // forwarding the instructions would tell the model to call a tool that
+    // does not exist. Strip the section (and only the section) when no
+    // advisor tool is actually being sent upstream. NOTE: the proxy
+    // additionally re-applies this strip AFTER translation, based on the
+    // real advisor-active predicate, so `enabled:false` + an inbound
+    // declaration cannot leak the orphan instructions (B9).
     let has_advisor_tool = req
         .tools
         .as_ref()
@@ -289,7 +292,7 @@ fn system_text(system: &SystemPrompt) -> String {
 /// available" notice Claude Code itself uses: the executor never saw a
 /// working advisor through this proxy, so there is no earlier instruction
 /// to retract. Deleting the section is the least surprising outcome.
-fn strip_advisor_tool_instructions(instructions: &mut String) {
+pub fn strip_advisor_tool_instructions(instructions: &mut String) {
     const HEADING: &str = "# Advisor Tool";
     const SKILLS: &str = "The following skills are available for use with the Skill tool:";
 

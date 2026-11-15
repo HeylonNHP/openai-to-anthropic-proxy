@@ -69,6 +69,12 @@ async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
         all.push(body.clone());
         *s.request_count.lock().await = all.len();
     }
+    // Claim the scripted response BEFORE the delay. A request the client
+    // times out on has still consumed its slot; otherwise a later (fast)
+    // request would pop the stalled response instead of its own. The
+    // MutexGuard is bound to its own `let` so it doesn't live across the
+    // `if let` (clippy::significant_drop_in_scrutinee).
+    let next = s.canned_per_attempt.lock().await.pop_front();
     if let Some(delay) = *s.delay.lock().await {
         tokio::time::sleep(delay).await;
     }
@@ -78,10 +84,7 @@ async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
     }
     *s.received.lock().await = Some(body);
     // Per-attempt responses take priority. Once exhausted, fall
-    // through to the legacy single-shot fields. The MutexGuard is
-    // bound to its own `let` so it doesn't live across the
-    // `if let` (clippy::significant_drop_in_scrutinee).
-    let next = s.canned_per_attempt.lock().await.pop_front();
+    // through to the legacy single-shot fields.
     if let Some(resp) = next {
         return build_fake_response(resp);
     }
@@ -3263,16 +3266,18 @@ async fn advisor_disabled_is_byte_for_byte_identical() {
             !upstream_tools.iter().any(|t| t["name"] == "advisor"),
             "{label}: no synthesized advisor tool"
         );
-        // With the advisor declaration present the # Advisor Tool section is
-        // preserved by translate.rs; with only a Bash declaration it is
-        // stripped (the pre-existing policy). Both are unchanged by phase 3.
-        assert_eq!(
-            received["instructions"]
+        // B9: with the advisor pipeline INACTIVE (both cases here — the
+        // shipped default `enabled:false`, or `enabled:true` with no real
+        // declaration) the orphan `# Advisor Tool` section must NOT reach
+        // the executor. Before the fix, translate.rs's name-based check
+        // preserved it for the disabled + declaration case, telling the
+        // model to call a tool that was dropped on translation.
+        assert!(
+            !received["instructions"]
                 .as_str()
                 .unwrap()
                 .contains("Call advisor BEFORE substantive work"),
-            label == "disabled",
-            "{label}: # Advisor Tool section policy unchanged"
+            "{label}: inactive advisor must strip the # Advisor Tool instructions"
         );
     }
 }
@@ -3691,8 +3696,11 @@ async fn advisor_repeated_failure_emits_one_warning() {
 }
 
 /// 4. `max_uses` caps the loop. The executor keeps asking for advice; the
-/// proxy must stop after `max_uses` consultations and emit
-/// `max_uses_exceeded` instead of a 4th POST.
+/// proxy must stop after `max_uses` consultations, inject a
+/// `function_call_output` for the pending (3rd) call and re-run the executor
+/// ONE final time for a real answer. That extra re-run is TERMINAL: if it
+/// asks for advice again, no more POSTs are made and the orphan tool_use is
+/// stripped. Six POSTs is the hard bound for this script.
 #[tokio::test]
 async fn advisor_max_uses_caps_the_loop() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
@@ -3703,9 +3711,10 @@ async fn advisor_max_uses_caps_the_loop() {
             advisor_answer("Advice one."),
             advisor_call_response("resp_c2", "call_c2"),
             advisor_answer("Advice two."),
-            // A 5th/6th response would be needed for a 3rd consultation.
+            // The cap-triggering 3rd advisor call (no consultation).
             advisor_call_response("resp_c3", "call_c3"),
-            advisor_executor_message("resp_never", "should not be reached"),
+            // The ONE terminal re-run: still asks for advice. Render it.
+            advisor_executor_message("resp_final", "Final answer after the cap."),
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
@@ -3725,9 +3734,42 @@ async fn advisor_max_uses_caps_the_loop() {
     let sent = upstream.received_all.lock().await.clone();
     assert_eq!(
         sent.len(),
-        5,
-        "2 executor calls + 2 advisor calls + capped 3rd executor call; no 4th POST"
+        6,
+        "2 executor + 2 advisor + capped 3rd executor + ONE terminal re-run; no 7th POST"
     );
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    // The terminal re-run carries the FunctionCallOutput for the cap call.
+    assert!(
+        bodies[5]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["type"] == "function_call_output"
+                && i["call_id"] == "call_c3"
+                && i["output"].as_str().unwrap().contains("limit reached")),
+        "the cap-triggering call got a FunctionCallOutput"
+    );
+    // No orphan advisor function_call in ANY upstream request.
+    for (i, b) in bodies.iter().enumerate() {
+        assert!(
+            !b["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call"
+                    && item["name"] == "advisor"
+                    && !b["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|o| o["type"] == "function_call_output"
+                            && o["call_id"] == item["call_id"])),
+            "attempt {i}: every advisor function_call has a matching output"
+        );
+    }
     let content = body["content"].as_array().unwrap();
     let results: Vec<&serde_json::Value> = content
         .iter()
@@ -3738,12 +3780,18 @@ async fn advisor_max_uses_caps_the_loop() {
     assert_eq!(results[1]["content"]["type"], "advisor_result");
     assert_eq!(results[2]["content"]["type"], "advisor_tool_result_error");
     assert_eq!(results[2]["content"]["error_code"], "max_uses_exceeded");
-    // Every pair is contiguous with a matching id.
+    // Every pair is contiguous with a matching id (the first 6 blocks).
     for pair in content.chunks(2).take(3) {
         assert_eq!(pair[0]["type"], "server_tool_use");
         assert_eq!(pair[1]["type"], "advisor_tool_result");
         assert_eq!(pair[0]["id"], pair[1]["tool_use_id"]);
     }
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "Final answer after the cap."),
+        "the terminal re-run's real answer must be rendered"
+    );
     assert_eq!(body["stop_reason"], "end_turn");
 }
 
@@ -4047,4 +4095,993 @@ async fn advisor_tool_declaration_reaches_upstream() {
     assert!(instructions.contains("# Advisor Tool"), "section preserved");
     assert!(instructions.contains("Call advisor BEFORE substantive work."));
     assert!(instructions.contains("<system-reminder>skills</system-reminder>"));
+}
+
+// ─── Regression tests for the confirmed advisor bugs (B1–B12) ──────────────
+//
+// All use the in-process fake upstream. No real API calls, no expensive
+// model names: the only advisor model is `beam`.
+
+/// An executor sampling that produces BOTH visible text and a sibling client
+/// tool_use alongside the advisor call. Used by the B1/B6 fidelity tests.
+fn advisor_call_with_text_and_bash(id: &str, call_id: &str, text: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "{id}", "object": "response", "created_at": 1,
+                "status": "completed", "model": "gpt-4o-mini",
+                "output": [
+                    {{"type": "message", "role": "assistant",
+                      "content": [{{"type": "output_text", "text": "{text}", "annotations": []}}]}},
+                    {{"type": "function_call", "call_id": "{call_id}",
+                      "name": "advisor", "arguments": "{{}}"}},
+                    {{"type": "function_call", "call_id": "call_bash_side",
+                      "name": "Bash", "arguments": "{{\"command\":\"ls\"}}"}}
+                ],
+                "usage": {{"input_tokens":9,"output_tokens":4,"total_tokens":13}}
+            }}"#
+        )),
+    }
+}
+
+/// An executor response with BOTH visible text and an advisor call (B3).
+fn advisor_call_with_text(id: &str, call_id: &str, text: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "{id}", "object": "response", "created_at": 1,
+                "status": "completed", "model": "gpt-4o-mini",
+                "output": [
+                    {{"type": "message", "role": "assistant",
+                      "content": [{{"type": "output_text", "text": "{text}", "annotations": []}}]}},
+                    {{"type": "function_call", "call_id": "{call_id}",
+                      "name": "advisor", "arguments": "{{}}"}}
+                ],
+                "usage": {{"input_tokens":9,"output_tokens":4,"total_tokens":13}}
+            }}"#
+        )),
+    }
+}
+
+/// An advisor response with a non-`completed` status but a plausible-looking
+/// `output_text`. B2: this must NEVER be accepted as advice.
+fn advisor_answer_with_status(status: &str, text: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "resp_advice_bad", "object": "response", "created_at": 1,
+                "status": "{status}", "model": "beam",
+                "output": [{{
+                    "type": "message", "role": "assistant",
+                    "content": [{{"type": "output_text", "text": "{text}", "annotations": []}}]
+                }}],
+                "usage": {{"input_tokens":21,"output_tokens":13,"total_tokens":34}}
+            }}"#
+        )),
+    }
+}
+
+/// An advisor call with NO `usage` field (B10).
+fn advisor_call_without_usage(id: &str, call_id: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "{id}", "object": "response", "created_at": 1,
+                "status": "completed", "model": "gpt-4o-mini",
+                "output": [{{
+                    "type": "function_call", "call_id": "{call_id}",
+                    "name": "advisor", "arguments": "{{}}"
+                }}]
+            }}"#
+        )),
+    }
+}
+
+/// A completed response with NO `usage` field (B10).
+fn response_without_usage(id: &str, text: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "{id}", "object": "response", "created_at": 1,
+                "status": "completed", "model": "gpt-4o-mini",
+                "output": [{{
+                    "type": "message", "role": "assistant",
+                    "content": [{{"type": "output_text", "text": "{text}", "annotations": []}}]
+                }}]
+            }}"#
+        )),
+    }
+}
+
+/// A terminal `incomplete` / `max_output_tokens` executor response (B7).
+fn executor_max_tokens_response(id: &str) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "{id}", "object": "response", "created_at": 1,
+                "status": "incomplete", "model": "gpt-4o-mini",
+                "incomplete_details": {{"reason": "max_output_tokens"}},
+                "output": [{{
+                    "type": "message", "role": "assistant",
+                    "content": [{{"type": "output_text", "text": "Truncated.", "annotations": []}}]
+                }}],
+                "usage": {{"input_tokens":7,"output_tokens":64,"total_tokens":71}}
+            }}"#
+        )),
+    }
+}
+
+/// B1(a): an executor RE-RUN error must NOT fail the user's turn. The last
+/// good response is rendered with an `unavailable` pair, and the executor's
+/// own answer survives.
+#[tokio::test]
+async fn b1_rerun_500_degrades_to_last_good_with_unavailable() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_with_text_and_bash("resp_first", "call_b1", "Let me consult the advisor."),
+            advisor_answer("Use a channel."),
+            FakeResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: Some(r#"{"error":{"message":"executor exploded"}}"#.into()),
+            },
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let started = std::time::Instant::now();
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "never propagate a re-run error"
+    );
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let content = body["content"].as_array().unwrap();
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "Let me consult the advisor."),
+        "the last good executor answer survives"
+    );
+    let unavailable: Vec<_> = content
+        .iter()
+        .filter(|b| b["type"] == "advisor_tool_result")
+        .collect();
+    assert!(
+        unavailable
+            .iter()
+            .any(|b| b["content"]["error_code"] == "unavailable"),
+        "a fail-closed unavailable block is emitted for the failed re-run"
+    );
+    // The advisor's successful pair is still contiguous and id-matched.
+    let mut pair_positions = Vec::new();
+    for (i, b) in content.iter().enumerate() {
+        if b["type"] == "server_tool_use" {
+            let id = &b["id"];
+            assert_eq!(
+                content[i + 1]["type"],
+                "advisor_tool_result",
+                "server_tool_use must be immediately followed by its result"
+            );
+            assert_eq!(content[i + 1]["tool_use_id"], *id);
+            pair_positions.push(i);
+        }
+    }
+    assert_eq!(pair_positions.len(), 2, "consultation pair + degraded pair");
+    assert_eq!(body["stop_reason"], "tool_use", "Bash is still pending");
+}
+
+/// B1(b): a re-run 400 naming ALL THREE beta-latching tokens must not leak
+/// any of them into the client body. §18.4: such a 400 makes Claude Code
+/// disable the advisor for the whole process.
+#[tokio::test]
+async fn b1_rerun_400_with_advisor_tokens_is_scrubbed() {
+    const BETA_400: &str = r#"{"error":{"type":"invalid_request_error","message":"Input tag 'advisor_20260301' found; advisor-tool-2026-03-01 beta required for advisor_20260301"}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_first", "call_b1b"),
+            advisor_answer("Use a channel."),
+            FakeResponse {
+                status: StatusCode::BAD_REQUEST,
+                body: Some(BETA_400.into()),
+            },
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "re-run error is fail-closed");
+    let raw = res.text().await.unwrap();
+    for token in ["advisor_20260301", "advisor-tool-2026-03-01", "Input tag"] {
+        assert!(
+            !raw.contains(token),
+            "{token} must NEVER reach the client from the advisor path"
+        );
+    }
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["content"]["error_code"] == "unavailable"),
+        "the turn degrades to an unavailable block instead"
+    );
+}
+
+/// B1 (first-attempt variant): an advisor-active turn whose FIRST executor
+/// POST returns a beta-naming 400 still propagates the error, but the body
+/// must be scrubbed so Claude Code cannot latch the feature off.
+#[tokio::test]
+async fn b1_first_executor_400_is_scrubbed_before_reaching_client() {
+    const BETA_400: &str = r#"{"error":{"type":"invalid_request_error","message":"Input tag 'advisor_20260301' found; advisor-tool-2026-03-01 beta required"}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(BETA_400.into()),
+        }],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let raw = res.text().await.unwrap();
+    for token in ["advisor_20260301", "advisor-tool-2026-03-01", "Input tag"] {
+        assert!(!raw.contains(token), "{token} leaked on the first error");
+    }
+}
+
+/// B2: a 200 with `status:"failed"`/`"incomplete"` and an `output_text`
+/// must degrade to `unavailable`, and its text must NOT be injected into the
+/// executor prompt or billed as an `advisor_message`.
+#[tokio::test]
+async fn b2_failed_advisor_status_is_not_accepted_as_advice() {
+    for status in ["failed", "incomplete"] {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        script(
+            &upstream,
+            vec![
+                advisor_call_response("resp_call", "call_b2"),
+                advisor_answer_with_status(status, "FAKE ADVICE FROM A FAILED RESPONSE"),
+                advisor_executor_message("resp_final", "Answer without advice."),
+            ],
+        );
+        let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(advisor_request(false)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "status={status}");
+        let body: serde_json::Value = res.json().await.unwrap();
+        let content = body["content"].as_array().unwrap();
+        let result = content
+            .iter()
+            .find(|b| b["type"] == "advisor_tool_result")
+            .unwrap();
+        assert_eq!(result["content"]["error_code"], "unavailable", "{status}");
+        assert!(result["content"]["text"].is_null(), "{status}");
+        assert!(
+            content
+                .iter()
+                .any(|b| b["text"] == "Answer without advice."),
+            "{status}: the executor still answers"
+        );
+        let iterations = body["usage"]["iterations"].as_array().unwrap();
+        assert!(
+            iterations.iter().all(|i| i["type"] == "message"),
+            "{status}: a failed review must not be billed"
+        );
+
+        // The failed text was NOT injected into the executor's transcript.
+        let sent = upstream.received_all.lock().await.clone();
+        assert_eq!(sent.len(), 3, "{status}: no extra POSTs");
+        let final_body: serde_json::Value = serde_json::from_slice(&sent[2]).unwrap();
+        let injected = final_body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap()["output"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !injected.contains("FAKE ADVICE"),
+            "{status}: failed advice leaked into the executor prompt"
+        );
+        assert!(injected.contains("temporarily unavailable"), "{status}");
+    }
+}
+
+/// B3: at `max_uses`, the pending advisor call gets a FunctionCallOutput,
+/// the executor is re-run ONCE for a real answer, and no orphan advisor
+/// `function_call` reaches the upstream. The total POST count is bounded.
+#[tokio::test]
+async fn b3_cap_injects_output_reruns_once_and_bounds_the_loop() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            // max_uses = 1: the first advisor call IS consulted…
+            advisor_call_response("resp_first", "call_first"),
+            advisor_answer("Advice one."),
+            // …the second one hits the cap and gets a FunctionCallOutput…
+            advisor_call_response("resp_cap", "call_cap"),
+            // …and the ONE terminal re-run STILL asks for advice, but also
+            // gives a real text answer. No further consultation and no
+            // further POST is allowed.
+            advisor_call_with_text(
+                "resp_rerun_asks_again",
+                "call_cap_again",
+                "Terminal answer despite another advisor request.",
+            ),
+            advisor_executor_message("resp_never", "should not be reached"),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = 1;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent.len(),
+        4,
+        "executor + advisor + cap executor + ONE terminal re-run; no 5th POST"
+    );
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    // The cap-triggering call is answered with a FunctionCallOutput on the
+    // terminal re-run (and on no other request).
+    let caps: Vec<&serde_json::Value> = bodies[3]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "function_call_output" && i["call_id"] == "call_cap")
+        .collect();
+    assert_eq!(caps.len(), 1, "exactly one injected cap output");
+    assert!(
+        caps[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("limit reached")
+    );
+    for (i, b) in bodies.iter().enumerate() {
+        for item in b["input"].as_array().unwrap() {
+            if item["type"] == "function_call" && item["name"] == "advisor" {
+                assert!(
+                    b["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|o| o["type"] == "function_call_output"
+                            && o["call_id"] == item["call_id"]),
+                    "attempt {i}: orphan advisor function_call"
+                );
+            }
+        }
+    }
+    let content = body["content"].as_array().unwrap();
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "advisor"),
+        "no orphan client tool_use named advisor"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|b| b["content"]["error_code"] == "max_uses_exceeded"),
+        "the cap is reported to the client"
+    );
+    assert!(
+        content.iter().all(|b| b["type"] != "pause_turn"),
+        "never pause_turn"
+    );
+    assert!(
+        content.iter().any(|b| b["type"] == "text"
+            && b["text"] == "Terminal answer despite another advisor request."),
+        "a text block from the terminal re-run is rendered"
+    );
+    assert_eq!(body["stop_reason"], "end_turn");
+}
+
+/// B3 (real-answer variant): the terminal re-run produces a plain text
+/// answer. It must be rendered (not discarded) and no orphan call lingers.
+#[tokio::test]
+async fn b3_cap_terminal_rerun_renders_a_real_answer() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_first", "call_first2"),
+            advisor_answer("Advice one."),
+            // Cap-triggering call: inject FunctionCallOutput, re-run ONCE.
+            advisor_call_response("resp_cap", "call_cap2"),
+            advisor_executor_message("resp_answer", "A real answer after the cap."),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = 1;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "A real answer after the cap."),
+        "the terminal re-run's answer must be rendered"
+    );
+    let results: Vec<&serde_json::Value> = content
+        .iter()
+        .filter(|b| b["type"] == "advisor_tool_result")
+        .collect();
+    assert_eq!(results.len(), 2, "one successful pair + one cap result");
+    assert_eq!(results[0]["content"]["type"], "advisor_result");
+    assert_eq!(results[1]["content"]["error_code"], "max_uses_exceeded");
+    assert_eq!(
+        upstream.received_all.lock().await.len(),
+        4,
+        "no POST beyond the bound"
+    );
+}
+
+/// B4: `timeout_secs > request_timeout` must NOT extend the operator's
+/// timeout. A large advisor timeout is clamped to `request_timeout`, so a
+/// stalled advisor is cut off quickly and the turn degrades.
+#[tokio::test]
+async fn b4_advisor_timeout_is_clamped_to_request_timeout() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_b4"),
+            advisor_answer("never arrives"),
+            advisor_executor_message("resp_final", "Continued without advice."),
+        ],
+    );
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_secs(3), Duration::ZERO]);
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.request_timeout = Duration::from_millis(300);
+    config.advisor.timeout_secs = 5;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let started = std::time::Instant::now();
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(res.status(), StatusCode::OK, "degrades, never errors");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "the 5s advisor timeout must be clamped to 300ms; turn took {elapsed:?}"
+    );
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "advisor_tool_result")
+        .unwrap();
+    assert_eq!(result["content"]["error_code"], "unavailable");
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"] == "Continued without advice."),
+        "the executor re-run still answers"
+    );
+}
+
+/// B5: a `default_model` fallback on the FINAL executor re-run must preserve
+/// the injected advice (`function_call_output`) in the accumulator.
+#[tokio::test]
+async fn b5_mid_session_fallback_preserves_injected_advice() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_b5"),
+            advisor_answer("Advice that must survive the fallback."),
+            // The FINAL executor call first returns a model-rejection 404.
+            FakeResponse {
+                status: StatusCode::NOT_FOUND,
+                body: Some(REAL_GATEWAY_MODEL_404.into()),
+            },
+            // Then succeeds via `default_model`.
+            advisor_executor_message("resp_final", "Done after fallback."),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.model_aliases = ModelAliases {
+        map: BTreeMap::new(),
+        default_model: Some("gpt-4o-mini".into()),
+    };
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let request = advisor_request(false).replace(
+        "\"model\": \"gpt-4o-mini\"",
+        "\"model\": \"claude-sonnet-5\"",
+    );
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"] == "Done after fallback.")
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 4, "call, advisor, rejected final, fallback");
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert_eq!(bodies[2]["model"], "claude-sonnet-5");
+    assert_eq!(bodies[3]["model"], "gpt-4o-mini", "fallback model");
+    let items = bodies[3]["input"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        3,
+        "original translation + injected function_call/output pair"
+    );
+    assert!(
+        items.iter().any(|i| i["type"] == "function_call_output"
+            && i["output"] == "Advice that must survive the fallback."),
+        "the injected advice survives the re-translation"
+    );
+    let call = items.iter().find(|i| i["type"] == "function_call").unwrap();
+    assert_eq!(call["call_id"], "call_b5");
+    let output = items
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(output["call_id"], "call_b5", "no orphan function_call");
+}
+
+/// B6: intermediate executor text and a sibling client `tool_use` must
+/// survive to the final Anthropic message, with `stop_reason == tool_use`.
+#[tokio::test]
+async fn b6_intermediate_content_and_sibling_tool_use_survive() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_with_text_and_bash(
+                "resp_first",
+                "call_b6",
+                "Let me consult the advisor first.",
+            ),
+            advisor_answer("Use a channel."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "Let me consult the advisor first."),
+        "intermediate executor text survives"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "Bash"),
+        "sibling client tool_use survives"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "Here is the implementation."),
+        "the final executor text survives"
+    );
+    // The pair remains contiguous and id-matched.
+    let use_pos = content
+        .iter()
+        .position(|b| b["type"] == "server_tool_use")
+        .unwrap();
+    assert_eq!(content[use_pos + 1]["type"], "advisor_tool_result");
+    assert_eq!(content[use_pos + 1]["tool_use_id"], content[use_pos]["id"]);
+    assert_eq!(content[use_pos + 1]["content"]["text"], "Use a channel.");
+    // Order: intermediate text/tool_use precede the consultation pair.
+    assert!(
+        content
+            .iter()
+            .position(|b| b["text"] == "Let me consult the advisor first.")
+            .unwrap()
+            < use_pos
+    );
+    assert_eq!(
+        body["stop_reason"], "tool_use",
+        "a client tool is still pending"
+    );
+}
+
+/// B7: a terminal `incomplete` / `max_output_tokens` reason must survive
+/// `render_advisor` (not be clobbered to `end_turn`); a normal `completed`
+/// response still yields `end_turn`.
+#[tokio::test]
+async fn b7_stop_reason_is_preserved_for_incomplete_and_completed() {
+    // (a) incomplete / max_output_tokens → max_tokens
+    {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        script(
+            &upstream,
+            vec![
+                advisor_call_response("resp_call", "call_b7"),
+                advisor_answer("Be concise."),
+                executor_max_tokens_response("resp_incomplete"),
+            ],
+        );
+        let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(advisor_request(false)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["stop_reason"], "max_tokens");
+        assert!(
+            body["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["text"] == "Truncated.")
+        );
+    }
+    // (b) a normal completed turn → end_turn
+    {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        script(
+            &upstream,
+            vec![
+                advisor_call_response("resp_call", "call_b7b"),
+                advisor_answer("Be concise."),
+                advisor_executor_message("resp_done", "Done."),
+            ],
+        );
+        let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(advisor_request(false)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+}
+
+/// B8: an ordinary function tool named `advisor` (WITH an input_schema) must
+/// NOT activate the advisor pipeline — one POST, normal streaming preserved.
+#[tokio::test]
+async fn b8_ordinary_function_tool_named_advisor_does_not_activate() {
+    const ORDINARY_ADVISOR_TOOL: &str = r#"{"name":"advisor","description":"an ordinary client tool","input_schema":{"type":"object","properties":{}}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}"#,
+        r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_x","output_index":0,"content_index":0,"delta":"Hi"}"#,
+        r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+    ]
+    .join("\n\n")
+        + "\n\n";
+    *upstream.canned_stream.lock().await = Some(sse);
+    // Advisor config ENABLED: the discriminator must be the declaration
+    // shape, not the config flag.
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request_with_decl(
+            true,
+            ORDINARY_ADVISOR_TOOL,
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream",
+        "the REAL translated SSE stream, not the synthetic advisor sequence"
+    );
+    let text = res.text().await.unwrap();
+    let kinds: Vec<&str> = text
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("event: ")))
+        .collect();
+    assert_eq!(kinds.iter().filter(|k| **k == "message_start").count(), 1);
+    assert_eq!(kinds.iter().filter(|k| **k == "message_stop").count(), 1);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "NO extra advisor POST");
+    let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    assert_eq!(v["stream"], true, "normal streaming is preserved");
+    let tools = v["tools"].as_array().unwrap();
+    assert_eq!(
+        tools.iter().filter(|t| t["name"] == "advisor").count(),
+        1,
+        "exactly one (the client's own) advisor function tool; no duplicate"
+    );
+    assert_eq!(tools[0]["parameters"]["type"], "object");
+    // B9: inactive advisor → the orphan section is removed.
+    assert!(
+        !v["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Call advisor BEFORE substantive work")
+    );
+}
+
+/// B9: with `enabled:false` (the shipped default) and an inbound advisor
+/// declaration, the orphan `# Advisor Tool` instructions must NOT reach the
+/// executor; with `enabled:true` they MUST be kept.
+#[tokio::test]
+async fn b9_disabled_and_declared_strips_orphan_advisor_instructions() {
+    for (label, enabled, expect_instructions) in
+        [("disabled", false, false), ("enabled", true, true)]
+    {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        *upstream.canned.lock().await = Some(completed_response_with_id("resp_b9", "ok"));
+        let mut config = (*advisor_config(upstream_addr)).clone();
+        config.advisor.enabled = enabled;
+        let proxy_addr = start_proxy(Arc::new(config)).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(advisor_request(false)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{label}");
+        let sent = upstream.received_all.lock().await.clone();
+        let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+        let instructions = v["instructions"].as_str().unwrap();
+        assert_eq!(
+            instructions.contains("Call advisor BEFORE substantive work"),
+            expect_instructions,
+            "{label}: advisor instructions policy"
+        );
+        if expect_instructions {
+            assert!(instructions.contains("# Advisor Tool"), "{label}");
+        } else {
+            assert!(!instructions.contains("# Advisor Tool"), "{label}");
+            // Unrelated system sections must survive the strip.
+            assert!(instructions.contains("<system-reminder>skills</system-reminder>"));
+            assert!(instructions.contains("Git status: clean"));
+        }
+    }
+}
+
+/// B10: a zero-usage advisor-active turn must emit NO `iterations` field.
+#[tokio::test]
+async fn b10_zero_usage_turn_omits_iterations() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_without_usage("resp_call", "call_b10"),
+            FakeResponse {
+                status: StatusCode::OK,
+                body: Some(
+                    r#"{
+                        "id": "resp_advice_nousage", "object": "response", "created_at": 1,
+                        "status": "completed", "model": "beam",
+                        "output": [{"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": "Be concise.", "annotations": []}]}]
+                    }"#
+                    .into(),
+                ),
+            },
+            response_without_usage("resp_final", "Done."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = res.text().await.unwrap();
+    assert!(
+        !raw.contains("\"iterations\""),
+        "empty iterations must be None, not an empty array: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(body["usage"]["iterations"].is_null());
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"] == "Done.")
+    );
+}
+
+/// B12: the `advisor_message` iteration carries the explicit
+/// `cache_creation: null` field Claude Code sees on the wire (§3.5).
+#[tokio::test]
+async fn b12_advisor_iteration_has_cache_creation_null() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_b12"),
+            advisor_answer("Be concise."),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = res.text().await.unwrap();
+    assert!(raw.contains("\"cache_creation\":null"), "{raw}");
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let iterations = body["usage"]["iterations"].as_array().unwrap();
+    let advisor = iterations
+        .iter()
+        .find(|i| i["type"] == "advisor_message")
+        .unwrap();
+    assert!(advisor["cache_creation"].is_null());
+    assert_eq!(advisor["cache_creation_input_tokens"], 0);
+}
+
+/// HARD GATE: `enabled:false` with NO advisor declaration is byte-for-byte
+/// identical to the pre-advisor (`17f8329`) behaviour for ordinary
+/// non-streaming requests. The B9 post-translation strip is a no-op here
+/// (translate.rs already removed the section when no advisor tool exists).
+#[tokio::test]
+async fn b9_disabled_without_declaration_is_still_byte_identical() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_gate", "same answer"));
+    let config = make_proxy_config(upstream_addr);
+    assert!(!config.advisor.enabled);
+    let proxy_addr = start_proxy(config).await;
+
+    let request = advisor_request_with_decl(
+        false,
+        r#"{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{}}}"#,
+    );
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "id": "msg_resp_gate",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "same answer"}],
+            "model": "gpt-4o-mini",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 7, "output_tokens": 3}
+        })
+    );
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "no extra POST");
+    let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    assert_eq!(v["stream"], false);
+    assert!(v["tools"].as_array().unwrap().len() == 1);
+    assert_eq!(v["tools"][0]["name"], "Bash");
+    assert!(
+        !v["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Call advisor BEFORE substantive work"),
+        "the pre-existing strip already removed the section"
+    );
+    assert!(
+        v["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>skills</system-reminder>")
+    );
 }
