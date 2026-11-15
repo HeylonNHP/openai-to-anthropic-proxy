@@ -1530,6 +1530,70 @@ argument **for** building the mechanism once, not against it.
 
 ---
 
+## 16. Ready-to-implement contract (2026-11-15)
+
+Asked: *"Would you be ready to implement the advisor tool into the proxy now?"*
+**Yes.** Verified baseline before starting: HEAD `48a71d5`, working tree clean
+except the pre-existing `?? .claude/`; every research anchor still in place
+(`translate.rs:185` tool drop, `:153-158` instruction guard, `:292` stripper;
+`proxy.rs:321/348/1000` helpers); no `advisor` module yet. **355 lib + 2 doc
++ 37 e2e tests pass**; `cargo clippy --all-targets` reports the same **7**
+pre-existing warnings as the baseline. Builds use
+`CARGO_TARGET_DIR=/home/heylon/.cache/proxy-target` (the /tmp tmpfs is ~81%
+full).
+
+### 16.1 Decisions locked for the first implementation
+
+| decision | choice | why |
+|---|---|---|
+| architecture | **§13/§14: refactor first, one clean pipe.** `Attempt` + `build_outbound` + `execute`, then advisor = 2-3 `execute` calls | §15 removed the "speculative" reason to defer; bypass duplicates ~290-330 lines and duplicates an already-drifting policy |
+| consultation trigger | **A: detection** — consult only on `function_call{name:"advisor"}`, honoring `max_uses`. B (always consult) is a config flag for later | §15.2: tool calling is proven; A is faithful to Anthropic and costs nothing when the executor doesn't ask |
+| advisor model | **explicit UPSTREAM name in module-local `advisor.json`, default `beam`** | §7 (25× cheaper than kimi), §11.4 (no `Config` field — `deny_unknown_fields` + 17 literals + cycle) |
+| streaming | **buffer upstream, emit synthetic SSE**; `src/stream.rs` untouched | §11.3; Anthropic's own advisor sub-inference does not stream |
+| blocks | **one assistant message**, contiguous `server_tool_use` + `advisor_tool_result`, `stop_reason: end_turn`, never `pause_turn` | §11.5 (proven) |
+| wire types | **generic `#[serde(untagged)] Raw(Value)`** extension point on `ResponseContentBlock` + `ContentBlockKind` | §11.6 (compiled probe) |
+| failure | **fail closed**: no `default_model`, no capabilities, own timeout, `unavailable` error block, never `?`-propagate `AppError` | §11.4, §11.5 (a 400 naming the beta latches the feature off client-side) |
+| default | **`enabled: false`** — zero wire-field changes on the normal path | §12.0 |
+
+### 16.2 Commit sequence (each step independently green)
+
+1. `Attempt` refactor of `handle_messages_inner` with **zero behaviour change**
+   + the 4 characterization tests (§13.4). Gate: 355+2+37+4 green, clippy
+   still 7, differential diff of received bodies + log lines.
+2. `src/advisor/` skeleton: `mod`, `config` (OnceLock, off), `protocol`
+   (block constructors as `Value`), wire extension points. `try/execute`
+   still unreachable. Gate: full suite green, no behaviour change.
+3. Zero-argument `advisor` function tool synthesized from the 3-field
+   declaration; keep the `# Advisor Tool` instructions. E2E: upstream sees
+   the tool, a `function_call{name:"advisor"}` round-trips.
+4. Advisor upstream call + advice injection + `advisor_tool_result` blocks +
+   `usage.iterations[]`. E2E: happy path (3 POSTs), failure (404/timeout →
+   `unavailable`, executor answer intact, no fallback POST), `max_uses` cap.
+5. Synthetic SSE for `stream:true` (hard-coded `text/event-stream`, one
+   `message_start`/`message_stop`, `message_delta` with `stop_reason`). E2E +
+   Claude Code `--advisor` smoke test.
+6. Inbound echo (`ContentBlockParam` variants), TUI label, docs, `proxy.json.example`
+   note. Multi-turn smoke test.
+
+**Deletion rule:** if step 4 or 5 shows the feature is not worth keeping,
+steps 2-6 revert cleanly and step 1 remains as a debt-reducing refactor.
+
+### 16.3 Risks carried into the build
+
+- Empty `{}` schema must survive `sanitize_tool_schema` + the upstream's
+  strict validator (§15.3). Verify in step 3 before writing the loop.
+- Advice must be injected as a synthetic input item that the upstream accepts
+  after a `function_call` (§12.9 item 2); mirror `append_corrective_input`.
+- `ReasoningReplay`'s `Cell<u64>` is `!Sync` — read `replayed_chars` before
+  `Attempt::run` (§13.3).
+- `Outcome::Streaming` must carry the **raw** `reqwest::Response` (§13.3).
+- Keep the single `→ upstream` log statement in `proxy.rs`; the test at
+  `proxy.rs:1195` reads the source (§13.3).
+- Claude Code's standby advisor needs `api.anthropic.com`; the operator must
+  set `--advisor` explicitly (§9.2). Not fixable by the proxy.
+
+---
+
 ## Sources
 
 **Official docs**
