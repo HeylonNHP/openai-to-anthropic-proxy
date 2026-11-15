@@ -1831,6 +1831,129 @@ but no consultation occurs.
 
 ---
 
+## 19. IMPLEMENTED (2026-11-15 14:xx) — as-built record
+
+The advisor is implemented, verified with sub-agents, and committed. This
+section records what was actually built, the bugs the verifiers found, and
+the gates. It is the as-built counterpart to §17's plan.
+
+### 19.1 Commits (on `dev`, parent `17f8329`)
+
+| commit | what |
+|---|---|
+| `ee2673f` | `Attempt` / `build_outbound` / `execute` refactor; 4 characterization tests. Zero behavior change; deletes the existing first-attempt/fallback policy duplication |
+| `622a968` | `proxy.json` `advisor` config, `Raw(Value)` wire extension points, `Usage.iterations`, `src/advisor/{mod,protocol,sse}.rs` skeleton. Unreachable |
+| `033b3a2` | full integration: zero-arg tool, detection loop, advice injection, `usage.iterations`, buffered synthetic SSE, 11 e2e tests |
+| `7933758` | **12 verifier-confirmed bugs fixed** (B1-B12), +15 e2e / +6 unit tests |
+| `ddac5de` | inbound echo: `ContentBlockParam::{ServerToolUse, AdvisorToolResult}`, prior advice replays into the upstream transcript |
+| `89f5afc` | **2 final verifier-confirmed bugs fixed** (cap re-run double render; instruction-strip idempotence/byte-identity) |
+
+Diff `17f8329..89f5afc`: **15 files, +6666 / −349**. `src/stream.rs` control
+flow untouched (only 4 `iterations: None` literals). No new crate dependency.
+
+### 19.2 As-built architecture
+
+- **One clean pipe** (§13/§14): `Attempt::execute` is called 2-3 times by
+  `src/advisor/session.rs`; no bypass, no duplicated proxy policy.
+- **Config** in `proxy.json`: `advisor.{enabled,model,effort,max_uses,
+  max_tokens,timeout_secs}`, defaults `enabled:false`, `model:"beam"`,
+  `max_uses:2`, `max_tokens:2048`, `timeout_secs:45`. `JsonConfig.advisor`
+  has `skip_serializing_if` (TUI rollback safety). `ADVISOR_*` env overrides.
+- **Activation**: `enabled` AND a tool named `advisor` with **no
+  `input_schema`** (the real Claude Code declaration). A normal function tool
+  named `advisor` does not activate it (B8).
+- **Design A**: consult only on `function_call{name:"advisor"}`, bounded by
+  `max_uses`. Advisor POST is a standalone `send_upstream_once` with explicit
+  upstream `cfg.model`, `timeout` clamped to
+  `min(timeout_secs, request_timeout)`, no tools, no sampling params. No
+  `default_model`, no capability learning, no fallback, ever.
+- **Fail closed**: any advisor failure → `unavailable` (or
+  `max_uses_exceeded`) + one warning; executor re-run failures after the
+  first success degrade to the last good response; `scrub_error_body`
+  removes the three beta-latching tokens from any client-visible error.
+- **One assistant message**: contiguous `server_tool_use` /
+  `advisor_tool_result` pairs, intermediate executor text + sibling client
+  tool uses preserved in order, `end_turn` / `tool_use` / preserved terminal
+  `max_tokens`/`refusal`, never `pause_turn`. `usage.iterations[]` with
+  `advisor_message` billed at `cfg.model`.
+- **Streaming**: upstream forced non-streaming; final `Message` converted by
+  `sse::message_to_events`, hard-coded `text/event-stream`, one
+  `message_start`/`message_stop`, no `[DONE]`.
+- **Multi-turn**: echoed `server_tool_use` + `advisor_tool_result` blocks
+  parse explicitly; `advisor_result.text` is replayed into the upstream
+  assistant text as `[Advisor advice from a previous turn: …]`. Redacted and
+  error results inject nothing; no orphan `function_call`.
+- **`enabled:false` + no declaration**: byte-identical to `17f8329` for
+  non-streaming and streaming, including the two-`# Advisor Tool`-section
+  edge case (verified against a built old binary).
+
+### 19.3 Verification performed (sub-agents, all independent)
+
+1. **Happy path / wire shapes** — independent Python harness against the real
+   binary: 3 POSTs, exact request bodies, id-matched contiguous pair,
+   `iterations[]`, SSE framing, `enabled:false` byte-identity. Found 5 bugs.
+2. **Blind failure/security hunt** — 15 hunt items, found 11 bugs including
+   HIGH: re-run `AppError` propagation + beta-latching 400 leak,
+   `status:"failed"` advice accepted, cap orphan `function_call` / no answer,
+   timeout extension, fallback wiping injected advice.
+3. **Protocol + live Claude Code** — conformance table PASS; ran
+   `/opt/claude-code/bin/claude -p` against the real proxy with a LOCAL fake
+   upstream and scratch settings (`advisorModel` + the experimental env var,
+   **no `--advisor` flag**): exit 0, `is_error:false`, `result:"OK"`,
+   `[AdvisorTool] Advisor tool called` / `…result received` in the debug
+   log, `beam` billed separately. Found the multi-turn context gap.
+4. **Regression hunt on the fix commit** — all 12 fixes PASS; found 2 NEW
+   bugs (cap re-run double render; non-idempotent instruction strip).
+5. **Echo fix + final-two fix**, then a **final independent confirmation**:
+   cap sequence `["server_tool_use","advisor_tool_result","server_tool_use",
+   "advisor_tool_result","text"]` with one text and no orphan; two-section
+   instruction byte-identity SHA-256 match with `17f8329`; echo sentinel
+   reaches upstream; panic audit clean. **No new bugs found.**
+
+### 19.4 Final gates (re-run by the parent agent at HEAD `89f5afc`)
+
+| gate | result |
+|---|---|
+| `cargo test` | **412 lib + 2 bin + 73 e2e + 0 doc = 487 pass, 0 fail** |
+| `cargo clippy --all-targets` | **7** `^warning:` lines, exactly the pre-existing set |
+| `cargo build` / `cargo build --release` | green |
+| `cargo fmt -- --check` | 11 pre-existing diffs, zero new |
+| `git status` | clean except pre-existing `?? .claude/` |
+| `/home/heylon/.claude/settings.json` | **untouched** (mtime 14:04:20) |
+| models used in tests | fake upstream + `beam`; **no kimi / expensive model, no real API** |
+
+### 19.5 Residual risks (not bugs)
+
+1. **No live upstream was exercised.** Every test used a fake upstream or a
+   local fake behind the real proxy/Claude Code. Real gateway acceptance of
+   the empty strict `{}` tool schema, the `FunctionCall`/
+   `FunctionCallOutput` advice-injection shape, and `reasoning.effort`
+   passthrough are unverified against a live `beam` endpoint. Before enabling
+   against Ollama, do one cheap smoke turn with `max_tokens` small.
+2. **TTFT**: buffered 3-call chain; no early `message_start` or keepalive
+   pings. A slow advisor can hit a client-side timeout (the advisor timeout
+   is clamped to `request_timeout`, but the chain is up to ~3× that).
+3. **Instruction-strip fidelity** is scoped to the tested heading /
+   `<system-reminder>` layouts; unusual future Claude Code prompt layouts
+   could select a different boundary.
+4. **Public-type additions** (`Config.advisor`, `Usage.iterations`,
+   `ResponseContentBlock::Raw`, `ContentBlockKind::Raw`) are source-compatible
+   for this repo but would break an external exhaustive match. No
+   `impl Default for Config` was added.
+5. **Deletion**: reverse-order revert of `033b3a2`…`89f5afc` was verified
+   clean, leaving `ee2673f` as a debt-reducing refactor.
+
+### 19.6 To actually use it
+
+1. `proxy.json`: set `"advisor": { "enabled": true, "model": "beam", … }`
+   (the section is already in `proxy.json.example`).
+2. `~/.claude/settings.json`: `"advisorModel": "opus"` plus
+   `"env": { "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1" }` —
+   already applied to the operator's file on 2026-11-15 (§18.6, README).
+3. Restart both. No `--advisor` flag needed.
+
+---
+
 ## Sources
 
 **Official docs**
