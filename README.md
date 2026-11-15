@@ -101,6 +101,47 @@ Why both are required:
 To disable the advisor completely, remove `advisorModel`, run `/advisor off`,
 or set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` (that wins over everything).
 
+#### Removing the limits
+
+The advisor's three limits in `proxy.json` are removed by **zeroing** them:
+
+```json
+"advisor": {
+  "enabled": true,
+  "model": "beam",
+  "max_uses": 0,
+  "max_tokens": 0,
+  "timeout_secs": 0
+}
+```
+
+A **`0` means "no limit"** for `max_uses`, `max_tokens` and `timeout_secs`
+(in `proxy.json` and in the `ADVISOR_*` env vars alike). **Omitting a key is
+not the same thing** — an absent key keeps the shipped default (`max_uses` 2,
+`max_tokens` 2048, `timeout_secs` 45), so a config that only sets
+`"enabled": true` gets the safe, bounded behaviour.
+
+"No limit" means something different per field, so read the caveats in
+[`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor) before setting
+it:
+
+- **`max_uses: 0`** removes the consultation loop's only backstop — the
+  executor may call `advisor` as often as it likes, and each iteration costs
+  **two** upstream calls (the executor re-run *and* the advisor). The proxy
+  imposes no ceiling of its own, but warns once at startup and once per turn
+  that passes 10 consultations.
+- **`max_tokens: 0`** means the *proxy* stops capping the advisor's answer:
+  it omits `max_output_tokens` so the **upstream's** own default applies —
+  which may be *smaller* than 2048. If your upstream's default is too small,
+  set an explicit number instead.
+- **`timeout_secs: 0`** applies no per-request timeout override, so the
+  global `request_timeout_secs` still bounds the call. A *finite*
+  `timeout_secs` is always clamped to that global bound.
+
+An invalid limit (negative, fractional, or too large) is never a startup
+failure: the proxy starts anyway, falls back to that limit's shipped default,
+and prints a warning.
+
 > **Status caveat.** Until `advisor.enabled` is on in `proxy.json`, setting
 > this makes Claude Code declare the advisor tool and send its beta header,
 > but the proxy takes the ordinary (non-advisor) path, so no consultation

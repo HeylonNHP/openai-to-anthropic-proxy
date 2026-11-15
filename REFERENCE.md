@@ -82,6 +82,36 @@ For multiple custom headers, separate them with newlines (a single line is enoug
 - The `prompt_caching` object lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
 - `prompt_caching.models` defaults to `[]`; when empty, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
 - `prompt_caching.cache_key` is optional and forwarded as `prompt_cache_key`.
+- The `advisor` object enables the server-side advisor: a second, cheaper
+  model is consulted mid-turn and its advice is fed back to the executor. The
+  feature is **off by default** (`enabled` defaults to `false`), and when it
+  is off the request path is byte-for-byte unchanged.
+- **`advisor.max_uses`, `advisor.max_tokens` and `advisor.timeout_secs` are
+  removed by setting them to `0`.** A **`0` means "no limit"**; an
+  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 2048,
+  `timeout_secs` 45). The same rule applies to the `ADVISOR_MAX_USES`,
+  `ADVISOR_MAX_TOKENS` and `ADVISOR_TIMEOUT_SECS` env vars.
+
+  ```json
+  "advisor": {
+    "enabled": true,
+    "model": "beam",
+    "max_uses": 0,
+    "max_tokens": 0,
+    "timeout_secs": 0
+  }
+  ```
+
+  "No limit" differs per field: `max_uses: 0` removes the consultation
+  loop's only backstop (each iteration costs two upstream calls);
+  `max_tokens: 0` means the *upstream's* default answer cap applies rather
+  than the proxy's; `timeout_secs: 0` means no per-request override, so the
+  global `request_timeout_secs` still bounds the call. An invalid limit
+  (negative, fractional, too large) is a warning, not a startup failure —
+  the proxy starts and falls back to the default. Full detail in
+  [`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor).
+- `advisor.model` is an **explicit upstream model name**, not an inbound
+  alias; `model_aliases.map` is not applied to it.
 
 A small example of these in `proxy.json`:
 

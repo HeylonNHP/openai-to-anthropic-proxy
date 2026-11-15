@@ -269,7 +269,7 @@ Optional settings for the server-side advisor (a second-opinion consultation ins
 - `model` is an **explicit upstream model name**, not an inbound alias. It is written straight into the advisor's own upstream request; `model_aliases.map` is not applied to it. Keep it separate from the executor's alias so the advisor's effort and cost do not couple to the executor's `reasoning.models` entry.
 - **`beam` is the cheap default** ($0.125/M input, $0.40/M output — roughly 25× cheaper on output than `kimi-k3.1-pro`). An advisor consult re-runs the executor, so a wrong model choice multiplies cost. Never use a kimi model as the advisor.
 - `effort` is an optional reasoning effort string for the advisor only. Omit it to send none.
-- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's answer. `timeout_secs` bounds the extra upstream call.
+- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's answer. `timeout_secs` bounds the extra upstream call. **Set any of them to `0` to remove that limit** — a `0` means "no limit"; leaving a key out keeps its shipped default.
 - Every field has an env override with the same **env > file > default** precedence used elsewhere: `ADVISOR_ENABLED`, `ADVISOR_MODEL`, `ADVISOR_EFFORT`, `ADVISOR_MAX_USES`, `ADVISOR_MAX_TOKENS`, `ADVISOR_TIMEOUT_SECS`. `ADVISOR_ENABLED` accepts `1`/`true`/`yes`/`on` (anything else is `false`).
 - The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
 
