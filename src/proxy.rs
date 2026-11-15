@@ -225,60 +225,46 @@ async fn handle_messages(
     // Resolve the reasoning intent from the client's explicit signals
     // (output_config.effort, thinking.type = "disabled") against the
     // configured effort/thinking-disabled maps, falling back to the
-    // fixed per-model config when the client sent neither.
-    let requested_effort = req
-        .output_config
-        .as_ref()
-        .and_then(|oc| oc.effort.as_deref());
+    // fixed per-model config when the client sent neither. Owned here so
+    // `req` can move into `Attempt` without a self-referential borrow.
+    let requested_effort = req.output_config.as_ref().and_then(|oc| oc.effort.clone());
     let thinking_disabled = req
         .thinking
         .as_ref()
         .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
-    let reasoning_decision =
-        state
-            .config
-            .reasoning_for_request(&upstream_model, requested_effort, thinking_disabled);
-    let prompt_caching = state.config.prompt_caching_for_model(&upstream_model);
-    let reasoning_replay = state.config.reasoning_replay_for_model(&upstream_model);
-    let (mut outbound, registry) = translate::anthropic_to_responses(
-        &req,
-        Some(reasoning_decision),
-        &prompt_caching,
-        &reasoning_replay,
-    )
-    .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
-    // `registry` is reassigned in the `should_retry` branch below when we
-    // rebuild the outbound request for the fallback model. The `mut` on
-    // the second destructure is load-bearing for that branch.
-    // The translator copies the inbound model name verbatim; rewrite
-    // it here so the upstream sees the alias-resolved name.
-    outbound.model = upstream_model;
+    // Both the first attempt and the `default_model` fallback go through
+    // `build_outbound`, so their policies cannot drift apart.
+    // `ReasoningReplay` holds a `Cell` (!Sync): read its counter in the
+    // log below and let it drop before `Attempt::run` reaches an await.
+    let (outbound, registry) = {
+        let (outbound, registry, reasoning_replay) = build_outbound(
+            &req,
+            state.config.as_ref(),
+            &upstream_model,
+            requested_effort.as_deref(),
+            thinking_disabled,
+        )?;
 
-    // If the operator configured a prompt-cache key, forward it. This
-    // is done after translation so the key is independent of the
-    // alias-resolved model name.
-    if !prompt_caching.models.is_empty() {
-        outbound.prompt_cache_key = prompt_caching.cache_key.clone();
-    }
-
-    // Serialize once, log a short summary, and stash the full body for
-    // the error path. The body is the single most useful artifact when
-    tracing::info!(
-        inbound_model = %log_safe(&req.model),
-        upstream_model = %log_safe(&outbound.model),
-        stream = outbound.stream,
-        tools = outbound.tools.as_ref().map_or(0, Vec::len),
-        inbound_thinking = ?req.thinking.as_ref().map(|t| t.r#type.as_str()),
-        inbound_effort = ?requested_effort,
-        reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
-        // How many characters of prior reasoning were replayed upstream in
-        // this request. Reads 0 on every request once the upstream stops
-        // producing a reasoning summary — at that point the replay has
-        // silently become a no-op. This is the first attempt's count; a
-        // `default_model` fallback re-translates into its own counter.
-        replayed_chars = reasoning_replay.replayed_chars.get(),
-        "→ upstream"
-    );
+        // Serialize once, log a short summary, and stash the full body for
+        // the error path. The body is the single most useful artifact when
+        tracing::info!(
+            inbound_model = %log_safe(&req.model),
+            upstream_model = %log_safe(&outbound.model),
+            stream = outbound.stream,
+            tools = outbound.tools.as_ref().map_or(0, Vec::len),
+            inbound_thinking = ?req.thinking.as_ref().map(|t| t.r#type.as_str()),
+            inbound_effort = ?requested_effort,
+            reasoning_effort = ?outbound.reasoning.as_ref().map(|r| r.effort.clone()),
+            // How many characters of prior reasoning were replayed upstream in
+            // this request. Reads 0 on every request once the upstream stops
+            // producing a reasoning summary — at that point the replay has
+            // silently become a no-op. This is the first attempt's count; a
+            // `default_model` fallback re-translates into its own counter.
+            replayed_chars = reasoning_replay.replayed_chars.get(),
+            "→ upstream"
+        );
+        (outbound, registry)
+    };
 
     let start = Instant::now();
 
@@ -304,7 +290,7 @@ async fn handle_messages(
         ),
     });
 
-    handle_messages_inner(
+    Attempt {
         state,
         headers,
         req,
@@ -312,7 +298,13 @@ async fn handle_messages(
         registry,
         start,
         mappings_snapshot,
-    )
+        fallback_used: false,
+        param_retries: 0,
+        attempt: 1,
+        requested_effort,
+        thinking_disabled,
+    }
+    .run()
     .await
 }
 
@@ -359,238 +351,261 @@ async fn parse_upstream_body(
     })
 }
 
-async fn handle_messages_inner(
+/// One reusable request-execution unit: everything the request handler
+/// used to own as locals. Keeping the policy in one struct means a future
+/// caller can re-run the whole pipe without duplicating the preamble.
+struct Attempt {
     state: AppState,
     headers: HeaderMap,
     req: CreateMessageRequest,
     outbound: responses::ResponsesRequest,
     // Original (client-supplied) tool schemas captured at request
     // translation; threaded to both response paths so tool-call
-    // arguments can be repaired before shipping. Mutable because the
-    // fallback-model path rebuilds the request and its registry from
-    // scratch to avoid leaking the first model's cache policy into
-    // the retry.
-    mut registry: crate::repair::ToolSchemaRegistry,
+    // arguments can be repaired before shipping. Rebuilt by the
+    // fallback-model path so its repaired-input path stays bound to
+    // that attempt's tools.
+    registry: crate::repair::ToolSchemaRegistry,
     start: Instant,
     // Snapshot of the runtime mappings taken at handler entry. Used
     // for the `default_model` fallback so an edit made mid-request
     // doesn't tear the response — the same contract the alias
     // resolution above honours.
     mappings_snapshot: Arc<crate::tui::RuntimeMappings>,
-) -> Result<Response, AppError> {
-    let url = format!(
-        "{}{}",
-        state.config.upstream_base_url.trim_end_matches('/'),
-        state.config.upstream_path
-    );
+    // Retry-loop state. `param_retries` is bounded by
+    // `RequestParam::ALL.len()`, `attempt` gates the one-shot
+    // `default_model` fallback, and `fallback_used` drives stats
+    // attribution and the streaming `Drop` hook.
+    fallback_used: bool,
+    param_retries: usize,
+    attempt: u8,
+    // Policy inputs, resolved once from the client's explicit signals.
+    requested_effort: Option<String>,
+    thinking_disabled: bool,
+}
 
-    // Send the first attempt. Retries are issued here -- before any
-    // response bytes are written, so the streaming path is safe too
-    // (see TODO at the end of this file): once per sampling parameter
-    // the upstream says it does not support, and once with the
-    // configured `default_model` if the upstream rejects the requested
-    // model entirely.
-    let mut outbound = outbound;
-    let mut fallback_used = false;
-    // One parameter-strip retry is allowed *per droppable parameter*, so
-    // a model that rejects both `temperature` and `top_p` is still
-    // retried back to a working request. The `is_set` guard below means
-    // each retry removes a distinct parameter and none is ever re-added,
-    // so the loop cannot spin; the explicit cap is belt-and-braces.
-    let mut param_retries = 0usize;
-    let mut attempt = 1u8;
-    // Apply anything already learned about this model before the first
-    // send, so a fact cached on an earlier request (or by a concurrent
-    // one) is honoured immediately instead of re-triggering the 400.
-    let already_dropped = state.capabilities.apply_known(&mut outbound);
-    if !already_dropped.is_empty() {
-        tracing::debug!(
-            model = %outbound.model,
-            params = ?already_dropped,
-            "omitting parameters previously rejected by this model"
-        );
+/// The successful upstream response, split on `outbound.stream`.
+/// `Streaming` owns the RAW `reqwest::Response` so the caller can still
+/// consume `.bytes_stream()`; `Buffered` carries the parsed JSON body.
+enum Outcome {
+    Streaming(reqwest::Response),
+    Buffered(responses::ResponsesResponse),
+}
+
+/// Translate one inbound request for one upstream model. Both the first
+/// attempt and the `default_model` fallback call this, so reasoning,
+/// prompt-caching, reasoning-replay and the cache key are recomputed from
+/// the same policy rather than being hand-applied twice.
+fn build_outbound(
+    req: &CreateMessageRequest,
+    config: &Config,
+    model: &str,
+    requested_effort: Option<&str>,
+    thinking_disabled: bool,
+) -> Result<
+    (
+        responses::ResponsesRequest,
+        crate::repair::ToolSchemaRegistry,
+        crate::config::ReasoningReplay,
+    ),
+    AppError,
+> {
+    let reasoning_decision =
+        config.reasoning_for_request(model, requested_effort, thinking_disabled);
+    let prompt_caching = config.prompt_caching_for_model(model);
+    let reasoning_replay = config.reasoning_replay_for_model(model);
+    let (mut outbound, registry) = translate::anthropic_to_responses(
+        req,
+        Some(reasoning_decision),
+        &prompt_caching,
+        &reasoning_replay,
+    )
+    .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
+    // The translator copies the inbound model name verbatim; rewrite
+    // it here so the upstream sees the alias-resolved name.
+    outbound.model = model.to_owned();
+
+    // If the operator configured a prompt-cache key, forward it. This
+    // is done after translation so the key is independent of the
+    // alias-resolved model name.
+    if !prompt_caching.models.is_empty() {
+        outbound.prompt_cache_key = prompt_caching.cache_key;
     }
-    let upstream_resp = loop {
-        let resp = send_upstream_once(&state, &url, &headers, &outbound).await?;
-        let status = resp.status();
-        if status.is_success() {
-            break resp;
-        }
-        let body = resp.text().await.unwrap_or_default();
-        // The body of the request that actually failed. Serialised from
-        // `outbound` right here, so it reflects *this* attempt — including
-        // a `default_model` fallback and any parameter the capability
-        // store stripped. (The old code read a task-local captured before
-        // the loop, which meant the log showed the pre-fallback body.)
-        let sent = serde_json::to_string(&outbound).unwrap_or_default();
-        tracing::warn!(%status, body = %body, "← upstream error");
-        tracing::warn!(
-            target: "upstream_payload",
-            %status,
-            sent_body = %sent,
-            "← upstream error (full payload)"
-        );
+    Ok((outbound, registry, reasoning_replay))
+}
 
-        // Retry without a parameter the upstream says it does not
-        // support (e.g. `temperature` on an always-reasoning model).
-        // Two guard rails keep this conservative: the error must name a
-        // parameter we actually sent, and the body must say it is
-        // *unsupported* rather than merely invalid (see
-        // `capabilities::unsupported_parameter`). Each fact is recorded
-        // for the rest of the process, so the retry costs at most one
-        // wasted request per (model, parameter) per process lifetime.
-        if param_retries < capabilities::RequestParam::ALL.len()
-            && let Some(param) = capabilities::unsupported_parameter(status, &body)
-            && param.is_set(&outbound)
-        {
-            let newly_learned = state.capabilities.record_unsupported(&outbound.model, param);
-            tracing::warn!(
-                model = %outbound.model,
-                param = %param.as_str(),
-                newly_learned,
-                "upstream rejected request parameter; retrying without it"
+impl Attempt {
+    fn url(&self) -> String {
+        format!(
+            "{}{}",
+            self.state.config.upstream_base_url.trim_end_matches('/'),
+            self.state.config.upstream_path
+        )
+    }
+
+    /// Send repeatedly until the upstream answers with a success status.
+    /// Owns the `capabilities.apply_known` before the first send and after
+    /// a fallback re-translation, the parameter-strip retry (bounded by
+    /// `RequestParam::ALL.len()`), the one-shot `attempt == 1`
+    /// `default_model` fallback and `map_upstream_error`. Returns the raw
+    /// response so the streaming branch can still take `.bytes_stream()`.
+    async fn send_success(&mut self, url: &str) -> Result<reqwest::Response, AppError> {
+        // Apply anything already learned about this model before the first
+        // send, so a fact cached on an earlier request (or by a concurrent
+        // one) is honoured immediately instead of re-triggering the 400.
+        let already_dropped = self.state.capabilities.apply_known(&mut self.outbound);
+        if !already_dropped.is_empty() {
+            tracing::debug!(
+                model = %self.outbound.model,
+                params = ?already_dropped,
+                "omitting parameters previously rejected by this model"
             );
-            // Surface the discovery in the operator's log pane (and on
-            // stdout with --no-tui). Only on first sight of the fact:
-            // a model that rejects both temperature and top_p produces
-            // one line each, and repeats would just be noise.
-            if newly_learned {
-                state.output.emit(crate::tui::LogLine {
-                    kind: crate::tui::LogKind::Warning,
-                    text: format!(
-                        "  \u{26a0} learned: {} does not support {}  (dropping it from now on; press c to re-probe)",
-                        outbound.model,
-                        param.as_str()
-                    ),
-                });
-            }
-            param.clear_from(&mut outbound);
-            param_retries += 1;
-            continue;
         }
-
-        // Decide whether to retry with the default model. The retry
-        // happens before any response bytes are written to the client
-        // (streaming or not), so it is safe for both paths. Only one
-        // retry; the loop ends after attempt 2 regardless. The
-        // fallback name comes from the runtime snapshot, so an edit
-        // made via the TUI is honoured just like an alias edit is.
-        //
-        // `outbound.model` is the *alias-resolved* upstream name — the
-        // same name the fallback would carry — so comparing the two is
-        // exactly right.
-        let rejection = model_rejection::detect_model_rejection(status.as_u16(), &body);
-        // `default_model` may be written as an inbound name or as an
-        // upstream name; resolving it through the alias map makes both
-        // work, and makes the comparison below like-for-like (both sides
-        // are then alias-resolved upstream names).
-        let fallback = mappings_snapshot
-            .default_model()
-            .map(|fb| mappings_snapshot.resolve(fb));
-        let should_retry = attempt == 1
-            && rejection.is_some()
-            && fallback.as_deref().is_some_and(|fb| fb != outbound.model);
-
-        if should_retry {
-            let fallback = fallback.unwrap_or_default();
-            let requested_effort = req
-                .output_config
-                .as_ref()
-                .and_then(|oc| oc.effort.as_deref());
-            let thinking_disabled = req
-                .thinking
-                .as_ref()
-                .is_some_and(|t| t.r#type.eq_ignore_ascii_case("disabled"));
-            let fallback_reasoning =
-                state
-                    .config
-                    .reasoning_for_request(&fallback, requested_effort, thinking_disabled);
-            let fallback_prompt_caching = state.config.prompt_caching_for_model(&fallback);
-            let fallback_reasoning_replay = state.config.reasoning_replay_for_model(&fallback);
+        loop {
+            let resp = send_upstream_once(&self.state, url, &self.headers, &self.outbound).await?;
+            let status = resp.status();
+            if status.is_success() {
+                break Ok(resp);
+            }
+            let body = resp.text().await.unwrap_or_default();
+            // The body of the request that actually failed. Serialised from
+            // `outbound` right here, so it reflects *this* attempt — including
+            // a `default_model` fallback and any parameter the capability
+            // store stripped. (The old code read a task-local captured before
+            // the loop, which meant the log showed the pre-fallback body.)
+            let sent = serde_json::to_string(&self.outbound).unwrap_or_default();
+            tracing::warn!(%status, body = %body, "← upstream error");
             tracing::warn!(
-                // The model the *client* asked for.
-                inbound_model = %log_safe(&req.model),
-                // The upstream name that was rejected.
-                rejected_model = %log_safe(&outbound.model),
-                fallback_model = %log_safe(&fallback),
-                // The name the upstream itself used, when it named one.
-                upstream_named_model = ?rejection.as_ref().and_then(|r| r.rejected.as_deref()),
-                // What the upstream said it would serve instead. Telemetry
-                // only — we do NOT route to it (it is untrusted input and
-                // it bypasses the operator's model policy), but it is the
-                // most actionable thing in the log: it tells the operator
-                // exactly which alias to add.
-                suggested_model = ?rejection.as_ref().and_then(|r| r.suggested.as_deref()),
-                "upstream rejected model; falling back to default_model"
+                target: "upstream_payload",
+                %status,
+                sent_body = %sent,
+                "← upstream error (full payload)"
             );
 
-            // Rebuild the translated request for the fallback model. Prompt
-            // cache breakpoints are embedded in `input`, so patching only the
-            // model and reasoning fields would leak the first model's cache
-            // policy into the retry. The registry is also rebuilt so its
-            // repaired-input path stays bound to this attempt's tools.
-            let (fb_outbound, fb_registry) = translate::anthropic_to_responses(
-                &req,
-                Some(fallback_reasoning),
-                &fallback_prompt_caching,
-                &fallback_reasoning_replay,
-            )
-            .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
-            outbound = fb_outbound;
-            registry = fb_registry;
-            outbound.model = fallback.to_owned();
-            if !fallback_prompt_caching.models.is_empty() {
-                outbound.prompt_cache_key = fallback_prompt_caching.cache_key.clone();
+            // Retry without a parameter the upstream says it does not
+            // support (e.g. `temperature` on an always-reasoning model).
+            // Two guard rails keep this conservative: the error must name a
+            // parameter we actually sent, and the body must say it is
+            // *unsupported* rather than merely invalid (see
+            // `capabilities::unsupported_parameter`). Each fact is recorded
+            // for the rest of the process, so the retry costs at most one
+            // wasted request per (model, parameter) per process lifetime.
+            if self.param_retries < capabilities::RequestParam::ALL.len()
+                && let Some(param) = capabilities::unsupported_parameter(status, &body)
+                && param.is_set(&self.outbound)
+            {
+                let newly_learned = self
+                    .state
+                    .capabilities
+                    .record_unsupported(&self.outbound.model, param);
+                tracing::warn!(
+                    model = %self.outbound.model,
+                    param = %param.as_str(),
+                    newly_learned,
+                    "upstream rejected request parameter; retrying without it"
+                );
+                // Surface the discovery in the operator's log pane (and on
+                // stdout with --no-tui). Only on first sight of the fact:
+                // a model that rejects both temperature and top_p produces
+                // one line each, and repeats would just be noise.
+                if newly_learned {
+                    self.state.output.emit(crate::tui::LogLine {
+                        kind: crate::tui::LogKind::Warning,
+                        text: format!(
+                            "  \u{26a0} learned: {} does not support {}  (dropping it from now on; press c to re-probe)",
+                            self.outbound.model,
+                            param.as_str()
+                        ),
+                    });
+                }
+                param.clear_from(&mut self.outbound);
+                self.param_retries += 1;
+                continue;
             }
-            // The rebuilt request carries the client's full parameter
-            // set again, so apply anything already learned about the
-            // fallback model before it goes on the wire.
-            state.capabilities.apply_known(&mut outbound);
-            fallback_used = true;
-            attempt = 2;
-            continue;
+
+            // Decide whether to retry with the default model. The retry
+            // happens before any response bytes are written to the client
+            // (streaming or not), so it is safe for both paths. Only one
+            // retry; the loop ends after attempt 2 regardless. The
+            // fallback name comes from the runtime snapshot, so an edit
+            // made via the TUI is honoured just like an alias edit is.
+            //
+            // `outbound.model` is the *alias-resolved* upstream name — the
+            // same name the fallback would carry — so comparing the two is
+            // exactly right.
+            let rejection = model_rejection::detect_model_rejection(status.as_u16(), &body);
+            // `default_model` may be written as an inbound name or as an
+            // upstream name; resolving it through the alias map makes both
+            // work, and makes the comparison below like-for-like (both sides
+            // are then alias-resolved upstream names).
+            let fallback = self
+                .mappings_snapshot
+                .default_model()
+                .map(|fb| self.mappings_snapshot.resolve(fb));
+            let should_retry = self.attempt == 1
+                && rejection.is_some()
+                && fallback
+                    .as_deref()
+                    .is_some_and(|fb| fb != self.outbound.model);
+
+            if should_retry {
+                let fallback = fallback.unwrap_or_default();
+                tracing::warn!(
+                    // The model the *client* asked for.
+                    inbound_model = %log_safe(&self.req.model),
+                    // The upstream name that was rejected.
+                    rejected_model = %log_safe(&self.outbound.model),
+                    fallback_model = %log_safe(&fallback),
+                    // The name the upstream itself used, when it named one.
+                    upstream_named_model = ?rejection.as_ref().and_then(|r| r.rejected.as_deref()),
+                    // What the upstream said it would serve instead. Telemetry
+                    // only — we do NOT route to it (it is untrusted input and
+                    // it bypasses the operator's model policy), but it is the
+                    // most actionable thing in the log: it tells the operator
+                    // exactly which alias to add.
+                    suggested_model = ?rejection.as_ref().and_then(|r| r.suggested.as_deref()),
+                    "upstream rejected model; falling back to default_model"
+                );
+
+                // Rebuild the translated request for the fallback model. Prompt
+                // cache breakpoints are embedded in `input`, so patching only the
+                // model and reasoning fields would leak the first model's cache
+                // policy into the retry. The registry is also rebuilt so its
+                // repaired-input path stays bound to this attempt's tools.
+                // The fallback's replay counter is intentionally never
+                // reported today — only the first attempt logs `replayed_chars`.
+                let (fb_outbound, fb_registry, _) = build_outbound(
+                    &self.req,
+                    self.state.config.as_ref(),
+                    &fallback,
+                    self.requested_effort.as_deref(),
+                    self.thinking_disabled,
+                )?;
+                self.outbound = fb_outbound;
+                self.registry = fb_registry;
+                // The rebuilt request carries the client's full parameter
+                // set again, so apply anything already learned about the
+                // fallback model before it goes on the wire.
+                self.state.capabilities.apply_known(&mut self.outbound);
+                self.fallback_used = true;
+                self.attempt = 2;
+                continue;
+            }
+
+            return Err(map_upstream_error(status, &body));
+        }
+    }
+
+    /// Send and classify. The hidden validation retry is non-streaming
+    /// only: streaming bytes are already flowing at that point.
+    async fn execute(&mut self, url: &str) -> Result<Outcome, AppError> {
+        let upstream_resp = self.send_success(url).await?;
+        let status = upstream_resp.status();
+        debug_assert!(status.is_success(), "loop above only breaks on success");
+
+        if self.outbound.stream {
+            return Ok(Outcome::Streaming(upstream_resp));
         }
 
-        return Err(map_upstream_error(status, &body));
-    };
-
-    let status = upstream_resp.status();
-    debug_assert!(status.is_success(), "loop above only breaks on success");
-
-    if outbound.stream {
-        let content_type = upstream_resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("text/event-stream"));
-        let byte_stream = upstream_resp.bytes_stream();
-        let sse: EventStream<_> = byte_stream.eventsource();
-
-        let msg_id = synthetic_message_id(&req);
-        let model = outbound.model.clone();
-        let translator_stream = TranslatorStream::new(
-            sse,
-            TranslatorStreamConfig {
-                msg_id,
-                model,
-                registry,
-                start,
-                sink: state.output.clone(),
-                session_stats: state.stats.clone(),
-                stats_model: stats_model(&req.model, &outbound.model, fallback_used),
-                fallback_used,
-            },
-        );
-
-        let body = Body::from_stream(translator_stream);
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .map_err(|e| AppError::Internal(format!("build streaming response: {e}")))?;
-        Ok(response)
-    } else {
         let mut upstream_resp_body = parse_upstream_body(upstream_resp).await?;
 
         // Hidden validation retry: if the repaired tool input still
@@ -602,7 +617,8 @@ async fn handle_messages_inner(
         // all (bytes are already flowing).
         let mut validation_retries = 0u8;
         while validation_retries < 1 {
-            let violations = crate::repair::tool_input_violations(&upstream_resp_body, &registry);
+            let violations =
+                crate::repair::tool_input_violations(&upstream_resp_body, &self.registry);
             if violations.is_empty() {
                 break;
             }
@@ -611,11 +627,11 @@ async fn handle_messages_inner(
                 "tool input violates the original schema after repair; issuing corrective retry"
             );
             crate::repair::append_corrective_input(
-                &mut outbound.input,
+                &mut self.outbound.input,
                 &upstream_resp_body,
                 &violations,
             );
-            let resp = send_upstream_once(&state, &url, &headers, &outbound).await?;
+            let resp = send_upstream_once(&self.state, url, &self.headers, &self.outbound).await?;
             if !resp.status().is_success() {
                 // Upstream error on the retry: keep the original
                 // (already-successful) response body for error mapping.
@@ -625,54 +641,123 @@ async fn handle_messages_inner(
             validation_retries += 1;
         }
 
-        let anth = translate::responses_to_anthropic(&upstream_resp_body, &registry);
-        if is_countable_response_status(&upstream_resp_body.status)
-            && let Some(usage) = upstream_resp_body.usage.as_ref()
-        {
-            let usage = token_usage(usage);
-            if fallback_used {
-                state.stats.record_actual(outbound.model.clone(), usage);
-            } else {
-                state.stats.record(req.model.clone(), usage);
-            }
-        }
-        let elapsed = start.elapsed();
-        let usage = &upstream_resp_body.usage;
-        let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
-        let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
-        let thinking = usage
-            .as_ref()
-            .and_then(|u| u.output_tokens_details.as_ref())
-            .map_or(0, |d| d.reasoning_tokens);
-        let cache_read = usage
-            .as_ref()
-            .and_then(|u| u.input_tokens_details.as_ref())
-            .map_or(0, |d| d.cached_tokens);
-        let cache_write = usage
-            .as_ref()
-            .and_then(|u| u.input_tokens_details.as_ref())
-            .map_or(0, |d| d.cache_write_tokens);
-        let thinking_str = if thinking > 0 {
-            format!("  |  {} thinking", thinking)
-        } else {
-            String::new()
-        };
-        let line = format!(
-            "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
-            upstream_resp_body.status,
-            elapsed.as_secs_f64(),
-            in_tokens,
-            out_tokens,
-            thinking_str,
-            cache_read,
-            cache_write,
-        );
-        state.output.emit(crate::tui::LogLine {
-            kind: crate::tui::LogKind::Response,
-            text: line,
-        });
-        Ok(Json(anth).into_response())
+        Ok(Outcome::Buffered(upstream_resp_body))
     }
+
+    async fn run(mut self) -> Result<Response, AppError> {
+        let url = self.url();
+        // Retries are issued here -- before any response bytes are written,
+        // so the streaming path is safe too (see TODO at the end of this
+        // file): once per sampling parameter the upstream says it does not
+        // support, and once with the configured `default_model` if the
+        // upstream rejects the requested model entirely.
+        match self.execute(&url).await? {
+            Outcome::Streaming(resp) => render_streaming(self, resp),
+            Outcome::Buffered(body) => render_json(&self, body),
+        }
+    }
+}
+
+/// Render the raw upstream SSE response into an Anthropic-shaped stream.
+/// `TranslatorStream` takes ownership of the registry and clones the sink /
+/// stats; its `Drop` hook prints the response line and records usage.
+fn render_streaming(
+    attempt: Attempt,
+    upstream_resp: reqwest::Response,
+) -> Result<Response, AppError> {
+    let content_type = upstream_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("text/event-stream"));
+    let byte_stream = upstream_resp.bytes_stream();
+    let sse: EventStream<_> = byte_stream.eventsource();
+
+    let msg_id = synthetic_message_id(&attempt.req);
+    let model = attempt.outbound.model.clone();
+    let translator_stream = TranslatorStream::new(
+        sse,
+        TranslatorStreamConfig {
+            msg_id,
+            model,
+            registry: attempt.registry,
+            start: attempt.start,
+            sink: attempt.state.output.clone(),
+            session_stats: attempt.state.stats.clone(),
+            stats_model: stats_model(
+                &attempt.req.model,
+                &attempt.outbound.model,
+                attempt.fallback_used,
+            ),
+            fallback_used: attempt.fallback_used,
+        },
+    );
+
+    let body = Body::from_stream(translator_stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("build streaming response: {e}")))
+}
+
+/// Translate a buffered upstream response, record stats once, emit the
+/// operator-visible `←` line, and return the Anthropic JSON response.
+fn render_json(
+    attempt: &Attempt,
+    upstream_resp_body: responses::ResponsesResponse,
+) -> Result<Response, AppError> {
+    let anth = translate::responses_to_anthropic(&upstream_resp_body, &attempt.registry);
+    if is_countable_response_status(&upstream_resp_body.status)
+        && let Some(usage) = upstream_resp_body.usage.as_ref()
+    {
+        let usage = token_usage(usage);
+        if attempt.fallback_used {
+            attempt
+                .state
+                .stats
+                .record_actual(attempt.outbound.model.clone(), usage);
+        } else {
+            attempt.state.stats.record(attempt.req.model.clone(), usage);
+        }
+    }
+    let elapsed = attempt.start.elapsed();
+    let usage = &upstream_resp_body.usage;
+    let in_tokens = usage.as_ref().map_or(0, |u| u.input_tokens);
+    let out_tokens = usage.as_ref().map_or(0, |u| u.output_tokens);
+    let thinking = usage
+        .as_ref()
+        .and_then(|u| u.output_tokens_details.as_ref())
+        .map_or(0, |d| d.reasoning_tokens);
+    let cache_read = usage
+        .as_ref()
+        .and_then(|u| u.input_tokens_details.as_ref())
+        .map_or(0, |d| d.cached_tokens);
+    let cache_write = usage
+        .as_ref()
+        .and_then(|u| u.input_tokens_details.as_ref())
+        .map_or(0, |d| d.cache_write_tokens);
+    let thinking_str = if thinking > 0 {
+        format!("  |  {} thinking", thinking)
+    } else {
+        String::new()
+    };
+    let line = format!(
+        "  ← {}  |  {:.2}s  |  {} in  |  {} out{}  |  cache: {}r {}w",
+        upstream_resp_body.status,
+        elapsed.as_secs_f64(),
+        in_tokens,
+        out_tokens,
+        thinking_str,
+        cache_read,
+        cache_write,
+    );
+    attempt.state.output.emit(crate::tui::LogLine {
+        kind: crate::tui::LogKind::Response,
+        text: line,
+    });
+    Ok(Json(anth).into_response())
 }
 
 /// Print a response stats line from a `StreamStats` (used by the streaming path).
@@ -1305,5 +1390,4 @@ mod tests {
         let resp = AppError::Unauthorized.into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-
 }
