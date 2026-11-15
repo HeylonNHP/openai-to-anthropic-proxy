@@ -225,7 +225,11 @@ pub struct Config {
 ///   `timeout_secs` 45) — an absent key is *not* "no limit";
 /// * **`0`** → **no limit** — the house precedent of
 ///   `reasoning_replay.max_chars`, where `0` means unlimited;
-/// * **`n > 0`** → that bound.
+/// * **`n > 0`** → that bound;
+/// * **an INVALID value** (negative, fractional, or too large for the
+///   field's type) → the shipped default **with a warning** — the proxy
+///   still starts. An operator typo in one limit must not take the whole
+///   deployment down (see `resolve_advisor_limit`).
 ///
 /// "No limit" means something DIFFERENT per field, and the difference
 /// matters:
@@ -662,10 +666,11 @@ impl Config {
 
         // `advisor`: env > file > default, following `pick_str`. The whole
         // feature is off unless `enabled` resolves to true. A limit of `0`
-        // means "no limit" (see `AdvisorConfig`); a value that does not fit
-        // the field's integer type falls back to the default with a warning
-        // rather than failing startup — the same house style as an unusable
-        // upstream value surfacing as a 400 instead of a startup error.
+        // means "no limit" (see `AdvisorConfig`); a value that cannot be a
+        // limit (negative, fractional, or too big for the field's type)
+        // falls back to the default with a warning rather than failing
+        // startup — the same house style as an unusable upstream value
+        // surfacing as a 400 instead of a startup error.
         //
         // The warnings are COLLECTED, not emitted: the tracing subscriber
         // does not exist yet (the binary installs it after this returns), so
@@ -687,24 +692,27 @@ impl Config {
             env.advisor_effort.as_deref(),
         );
         let advisor_max_uses = resolve_advisor_limit(
-            pick_u64(advisor_json.and_then(|a| a.max_uses), env.advisor_max_uses),
+            pick_limit(
+                advisor_json.and_then(|a| a.max_uses.as_ref()),
+                env.advisor_max_uses.as_ref(),
+            ),
             DEFAULT_ADVISOR_MAX_USES,
             "advisor.max_uses",
             &mut warnings,
         );
         let advisor_max_tokens = resolve_advisor_limit(
-            pick_u64(
-                advisor_json.and_then(|a| a.max_tokens),
-                env.advisor_max_tokens,
+            pick_limit(
+                advisor_json.and_then(|a| a.max_tokens.as_ref()),
+                env.advisor_max_tokens.as_ref(),
             ),
             DEFAULT_ADVISOR_MAX_TOKENS,
             "advisor.max_tokens",
             &mut warnings,
         );
         let advisor_timeout_secs = resolve_advisor_limit(
-            pick_u64(
-                advisor_json.and_then(|a| a.timeout_secs),
-                env.advisor_timeout_secs,
+            pick_limit(
+                advisor_json.and_then(|a| a.timeout_secs.as_ref()),
+                env.advisor_timeout_secs.as_ref(),
             ),
             DEFAULT_ADVISOR_TIMEOUT_SECS,
             "advisor.timeout_secs",
@@ -933,18 +941,20 @@ pub struct EnvInputs {
     /// `PROXY_KEY=<secret>` enables client auth via `X-Proxy-Key`.
     pub proxy_key: Option<String>,
     /// Advisor overrides. `ADVISOR_ENABLED` uses the same truthy values as
-    /// `LOG_TO_DISK`; numeric values that fail to parse are ignored (the
+    /// `LOG_TO_DISK`; a value that is not a number at all is ignored (the
     /// file/default value wins) rather than silently disabling the section.
     ///
-    /// The two token limits are read as `u64` so an out-of-range value
-    /// (`ADVISOR_MAX_USES=99999999999`) reaches the resolver and is
-    /// reported with a WARN instead of being dropped in silence.
+    /// The three limits are read as RAW numbers (`serde_json::Number`), so
+    /// a negative or fractional value REACHES the resolver instead of
+    /// being dropped in silence: the resolver judges it exactly like a
+    /// value from `proxy.json` — an invalid one falls back to the shipped
+    /// default WITH a warning, and a valid one is that bound.
     pub advisor_enabled: Option<bool>,
     pub advisor_model: Option<String>,
     pub advisor_effort: Option<String>,
-    pub advisor_max_uses: Option<u64>,
-    pub advisor_max_tokens: Option<u64>,
-    pub advisor_timeout_secs: Option<u64>,
+    pub advisor_max_uses: Option<serde_json::Number>,
+    pub advisor_max_tokens: Option<serde_json::Number>,
+    pub advisor_timeout_secs: Option<serde_json::Number>,
 }
 
 fn parse_truthy(raw: &str) -> bool {
@@ -973,13 +983,13 @@ impl EnvInputs {
             advisor_effort: env::var("ADVISOR_EFFORT").ok(),
             advisor_max_uses: env::var("ADVISOR_MAX_USES")
                 .ok()
-                .and_then(|s| s.parse().ok()),
+                .and_then(|s| parse_env_limit(&s)),
             advisor_max_tokens: env::var("ADVISOR_MAX_TOKENS")
                 .ok()
-                .and_then(|s| s.parse().ok()),
+                .and_then(|s| parse_env_limit(&s)),
             advisor_timeout_secs: env::var("ADVISOR_TIMEOUT_SECS")
                 .ok()
-                .and_then(|s| s.parse().ok()),
+                .and_then(|s| parse_env_limit(&s)),
         }
     }
 }
@@ -1003,22 +1013,90 @@ fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
     env_value.or(file_value)
 }
 
-/// Resolve one advisor limit from its JSON/env value.
+/// Pick an advisor limit: env > file.
+///
+/// The value is a RAW number (see [`JsonAdvisorConfig`]); the resolver is
+/// the only place that judges it.
+fn pick_limit(
+    file_value: Option<&serde_json::Number>,
+    env_value: Option<&serde_json::Number>,
+) -> Option<serde_json::Number> {
+    env_value.or(file_value).cloned()
+}
+
+/// How a raw (unresolved) advisor limit number was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawLimit {
+    /// A whole number that fits in `u64`.
+    Whole(u64),
+    /// A negative number.
+    Negative,
+    /// A number with a fractional part.
+    Fractional,
+    /// A whole number too large to be a limit.
+    TooLarge,
+}
+
+/// Classify a raw advisor limit number.
+///
+/// The JSON layer accepts ANY number (so a typo can never stop the proxy
+/// from starting); this is where the number is judged:
+///
+/// * a whole, non-negative number → `Whole(v)`;
+/// * a negative number → `Negative`;
+/// * a number with a fractional part → `Fractional`;
+/// * a whole number too large for `u64` → `TooLarge`.
+fn classify_limit(number: &serde_json::Number) -> RawLimit {
+    if let Some(v) = number.as_u64() {
+        return RawLimit::Whole(v);
+    }
+    if let Some(v) = number.as_i64() {
+        // serde_json stores every negative integer as an `i64`.
+        return if v < 0 {
+            RawLimit::Negative
+        } else {
+            RawLimit::Whole(v as u64)
+        };
+    }
+    // A float: serde_json only stores one when the number is not a plain
+    // integer (or is too big for `u64`).
+    let Some(v) = number.as_f64() else {
+        // Unreachable in practice: a `serde_json::Number` is always an
+        // integer or a float.
+        return RawLimit::Fractional;
+    };
+    if !v.is_finite() {
+        return RawLimit::TooLarge;
+    }
+    if v.fract() != 0.0 {
+        return RawLimit::Fractional;
+    }
+    if v < 0.0 {
+        return RawLimit::Negative;
+    }
+    if v >= u64::MAX as f64 {
+        return RawLimit::TooLarge;
+    }
+    RawLimit::Whole(v as u64)
+}
+
+/// Resolve one advisor limit from its raw JSON/env value.
 ///
 /// * **absent** → the shipped default (an absent key is NOT "no limit");
 /// * **`0`** → **no limit** (`None`);
-/// * **`n > 0`** → `Some(n)`.
+/// * **`n > 0`** → `Some(n)`;
+/// * **anything else** (negative, fractional, too large for the field's
+///   type) → the shipped default WITH a warning.
 ///
-/// A value that does not fit the field's integer type falls back to the
-/// default with a warning: an operator typo must not stop the proxy from
-/// starting. (`0` is meaningful now, so there is no other invalid value
-/// for these three fields.)
+/// A value that cannot be a limit falls back to the default instead of
+/// failing the startup: an operator typo must not stop the proxy from
+/// starting.
 ///
 /// The warning is COLLECTED, not emitted: the resolver runs before the
 /// tracing subscriber exists, so a `tracing::warn!` here would vanish.
 /// See [`ConfigWarning`].
 fn resolve_advisor_limit<T>(
-    value: Option<u64>,
+    value: Option<serde_json::Number>,
     default: T,
     field: &str,
     warnings: &mut Vec<ConfigWarning>,
@@ -1027,29 +1105,93 @@ where
     T: Copy + std::fmt::Display + TryFrom<u64>,
     T::Error: std::fmt::Display,
 {
-    match value {
-        None => Some(default),
-        Some(0) => None,
-        Some(v) => match T::try_from(v) {
-            Ok(n) => Some(n),
-            Err(err) => {
-                warnings.push(
-                    ConfigWarning::new(format!(
-                        "{field} = {v} is out of range ({err}); using the default {default}"
-                    ))
-                    .with_field("field", field)
-                    .with_field("value", v.to_string())
-                    .with_field("fallback", default.to_string()),
-                );
-                Some(default)
-            }
-        },
+    let Some(number) = value.as_ref() else {
+        return Some(default);
+    };
+    let v = match classify_limit(number) {
+        RawLimit::Whole(v) => v,
+        RawLimit::Negative => {
+            push_invalid_limit_warning(warnings, field, number, default, "it is negative");
+            return Some(default);
+        }
+        RawLimit::Fractional => {
+            push_invalid_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it is not a whole number",
+            );
+            return Some(default);
+        }
+        RawLimit::TooLarge => {
+            push_invalid_limit_warning(warnings, field, number, default, "it is out of range");
+            return Some(default);
+        }
+    };
+    if v == 0 {
+        // `0` = no limit (see `AdvisorConfig`).
+        return None;
+    }
+    match T::try_from(v) {
+        Ok(n) => Some(n),
+        Err(err) => {
+            warnings.push(
+                ConfigWarning::new(format!(
+                    "{field} = {v} is out of range ({err}); using the default {default}"
+                ))
+                .with_field("field", field)
+                .with_field("value", v.to_string())
+                .with_field("fallback", default.to_string()),
+            );
+            Some(default)
+        }
+    }
+}
+
+/// Record the warning for an advisor limit that cannot be a limit
+/// (negative, fractional, too large). COLLECTED, not emitted — see
+/// [`ConfigWarning`].
+fn push_invalid_limit_warning<T: std::fmt::Display>(
+    warnings: &mut Vec<ConfigWarning>,
+    field: &str,
+    number: &serde_json::Number,
+    default: T,
+    reason: &str,
+) {
+    warnings.push(
+        ConfigWarning::new(format!(
+            "{field} = {number} is not a valid limit ({reason}); using the default {default}"
+        ))
+        .with_field("field", field)
+        .with_field("value", number.to_string())
+        .with_field("fallback", default.to_string()),
+    );
+}
+
+/// Parse an advisor limit from an env var.
+///
+/// The env var is a free-form STRING, so it can hold anything the operator
+/// typed. Every JSON NUMBER is kept — negative, fractional, huge — so the
+/// resolver judges it exactly like a value from `proxy.json` (and warns
+/// about the invalid ones instead of dropping them in silence).
+///
+/// A value that is not a number at all is IGNORED: the file/default value
+/// wins. That is the long-standing behaviour for these vars.
+fn parse_env_limit(raw: &str) -> Option<serde_json::Number> {
+    match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        Ok(serde_json::Value::Number(n)) => Some(n),
+        _ => None,
     }
 }
 
 /// JSON representation of `proxy.json`. Every field is optional; missing
 /// fields fall through to env vars and then to defaults.
-#[derive(Debug, Default, Deserialize, Serialize)]
+///
+/// `PartialEq` (and `Eq`) so a test can compare a config with its
+/// round-tripped self: the advisor limits are raw JSON numbers, which
+/// serde_json keeps `Eq` (its floats are always finite).
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JsonConfig {
     pub listen_addr: Option<String>,
@@ -1108,24 +1250,49 @@ pub struct JsonConfig {
 /// default; `0` means **no limit**. See [`AdvisorConfig`] for what "no
 /// limit" means per field.
 ///
-/// The three limits are `u64` here on purpose. The RESOLVED values are
-/// `u32` / `u32` / `u64` ([`AdvisorConfig`]), but a JSON number that does
-/// not fit `u32` must still PARSE: with a narrow type it would be a hard
-/// startup failure ("invalid value: integer 4294967296, expected u32"),
-/// which contradicts the house rule that an operator typo in one advisor
-/// limit must not take the whole deployment down. Widening the JSON type
-/// lets the resolver range-check the value and fall back to the default
-/// WITH a warning. The serialized shape is unchanged, so `deny_unknown_fields`
-/// and the TUI rollback guarantee are unaffected.
-#[derive(Debug, Default, Deserialize, Serialize)]
+/// ## The three limits are RAW numbers
+///
+/// `max_uses` / `max_tokens` / `timeout_secs` are
+/// `Option<serde_json::Number>` — the number EXACTLY as the operator
+/// wrote it, with NO sign, fraction or range check at parse time. That is
+/// deliberate:
+///
+/// * a NEGATIVE number (`-1`) and a FRACTIONAL one (`2.5`) used to be
+///   rejected by serde at PARSE time (`invalid value: integer -1,
+///   expected u64`), so the proxy EXITED — the opposite of the house rule
+///   that an operator typo in one advisor limit must not take the whole
+///   deployment down;
+/// * a number too big for the field's range used to fail the same way.
+///
+/// Now the JSON layer accepts ANY JSON number and the RESOLVER is the
+/// only place that interprets one: `0` → no limit, a positive whole
+/// number in range → that bound, and anything else (negative,
+/// fractional, too large) → the shipped default WITH a warning. The
+/// serialized shape is unchanged for every value, so the TUI's rewrite of
+/// `proxy.json` (§17.2) and its rollback guarantee are unaffected: an
+/// invalid value is written back VERBATIM, so the operator can still see
+/// (and fix) their typo.
+///
+/// A value that is not a NUMBER at all (a string, say) is still a
+/// configuration error: serde rejects it with a clear message.
+///
+/// `Eq` is safe: `serde_json::Number` only ever holds FINITE floats, so
+/// it is `Eq` (see serde_json's own `Number`).
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonAdvisorConfig {
     pub enabled: Option<bool>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub max_uses: Option<u64>,
-    pub max_tokens: Option<u64>,
-    pub timeout_secs: Option<u64>,
+    /// Raw limit, exactly as written. The RESOLVER judges it — see the
+    /// struct docs.
+    pub max_uses: Option<serde_json::Number>,
+    /// Raw limit, exactly as written. The RESOLVER judges it — see the
+    /// struct docs.
+    pub max_tokens: Option<serde_json::Number>,
+    /// Raw limit, exactly as written. The RESOLVER judges it — see the
+    /// struct docs.
+    pub timeout_secs: Option<serde_json::Number>,
 }
 
 /// JSON shape of `reasoning`.
@@ -1139,7 +1306,7 @@ pub struct JsonAdvisorConfig {
 ///   requests. Same shape as `effort_map`, keyed by the `"disabled"`
 ///   sentinel. A value of `"none"` sends `reasoning.effort = "none"`;
 ///   `null` omits the upstream `reasoning` object.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JsonReasoningConfig {
     pub default: Option<String>,
@@ -1156,7 +1323,7 @@ pub struct JsonReasoningConfig {
 /// `default` is the fallback for all upstream models; `models` holds
 /// per-upstream-model translations. Inner values are `Option<String>` so
 /// `null` can mean "omit the upstream `reasoning` object".
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JsonEffortMap {
     #[serde(default)]
@@ -1180,7 +1347,7 @@ impl From<JsonEffortMap> for EffortMap {
 ///
 /// `#[serde(default)]` lets either field be omitted from the JSON —
 /// a `model_aliases` object with only `default_model` is valid.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonModelAliases {
     pub map: BTreeMap<String, String>,
@@ -1188,7 +1355,7 @@ pub struct JsonModelAliases {
 }
 
 /// JSON shape of `prompt_caching`.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonPromptCachingConfig {
     #[serde(default)]
@@ -1203,7 +1370,7 @@ pub struct JsonPromptCachingConfig {
 /// - `models` — flat upstream-model-name → mode object.
 /// - `max_chars` — max characters of reasoning text replayed per assistant
 ///   turn. `0` (the default) means unlimited.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonReasoningReplayConfig {
     pub default: Option<ReasoningReplayMode>,
@@ -1230,6 +1397,18 @@ mod tests {
             upstream_api_key: Some("sk-test".into()),
             ..EnvInputs::default()
         }
+    }
+
+    /// A raw advisor limit, exactly as the JSON layer holds it: the number
+    /// the operator wrote, with NO sign, fraction or range check. The
+    /// RESOLVER is the only place that judges it.
+    fn limit(n: u64) -> Option<serde_json::Number> {
+        Some(serde_json::Number::from(n))
+    }
+
+    /// A raw advisor limit written as a fraction (e.g. `2.5`).
+    fn fractional_limit(n: f64) -> Option<serde_json::Number> {
+        Some(serde_json::Number::from_f64(n).expect("a finite fraction"))
     }
 
     #[test]
@@ -1610,9 +1789,9 @@ mod tests {
                 enabled: Some(true),
                 model: Some("file-model".into()),
                 effort: Some("low".into()),
-                max_uses: Some(5),
-                max_tokens: Some(999),
-                timeout_secs: Some(30),
+                max_uses: limit(5),
+                max_tokens: limit(999),
+                timeout_secs: limit(30),
             }),
             ..JsonConfig::default()
         };
@@ -1620,9 +1799,9 @@ mod tests {
             advisor_enabled: Some(false),
             advisor_model: Some("env-model".into()),
             advisor_effort: Some("high".into()),
-            advisor_max_uses: Some(1),
-            advisor_max_tokens: Some(77),
-            advisor_timeout_secs: Some(9),
+            advisor_max_uses: limit(1),
+            advisor_max_tokens: limit(77),
+            advisor_timeout_secs: limit(9),
             ..env_with_required()
         };
         let cfg = Config::resolve(Some(&file), &env).unwrap();
@@ -1654,9 +1833,9 @@ mod tests {
         let file = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(true),
-                max_uses: Some(0),
-                max_tokens: Some(0),
-                timeout_secs: Some(0),
+                max_uses: limit(0),
+                max_tokens: limit(0),
+                timeout_secs: limit(0),
                 ..JsonAdvisorConfig::default()
             }),
             ..JsonConfig::default()
@@ -1684,9 +1863,9 @@ mod tests {
         let explicit = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(true),
-                max_uses: Some(3),
-                max_tokens: Some(1024),
-                timeout_secs: Some(20),
+                max_uses: limit(3),
+                max_tokens: limit(1024),
+                timeout_secs: limit(20),
                 ..JsonAdvisorConfig::default()
             }),
             ..JsonConfig::default()
@@ -1702,9 +1881,9 @@ mod tests {
         // The env override follows the same rule as the file: `0` = no
         // limit, absent = the default.
         let env = EnvInputs {
-            advisor_max_uses: Some(0),
-            advisor_max_tokens: Some(0),
-            advisor_timeout_secs: Some(0),
+            advisor_max_uses: limit(0),
+            advisor_max_tokens: limit(0),
+            advisor_timeout_secs: limit(0),
             ..env_with_required()
         };
         let cfg = Config::resolve(None, &env).unwrap();
@@ -1716,9 +1895,9 @@ mod tests {
         let file = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(true),
-                max_uses: Some(5),
-                max_tokens: Some(999),
-                timeout_secs: Some(30),
+                max_uses: limit(5),
+                max_tokens: limit(999),
+                timeout_secs: limit(30),
                 ..JsonAdvisorConfig::default()
             }),
             ..JsonConfig::default()
@@ -1735,8 +1914,8 @@ mod tests {
         // back to the default (the house style — a bad value must not stop
         // the proxy from starting) AND it raises a warning.
         let env = EnvInputs {
-            advisor_max_uses: Some(u64::from(u32::MAX) + 1),
-            advisor_max_tokens: Some(u64::from(u32::MAX) + 1),
+            advisor_max_uses: limit(u64::from(u32::MAX) + 1),
+            advisor_max_tokens: limit(u64::from(u32::MAX) + 1),
             ..env_with_required()
         };
         let cfg = Config::resolve(None, &env).unwrap();
@@ -1829,6 +2008,203 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_json_limit_still_loads_and_warns() {
+        // DEFECT: a NEGATIVE limit used to be a HARD STARTUP FAILURE — the
+        // JSON type was an unsigned integer, so serde rejected `-1` at
+        // PARSE time (`invalid value: integer -1, expected u64`) and the
+        // proxy EXITED. The JSON layer now accepts any number and the
+        // RESOLVER judges it: the proxy starts, the value falls back to
+        // the shipped default, and a warning is raised.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": {
+                "enabled": true,
+                "max_uses": -1,
+                "max_tokens": -2048,
+                "timeout_secs": -45
+            }
+        }"#;
+        let file = JsonConfig::parse(raw).expect("a negative limit must still parse");
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        assert_eq!(cfg.advisor.timeout_secs, Some(DEFAULT_ADVISOR_TIMEOUT_SECS));
+        assert_eq!(cfg.warnings.len(), 3, "one warning per invalid limit");
+        for warning in &cfg.warnings {
+            assert!(
+                warning.message.contains("is not a valid limit"),
+                "the warning says what happened: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("using the default"),
+                "the warning says what happened: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("negative"),
+                "the warning says WHY: {}",
+                warning.message
+            );
+        }
+        assert!(cfg.warnings[0].message.contains("advisor.max_uses"));
+        assert!(cfg.warnings[0].message.contains("-1"));
+        assert!(cfg.warnings[1].message.contains("advisor.max_tokens"));
+        assert!(cfg.warnings[2].message.contains("advisor.timeout_secs"));
+        // The structured fields name the field, the offending value and
+        // the fallback, so a postmortem can grep for them.
+        assert_eq!(
+            cfg.warnings[0].fields[0],
+            ("field".to_owned(), "advisor.max_uses".to_owned())
+        );
+        assert_eq!(
+            cfg.warnings[0].fields[1],
+            ("value".to_owned(), "-1".to_owned())
+        );
+        assert_eq!(
+            cfg.warnings[0].fields[2],
+            ("fallback".to_owned(), DEFAULT_ADVISOR_MAX_USES.to_string())
+        );
+    }
+
+    #[test]
+    fn a_fractional_json_limit_still_loads_and_warns() {
+        // The same for a FRACTIONAL limit: `2.5` is not a number of
+        // consultations, so it cannot be a limit — but it must not stop
+        // the proxy from starting either.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": { "enabled": true, "max_uses": 2.5, "max_tokens": 0.5 }
+        }"#;
+        let file = JsonConfig::parse(raw).expect("a fractional limit must still parse");
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        assert_eq!(cfg.warnings.len(), 2, "one warning per invalid limit");
+        for warning in &cfg.warnings {
+            assert!(
+                warning.message.contains("is not a valid limit"),
+                "{}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains("not a whole number"),
+                "the warning says WHY: {}",
+                warning.message
+            );
+        }
+        assert!(cfg.warnings[0].message.contains("advisor.max_uses"));
+        assert!(cfg.warnings[0].message.contains("2.5"));
+        assert!(cfg.warnings[1].message.contains("advisor.max_tokens"));
+    }
+
+    #[test]
+    fn an_invalid_json_limit_loads_through_the_real_entry_point() {
+        // The same as above, but through `Config::load_from` (fs read +
+        // parse + resolve) — the path the binary actually takes. The proxy
+        // must START with a negative limit in `proxy.json`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("advisor-negative-limit-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "upstream_base_url": "https://api.example.com",
+                "upstream_api_key":  "k",
+                "advisor": { "enabled": true, "max_uses": -1 }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).expect("the proxy must still start");
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.warnings.len(), 1, "the negative limit warns once");
+        assert!(cfg.warnings[0].message.contains("advisor.max_uses"));
+        assert!(cfg.warnings[0].message.contains("-1"));
+
+        // ...and the same for a fractional one.
+        std::fs::write(
+            &path,
+            r#"{
+                "upstream_base_url": "https://api.example.com",
+                "upstream_api_key":  "k",
+                "advisor": { "enabled": true, "max_uses": 2.5 }
+            }"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path).expect("the proxy must still start");
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.warnings.len(), 1, "the fractional limit warns once");
+        assert!(cfg.warnings[0].message.contains("2.5"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invalid_env_limit_warns_like_an_invalid_file_limit() {
+        // The ENV path follows the FILE path: a negative or fractional
+        // value is not silently dropped (as it was when the env var was
+        // parsed as an unsigned integer) — it reaches the resolver, which
+        // falls back to the default WITH a warning.
+        let env = EnvInputs {
+            advisor_max_uses: Some(serde_json::Number::from(-1)),
+            advisor_max_tokens: fractional_limit(2.5),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        assert_eq!(cfg.warnings.len(), 2, "one warning per invalid limit");
+        assert!(cfg.warnings[0].message.contains("advisor.max_uses"));
+        assert!(cfg.warnings[0].message.contains("negative"));
+        assert!(cfg.warnings[1].message.contains("advisor.max_tokens"));
+        assert!(cfg.warnings[1].message.contains("not a whole number"));
+    }
+
+    #[test]
+    fn a_valid_limit_is_used_unchanged_and_raises_no_warning() {
+        // The other side of the contract: a valid limit is that bound, and
+        // nothing is said about it.
+        let file = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                max_uses: limit(3),
+                max_tokens: limit(1024),
+                timeout_secs: limit(20),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(3));
+        assert_eq!(cfg.advisor.max_tokens, Some(1024));
+        assert_eq!(cfg.advisor.timeout_secs, Some(20));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    }
+
+    #[test]
+    fn a_whole_number_written_as_a_float_is_a_valid_limit() {
+        // `2.0` is a whole number in VALUE, so it is that bound — not an
+        // invalid value. The file keeps the operator's own spelling
+        // (`2.0`), the resolved limit is 2.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": { "enabled": true, "max_uses": 2.0 }
+        }"#;
+        let file = JsonConfig::parse(raw).expect("parse json");
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(2));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    }
+
+    #[test]
     fn config_warnings_carry_the_unbounded_loop_warning_once() {
         // The unbounded-loop warning is COLLECTED like every other
         // config-time warning, so the binary can print it after the
@@ -1837,7 +2213,7 @@ mod tests {
         let file = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(true),
-                max_uses: Some(0),
+                max_uses: limit(0),
                 ..JsonAdvisorConfig::default()
             }),
             ..JsonConfig::default()
@@ -1859,7 +2235,7 @@ mod tests {
         let disabled = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(false),
-                max_uses: Some(0),
+                max_uses: limit(0),
                 ..JsonAdvisorConfig::default()
             }),
             ..JsonConfig::default()
@@ -1990,23 +2366,24 @@ mod tests {
     }
 
     #[test]
-    fn the_widened_json_limits_survive_the_tui_save_round_trip() {
+    fn the_raw_json_limits_survive_the_tui_save_round_trip() {
         // The TUI rewrites `proxy.json` wholesale from the parsed
-        // `JsonConfig` (§17.2). The widened JSON types (`Option<u64>`)
-        // must not change that round-trip: an in-range value is written
-        // back unchanged, and an out-of-range value — which the resolver
-        // falls back on — is PRESERVED verbatim instead of being silently
-        // rewritten, so the operator can still see (and fix) their typo.
+        // `JsonConfig` (§17.2). The RAW JSON numbers must not change that
+        // round-trip: an in-range value is written back unchanged, and an
+        // out-of-range value — which the resolver falls back on — is
+        // PRESERVED verbatim instead of being silently rewritten, so the
+        // operator can still see (and fix) their typo.
         let raw = r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
             "advisor":{"enabled":true,"model":"beam","max_uses":2,"max_tokens":2048,
                        "timeout_secs":45}}"#;
         let parsed = JsonConfig::parse(raw).expect("parse json");
         let saved = serde_json::to_string_pretty(&parsed).unwrap();
         let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(reparsed, parsed, "the whole config round-trips");
         let advisor = reparsed.advisor.as_ref().unwrap();
-        assert_eq!(advisor.max_uses, Some(2));
-        assert_eq!(advisor.max_tokens, Some(2048));
-        assert_eq!(advisor.timeout_secs, Some(45));
+        assert_eq!(advisor.max_uses, Some(serde_json::Number::from(2)));
+        assert_eq!(advisor.max_tokens, Some(serde_json::Number::from(2048)));
+        assert_eq!(advisor.timeout_secs, Some(serde_json::Number::from(45)));
         // The saved form is the plain number an operator wrote — the
         // widened type does not leak into the file.
         assert!(saved.contains("\"max_uses\": 2"), "{saved}");
@@ -2022,10 +2399,36 @@ mod tests {
         let saved = serde_json::to_string_pretty(&oor).unwrap();
         assert!(saved.contains("4294967296"), "{saved}");
         let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(reparsed, oor, "the whole config round-trips");
         assert_eq!(
-            reparsed.advisor.as_ref().and_then(|a| a.max_uses),
-            Some(4294967296)
+            reparsed.advisor.as_ref().and_then(|a| a.max_uses.as_ref()),
+            Some(&serde_json::Number::from(4294967296u64))
         );
+    }
+
+    #[test]
+    fn an_invalid_json_limit_survives_the_tui_save_round_trip_verbatim() {
+        // A NEGATIVE or FRACTIONAL limit cannot be a limit (the resolver
+        // falls back to the default with a warning), but the TUI must
+        // write it back EXACTLY as the operator wrote it: the file is the
+        // operator's record of their intent, and silently rewriting the
+        // value would hide the typo.
+        let raw = r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
+            "advisor":{"enabled":true,"max_uses":-1,"max_tokens":2.5,"timeout_secs":-45}}"#;
+        let parsed = JsonConfig::parse(raw).expect("an invalid limit must still parse");
+        let saved = serde_json::to_string_pretty(&parsed).unwrap();
+        assert!(saved.contains("\"max_uses\": -1"), "{saved}");
+        assert!(saved.contains("\"max_tokens\": 2.5"), "{saved}");
+        assert!(saved.contains("\"timeout_secs\": -45"), "{saved}");
+        let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(reparsed, parsed, "the whole config round-trips unchanged");
+        let advisor = reparsed.advisor.as_ref().unwrap();
+        assert_eq!(advisor.max_uses, Some(serde_json::Number::from(-1)));
+        assert_eq!(
+            advisor.max_tokens,
+            Some(serde_json::Number::from_f64(2.5).unwrap())
+        );
+        assert_eq!(advisor.timeout_secs, Some(serde_json::Number::from(-45)));
     }
 
     #[test]

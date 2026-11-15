@@ -282,6 +282,7 @@ These three keys follow one rule, in `proxy.json` and in the env vars alike:
 | key **absent** | the shipped default — `max_uses` 2, `max_tokens` 2048, `timeout_secs` 45. An absent key is **not** "no limit". |
 | **`0`** | **no limit** |
 | `n > 0` | that bound |
+| invalid (negative, fractional, too large) | the shipped default, **with a warning** — the proxy still starts (see below) |
 
 `0` = unlimited follows the house precedent of `reasoning_replay.max_chars`, where `0` means unlimited. **"No limit" means something different per field**, so read the caveats before setting it:
 
@@ -291,15 +292,30 @@ These three keys follow one rule, in `proxy.json` and in the env vars alike:
 
 The env vars follow the same `0` = no limit rule (`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
 
-#### An out-of-range value is a warning, not a startup failure
+#### An invalid value is a warning, not a startup failure
 
-If a limit does not fit the field's range — for example `"max_uses": 4294967296`, which is bigger than the 32-bit value the proxy uses internally — the proxy **starts anyway**, falls back to that limit's shipped default, and prints a warning:
+A limit must be a **whole number that is not negative**. Anything else is invalid, and an invalid value never stops the proxy: it **starts anyway**, falls back to that limit's shipped default, and prints a warning. (The judgement is on the VALUE: `2` and `2.0` are the same valid limit; `-1` and `2.5` are not.)
+
+| written value | what happens |
+| --- | --- |
+| `"max_uses": -1` (negative) | starts; `max_uses` falls back to the default (`2`); warning |
+| `"max_uses": 2.5` (fractional) | starts; `max_uses` falls back to the default (`2`); warning |
+| `"max_uses": 4294967296` (bigger than the 32-bit value the proxy uses internally) | starts; `max_uses` falls back to the default (`2`); warning |
 
 ```
+WARNING: advisor.max_uses = -1 is not a valid limit (it is negative); using the default 2
+WARNING: advisor.max_uses = 2.5 is not a valid limit (it is not a whole number); using the default 2
 WARNING: advisor.max_uses = 4294967296 is out of range (...); using the default 2
 ```
 
-The same applies to the env vars (`ADVISOR_MAX_USES=4294967296`). This follows the house rule: a typo in one advisor limit must not take the whole deployment down. The warning is printed on stderr (so you see it even without file logging) and written to `target/logs/proxy.log` when `log_to_disk` is on.
+Each limit is judged on its own, so one bad value does not affect the others. The env vars are judged exactly like the file (`ADVISOR_MAX_USES=-1`, `ADVISOR_MAX_USES=2.5`, `ADVISOR_MAX_USES=4294967296` all warn and fall back the same way). This follows the house rule: a typo in one advisor limit must not take the whole deployment down. The warning is printed on stderr (so you see it even without file logging) and written to `target/logs/proxy.log` when `log_to_disk` is on.
+
+Two things are still configuration **errors** — the file is not a valid config, so the proxy refuses to start:
+
+* a limit that is not a number at all (`"max_uses": "2"` — a string);
+* a number that is not representable as a JSON number at all (`1e400`).
+
+One env-var case is different: `ADVISOR_MAX_USES=abc` is not a number, so the variable is **ignored** (the file value or the default wins) and nothing is printed. That is the long-standing behaviour for these variables.
 
 ### Model aliases
 

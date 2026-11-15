@@ -1984,18 +1984,21 @@ operator writes **`0`** explicitly. The same rule holds for the env vars
   `Some(2048)` / `Some(45)` — so the shipped behaviour does not move.
 * The JSON **keys** are unchanged, so `deny_unknown_fields` and the TUI
   rollback guarantee (§18.5) are unaffected. `proxy.json.example` keeps
-  the safe defaults. The JSON **types** were widened in a later commit
-  (§21.2): `JsonAdvisorConfig::max_uses` / `max_tokens` are `Option<u64>`
-  (they were `Option<u32>`), so an out-of-range number PARSES instead of
+  the safe defaults. The JSON **types** were widened in later commits
+  (§21.2, then §22): `JsonAdvisorConfig::max_uses` / `max_tokens` /
+  `timeout_secs` are `Option<serde_json::Number>` (they were
+  `Option<u32>`, then `Option<u64>`), so ANY number PARSES instead of
   killing the startup — the serialized shape is identical for every
   in-range value, so the TUI round-trip is unchanged.
-* `valid_or_default` was **removed**: with `0` now meaningful there is no
-  longer any invalid value for these three fields. The WARN-on-overflow
-  behaviour moved into the new resolver `resolve_advisor_limit` (a value
-  that does not fit `u32` falls back to the default **with** a warning,
-  where the old code fell back silently). That warning is only VISIBLE
-  since §21.1 — before that fix it was emitted during config resolution
-  and dropped on the floor.
+* `valid_or_default` was **removed**: the resolver `resolve_advisor_limit`
+  is the ONE place that judges a limit, and it falls back to the default
+  **with** a warning for every value that cannot be a limit (negative,
+  fractional, too large for the field's type) — where the old code fell
+  back silently. (At the time of §20 there was "no other invalid value
+  for these three fields"; §22 added the negative and fractional ones
+  back, on purpose.) Those warnings are only VISIBLE since §21.1 — before
+  that fix they were emitted during config resolution and dropped on the
+  floor.
 * `advisor_timeout` now returns `Option<Duration>`: `None` = no
   per-request override (the global `request_timeout` applies), `Some(secs)`
   = `Some(min(secs, request_timeout))`. The clamp is kept, so the advisor
@@ -2011,8 +2014,12 @@ operator writes **`0`** explicitly. The same rule holds for the env vars
    a real hazard: every iteration costs **two** upstream calls (the executor
    re-run *and* the advisor), so an executor that keeps asking will spin.
    Implemented as asked — **no hidden ceiling** — but made visible:
-   * one WARN at startup (config-resolve time) when the advisor is enabled
-     with an unlimited `max_uses`;
+   * one WARN at startup when the advisor is enabled with an unlimited
+     `max_uses`. The resolver does NOT emit it — it runs before the
+     tracing subscriber exists (§21.1): it COLLECTS it on the resolved
+     `Config` (`Config::warnings`) and `src/main.rs` prints it right after
+     `init_tracing`, on stderr (visible even with `log_to_disk: false`)
+     and as a tracing event (so it lands in `target/logs/proxy.log`);
    * one WARN per turn that passes **10** consultations.
 2. **`max_tokens` = no limit → the proxy imposes no cap, the upstream still
    does.** The proxy omits `max_output_tokens` from the advisor's own
@@ -2110,6 +2117,10 @@ value, so the TUI's rewrite of `proxy.json` (§17.2, §18.5) and its
 rollback guarantee are unaffected — the `skip_serializing_if` behaviour is
 untouched.
 
+(§22 widens the JSON type once more, to `Option<serde_json::Number>`, so
+that a NEGATIVE or FRACTIONAL value parses too — `Option<u64>` still
+rejected those at parse time.)
+
 ### 21.3 `Some(0)` and a configured `0` meant OPPOSITE things (LOW)
 
 **The bug.** The config resolver was the only place that interpreted `0` →
@@ -2144,6 +2155,106 @@ one cap pair and exactly one text block.
 the pre-existing diffs (in files this change does not touch). No new
 dependency, no real API call, and `enabled: false` stays byte-identical
 (the e2e `advisor_disabled_is_byte_for_byte_identical` case still passes).
+
+(§22 supersedes the counts above with the current ones.)
+
+---
+
+## 22. A NEGATIVE or FRACTIONAL advisor limit was a HARD STARTUP FAILURE (2026-11-15)
+
+### 22.1 The bug
+
+§21.2 widened the JSON type of the advisor limits from `Option<u32>` to
+`Option<u64>`, which fixed the UPPER bound: `"max_uses": 4294967296` now
+PARSES, and the resolver falls back to the default with a warning. The
+LOWER bound was still a hard failure, because serde rejects a negative or
+a fractional number for an unsigned integer AT PARSE TIME:
+
+| file | before this fix | after |
+| --- | --- | --- |
+| `"max_uses": -1` | ``invalid value: integer `-1`, expected u64`` → **the proxy EXITED** | starts; falls back to the default; warns |
+| `"max_uses": 2.5` | ``invalid type: floating point `2.5`, expected u64`` → **the proxy EXITED** | starts; falls back to the default; warns |
+
+That contradicted `proxy.json-guide.md` (which promised that an invalid
+limit means *"the proxy starts anyway, falls back to that limit's shipped
+default, and prints a warning"*) and it violated the house rule in
+`src/config.rs` (*"an operator typo in one advisor limit should not take
+the whole deployment down"*).
+
+The ENV path was SAFE (`ADVISOR_MAX_USES=-1` was ignored, because
+`Option<u64>` could not parse it) — but silently, and the file and the env
+disagreed about the same mistake.
+
+### 22.2 The fix — the RESOLVER is the only judge
+
+* The JSON layer now accepts ANY JSON number: `JsonAdvisorConfig::max_uses`
+  / `max_tokens` / `timeout_secs` are `Option<serde_json::Number>` — the
+  number exactly as the operator wrote it, with NO sign, fraction or range
+  check at parse time. `serde_json::Number` still rejects a value that is
+  not a number at all (a string) with a clear message, and that is still
+  a configuration error.
+* The RESOLVER (`resolve_advisor_limit`) is the only place that judges a
+  limit — exactly as it already was for `0` and for a too-large value:
+
+  | configured value | resolved | warning |
+  | --- | --- | --- |
+  | absent | the shipped default | no |
+  | `0` | no limit (`None`) | no |
+  | `n > 0`, in range | `Some(n)` | no |
+  | negative | the shipped default | yes — "it is negative" |
+  | fractional | the shipped default | yes — "it is not a whole number" |
+  | too large for the field's type | the shipped default | yes — "is out of range" |
+
+  A whole number written as a float (`2.0`) is a VALID limit: its value
+  is 2. `AdvisorConfig`'s own types are unchanged (`Option<u32>` /
+  `Option<u32>` / `Option<u64>`) — those are the resolved, in-range values.
+* The ENV path is now CONSISTENT with the file path: `EnvInputs`' three
+  advisor limits are `Option<serde_json::Number>` too (parsed from the env
+  string), so `ADVISOR_MAX_USES=-1` reaches the resolver and warns exactly
+  like `"max_uses": -1` does. An env value that is not a number at all
+  (`ADVISOR_MAX_USES=abc`) is still IGNORED — the file value or the default
+  wins — which is the long-standing behaviour of these vars.
+* The TUI round-trip is unaffected: the saved JSON shape is unchanged, an
+  invalid value is written back VERBATIM (so the operator can still see
+  and fix their typo), and `skip_serializing_if` is untouched, so the
+  rollback guarantee (§17.2, §18.5) still holds.
+
+### 22.3 Verification
+
+510 tests (430 lib + 2 bin + 78 e2e), all green; `cargo clippy --all-targets`
+exactly 7 warnings (the pre-existing set, unchanged); `cargo fmt --check`
+shows only the pre-existing diffs (in files this change does not touch).
+No new dependency, no real API call, and `enabled: false` stays
+byte-identical (the e2e `advisor_disabled_is_byte_for_byte_identical` case
+still passes).
+
+Verified by RUNNING the built binary (no upstream call was ever made):
+
+| case | proxy | stderr | `target/logs/proxy.log.YYYY-MM-DD` |
+| --- | --- | --- | --- |
+| `"max_uses": -1` | STARTS | `WARNING: advisor.max_uses = -1 is not a valid limit (it is negative); using the default 2` | the same warning |
+| `"max_uses": 2.5` | STARTS | `WARNING: advisor.max_uses = 2.5 is not a valid limit (it is not a whole number); using the default 2` | the same warning |
+| `"max_tokens": -2048`, `"timeout_secs": -45` | STARTS | one warning per invalid limit | the same warnings |
+| `"max_uses": 3` (control) | STARTS | none | none |
+| `ADVISOR_MAX_USES=-1` | STARTS | `WARNING: advisor.max_uses = -1 is not a valid limit (it is negative); using the default 2` | the same warning |
+| `ADVISOR_MAX_USES=2.5` | STARTS | `... (it is not a whole number) ...` | the same warning |
+| `ADVISOR_MAX_USES=abc` | STARTS | none (not a number: ignored) | none |
+
+### 22.4 Doc corrections made alongside
+
+* §20.3 said the unbounded-loop WARN is raised at "config-resolve time" —
+  stale since §21.1: the resolver COLLECTS the warning and `main.rs`
+  emits it right after `init_tracing`.
+* §20.2's claim that there is "no longer any invalid value for these
+  three fields" was stale — §22 adds the negative and the fractional ones
+  back, on purpose.
+* `proxy.json-guide.md` now states exactly which values are invalid and
+  what happens to each (start, fall back to that limit's shipped default,
+  print a warning), and it no longer over-claims: a limit that is not a
+  number at all (`"max_uses": "2"`) is still a configuration error, and
+  `1e400` is not a representable JSON number.
+
+(§22 supersedes the test counts in §20.5 and §21.4 with the current ones.)
 
 ---
 
