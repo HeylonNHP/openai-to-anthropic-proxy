@@ -1689,6 +1689,137 @@ cleanly and phase 1 remains a debt-reducing refactor.
 
 ---
 
+## 18. Persistent advisor configuration (2026-11-15 13:25)
+
+Operator question: *"Do I always need `--advisor`? Can it be done from
+`/home/heylon/.claude/settings.json` once the proxy advisor is implemented?"*
+
+**Yes — set `advisorModel` once. But behind a proxy you ALSO need the
+experimental-advisor env var (or a fetched Anthropic feature flag), which
+the earlier §9.2 caveat missed entirely.** Three agents: binary reverse
+engineering, official docs, and a live fake-upstream experiment.
+
+### 18.1 The key — PROVEN twice
+
+```json
+{ "advisorModel": "opus" }
+```
+
+- **Binary** (v2.1.322): schema at byte 283982704
+  `advisorModel:()=>o().optional().describe("Advisor model for the server-side advisor tool.")`
+  — top-level, sibling of `model`; **not** nested under `env`/`experimental`.
+  Reader `ASr()` / `whs(e)` at 291754937 reads `bt().settings` (the **merged**
+  settings object), so any scope works. `/advisor` writes
+  `Kn("userSettings",{advisorModel:e},…)` at 308288697 → **user scope
+  `~/.claude/settings.json`**; `off` writes `advisorModel: void 0`.
+  Bundled changelog `~/.claude/cache/changelog.md:1187` (2.1.300): *"no
+  advisor runs until you pick one with `/advisor`, `advisorModel` or
+  `--advisor`"*.
+- **Official docs**: "You can set the advisor model in three ways: `/advisor`
+  … save it as your default; `advisorModel` setting … persistent default in
+  your settings file; `--advisor` … single session" [19]. Settings reference:
+  "Scope: Any file. Type: string, one of `fable`, `opus`, `sonnet`, or a full
+  model ID. Default: unset, so the advisor is off. Per-session overrides:
+  `--advisor` takes precedence" [20]. `/advisor` "saves your pick to this key
+  in `~/.claude/settings.json`" [20].
+- Values are aliases (`opus` → `claude-opus-5-5`) or full model ids; the
+  advisor "must be at least as capable as your main model" [20]. Scope order
+  (binary 283675745, docs [21]): user < shared project < project local <
+  `--settings` (command-line JSON) < managed. `--advisor` outranks all of
+  them for that session [22].
+
+### 18.2 The catch behind a proxy — PROVEN by live experiment
+
+The earlier §9.2 claim ("standby needs `api.anthropic.com`, so just set
+`--advisor` explicitly") was **incomplete**. A 14-case live experiment with a
+local fake Messages API, `--settings` files, scratch `HOME`, and no external
+network found:
+
+| case | `advisor_20260301` in `tools[]` | beta `advisor-tool-2026-03-01` |
+|---|---|---|
+| `{}` settings, no flag | none | no |
+| `{"advisorModel":"opus"}`, no flag | **none** | no |
+| `--advisor opus`, no flag | **none** | no |
+| scratch `HOME/.claude/settings.json` = sonnet, no flag | none | no |
+| `advisorModel` **+ `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`** | **yes**: `{"type":"advisor_20260301","name":"advisor","model":"claude-opus-5-5","defer_loading":true}` | yes |
+| user-scope `HOME` settings + the env var, **no `--settings`** | yes | yes |
+| settings `env` holds custom URL + `advisorModel` + the env var | yes | yes |
+| `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` | none (kills it) | no |
+| both `advisorModel: sonnet` and `--advisor opus` | **opus** (flag wins) | yes |
+
+Why: `ASr()` calls `MR()`, and `MR()` requires the **remote GrowthBook flag
+`tengu_sage_compass2`** unless `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`
+is set. The docs confirm "the advisor needs a feature flag fetched from
+Anthropic" and that a gateway token with no API key has no credential to
+fetch it [19][23]. In the network-isolated test the flag could not be
+fetched, so **even `--advisor` did nothing** until that env var was set.
+`_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` did NOT help in this setup.
+
+**⇒ The proxy implementing the advisor does not remove this client-side
+gate.** It is about Claude Code's flag fetching, not about our response.
+
+### 18.3 What to actually put in the settings file
+
+Merge into the existing `/home/heylon/.claude/settings.json` (it already has
+top-level `env`, `model`, `enabledPlugins`, `effortLevel`, `modelSettings`,
+`theme` — do **not** replace `env`, it holds the custom `ANTHROPIC_BASE_URL`
+and auth tokens):
+
+```json
+{
+  "advisorModel": "opus",
+  "env": {
+    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1"
+  }
+}
+```
+
+That exact shape (case Z/V) produced the declaration with **zero CLI flags
+and zero process env**. `advisorModel` alone is sufficient **only** when the
+remote flag is available (first-party, reachable Anthropic); with a custom
+base URL, keep the env var to be deterministic. To turn it off: remove
+`advisorModel`, or `/advisor off`, or `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`
+(which wins over everything) [23].
+
+`CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL` is **NOT in the official env-vars
+docs** [23] — it is an internal binary knob (283285290). `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`
+IS documented. Note the settings `env` block is an env-var map, not a
+separate precedence level [21].
+
+### 18.4 Effect on the implementation plan
+
+- **Testing (§17.3 phases 5-6):** use `advisorModel: "opus"` in a **scratch
+  `HOME`/`--settings`**, plus `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`,
+  and a fake/cheap (`beam`) upstream. Do NOT edit
+  `/home/heylon/.claude/settings.json` during tests. No `--advisor` needed
+  once the settings file carries it.
+- **The standby-advisor gate (§9.2) is superseded**: the real gate that
+  matters behind a proxy is the **fetched feature flag**, not
+  `api.anthropic.com` per se. An explicit `advisorModel` bypasses the
+  standby lookup but still needs `MR()`.
+- **Docs say a gateway must forward the tool entry + beta header intact**;
+  if we return a 400/422 naming `Input tag 'advisor_20260301'` or the beta,
+  Claude Code retries once WITHOUT the advisor and then omits it for later
+  requests [24][25]. Our fail-closed `unavailable` degradation (§11.4)
+  remains mandatory.
+
+### 18.5 Experiment hygiene / caveats
+
+- One diagnostic run accidentally used the real settings' `ANTHROPIC_BASE_URL`
+  (`http://192.168.1.6:60200`) and hit the user's own local proxy (~26.6k
+  input tokens) before the sandbox was applied; no external Anthropic/Ollama/
+  kimi API was called. Every later run ran in `bwrap --unshare-net` with a
+  scratch `HOME`. **`/home/heylon/.claude/settings.json` was never modified**
+  (sha256 verified unchanged). Claude Code did write its own state files
+  under `~/.claude/` (history/sessions/plugins) — normal session side effects.
+- The conclusion is scoped to **no fetched flag**. In normal first-party use
+  `advisorModel` alone works; the env var is the deterministic override for
+  an isolated/custom-base-URL setup.
+- Scratch: `/tmp/locopilot-advisor-live-SR4F13/` and `/tmp/advisor-re-20261115/`
+  (may be cleaned up).
+
+---
+
 ## Sources
 
 **Official docs**
@@ -1724,3 +1855,16 @@ cleanly and phase 1 remains a debt-reducing refactor.
 - Ollama `POST https://ollama.com/api/show` (public, no auth) — per-model `thinking` vocabulary
 - Repo at HEAD `df5d78e` — all §11/§12 `file:line` references are against this commit
 - Serde `#[serde(untagged)] Raw(Value)` probe — compiled against this repo's serde version; scratch at `/home/heylon/.cache/serde-probe/`
+
+**§18 additions (2026-11-15)**
+- [19] Escalate hard decisions with the advisor tool — https://code.claude.com/docs/en/advisor
+- [20] All settings (`advisorModel`) — https://code.claude.com/docs/en/settings-reference
+- [21] Settings files and precedence — https://code.claude.com/docs/en/settings
+- [22] CLI reference (`--advisor`) — https://code.claude.com/docs/en/cli-reference
+- [23] Environment variables — https://code.claude.com/docs/en/env-vars
+- [24] Feature availability — https://code.claude.com/docs/en/feature-availability
+- [25] LLM gateway protocol (automatic retry / error forwarding) — https://code.claude.com/docs/en/llm-gateway-protocol
+- [26] Connect Claude Code to an LLM gateway — https://code.claude.com/docs/en/llm-gateway-connect
+- [27] Claude Code commands (`/advisor`) — https://code.claude.com/docs/en/commands
+- Claude Code binary v2.1.322 byte offsets 283982704 / 291754937 / 296153443 / 302870248 / 308288697; bundled `~/.claude/cache/changelog.md:1187`
+- Live fake-upstream experiment (14 cases), scratch `/tmp/locopilot-advisor-live-SR4F13/`
