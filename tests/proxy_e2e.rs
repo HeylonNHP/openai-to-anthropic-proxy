@@ -3107,9 +3107,9 @@ fn advisor_config(addr: SocketAddr) -> Arc<Config> {
         enabled: true,
         model: "beam".into(),
         effort: None,
-        max_uses: 2,
-        max_tokens: 64,
-        timeout_secs: 2,
+        max_uses: Some(2),
+        max_tokens: Some(64),
+        timeout_secs: Some(2),
     };
     Arc::new(config)
 }
@@ -3580,7 +3580,7 @@ async fn advisor_timeout_degrades_gracefully() {
     *upstream.delay_per_attempt.lock().await =
         VecDeque::from([Duration::ZERO, Duration::from_secs(3), Duration::ZERO]);
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.timeout_secs = 1;
+    config.advisor.timeout_secs = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -3647,7 +3647,7 @@ async fn advisor_repeated_failure_emits_one_warning() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 2;
+    config.advisor.max_uses = Some(2);
     let stats = Arc::new(SessionStatsStore::new());
     let (output, log_rx) = openai_to_anthropic_proxy::OutputSink::tui();
     let proxy_addr = start_proxy_with_captured_stores(Arc::new(config), stats, output).await;
@@ -3718,7 +3718,7 @@ async fn advisor_max_uses_caps_the_loop() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 2;
+    config.advisor.max_uses = Some(2);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -3793,6 +3793,205 @@ async fn advisor_max_uses_caps_the_loop() {
         "the terminal re-run's real answer must be rendered"
     );
     assert_eq!(body["stop_reason"], "end_turn");
+}
+
+/// `max_uses = 0` means "no limit": the consultation loop is bounded ONLY
+/// by the executor's behaviour. This test drives the executor to ask 12
+/// times (past the runaway threshold of 10) and proves that EVERY ask is
+/// answered — no `max_uses_exceeded`, no early stop. The proxy does not
+/// impose a ceiling of its own; it only warns (once at startup, and once
+/// per turn past 10 consultations).
+#[tokio::test]
+async fn advisor_unlimited_max_uses_never_hits_a_cap() {
+    const CONSULTATIONS: usize = 12;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let mut scripted: Vec<FakeResponse> = Vec::new();
+    for i in 0..CONSULTATIONS {
+        scripted.push(advisor_call_response(
+            &format!("resp_c{i}"),
+            &format!("call_c{i}"),
+        ));
+        scripted.push(advisor_answer(&format!("Advice number {i}.")));
+    }
+    scripted.push(advisor_executor_message(
+        "resp_final",
+        "Done after many calls.",
+    ));
+    script(&upstream, scripted);
+
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = None;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+
+    let content = body["content"].as_array().unwrap();
+    let results: Vec<&serde_json::Value> = content
+        .iter()
+        .filter(|b| b["type"] == "advisor_tool_result")
+        .collect();
+    assert_eq!(
+        results.len(),
+        CONSULTATIONS,
+        "every consultation was answered — the loop has no ceiling"
+    );
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r["content"]["type"], "advisor_result");
+        assert_eq!(r["content"]["text"], format!("Advice number {i}."));
+    }
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["content"]["error_code"] == "max_uses_exceeded"),
+        "an unlimited max_uses must never produce a cap error"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|b| b["text"] == "Done after many calls.")
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent.len(),
+        CONSULTATIONS * 2 + 1,
+        "12 executor calls + 12 advisor calls + the final executor message"
+    );
+}
+
+/// `max_tokens = 0` means "no limit": the proxy must OMIT
+/// `max_output_tokens` from the advisor's OWN upstream request, so the
+/// UPSTREAM's default applies (it may well be smaller than 2048). The
+/// executor's own requests are untouched — they never carried the field.
+#[tokio::test]
+async fn advisor_unlimited_max_tokens_omits_the_cap() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_adv_unlim"),
+            advisor_answer("Use a channel-based coordination pattern."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_tokens = None;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["type"] == "advisor_tool_result"),
+        "the consultation still happened"
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 3, "executor, advisor, executor");
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert_eq!(bodies[1]["model"], "beam", "the advisor's own POST");
+    assert!(
+        bodies[1].get("max_output_tokens").is_none(),
+        "no limit => no cap on the advisor's own request: {}",
+        bodies[1]
+    );
+    // The bounded case (the default config) DOES send the cap — proven
+    // here so the omission above cannot be an accident of the wiring.
+    let (bounded_addr, bounded) = start_fake_upstream().await;
+    script(
+        &bounded,
+        vec![
+            advisor_call_response("resp_call", "call_adv_bounded"),
+            advisor_answer("Advice."),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    );
+    let bounded_addr = start_proxy(advisor_config(bounded_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{bounded_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent = bounded.received_all.lock().await.clone();
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert_eq!(bodies[1]["max_output_tokens"], 64, "the bounded case");
+}
+
+/// `timeout_secs = 0` means "no limit": no per-request timeout override is
+/// sent, so the GLOBAL `request_timeout` (the reqwest client's own timeout)
+/// is the only bound. Proof: the advisor POST is stalled for 2s — longer
+/// than the 1s a per-request timeout would allow — and it still succeeds.
+/// (The bounded counterpart is `advisor_timeout_degrades_gracefully`: the
+/// same stall with `timeout_secs: 1` degrades to `unavailable`.)
+#[tokio::test]
+async fn advisor_unlimited_timeout_sends_no_per_request_timeout() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_adv_unlim"),
+            advisor_answer("Slow but useful advice."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    // Attempt 1 = executor (fast); attempt 2 = advisor (stalled 2s, which
+    // is LONGER than the 1s per-request timeout the bounded case uses);
+    // attempt 3 = final executor (fast).
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_secs(2), Duration::ZERO]);
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.timeout_secs = None;
+    // The global bound still applies — it is simply the ONLY bound.
+    config.request_timeout = Duration::from_secs(10);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "fail closed on a timeout");
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "advisor_tool_result")
+        .unwrap();
+    assert_eq!(
+        result["content"]["type"], "advisor_result",
+        "the stalled advisor call still completed: no per-request timeout was applied"
+    );
+    assert_eq!(result["content"]["text"], "Slow but useful advice.");
 }
 
 /// A `default_model` fallback RE-TRANSLATES the executor request through
@@ -4556,7 +4755,7 @@ async fn b3_cap_injects_output_reruns_once_and_bounds_the_loop() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 1;
+    config.advisor.max_uses = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -4650,7 +4849,7 @@ async fn b3_cap_terminal_rerun_renders_a_real_answer() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 1;
+    config.advisor.max_uses = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
     let res = reqwest::Client::new()
         .post(format!("http://{proxy_addr}/v1/messages"))
@@ -4706,7 +4905,7 @@ async fn cap_terminal_rerun_with_another_advisor_call_renders_once() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 1;
+    config.advisor.max_uses = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -4814,9 +5013,14 @@ async fn cap_terminal_rerun_with_another_advisor_call_renders_once() {
     }
 }
 
-/// `max_uses = 0` with a terminal cap pair (no successful consultation):
-/// exactly `[server_tool_use, max_uses_exceeded, text]`, id-matched, no
-/// duplicate pair and no POST after the bound.
+/// A cap of ZERO consultations (`max_uses: Some(0)`) with a terminal cap
+/// pair (no successful consultation): exactly
+/// `[server_tool_use, max_uses_exceeded, text]`, id-matched, no duplicate
+/// pair and no POST after the bound.
+///
+/// NOTE: `Some(0)` is only reachable by constructing the config directly —
+/// a CONFIGURED `0` resolves to `None`, which means "no limit" (an
+/// unbounded loop), the opposite of this cap.
 #[tokio::test]
 async fn cap_terminal_rerun_emits_exactly_one_cap_pair_and_text() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
@@ -4829,7 +5033,7 @@ async fn cap_terminal_rerun_emits_exactly_one_cap_pair_and_text() {
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = 0;
+    config.advisor.max_uses = Some(0);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -4894,7 +5098,7 @@ async fn b4_advisor_timeout_is_clamped_to_request_timeout() {
         VecDeque::from([Duration::ZERO, Duration::from_secs(3), Duration::ZERO]);
     let mut config = (*advisor_config(upstream_addr)).clone();
     config.request_timeout = Duration::from_millis(300);
-    config.advisor.timeout_secs = 5;
+    config.advisor.timeout_secs = Some(5);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let started = std::time::Instant::now();

@@ -24,6 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use openai_to_anthropic_proxy::{
     CapabilityStore, Config, MappingsStore, OutputSink, RuntimeMappings, SessionStatsStore,
+    UNBOUNDED_ADVISOR_LOOP_WARNING,
 };
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -40,6 +41,21 @@ async fn main() -> Result<()> {
 
     let config = Config::load().context("load configuration")?;
     let _log_guard = init_tracing(config.log_to_disk);
+
+    // The config resolver already warns about an UNBOUNDED advisor
+    // consultation loop (`max_uses` = 0 = "no limit"), but the binary
+    // installs the tracing subscriber AFTER the config is loaded, so that
+    // event was dropped on the floor. Repeat it here: on stderr, so the
+    // operator sees it even with `log_to_disk: false`, and as a tracing
+    // event, so it lands in the log file for postmortems.
+    if config.advisor.enabled && config.advisor.max_uses.is_none() {
+        eprintln!("WARNING: {UNBOUNDED_ADVISOR_LOOP_WARNING}");
+        tracing::warn!(
+            advisor_model = %config.advisor.model,
+            "{}",
+            UNBOUNDED_ADVISOR_LOOP_WARNING
+        );
+    }
 
     // Runtime mappings: start from whatever the static config has, and
     // also seed the on-disk snapshot to the same value. A TUI save

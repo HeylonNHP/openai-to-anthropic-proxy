@@ -42,6 +42,12 @@ const DEFAULT_ADVISOR_MAX_USES: u32 = 2;
 const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 2048;
 const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 
+/// Warning text for an advisor whose consultation loop is UNBOUNDED.
+///
+/// `advisor.max_uses` = 0 = "no limit". Shared by the config resolver and
+/// by the binary's startup banner so the two can never drift.
+pub const UNBOUNDED_ADVISOR_LOOP_WARNING: &str = "advisor.max_uses is 0 (no limit): the consultation loop is unbounded — each iteration costs two upstream calls (executor re-run + advisor)";
+
 /// Resolved proxy configuration. Cheap to clone (`String`s and a `Duration`).
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -115,16 +121,50 @@ pub struct Config {
 ///
 /// `effort` is an optional upstream reasoning effort string, kept separate
 /// from `reasoning.models` (which is keyed on the executor's upstream name).
-/// `max_uses` caps consultations per turn, `max_tokens` caps the advisor's
-/// answer, and `timeout_secs` bounds the extra upstream call.
+///
+/// ## The three limits, and what `0` means
+///
+/// `max_uses`, `max_tokens` and `timeout_secs` are all [`Option`]: `None`
+/// means **no limit**, `Some(n)` means a bound of `n`. The rule is the same
+/// in `proxy.json` and in the env vars:
+///
+/// * **key ABSENT** → the shipped default (`max_uses` 2, `max_tokens` 2048,
+///   `timeout_secs` 45) — an absent key is *not* "no limit";
+/// * **`0`** → **no limit** — the house precedent of
+///   `reasoning_replay.max_chars`, where `0` means unlimited;
+/// * **`n > 0`** → that bound.
+///
+/// "No limit" means something DIFFERENT per field, and the difference
+/// matters:
+///
+/// * `max_uses: None` — the consultation loop is bounded only by the
+///   executor's behaviour. Every iteration costs TWO upstream calls (the
+///   executor re-run and the advisor), so an executor that keeps asking
+///   will spin. The proxy does NOT impose a ceiling of its own: it warns
+///   once at startup (config-resolve time) and again at runtime when one
+///   turn passes 10 consultations.
+/// * `max_tokens: None` — the proxy OMITS `max_output_tokens` from the
+///   advisor's own upstream request, so the **upstream's own default**
+///   applies. That default may be SMALLER than 2048 — and for reasoning
+///   models the cap must also cover the reasoning tokens — so "no limit"
+///   here means "the proxy imposes no cap", NOT "the answer may be long".
+/// * `timeout_secs: None` — no per-request timeout override. The global
+///   `request_timeout` still applies (the reqwest client is built with
+///   `.timeout(config.request_timeout)`), and a *bounded* value is always
+///   clamped to it, so the advisor can never extend the operator's bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisorConfig {
     pub enabled: bool,
     pub model: String,
     pub effort: Option<String>,
-    pub max_uses: u32,
-    pub max_tokens: u32,
-    pub timeout_secs: u64,
+    /// Consultations per turn. `None` = no limit (see the module docs).
+    pub max_uses: Option<u32>,
+    /// Cap on the advisor's own answer. `None` = no limit: the proxy sends
+    /// no `max_output_tokens` and the upstream's default applies.
+    pub max_tokens: Option<u32>,
+    /// Per-request timeout for the advisor's upstream call. `None` = no
+    /// per-request override; the global `request_timeout` applies.
+    pub timeout_secs: Option<u64>,
 }
 
 impl Default for AdvisorConfig {
@@ -133,9 +173,9 @@ impl Default for AdvisorConfig {
             enabled: false,
             model: DEFAULT_ADVISOR_MODEL.to_owned(),
             effort: None,
-            max_uses: DEFAULT_ADVISOR_MAX_USES,
-            max_tokens: DEFAULT_ADVISOR_MAX_TOKENS,
-            timeout_secs: DEFAULT_ADVISOR_TIMEOUT_SECS,
+            max_uses: Some(DEFAULT_ADVISOR_MAX_USES),
+            max_tokens: Some(DEFAULT_ADVISOR_MAX_TOKENS),
+            timeout_secs: Some(DEFAULT_ADVISOR_TIMEOUT_SECS),
         }
     }
 }
@@ -509,10 +549,11 @@ impl Config {
             .unwrap_or(false);
 
         // `advisor`: env > file > default, following `pick_str`. The whole
-        // feature is off unless `enabled` resolves to true. Invalid numeric
-        // values are clamped back to the default with a WARN rather than
-        // failing startup — the same house style as an unusable upstream
-        // value surfacing as a 400 instead of a startup error.
+        // feature is off unless `enabled` resolves to true. A limit of `0`
+        // means "no limit" (see `AdvisorConfig`); a value that does not fit
+        // the field's integer type falls back to the default with a WARN
+        // rather than failing startup — the same house style as an unusable
+        // upstream value surfacing as a 400 instead of a startup error.
         let advisor_defaults = AdvisorConfig::default();
         let advisor_json = file.and_then(|f| f.advisor.as_ref());
         let advisor_enabled = env
@@ -528,44 +569,31 @@ impl Config {
             advisor_json.and_then(|a| a.effort.as_deref()),
             env.advisor_effort.as_deref(),
         );
-        let advisor_max_uses = pick_u64(
-            advisor_json.and_then(|a| a.max_uses).map(u64::from),
-            env.advisor_max_uses.map(u64::from),
-        )
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(advisor_defaults.max_uses);
-        let advisor_max_tokens = pick_u64(
-            advisor_json.and_then(|a| a.max_tokens).map(u64::from),
-            env.advisor_max_tokens.map(u64::from),
-        )
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(advisor_defaults.max_tokens);
-        let advisor_timeout_secs = pick_u64(
-            advisor_json.and_then(|a| a.timeout_secs),
-            env.advisor_timeout_secs,
-        )
-        .unwrap_or(advisor_defaults.timeout_secs);
-
-        // Validate: zero-valued limits/timeout would make the advisor
-        // unusable (or hang), so fall back to the defaults individually.
-        let advisor_max_uses = valid_or_default(
-            advisor_max_uses,
-            advisor_defaults.max_uses,
-            |v| v > 0,
+        let advisor_max_uses = resolve_advisor_limit(
+            pick_u64(
+                advisor_json.and_then(|a| a.max_uses).map(u64::from),
+                env.advisor_max_uses,
+            ),
+            DEFAULT_ADVISOR_MAX_USES,
             "advisor.max_uses",
         );
-        let advisor_max_tokens = valid_or_default(
-            advisor_max_tokens,
-            advisor_defaults.max_tokens,
-            |v| v > 0,
+        let advisor_max_tokens = resolve_advisor_limit(
+            pick_u64(
+                advisor_json.and_then(|a| a.max_tokens).map(u64::from),
+                env.advisor_max_tokens,
+            ),
+            DEFAULT_ADVISOR_MAX_TOKENS,
             "advisor.max_tokens",
         );
-        let advisor_timeout_secs = valid_or_default(
-            advisor_timeout_secs,
-            advisor_defaults.timeout_secs,
-            |v| v > 0,
+        let advisor_timeout_secs = resolve_advisor_limit(
+            pick_u64(
+                advisor_json.and_then(|a| a.timeout_secs),
+                env.advisor_timeout_secs,
+            ),
+            DEFAULT_ADVISOR_TIMEOUT_SECS,
             "advisor.timeout_secs",
         );
+
         let advisor = AdvisorConfig {
             enabled: advisor_enabled,
             model: advisor_model,
@@ -574,6 +602,19 @@ impl Config {
             max_tokens: advisor_max_tokens,
             timeout_secs: advisor_timeout_secs,
         };
+
+        // An unlimited consultation loop is a real hazard: every iteration
+        // costs TWO upstream calls (the executor re-run and the advisor), so
+        // an executor that keeps asking would spin. The operator asked for
+        // no limit, so the proxy does NOT impose a ceiling — it only makes
+        // the hazard visible, once, at startup.
+        if advisor.enabled && advisor.max_uses.is_none() {
+            tracing::warn!(
+                advisor_model = %advisor.model,
+                "{}",
+                UNBOUNDED_ADVISOR_LOOP_WARNING
+            );
+        }
 
         Ok(Self {
             listen_addr,
@@ -777,11 +818,15 @@ pub struct EnvInputs {
     /// Advisor overrides. `ADVISOR_ENABLED` uses the same truthy values as
     /// `LOG_TO_DISK`; numeric values that fail to parse are ignored (the
     /// file/default value wins) rather than silently disabling the section.
+    ///
+    /// The two token limits are read as `u64` so an out-of-range value
+    /// (`ADVISOR_MAX_USES=99999999999`) reaches the resolver and is
+    /// reported with a WARN instead of being dropped in silence.
     pub advisor_enabled: Option<bool>,
     pub advisor_model: Option<String>,
     pub advisor_effort: Option<String>,
-    pub advisor_max_uses: Option<u32>,
-    pub advisor_max_tokens: Option<u32>,
+    pub advisor_max_uses: Option<u64>,
+    pub advisor_max_tokens: Option<u64>,
     pub advisor_timeout_secs: Option<u64>,
 }
 
@@ -841,21 +886,32 @@ fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
     env_value.or(file_value)
 }
 
-/// Keep a resolved numeric config value when the predicate accepts it,
-/// otherwise fall back to `default` with a structured WARN. Invalid values
-/// must not stop the proxy from starting — an operator typo in one advisor
-/// limit should not take the whole deployment down.
-fn valid_or_default<T: Copy + std::fmt::Display>(
-    value: T,
-    default: T,
-    valid: impl Fn(T) -> bool,
-    field: &str,
-) -> T {
-    if valid(value) {
-        return value;
+/// Resolve one advisor limit from its JSON/env value.
+///
+/// * **absent** → the shipped default (an absent key is NOT "no limit");
+/// * **`0`** → **no limit** (`None`);
+/// * **`n > 0`** → `Some(n)`.
+///
+/// A value that does not fit the field's integer type falls back to the
+/// default with a structured WARN: an operator typo must not stop the proxy
+/// from starting. (`0` is meaningful now, so there is no other invalid
+/// value for these three fields.)
+fn resolve_advisor_limit<T>(value: Option<u64>, default: T, field: &str) -> Option<T>
+where
+    T: Copy + std::fmt::Display + TryFrom<u64>,
+    T::Error: std::fmt::Display,
+{
+    match value {
+        None => Some(default),
+        Some(0) => None,
+        Some(v) => match T::try_from(v) {
+            Ok(n) => Some(n),
+            Err(err) => {
+                tracing::warn!(field, value = %v, error = %err, fallback = %default, "advisor limit out of range; using default");
+                Some(default)
+            }
+        },
     }
-    tracing::warn!(field, value = %value, fallback = %default, "invalid advisor config; using default");
-    default
 }
 
 /// JSON representation of `proxy.json`. Every field is optional; missing
@@ -914,6 +970,10 @@ pub struct JsonConfig {
 /// `model`. `deny_unknown_fields` keeps a typo from being silently ignored.
 /// `model` is an explicit **upstream** model name (default `"beam"`, the
 /// cheap advisor), not an inbound alias — see [`AdvisorConfig`].
+///
+/// An ABSENT `max_uses` / `max_tokens` / `timeout_secs` means the shipped
+/// default; `0` means **no limit**. See [`AdvisorConfig`] for what "no
+/// limit" means per field.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonAdvisorConfig {
@@ -1362,9 +1422,9 @@ mod tests {
         assert!(!cfg.advisor.enabled, "advisor must be opt-in");
         assert_eq!(cfg.advisor.model, "beam", "default advisor must be cheap");
         assert_eq!(cfg.advisor.effort, None);
-        assert_eq!(cfg.advisor.max_uses, 2);
-        assert_eq!(cfg.advisor.max_tokens, 2048);
-        assert_eq!(cfg.advisor.timeout_secs, 45);
+        assert_eq!(cfg.advisor.max_uses, Some(2));
+        assert_eq!(cfg.advisor.max_tokens, Some(2048));
+        assert_eq!(cfg.advisor.timeout_secs, Some(45));
     }
 
     #[test]
@@ -1393,9 +1453,9 @@ mod tests {
                 enabled: true,
                 model: "glm-5.3-flash".into(),
                 effort: Some("medium".into()),
-                max_uses: 3,
-                max_tokens: 1024,
-                timeout_secs: 20,
+                max_uses: Some(3),
+                max_tokens: Some(1024),
+                timeout_secs: Some(20),
             }
         );
     }
@@ -1429,24 +1489,25 @@ mod tests {
                 enabled: false,
                 model: "env-model".into(),
                 effort: Some("high".into()),
-                max_uses: 1,
-                max_tokens: 77,
-                timeout_secs: 9,
+                max_uses: Some(1),
+                max_tokens: Some(77),
+                timeout_secs: Some(9),
             }
         );
 
         // With no env override, the file wins; with neither, the defaults.
         let from_file = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert_eq!(from_file.advisor.model, "file-model");
-        assert_eq!(from_file.advisor.max_uses, 5);
+        assert_eq!(from_file.advisor.max_uses, Some(5));
         let defaults = Config::resolve(None, &env_with_required()).unwrap();
         assert_eq!(defaults.advisor, AdvisorConfig::default());
     }
 
     #[test]
-    fn advisor_zero_limits_fall_back_to_defaults() {
-        // A zero limit/timeout would make the feature unusable; the house
-        // style is a WARN + default rather than a startup failure.
+    fn advisor_zero_limits_mean_no_limit() {
+        // The operator's rule: `0` means "no limit" (the house precedent of
+        // `reasoning_replay.max_chars`), and an ABSENT key means the
+        // shipped default. The two are NOT the same thing.
         let file = JsonConfig {
             advisor: Some(JsonAdvisorConfig {
                 enabled: Some(true),
@@ -1459,9 +1520,85 @@ mod tests {
         };
         let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
         assert!(cfg.advisor.enabled, "the section itself stays enabled");
-        assert_eq!(cfg.advisor.max_uses, DEFAULT_ADVISOR_MAX_USES);
-        assert_eq!(cfg.advisor.max_tokens, DEFAULT_ADVISOR_MAX_TOKENS);
-        assert_eq!(cfg.advisor.timeout_secs, DEFAULT_ADVISOR_TIMEOUT_SECS);
+        assert_eq!(cfg.advisor.max_uses, None, "0 = no limit");
+        assert_eq!(cfg.advisor.max_tokens, None, "0 = no limit");
+        assert_eq!(cfg.advisor.timeout_secs, None, "0 = no limit");
+
+        // An ABSENT key is the default, NOT "no limit".
+        let absent = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&absent), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        assert_eq!(cfg.advisor.timeout_secs, Some(DEFAULT_ADVISOR_TIMEOUT_SECS));
+
+        // An explicit `n > 0` is that bound.
+        let explicit = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                max_uses: Some(3),
+                max_tokens: Some(1024),
+                timeout_secs: Some(20),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&explicit), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(3));
+        assert_eq!(cfg.advisor.max_tokens, Some(1024));
+        assert_eq!(cfg.advisor.timeout_secs, Some(20));
+    }
+
+    #[test]
+    fn advisor_zero_limits_from_the_env_mean_no_limit() {
+        // The env override follows the same rule as the file: `0` = no
+        // limit, absent = the default.
+        let env = EnvInputs {
+            advisor_max_uses: Some(0),
+            advisor_max_tokens: Some(0),
+            advisor_timeout_secs: Some(0),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert_eq!(cfg.advisor.max_uses, None);
+        assert_eq!(cfg.advisor.max_tokens, None);
+        assert_eq!(cfg.advisor.timeout_secs, None);
+
+        // An env `0` also beats a file value: env > file.
+        let file = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                max_uses: Some(5),
+                max_tokens: Some(999),
+                timeout_secs: Some(30),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(cfg.advisor.max_uses, None, "env 0 wins over the file");
+        assert_eq!(cfg.advisor.max_tokens, None);
+        assert_eq!(cfg.advisor.timeout_secs, None);
+    }
+
+    #[test]
+    fn advisor_out_of_range_limit_falls_back_to_the_default() {
+        // A value that does not fit `u32` is not silently dropped: it falls
+        // back to the default (the house style — a bad value must not stop
+        // the proxy from starting).
+        let env = EnvInputs {
+            advisor_max_uses: Some(u64::from(u32::MAX) + 1),
+            advisor_max_tokens: Some(u64::from(u32::MAX) + 1),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
     }
 
     #[test]
@@ -1507,9 +1644,9 @@ mod tests {
                 enabled: true,
                 model: "beam".into(),
                 effort: Some("medium".into()),
-                max_uses: 2,
-                max_tokens: 2048,
-                timeout_secs: 45,
+                max_uses: Some(2),
+                max_tokens: Some(2048),
+                timeout_secs: Some(45),
             }
         );
         // Every other resolved setting is identical to the legacy file.

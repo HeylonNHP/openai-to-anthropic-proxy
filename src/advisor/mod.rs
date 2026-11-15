@@ -18,7 +18,9 @@
 //! ## Design A — detection, not proactive review
 //!
 //! Consultations happen ONLY after the executor emits
-//! `function_call{name:"advisor"}`, bounded by `AdvisorConfig::max_uses`.
+//! `function_call{name:"advisor"}`, bounded by `AdvisorConfig::max_uses`
+//! (unless `max_uses` is `0` = "no limit", which removes the bound
+//! entirely — the proxy only WARNs about that, it does not cap it).
 //! The executor's request is forced to `stream: false` (§11.3): the whole
 //! chain is buffered and, if the client asked for streaming, converted to a
 //! synthetic Anthropic SSE sequence by [`sse::message_to_events`].

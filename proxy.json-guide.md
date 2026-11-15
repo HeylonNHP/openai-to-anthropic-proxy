@@ -253,7 +253,7 @@ less of it — but remember the cap is per turn, so the real bound is `turns × 
 
 ### Advisor (`advisor`)
 
-Optional settings for the server-side advisor (a second-opinion consultation inside one assistant message). **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy makes no extra upstream calls, synthesizes no tool, and emits no advisor wire fields — every ordinary request is byte-for-byte unchanged. When enabled, a consultation happens only if the client declared a tool named `advisor` **and** the executor emits `function_call{name:"advisor"}`; it is bounded by `max_uses` and degrades to `error_code: "unavailable"` on any advisor failure without failing the client request.
+Optional settings for the server-side advisor (a second-opinion consultation inside one assistant message). **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy makes no extra upstream calls, synthesizes no tool, and emits no advisor wire fields — every ordinary request is byte-for-byte unchanged. When enabled, a consultation happens only if the client declared a tool named `advisor` **and** the executor emits `function_call{name:"advisor"}`; it is bounded by `max_uses` (set `max_uses` to `0` to remove that bound — see below) and degrades to `error_code: "unavailable"` on any advisor failure without failing the client request.
 
 ```json
 "advisor": {
@@ -269,9 +269,27 @@ Optional settings for the server-side advisor (a second-opinion consultation ins
 - `model` is an **explicit upstream model name**, not an inbound alias. It is written straight into the advisor's own upstream request; `model_aliases.map` is not applied to it. Keep it separate from the executor's alias so the advisor's effort and cost do not couple to the executor's `reasoning.models` entry.
 - **`beam` is the cheap default** ($0.125/M input, $0.40/M output — roughly 25× cheaper on output than `kimi-k3.1-pro`). An advisor consult re-runs the executor, so a wrong model choice multiplies cost. Never use a kimi model as the advisor.
 - `effort` is an optional reasoning effort string for the advisor only. Omit it to send none.
-- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's answer. `timeout_secs` bounds the extra upstream call. A value of `0` for any of these falls back to the default with a WARN rather than failing startup.
+- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's answer. `timeout_secs` bounds the extra upstream call.
 - Every field has an env override with the same **env > file > default** precedence used elsewhere: `ADVISOR_ENABLED`, `ADVISOR_MODEL`, `ADVISOR_EFFORT`, `ADVISOR_MAX_USES`, `ADVISOR_MAX_TOKENS`, `ADVISOR_TIMEOUT_SECS`. `ADVISOR_ENABLED` accepts `1`/`true`/`yes`/`on` (anything else is `false`).
 - The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
+
+#### `0` means "no limit" — an ABSENT key means the default
+
+These three keys follow one rule, in `proxy.json` and in the env vars alike:
+
+| value | meaning |
+| --- | --- |
+| key **absent** | the shipped default — `max_uses` 2, `max_tokens` 2048, `timeout_secs` 45. An absent key is **not** "no limit". |
+| **`0`** | **no limit** |
+| `n > 0` | that bound |
+
+`0` = unlimited follows the house precedent of `reasoning_replay.max_chars`, where `0` means unlimited. **"No limit" means something different per field**, so read the caveats before setting it:
+
+- **`max_uses: 0` — the consultation loop loses its bound.** The loop is then bounded only by the executor's behaviour: the executor may call `advisor` as often as it likes. This is a real hazard — every iteration costs **two** upstream calls (the executor re-run *and* the advisor), so an executor that keeps asking will spin and burn tokens. The proxy imposes no ceiling of its own (you asked for no limit), but it makes the hazard visible: one WARN at startup when the advisor is enabled with an unlimited `max_uses`, and one WARN per turn that passes 10 consultations.
+- **`max_tokens: 0` — the proxy stops capping the answer, the upstream does not.** The proxy then **omits** `max_output_tokens` from the advisor's own upstream request, so the **upstream's own default** applies. That default may be **smaller** than 2048, and for reasoning models the cap must also cover the reasoning tokens — so "no limit" here means *the proxy imposes no cap*, not *the answer may be long*. If your upstream's default is too small, set an explicit number instead.
+- **`timeout_secs: 0` — no per-request timeout override.** The advisor's own call is then bounded only by the **global `request_timeout_secs`** (the reqwest client is built with that timeout, so every request is bounded by it anyway). A *bounded* `timeout_secs` is always clamped to the global value, so the advisor can never extend your global bound.
+
+The env vars follow the same `0` = no limit rule (`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
 
 ### Model aliases
 

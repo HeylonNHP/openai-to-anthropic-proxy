@@ -1954,6 +1954,94 @@ flow untouched (only 4 `iterations: None` literals). No new crate dependency.
 
 ---
 
+## 20. `0` means "no limit" for the advisor limits (2026-11-15)
+
+### 20.1 The operator's question
+
+> *"If I exclude `max_uses`, `max_tokens`, `timeout_secs` from `proxy.json`,
+> can these values be set to infinity (no limit)?"*
+
+**Answer (now encoded in the code):** excluding a key means **"use the
+default"** (2 / 2048 / 45) — unchanged and safe. To ask for **no limit** the
+operator writes **`0`** explicitly. The same rule holds for the env vars
+(`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
+
+| value | meaning |
+| --- | --- |
+| key **absent** | the shipped default — 2 / 2048 / 45. NOT "no limit". |
+| **`0`** | **no limit** |
+| `n > 0` | that bound |
+
+`0` = unlimited follows the house precedent already in this repo:
+`reasoning_replay.max_chars` documents *"`0` means unlimited"*
+(`src/config.rs`, `ReasoningReplayConfig::max_chars`).
+
+### 20.2 What changed
+
+* `AdvisorConfig::max_uses` / `max_tokens` / `timeout_secs` are now
+  `Option<u32>` / `Option<u32>` / `Option<u64>`: **`None` = no limit**.
+  `AdvisorConfig::default()` is unchanged in VALUE — `Some(2)` /
+  `Some(2048)` / `Some(45)` — so the shipped behaviour does not move.
+* The JSON shape is unchanged (`JsonAdvisorConfig` keeps `Option<u32>` /
+  `Option<u64>`), so `deny_unknown_fields` and the TUI rollback guarantee
+  (§18.5) are unaffected. `proxy.json.example` keeps the safe defaults.
+* `valid_or_default` was **removed**: with `0` now meaningful there is no
+  longer any invalid value for these three fields. The WARN-on-overflow
+  behaviour moved into the new resolver `resolve_advisor_limit` (a value
+  that does not fit `u32` falls back to the default **with** a WARN, where
+  the old code fell back silently).
+* `advisor_timeout` now returns `Option<Duration>`: `None` = no
+  per-request override (the global `request_timeout` applies), `Some(secs)`
+  = `Some(min(secs, request_timeout))`. The clamp is kept, so the advisor
+  can never EXTEND the operator's global bound (§11.4).
+* `advisor_request` sends `max_output_tokens: cfg.max_tokens`, so
+  `None` **omits** the field and the upstream's own default applies.
+
+### 20.3 "No limit" means something different per field
+
+1. **`max_uses` = no limit → the loop is unbounded.** The consultation loop
+   is bounded only by the executor's behaviour (`cap = usize::MAX`). This is
+   a real hazard: every iteration costs **two** upstream calls (the executor
+   re-run *and* the advisor), so an executor that keeps asking will spin.
+   Implemented as asked — **no hidden ceiling** — but made visible:
+   * one WARN at startup (config-resolve time) when the advisor is enabled
+     with an unlimited `max_uses`;
+   * one WARN per turn that passes **10** consultations.
+2. **`max_tokens` = no limit → the proxy imposes no cap, the upstream still
+   does.** The proxy omits `max_output_tokens` from the advisor's own
+   upstream request, so the **upstream's** default applies. That default may
+   be SMALLER than 2048, and for reasoning models the cap must also cover
+   the reasoning tokens — so this is "the proxy does not cap it", NOT "the
+   answer may be long".
+3. **`timeout_secs` = no limit → only the global bound remains.** No
+   per-request timeout override is sent; the reqwest client is built with
+   `.timeout(config.request_timeout)`, so every request — advisor included —
+   is bounded by the global `request_timeout` anyway.
+
+### 20.4 The two WARNs
+
+* **Startup (once).** Emitted from `Config::resolve` when the advisor is
+  enabled with an unlimited `max_uses`. The binary installs the tracing
+  subscriber AFTER the config is loaded, so `src/main.rs` repeats the same
+  warning right after `init_tracing` — on stderr (visible even with
+  `log_to_disk: false`, like the `proxy_key` warning) and as a tracing event
+  (so it lands in `target/logs/proxy.log`). The operator sees it exactly
+  once. The message text lives in one place,
+  `config::UNBOUNDED_ADVISOR_LOOP_WARNING`.
+* **Runtime (once per turn).** `should_warn_runaway` fires when a turn
+  crosses `RUNAWAY_CONSULTATION_THRESHOLD` (10) consultations: one WARN
+  per turn, at the crossing, not one per consultation.
+
+### 20.5 Verification
+
+495 tests (417 lib + 2 bin + 76 e2e), all green; `cargo clippy --all-targets`
+7 warnings (the pre-existing set, unchanged); `cargo fmt --check` shows only
+the pre-existing diffs (in files this change does not touch). No new
+dependency, no real API call, and `enabled: false` stays byte-identical
+(the e2e `advisor_disabled_is_byte_for_byte_identical` case still passes).
+
+---
+
 ## Sources
 
 **Official docs**

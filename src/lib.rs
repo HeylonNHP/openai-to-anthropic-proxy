@@ -15,7 +15,7 @@ mod translate;
 pub mod tui;
 
 pub use capabilities::{CapabilityRegistry, CapabilityStore, RequestParam};
-pub use config::Config;
+pub use config::{Config, UNBOUNDED_ADVISOR_LOOP_WARNING};
 pub use error::AppError;
 pub use tui::{
     MappingsStore, OutputSink, RuntimeMappings, SessionStatsSnapshot, SessionStatsStore,

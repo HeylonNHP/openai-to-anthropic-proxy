@@ -30,7 +30,10 @@
 //! client. Every failure degrades to `protocol::unavailable`, at most one TUI
 //! warning is emitted for the whole turn, and the executor's transcript is
 //! still given a `function_call_output` so the upstream never sees an orphan
-//! `function_call`. The loop is bounded by `AdvisorConfig::max_uses`.
+//! `function_call`. The loop is bounded by `AdvisorConfig::max_uses` —
+//! unless `max_uses` is `0` ("no limit"), in which case the loop is bounded
+//! only by the executor's behaviour and the proxy merely WARNs (once at
+//! startup, and once per turn past [`RUNAWAY_CONSULTATION_THRESHOLD`]).
 //!
 //! After the FIRST successful executor response, a failure on a re-run is
 //! ALSO fail-closed: the last good executor response is rendered and an
@@ -92,13 +95,44 @@ const NO_ADVICE: &str =
 const NO_MORE_ADVICE: &str =
     "Advisor consultation limit reached. Continue the task without another second opinion.";
 
+/// A single turn that passes this many consultations is a runaway loop.
+/// Every iteration costs TWO upstream calls (the executor re-run and the
+/// advisor), so an executor that keeps asking would spin. The proxy does
+/// NOT cap an unlimited `max_uses` (the operator asked for no limit) — it
+/// only makes the loop visible in the log.
+const RUNAWAY_CONSULTATION_THRESHOLD: usize = 10;
+
 /// Clamp the advisor's own per-request timeout to the operator's global
 /// `request_timeout`. reqwest's per-request `.timeout()` OVERRIDES the
 /// client-level one, so a large `advisor.timeout_secs` must not be allowed
 /// to EXTEND the operator's bound (§11.4).
+///
+/// `None` = **no per-request override** ("no limit"): the global
+/// `request_timeout` — the timeout the reqwest client itself was built
+/// with — still applies to every request, advisor or not. `Some(secs)` =
+/// that bound, clamped to the global one.
+///
+/// The "0 means no limit" rule is applied where the operator's input
+/// enters — in the config resolver, which turns a configured `0` into
+/// `None`. This function therefore sees `Some(secs)` as "secs seconds".
 #[must_use]
-fn advisor_timeout(cfg: &AdvisorConfig, request_timeout: Duration) -> Duration {
-    Duration::from_secs(cfg.timeout_secs).min(request_timeout)
+fn advisor_timeout(cfg: &AdvisorConfig, request_timeout: Duration) -> Option<Duration> {
+    cfg.timeout_secs
+        .map(|secs| Duration::from_secs(secs).min(request_timeout))
+}
+
+/// The consultation cap for one turn.
+///
+/// `None` (`max_uses` = 0 = "no limit") means the loop is bounded ONLY by
+/// the executor's behaviour: the executor may call `advisor` any number of
+/// times. Every iteration costs TWO upstream calls (the executor re-run and
+/// the advisor), so an executor that keeps asking will spin — the proxy
+/// warns about it (once at startup, and again at runtime past
+/// [`RUNAWAY_CONSULTATION_THRESHOLD`]) but imposes no ceiling of its own.
+#[must_use]
+fn advisor_cap(cfg: &AdvisorConfig) -> usize {
+    cfg.max_uses
+        .map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX))
 }
 
 /// Build the separate, tool-free advisor request. `model` is the explicit
@@ -129,7 +163,9 @@ fn advisor_request(cfg: &AdvisorConfig, transcript: &str) -> ResponsesRequest {
         text: None,
         temperature: None,
         top_p: None,
-        max_output_tokens: Some(cfg.max_tokens),
+        // `max_tokens: None` = "no limit": OMIT the field so the UPSTREAM's
+        // own default applies (it may well be smaller than 2048).
+        max_output_tokens: cfg.max_tokens,
         parallel_tool_calls: None,
         store: None,
         previous_response_id: None,
@@ -203,15 +239,13 @@ async fn consult(
 ) -> Result<(String, Option<ResponsesUsage>), String> {
     let outbound = advisor_request(cfg, prompt);
     let url = attempt.url();
-    let resp = send_upstream_once(
-        &attempt.state,
-        &url,
-        &attempt.headers,
-        &outbound,
-        Some(advisor_timeout(cfg, attempt.state.config.request_timeout)),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    // `None` = no per-request timeout override ("no limit"): the global
+    // `request_timeout` — the timeout the reqwest client was built with —
+    // still applies.
+    let timeout = advisor_timeout(cfg, attempt.state.config.request_timeout);
+    let resp = send_upstream_once(&attempt.state, &url, &attempt.headers, &outbound, timeout)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -257,6 +291,18 @@ fn warn_once(state: &AppState, warned: &mut bool, cfg: &AdvisorConfig, error: &s
             cfg.model
         ),
     });
+}
+
+/// The gate behind the runaway warning: exactly ONE warning per turn, at
+/// the moment the turn crosses the threshold. A turn with at most
+/// [`RUNAWAY_CONSULTATION_THRESHOLD`] consultations is normal and never
+/// warns.
+fn should_warn_runaway(consultations: usize, warned: &mut bool) -> bool {
+    if *warned || consultations <= RUNAWAY_CONSULTATION_THRESHOLD {
+        return false;
+    }
+    *warned = true;
+    true
 }
 
 /// Canonical Responses shape for feeding a tool result back to the executor
@@ -355,7 +401,10 @@ pub async fn run(
     let mut iterations: Vec<Value> = Vec::new();
     let mut warned = false;
     let mut uses = 0usize;
-    let cap = usize::try_from(cfg.max_uses).unwrap_or(usize::MAX);
+    let cap = advisor_cap(cfg);
+    // Set once the turn passes the runaway threshold, so the warning is
+    // logged once per turn and not on every further consultation.
+    let mut runaway_warned = false;
     // Once set, the very next executor response is TERMINAL: no more
     // consultations and no more re-runs. This bounds the whole chain even
     // when the executor keeps asking for advice.
@@ -443,6 +492,19 @@ pub async fn run(
         }
         uses += 1;
 
+        // A turn that keeps consulting is a runaway loop. Warn ONCE per
+        // turn, at the moment it crosses the threshold, so the spin is
+        // visible in the log without flooding it.
+        if should_warn_runaway(uses, &mut runaway_warned) {
+            tracing::warn!(
+                consultations = uses,
+                advisor_model = %cfg.model,
+                max_uses = ?cfg.max_uses,
+                "advisor consultations in one turn exceeded the runaway threshold — \
+                 each iteration costs two upstream calls (executor re-run + advisor)"
+            );
+        }
+
         let advice = match consult(attempt, cfg, &transcript(attempt)).await {
             Ok((text, usage)) => {
                 if let Some(u) = usage.as_ref() {
@@ -485,9 +547,9 @@ mod tests {
             enabled: true,
             model: "beam".into(),
             effort: Some("medium".into()),
-            max_uses: 2,
-            max_tokens: 64,
-            timeout_secs: 2,
+            max_uses: Some(2),
+            max_tokens: Some(64),
+            timeout_secs: Some(2),
         }
     }
 
@@ -549,18 +611,87 @@ mod tests {
     #[test]
     fn advisor_timeout_is_clamped_to_the_global_request_timeout() {
         let mut c = cfg();
-        c.timeout_secs = 5;
+        // Unlimited: no per-request override at all — the global
+        // `request_timeout` (the reqwest client's own timeout) applies.
+        c.timeout_secs = None;
+        assert_eq!(advisor_timeout(&c, Duration::from_millis(300)), None);
+        assert_eq!(advisor_timeout(&c, Duration::from_secs(30)), None);
+        // A bounded value is clamped to the global bound, never above it.
+        c.timeout_secs = Some(5);
         assert_eq!(
             advisor_timeout(&c, Duration::from_millis(300)),
-            Duration::from_millis(300)
+            Some(Duration::from_millis(300))
         );
-        c.timeout_secs = 1;
+        c.timeout_secs = Some(1);
         assert_eq!(
             advisor_timeout(&c, Duration::from_secs(30)),
-            Duration::from_secs(1)
+            Some(Duration::from_secs(1))
         );
-        c.timeout_secs = 0;
-        assert_eq!(advisor_timeout(&c, Duration::from_secs(30)), Duration::ZERO);
+        // The config resolver turns a configured `0` into `None` ("no
+        // limit"), so `Some(0)` can only come from a hand-built config —
+        // and it then means literally "zero seconds".
+        c.timeout_secs = Some(0);
+        assert_eq!(
+            advisor_timeout(&c, Duration::from_secs(30)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn advisor_cap_is_unbounded_when_max_uses_is_unlimited() {
+        let mut c = cfg();
+        assert_eq!(advisor_cap(&c), 2);
+        c.max_uses = None;
+        assert_eq!(
+            advisor_cap(&c),
+            usize::MAX,
+            "no limit means the loop is bounded only by the executor"
+        );
+        // A cap that does not fit `usize` on this platform means "no
+        // limit" rather than a panic.
+        c.max_uses = Some(u32::MAX);
+        assert_eq!(
+            advisor_cap(&c),
+            usize::try_from(u32::MAX).unwrap_or(usize::MAX)
+        );
+    }
+
+    #[test]
+    fn advisor_request_omits_max_output_tokens_when_unlimited() {
+        let mut c = cfg();
+        c.max_tokens = None;
+        let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
+        assert!(
+            v.get("max_output_tokens").is_none(),
+            "no limit means the upstream's own default applies: {v}"
+        );
+        // The bounded case still sends the cap.
+        c.max_tokens = Some(64);
+        let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
+        assert_eq!(v["max_output_tokens"], 64);
+    }
+
+    #[test]
+    fn runaway_warning_fires_once_past_the_threshold() {
+        let mut warned = false;
+        assert!(!should_warn_runaway(1, &mut warned));
+        assert!(
+            !should_warn_runaway(RUNAWAY_CONSULTATION_THRESHOLD, &mut warned),
+            "the threshold itself is not yet a runaway"
+        );
+        assert!(should_warn_runaway(
+            RUNAWAY_CONSULTATION_THRESHOLD + 1,
+            &mut warned
+        ));
+        assert!(
+            !should_warn_runaway(RUNAWAY_CONSULTATION_THRESHOLD + 5, &mut warned),
+            "once per turn, not once per consultation"
+        );
+        let mut fresh = false;
+        assert!(
+            should_warn_runaway(RUNAWAY_CONSULTATION_THRESHOLD + 1, &mut fresh),
+            "a new turn warns again"
+        );
     }
 
     #[test]
