@@ -449,15 +449,19 @@ fn build_outbound(
     // it here so the upstream sees the alias-resolved name.
     outbound.model = model.to_owned();
 
-    // B9: the translator's name-based check preserves the `# Advisor Tool`
+    // B9: the translator's NAME-ONLY check preserves the `# Advisor Tool`
     // section whenever an inbound tool is named `advisor`, but the
     // schema-less declaration is DROPPED on translation. With the shipped
     // default (`advisor.enabled = false`) that left the executor told to
-    // call a tool it does not have. Strip the section here whenever the
-    // advisor pipeline is not actually active; keep it when it is (so the
-    // synthesized tool is usable). This is applied AFTER translation, on
-    // `outbound.instructions`, with no signature change to translate.rs.
-    if !crate::advisor::active(config, req)
+    // call a tool it does not have. Re-apply ONE single-section strip here
+    // ONLY when the translator skipped it (`has_inbound_advisor_tool`) and
+    // the advisor pipeline is inactive. The ordinary no-declaration path
+    // already stripped once during translation; stripping again would eat a
+    // SECOND unrelated section and break byte identity with 17f8329.
+    // When the pipeline is active, the synthesized tool is usable so both
+    // sections are deliberately preserved.
+    if crate::advisor::has_inbound_advisor_tool(req)
+        && !crate::advisor::active(config, req)
         && let Some(instructions) = outbound.instructions.as_mut()
     {
         translate::strip_advisor_tool_instructions(instructions);

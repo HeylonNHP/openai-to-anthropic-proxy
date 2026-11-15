@@ -80,6 +80,20 @@ pub fn scrub_error_body(body: &str) -> String {
     out
 }
 
+/// Whether the client declared a tool named `advisor`, whatever its shape.
+/// The translator uses this NAME-ONLY check to decide whether it may keep
+/// the `# Advisor Tool` system section (an ordinary function tool with that
+/// name is forwarded upstream and can be called). `build_outbound` also
+/// uses it to detect the one case where the translator skipped its strip but
+/// the advisor pipeline is NOT active: the schema-less Claude Code
+/// declaration (B9).
+#[must_use]
+pub fn has_inbound_advisor_tool(req: &CreateMessageRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == ADVISOR_TOOL_NAME))
+}
+
 /// Whether the client declared the real Claude Code advisor tool: a tool
 /// named `advisor` with NO `input_schema` (the three-field, schema-less
 /// declaration). An ordinary function tool that happens to be called

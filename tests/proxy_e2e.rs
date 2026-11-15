@@ -4682,6 +4682,200 @@ async fn b3_cap_terminal_rerun_renders_a_real_answer() {
     );
 }
 
+/// HIGH regression: the terminal cap re-run asked for `advisor` again. Its
+/// content must be rendered EXACTLY ONCE: no second `intermediate_blocks`
+/// splice, no THIRD `server_tool_use` / `max_uses_exceeded` pair, and no POST
+/// after the bound. With `max_uses = 1` the exact sequence is the consulted
+/// pair, the (already emitted) cap pair, then the terminal text. The advisor-
+/// only `function_call` is stripped from the final response, and the previous
+/// cap call still has NO_MORE_ADVICE in the upstream transcript.
+#[tokio::test]
+async fn cap_terminal_rerun_with_another_advisor_call_renders_once() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            // max_uses = 1: first call is consulted, second hits the cap.
+            advisor_call_response("resp_first", "call_first"),
+            advisor_answer("Advice one."),
+            advisor_call_response("resp_cap", "call_cap"),
+            // Terminal re-run: real text AND another advisor call. This
+            // response must render once, from final_resp only.
+            advisor_call_with_text("resp_terminal", "call_terminal_again", "Terminal answer."),
+            advisor_executor_message("resp_never", "must not be reached"),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = 1;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+
+    let types: Vec<&str> = content
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "server_tool_use",
+            "advisor_tool_result",
+            "server_tool_use",
+            "advisor_tool_result",
+            "text",
+        ],
+        "exact block sequence: consulted pair + cap pair + ONE terminal text"
+    );
+    assert_eq!(content[4]["text"], "Terminal answer.");
+    assert_eq!(
+        content
+            .iter()
+            .filter(|b| b["type"] == "text" && b["text"] == "Terminal answer.")
+            .count(),
+        1,
+        "terminal text appears exactly once"
+    );
+    assert_eq!(content[1]["content"]["type"], "advisor_result");
+    assert_eq!(content[1]["content"]["text"], "Advice one.");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[3]["content"]["error_code"], "max_uses_exceeded");
+    assert_eq!(content[3]["tool_use_id"], content[2]["id"]);
+    assert_ne!(content[0]["id"], content[2]["id"]);
+    assert!(
+        !content[0]["id"].as_str().unwrap().is_empty()
+            && !content[2]["id"].as_str().unwrap().is_empty(),
+        "consultation ids are non-empty"
+    );
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "advisor"),
+        "no orphan tool_use named advisor"
+    );
+    assert_eq!(
+        content
+            .iter()
+            .filter(|b| b["content"]["error_code"] == "max_uses_exceeded")
+            .count(),
+        1,
+        "exactly ONE cap result, never a third pair"
+    );
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(
+        body["usage"]["iterations"].as_array().unwrap().len(),
+        4,
+        "executor, advisor, cap executor, terminal executor"
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 4, "no POST beyond the bound");
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    // NO_MORE_ADVICE answers the cap call on the terminal re-run.
+    let cap_outputs: Vec<&serde_json::Value> = bodies[3]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "function_call_output" && i["call_id"] == "call_cap")
+        .collect();
+    assert_eq!(cap_outputs.len(), 1);
+    assert!(
+        cap_outputs[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("limit reached")
+    );
+    // No orphan advisor function_call in ANY upstream input.
+    for (i, b) in bodies.iter().enumerate() {
+        for item in b["input"].as_array().unwrap() {
+            if item["type"] == "function_call" && item["name"] == "advisor" {
+                assert!(
+                    b["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|o| o["type"] == "function_call_output"
+                            && o["call_id"] == item["call_id"]),
+                    "attempt {i}: orphan advisor function_call"
+                );
+            }
+        }
+    }
+}
+
+/// `max_uses = 0` with a terminal cap pair (no successful consultation):
+/// exactly `[server_tool_use, max_uses_exceeded, text]`, id-matched, no
+/// duplicate pair and no POST after the bound.
+#[tokio::test]
+async fn cap_terminal_rerun_emits_exactly_one_cap_pair_and_text() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_cap", "call_cap0"),
+            advisor_call_with_text("resp_terminal", "call_terminal_again", "Terminal answer."),
+            advisor_executor_message("resp_never", "must not be reached"),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = 0;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    let types: Vec<&str> = content
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["server_tool_use", "advisor_tool_result", "text"],
+        "exact block sequence: one cap pair + one terminal text"
+    );
+    assert_eq!(content[1]["content"]["error_code"], "max_uses_exceeded");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[2]["text"], "Terminal answer.");
+    assert_eq!(
+        content
+            .iter()
+            .filter(|b| b["type"] == "server_tool_use")
+            .count(),
+        1
+    );
+    assert_eq!(
+        content
+            .iter()
+            .filter(|b| b["content"]["error_code"] == "max_uses_exceeded")
+            .count(),
+        1
+    );
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(
+        upstream.received_all.lock().await.len(),
+        2,
+        "no POST beyond the bound"
+    );
+}
+
 /// B4: `timeout_secs > request_timeout` must NOT extend the operator's
 /// timeout. A large advisor timeout is clamped to `request_timeout`, so a
 /// stalled advisor is cut off quickly and the turn degrades.
@@ -5186,5 +5380,202 @@ async fn b9_disabled_without_declaration_is_still_byte_identical() {
             .as_str()
             .unwrap()
             .contains("<system-reminder>skills</system-reminder>")
+    );
+}
+
+// ─── Two-section instruction-strip regressions (byte identity + B9) ─────────
+//
+// `17f8329` stripped only the FIRST line-start `# Advisor Tool` section.
+// A post-translation strip must NEVER run on the ordinary no-declaration
+// path: that is what deleted a SECOND unrelated section in `ddac5de`.
+
+/// Two `# Advisor Tool` sections, separated by `<system-reminder>`.
+const TWO_ADVISOR_SECTIONS: &str = "Git status: clean\n\n\
+# Advisor Tool\n\nCall advisor ONE.\n\n\
+<system-reminder>skills</system-reminder>\n\n\
+# Advisor Tool\n\nCall advisor TWO.\n\n\
+<system-reminder>agents</system-reminder>";
+
+fn two_section_request(stream: bool, declaration: &str) -> String {
+    let declaration: serde_json::Value = serde_json::from_str(declaration).unwrap();
+    serde_json::json!({
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "stream": stream,
+        "system": TWO_ADVISOR_SECTIONS,
+        "tools": [declaration],
+        "messages": [{"role": "user", "content": "Do the task"}],
+    })
+    .to_string()
+}
+
+/// `enabled:false` + NO declaration: the translator strips section ONE once
+/// and the proxy does NOT strip again. Section TWO survives, exactly as it
+/// did in `17f8329` (byte identity), for both non-streaming and streaming.
+#[tokio::test]
+async fn two_sections_disabled_no_declaration_preserves_second_section() {
+    const BASH_DECL: &str =
+        r#"{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{}}}"#;
+    for stream in [false, true] {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        if stream {
+            let created = serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_1", "object": "response",
+                    "created_at": 0, "status": "in_progress",
+                    "model": "gpt-4o", "output": []}
+            })
+            .to_string();
+            let completed = serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "object": "response",
+                    "created_at": 0, "status": "completed",
+                    "model": "gpt-4o", "output": [],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}}
+            })
+            .to_string();
+            *upstream.canned_stream.lock().await = Some(format!(
+                "event: response.created\ndata: {created}\n\n\
+                 event: response.completed\ndata: {completed}\n\n"
+            ));
+        } else {
+            *upstream.canned.lock().await =
+                Some(completed_response_with_id("resp_two_sec", "same answer"));
+        }
+        let config = make_proxy_config(upstream_addr);
+        assert!(!config.advisor.enabled);
+        let proxy_addr = start_proxy(config).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(two_section_request(stream, BASH_DECL)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "stream={stream}");
+        if stream {
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "text/event-stream"
+            );
+            let _ = res.text().await.unwrap();
+        } else {
+            assert_eq!(
+                res.json::<serde_json::Value>().await.unwrap(),
+                serde_json::json!({
+                    "id": "msg_resp_two_sec",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "same answer"}],
+                    "model": "gpt-4o-mini",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 7, "output_tokens": 3}
+                })
+            );
+        }
+        let sent = upstream.received_all.lock().await.clone();
+        assert_eq!(sent.len(), 1, "stream={stream}: no extra POST");
+        let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+        let instructions = v["instructions"].as_str().unwrap();
+        assert!(
+            !instructions.contains("Call advisor ONE"),
+            "stream={stream}: section ONE was stripped once"
+        );
+        assert!(
+            instructions.contains("# Advisor Tool\n\nCall advisor TWO."),
+            "stream={stream}: section TWO survives, byte-identical to 17f8329: {instructions:?}"
+        );
+        assert!(instructions.starts_with("Git status: clean\n\n<system-reminder>skills"));
+        assert!(instructions.contains("<system-reminder>agents</system-reminder>"));
+        assert_eq!(v["stream"], stream);
+        assert_eq!(v["tools"][0]["name"], "Bash");
+    }
+}
+
+/// `enabled:false` + schema-less declaration (B9): the translator skips its
+/// strip, so `build_outbound` applies ONE strip. Section ONE is removed; the
+/// second section is defined to survive (matching the single-strip contract).
+#[tokio::test]
+async fn two_sections_disabled_schema_less_decl_strips_only_first() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_b9_two", "ok"));
+    let config = make_proxy_config(upstream_addr);
+    assert!(!config.advisor.enabled);
+    let proxy_addr = start_proxy(config).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(two_section_request(
+            false,
+            ADVISOR_DECLARATION,
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "B9: no extra POST");
+    let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let instructions = v["instructions"].as_str().unwrap();
+    assert!(
+        !instructions.contains("Call advisor ONE"),
+        "no orphan tool instructions from section ONE: {instructions:?}"
+    );
+    assert!(
+        instructions.contains("Call advisor TWO"),
+        "exactly one strip; section TWO survives"
+    );
+    assert!(instructions.contains("<system-reminder>skills</system-reminder>"));
+    assert!(instructions.contains("<system-reminder>agents</system-reminder>"));
+    assert!(
+        !v["tools"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|t| t["name"] == "advisor"),
+        "schema-less declaration is dropped upstream"
+    );
+}
+
+/// `enabled:true` + real declaration: the advisor pipeline is active, so
+/// BOTH sections are preserved for the synthesized tool.
+#[tokio::test]
+async fn two_sections_enabled_declaration_preserves_both_sections() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_active", "Done."));
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(two_section_request(
+            false,
+            ADVISOR_DECLARATION,
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "no consultation without an advisor call");
+    let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let instructions = v["instructions"].as_str().unwrap();
+    assert_eq!(
+        instructions, TWO_ADVISOR_SECTIONS,
+        "active advisor keeps both sections byte-for-byte"
+    );
+    assert_eq!(
+        v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["name"] == "advisor")
+            .count(),
+        1,
+        "exactly one synthesized advisor tool"
     );
 }

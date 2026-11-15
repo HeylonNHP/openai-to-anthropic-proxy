@@ -298,6 +298,15 @@ fn without_output(resp: &ResponsesResponse) -> ResponsesResponse {
     clone
 }
 
+/// Strip the INTERNAL advisor `function_call` from a terminal executor
+/// response. `render_advisor` filters the translated `tool_use`, but the
+/// in-memory `final_resp` must not carry a call that was never consulted:
+/// no later rendering, transcript, or stats path may see an orphan.
+fn strip_advisor_call(resp: &mut ResponsesResponse) {
+    resp.output
+        .retain(|item| !matches!(item, OutputItem::FunctionCall { name, .. } if name == "advisor"));
+}
+
 /// Append a fresh `server_tool_use` / `unavailable` pair (or close a
 /// dangling `server_tool_use` with its result). Used when a re-run of the
 /// executor fails AFTER a consultation: the client must still see a
@@ -390,6 +399,19 @@ pub async fn run(
             iterations.push(protocol::message_iteration(usage));
         }
 
+        // `cap_reached` marks the ONE terminal extra re-run after the cap
+        // pair was already emitted. Its content — text, sibling client tool
+        // uses, even another advisor call — is FINAL and is rendered exactly
+        // once by `render_advisor` from `final_resp`. Do NOT splice it into
+        // `prefix_blocks` or open a THIRD `server_tool_use` pair. The cap
+        // already injected `NO_MORE_ADVICE` for the previous call, so no
+        // orphan `function_call` is left in any later upstream input.
+        if cap_reached {
+            let mut final_resp = resp;
+            strip_advisor_call(&mut final_resp);
+            return complete(final_resp, prefix_blocks, iterations);
+        }
+
         let Some((call_id, arguments)) = find_advisor_call(&resp.output) else {
             return complete(resp, prefix_blocks, iterations);
         };
@@ -406,25 +428,18 @@ pub async fn run(
         // call and re-run the executor ONE last time for a real answer.
         // That extra re-run is terminal — if it calls `advisor` again we
         // strip that tool_use and render without consulting.
-        if uses >= cap || cap_reached {
-            if !cap_reached {
-                warn_once(
-                    &attempt.state,
-                    &mut warned,
-                    cfg,
-                    "advisor max_uses exceeded",
-                );
-                prefix_blocks.push(ResponseContentBlock::Raw(protocol::max_uses_exceeded(&id)));
-                inject(attempt, &call_id, &arguments, NO_MORE_ADVICE);
-                cap_reached = true;
-                last_good = Some(without_output(&resp));
-                continue;
-            }
-            // The terminal extra re-run still asked for advice. Do NOT
-            // consult again and do NOT POST again. Close the pair and
-            // render (the advisor tool_use is filtered out below).
+        if uses >= cap {
+            warn_once(
+                &attempt.state,
+                &mut warned,
+                cfg,
+                "advisor max_uses exceeded",
+            );
             prefix_blocks.push(ResponseContentBlock::Raw(protocol::max_uses_exceeded(&id)));
-            return complete(resp, prefix_blocks, iterations);
+            inject(attempt, &call_id, &arguments, NO_MORE_ADVICE);
+            cap_reached = true;
+            last_good = Some(without_output(&resp));
+            continue;
         }
         uses += 1;
 
@@ -581,6 +596,31 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(find_advisor_call(&plain), None);
+    }
+
+    #[test]
+    fn strip_advisor_call_removes_only_the_internal_call() {
+        let mut resp = response("completed", Some("Terminal answer."));
+        let mut extra: Vec<OutputItem> = serde_json::from_value(json!([
+            {"type": "function_call", "call_id": "call_adv", "name": "advisor", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_bash", "name": "Bash", "arguments": "{}"}
+        ]))
+        .unwrap();
+        resp.output.append(&mut extra);
+        strip_advisor_call(&mut resp);
+        assert_eq!(resp.output.len(), 2);
+        assert!(matches!(&resp.output[0], OutputItem::Message { .. }));
+        assert!(matches!(
+            &resp.output[1],
+            OutputItem::FunctionCall { name, .. } if name == "Bash"
+        ));
+        let mut again = resp.clone();
+        strip_advisor_call(&mut again);
+        assert_eq!(
+            format!("{again:?}"),
+            format!("{resp:?}"),
+            "pure helper is idempotent"
+        );
     }
 
     #[test]

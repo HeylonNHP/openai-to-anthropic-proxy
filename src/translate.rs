@@ -149,10 +149,11 @@ pub fn anthropic_to_responses(
     // has no `input_schema` and is dropped by the filter_map below, so
     // forwarding the instructions would tell the model to call a tool that
     // does not exist. Strip the section (and only the section) when no
-    // advisor tool is actually being sent upstream. NOTE: the proxy
-    // additionally re-applies this strip AFTER translation, based on the
-    // real advisor-active predicate, so `enabled:false` + an inbound
-    // declaration cannot leak the orphan instructions (B9).
+    // advisor tool is actually being sent upstream. This is exactly the
+    // single-section strip introduced at 17f8329, and MUST stay that way
+    // for byte identity. The proxy re-applies this strip AFTER translation
+    // only when the translator skipped it but the pipeline is inactive
+    // (`enabled:false` + schema-less declaration, B9).
     let has_advisor_tool = req
         .tools
         .as_ref()
@@ -277,7 +278,7 @@ fn system_text(system: &SystemPrompt) -> String {
     }
 }
 
-/// Remove Claude Code's `# Advisor Tool` section from the assembled
+/// Remove the FIRST Claude Code `# Advisor Tool` section from the assembled
 /// `instructions`, leaving every byte before and after it untouched.
 ///
 /// Claude Code injects this section into the system prompt whenever the
@@ -287,6 +288,14 @@ fn system_text(system: &SystemPrompt) -> String {
 /// `The following skills are available for use with the Skill tool:`.
 /// It is never the last thing in the prompt in real traffic, but we also
 /// handle a section that runs to the end of the string.
+///
+/// Exactly ONE section is removed per call: that is the `17f8329` behaviour
+/// the `enabled:false` / no-declaration path must keep byte-for-byte. Callers
+/// that need the B9 schema-less-declaration case invoke it ONCE themselves
+/// after translation; no caller invokes it twice on the same string. With a
+/// single-section prompt that makes the call idempotent in practice (the
+/// second call finds no heading), and a malformed bare heading is left in
+/// place rather than causing an infinite loop.
 ///
 /// We deliberately do NOT replace it with the "advisor tool is no longer
 /// available" notice Claude Code itself uses: the executor never saw a
@@ -2241,6 +2250,55 @@ If you've already retrieved data pointing one way and the advisor points another
         // No advisor text at all: byte-for-byte unchanged.
         let plain = "You are helpful.\n\n## Auto Mode Active\n\nDo things.";
         assert_eq!(translate_system(plain, None).as_deref(), Some(plain));
+    }
+
+    /// A two-section system prompt exercises the 17f8329 byte-identity
+    /// contract: the helper removes ONLY the first section. The proxy must
+    /// never call it twice on the no-declaration path.
+    const TWO_SECTIONS: &str = "prefix\n\n\
+# Advisor Tool\n\nCall advisor ONE.\n\n\
+<system-reminder>skills</system-reminder>\n\n\
+# Advisor Tool\n\nCall advisor TWO.\n\n\
+<system-reminder>agents</system-reminder>\n\n\
+suffix";
+
+    #[test]
+    fn advisor_strip_removes_exactly_one_section_and_preserves_the_second() {
+        let mut out = TWO_SECTIONS.to_owned();
+        strip_advisor_tool_instructions(&mut out);
+        assert!(!out.contains("Call advisor ONE"));
+        assert!(out.contains("Call advisor TWO"), "second section survives");
+        assert!(out.starts_with("prefix\n\n<system-reminder>skills"));
+        assert!(out.contains("<system-reminder>agents</system-reminder>"));
+        assert!(out.ends_with("suffix"));
+        assert_eq!(out.matches("# Advisor Tool").count(), 1);
+    }
+
+    #[test]
+    fn advisor_strip_called_twice_is_idempotent_for_a_single_section() {
+        let mut once = format!(
+            "prefix\n\n{ADVISOR_SECTION}<system-reminder>skills</system-reminder>\n\nsuffix"
+        );
+        strip_advisor_tool_instructions(&mut once);
+        let first = once.clone();
+        strip_advisor_tool_instructions(&mut once);
+        assert_eq!(once, first, "second call must be a no-op");
+        assert!(!once.contains("# Advisor Tool"));
+        assert!(once.contains("prefix\n\n<system-reminder>skills"));
+        assert!(once.ends_with("suffix"));
+    }
+
+    #[test]
+    fn advisor_strip_preserves_inline_quote_and_bare_heading_directly() {
+        let quote = "Mentioned the \"# Advisor Tool\" doc in prose.\n\nKeep this paragraph.";
+        let mut out = quote.to_owned();
+        strip_advisor_tool_instructions(&mut out);
+        assert_eq!(out, quote);
+
+        let bare = "prefix\n\n# Advisor Tool";
+        let mut out = bare.to_owned();
+        strip_advisor_tool_instructions(&mut out);
+        assert_eq!(out, bare);
     }
 
     #[test]
