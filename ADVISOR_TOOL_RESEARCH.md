@@ -1818,6 +1818,17 @@ separate precedence level [21].
 - Scratch: `/tmp/locopilot-advisor-live-SR4F13/` and `/tmp/advisor-re-20261115/`
   (may be cleaned up).
 
+### 18.6 Documented for users (2026-11-15 14:01)
+
+The `advisorModel` + `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL` settings
+requirement is now in **`README.md` \u00a7 "Enabling the advisor tool"**, and
+has been applied to the operator's real `~/.claude/settings.json` (merging
+into the existing `env` block, keeping its `ANTHROPIC_*` and
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` values). The README also carries the
+"advisor support is being implemented" status caveat: until
+`proxy.json` has `advisor.enabled = true`, Claude Code will declare the tool
+but no consultation occurs.
+
 ---
 
 ## Sources
