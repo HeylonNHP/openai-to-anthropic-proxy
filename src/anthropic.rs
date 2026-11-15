@@ -18,7 +18,7 @@
 //! reasoning-effort selection rather than being rejected.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // ─── Requests (inbound) ─────────────────────────────────────────────────────
 
@@ -158,6 +158,15 @@ pub enum ContentBlockParam {
     /// Redacted extended-thinking block: `{"type":"redacted_thinking","data":"…"}`.
     /// `data` is an opaque Anthropic-encrypted blob with no readable text.
     RedactedThinking(RedactedThinkingBlockParam),
+    /// Claude Code echoes the advisor's `server_tool_use` block verbatim on
+    /// the next request (§11.5). It used to land in `Unknown` and be dropped,
+    /// taking the paired advice with it. Parse it explicitly so the pair can
+    /// be replayed as prior context instead of as an orphan `function_call`.
+    ServerToolUse(ServerToolUseBlockParam),
+    /// The advisor's paired result block. `content` is a 3-way union, kept
+    /// opaque: `advisor_result{text}`, `advisor_redacted_result{
+    /// encrypted_content}`, `advisor_tool_result_error{error_code}`.
+    AdvisorToolResult(AdvisorToolResultBlockParam),
     /// Unknown block types round-trip as raw JSON; the translator drops them
     /// when forwarding to OpenAI (with a tracing warning).
     #[serde(other)]
@@ -191,6 +200,54 @@ pub struct RedactedThinkingBlockParam {
     /// Opaque encrypted blob with no readable text.
     #[serde(default, deserialize_with = "tolerant_text")]
     pub data: String,
+}
+
+/// Anthropic `server_tool_use` block as echoed back by Claude Code:
+/// `{"type":"server_tool_use","id":"srvtoolu_…","name":"advisor","input":{}}`.
+///
+/// Every field is `#[serde(default)]` and the two text fields are tolerant of
+/// a wrong JSON type: a matched tag whose payload fails to deserialize is a
+/// hard error that would turn a previously tolerated block into a 400 for the
+/// whole request (`#[serde(other)]` only catches UNMATCHED tags). `extra`
+/// keeps `cache_control`, `caller` and any future fields so the block can be
+/// round-tripped verbatim.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerToolUseBlockParam {
+    /// `srvtoolu_…` id; the paired result block carries it as `tool_use_id`.
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub id: String,
+    /// Server-side tool name. Only `advisor` is understood by the translator.
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub name: String,
+    /// Tool input. The advisor tool takes no arguments (`{}`); kept as an
+    /// opaque `Value` so any future server tool shape still parses.
+    #[serde(default)]
+    pub input: Value,
+    /// All unrecognised fields, including Anthropic's `cache_control` and
+    /// `caller`, preserved for verbatim round-tripping.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Anthropic `advisor_tool_result` block as echoed back by Claude Code:
+/// `{"type":"advisor_tool_result","tool_use_id":"srvtoolu_…","content":{…}}`.
+///
+/// `content` is deliberately an opaque `Value` — it is a 3-way union and only
+/// `advisor_result{text}` carries plaintext advice. Defaults keep a partial
+/// or future-shaped block from failing the entire request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisorToolResultBlockParam {
+    /// Id of the preceding `server_tool_use` block.
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub tool_use_id: String,
+    /// Opaque result union: `advisor_result{text}`,
+    /// `advisor_redacted_result{encrypted_content}`, or
+    /// `advisor_tool_result_error{error_code}` (plus future fields).
+    #[serde(default)]
+    pub content: Value,
+    /// All unrecognised fields, preserved for verbatim round-tripping.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Deserialize a text field, tolerating a wrong JSON type.
@@ -815,15 +872,175 @@ mod tests {
         assert_eq!(value["iterations"], serde_json::Value::Array(iterations));
     }
 
+    // ── Advisor echo blocks (§11.5) ────────────────────────────────────────
+    //
+    // Claude Code echoes `server_tool_use` + `advisor_tool_result` verbatim
+    // on the next turn. They used to land in `Unknown` and be dropped, so the
+    // upstream never saw the prior advice. These tests pin the wire types.
+
     #[test]
-    fn unknown_block_type_still_maps_to_unknown() {
-        // Guards `#[serde(other)] Unknown` remaining the LAST variant.
+    fn parses_advisor_echo_pair_with_unknown_fields() {
         let blocks = parse_blocks(
             r#"{
                 "model": "claude-sonnet-5",
                 "max_tokens": 100,
                 "messages": [{"role": "assistant", "content": [
-                    {"type": "server_tool_use", "id": "srvtool_1"}
+                    {"type": "text", "text": "Let me consult the advisor."},
+                    {"type": "server_tool_use", "id": "srvtoolu_abc",
+                     "name": "advisor", "input": {},
+                     "cache_control": {"type": "ephemeral"},
+                     "caller": {"type": "direct"}},
+                    {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_abc",
+                     "content": {"type": "advisor_result",
+                                 "text": "Use a channel-based pattern.",
+                                 "stop_reason": "end_turn"},
+                     "cache_control": {"type": "ephemeral"}}
+                ]}]
+            }"#,
+        );
+        assert_eq!(blocks.len(), 3);
+        match &blocks[1] {
+            ContentBlockParam::ServerToolUse(u) => {
+                assert_eq!(u.id, "srvtoolu_abc");
+                assert_eq!(u.name, "advisor");
+                assert_eq!(u.input, serde_json::json!({}));
+                assert_eq!(u.extra["cache_control"]["type"], "ephemeral");
+                assert_eq!(u.extra["caller"]["type"], "direct");
+                // Round-trip: named fields + flattened extras reproduce the
+                // original object (the tag is added by the enum).
+                let mut round = serde_json::Map::from_iter([
+                    ("id".into(), u.id.clone().into()),
+                    ("name".into(), u.name.clone().into()),
+                    ("input".into(), u.input.clone()),
+                ]);
+                round.extend(u.extra.clone());
+                round.insert("type".into(), "server_tool_use".into());
+                assert_eq!(
+                    Value::Object(round),
+                    serde_json::json!({
+                        "type": "server_tool_use", "id": "srvtoolu_abc",
+                        "name": "advisor", "input": {},
+                        "cache_control": {"type": "ephemeral"},
+                        "caller": {"type": "direct"}
+                    })
+                );
+            }
+            other => panic!("expected ServerToolUse, got {other:?}"),
+        }
+        match &blocks[2] {
+            ContentBlockParam::AdvisorToolResult(r) => {
+                assert_eq!(r.tool_use_id, "srvtoolu_abc");
+                assert_eq!(r.content["type"], "advisor_result");
+                assert_eq!(r.content["text"], "Use a channel-based pattern.");
+                assert_eq!(r.content["stop_reason"], "end_turn");
+                assert_eq!(r.extra["cache_control"]["type"], "ephemeral");
+            }
+            other => panic!("expected AdvisorToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn advisor_echo_blocks_accept_all_three_result_variants() {
+        // `content` is opaque: the redacted and error variants must parse
+        // without failing the request, even though the translator will not
+        // inject any advice text for them.
+        let blocks = parse_blocks(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_1",
+                     "content": {"type": "advisor_redacted_result",
+                                 "encrypted_content": "BLOB"}},
+                    {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_2",
+                     "content": {"type": "advisor_tool_result_error",
+                                 "error_code": "unavailable"}},
+                    {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_3",
+                     "content": {"type": "future_result", "future": 1}}
+                ]}]
+            }"#,
+        );
+        assert_eq!(blocks.len(), 3);
+        for (i, expected) in [
+            "advisor_redacted_result",
+            "advisor_tool_result_error",
+            "future_result",
+        ]
+        .iter()
+        .enumerate()
+        {
+            match &blocks[i] {
+                ContentBlockParam::AdvisorToolResult(r) => {
+                    assert_eq!(r.content["type"], *expected);
+                }
+                other => panic!("expected AdvisorToolResult, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn partial_or_wrong_typed_advisor_echo_blocks_never_fail_the_request() {
+        // A matched tag with missing/wrong-typed fields is a hard serde error
+        // unless every field defaults; `#[serde(other)]` does not help here.
+        let blocks = parse_blocks(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "server_tool_use"},
+                    {"type": "server_tool_use", "id": 123, "name": {},
+                     "input": null},
+                    {"type": "advisor_tool_result"},
+                    {"type": "advisor_tool_result", "tool_use_id": 5,
+                     "content": "garbage", "future": [1, 2]}
+                ]}]
+            }"#,
+        );
+        assert_eq!(blocks.len(), 4);
+        match &blocks[0] {
+            ContentBlockParam::ServerToolUse(u) => {
+                assert!(u.id.is_empty());
+                assert!(u.name.is_empty());
+                assert!(u.input.is_null());
+                assert!(u.extra.is_empty());
+            }
+            other => panic!("expected ServerToolUse, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlockParam::ServerToolUse(u) => {
+                assert_eq!(u.id, "123");
+                assert_eq!(u.name, "{}");
+                assert!(u.input.is_null());
+            }
+            other => panic!("expected ServerToolUse, got {other:?}"),
+        }
+        match &blocks[2] {
+            ContentBlockParam::AdvisorToolResult(r) => {
+                assert!(r.tool_use_id.is_empty());
+                assert!(r.content.is_null());
+            }
+            other => panic!("expected AdvisorToolResult, got {other:?}"),
+        }
+        match &blocks[3] {
+            ContentBlockParam::AdvisorToolResult(r) => {
+                assert_eq!(r.tool_use_id, "5");
+                assert_eq!(r.content, "garbage");
+                assert_eq!(r.extra["future"], serde_json::json!([1, 2]));
+            }
+            other => panic!("expected AdvisorToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_block_type_still_maps_to_unknown() {
+        // Guards `#[serde(other)] Unknown` remaining the LAST variant. Use a
+        // genuinely unrecognised tag: `server_tool_use` is now explicit.
+        let blocks = parse_blocks(
+            r#"{
+                "model": "claude-sonnet-5",
+                "max_tokens": 100,
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "future_server_block", "id": "srvtool_1"}
                 ]}]
             }"#,
         );

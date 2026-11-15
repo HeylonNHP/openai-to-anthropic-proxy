@@ -1502,6 +1502,17 @@ fn append_user_message(
                             "dropping redacted_thinking block from user message"
                         );
                     }
+                    ContentBlockParam::ServerToolUse(_)
+                    | ContentBlockParam::AdvisorToolResult(_) => {
+                        // Advisor echo blocks belong to an assistant turn.
+                        // Folding them into the user's voice would attribute
+                        // the prior consultation to the user, so drop them
+                        // just as the old `Unknown` fallback did.
+                        tracing::warn!(
+                            "dropping advisor echo block from user message \
+                             (server tool blocks belong in assistant turns)"
+                        );
+                    }
                     ContentBlockParam::Unknown => {
                         tracing::warn!("dropping unknown user content block type");
                     }
@@ -1621,6 +1632,12 @@ fn tool_result_output(tr: &ToolResultBlockParam) -> String {
 const THINKING_PREFIX: &str = "<thinking>\n";
 const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
 
+/// Delimiters for replayed advisor advice folded into an assistant
+/// `output_text` part. Follow-up turns must see prior advice as prior context,
+/// not as words the assistant is saying now.
+const ADVISOR_ADVICE_PREFIX: &str = "[Advisor advice from a previous turn: ";
+const ADVISOR_ADVICE_SUFFIX: &str = "]\n";
+
 /// Neutralise the reasoning fence inside replayed reasoning text.
 ///
 /// The reasoning is model output from a *previous* turn, and the model may
@@ -1725,6 +1742,10 @@ fn append_assistant_message(
             let mut signature = String::new();
             let mut thinking_blocks = 0usize;
             let mut calls: Vec<(String, String, String)> = Vec::new(); // (id, name, arguments)
+            // Ids of echoed `server_tool_use{name:"advisor"}` blocks, in wire
+            // order. Kept so the paired result below can be attributed; they
+            // must NOT become Responses `function_call` items (see below).
+            let mut advisor_consultation_ids: Vec<String> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
@@ -1776,6 +1797,76 @@ fn append_assistant_message(
                             "dropping redacted_thinking block from assistant message \
                              (opaque Anthropic blob; not replayable upstream)"
                         );
+                    }
+                    ContentBlockParam::ServerToolUse(stu) => {
+                        // Claude Code echoes the advisor `server_tool_use`
+                        // verbatim on the next turn. Do NOT synthesize a
+                        // Responses `function_call`: it would need a matching
+                        // `function_call_output` (an Anthropic advisor result
+                        // is not one) and would orphan the call upstream.
+                        // Record the consultation instead; the paired RESULT
+                        // block is what carries the advice into context.
+                        if stu.name == "advisor" {
+                            advisor_consultation_ids.push(stu.id.clone());
+                            tracing::debug!(
+                                id = %stu.id,
+                                "echoed advisor server_tool_use; no function_call emitted"
+                            );
+                        } else {
+                            tracing::warn!(
+                                name = %stu.name,
+                                "dropping unsupported server_tool_use block from assistant message"
+                            );
+                        }
+                    }
+                    ContentBlockParam::AdvisorToolResult(res) => {
+                        // `content` is an opaque 3-way union. Only
+                        // `advisor_result{text}` carries plaintext advice;
+                        // `advisor_redacted_result` and
+                        // `advisor_tool_result_error` must never be presented
+                        // as advice that was actually given.
+                        let kind = res.content.get("type").and_then(Value::as_str);
+                        match kind {
+                            Some("advisor_result") => {
+                                let advice = res
+                                    .content
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if advice.trim().is_empty() {
+                                    tracing::debug!(
+                                        "empty advisor_result text; no advice replayed"
+                                    );
+                                } else {
+                                    // The API requires the pair contiguous in
+                                    // one assistant message; tolerate a
+                                    // partial echo but still replay the text
+                                    // so prior advice is never lost.
+                                    let paired = advisor_consultation_ids
+                                        .iter()
+                                        .any(|id| id == &res.tool_use_id);
+                                    if !paired {
+                                        tracing::debug!(
+                                            tool_use_id = %res.tool_use_id,
+                                            "echoed advisor result has no preceding \
+                                             server_tool_use in this message"
+                                        );
+                                    }
+                                    // Fold the advice into the SAME assistant
+                                    // `output_text` part, delimited so the
+                                    // upstream can distinguish it from the
+                                    // assistant's own words.
+                                    text.push('\n');
+                                    text.push_str(ADVISOR_ADVICE_PREFIX);
+                                    text.push_str(advice);
+                                    text.push_str(ADVISOR_ADVICE_SUFFIX);
+                                }
+                            }
+                            _ => tracing::debug!(
+                                kind = ?kind,
+                                "echoed advisor result carries no plaintext advice"
+                            ),
+                        }
                     }
                     ContentBlockParam::Image(_)
                     | ContentBlockParam::ToolResult(_)
@@ -2001,8 +2092,9 @@ fn map_tool_choice(choice: &ToolChoice) -> (ResponsesToolChoice, Option<bool>) {
 mod tests {
     use super::*;
     use crate::anthropic::{
-        CacheControl, ImageBlockParam, MessageParam, RedactedThinkingBlockParam, TextBlockParam,
-        ThinkingBlockParam, Tool, ToolResultBlockParam, ToolUseBlockParam,
+        AdvisorToolResultBlockParam, CacheControl, ImageBlockParam, MessageParam,
+        RedactedThinkingBlockParam, ServerToolUseBlockParam, TextBlockParam, ThinkingBlockParam,
+        Tool, ToolResultBlockParam, ToolUseBlockParam,
     };
     use crate::config::PromptCachingConfig;
     use crate::responses::ReasoningSummaryText;
@@ -2365,6 +2457,163 @@ If you've already retrieved data pointing one way and the advisor points another
             }
             _ => panic!("expected assistant message"),
         }
+    }
+
+    /// Translate a request whose assistant turn carries echoed advisor
+    /// blocks, mirroring §11.5's exact wire shape.
+    fn request_with_advisor_echo(result_content: Value) -> CreateMessageRequest {
+        let mut req = fixture_request();
+        req.messages = vec![
+            MessageParam {
+                role: MessageRole::User,
+                content: MessageContent::Text("Do the task".into()),
+            },
+            MessageParam {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(vec![
+                    ContentBlockParam::Text(TextBlockParam {
+                        text: "Let me consult the advisor.".into(),
+                        cache_control: None,
+                    }),
+                    ContentBlockParam::ServerToolUse(ServerToolUseBlockParam {
+                        id: "srvtoolu_abc123".into(),
+                        name: "advisor".into(),
+                        input: json!({}),
+                        extra: Default::default(),
+                    }),
+                    ContentBlockParam::AdvisorToolResult(AdvisorToolResultBlockParam {
+                        tool_use_id: "srvtoolu_abc123".into(),
+                        content: result_content,
+                        extra: Default::default(),
+                    }),
+                    // §11.5 allows executor text AFTER the pair; the advice
+                    // must stay in wire order inside the same output_text.
+                    ContentBlockParam::Text(TextBlockParam {
+                        text: "Here's the implementation.".into(),
+                        cache_control: None,
+                    }),
+                ]),
+            },
+            MessageParam {
+                role: MessageRole::User,
+                content: MessageContent::Text("Continue".into()),
+            },
+        ];
+        req
+    }
+
+    /// The exact translated `InputItem` list for the echo turn: ONE assistant
+    /// message whose single `output_text` part carries the delimited advice,
+    /// and NO orphan `function_call` / `function_call_output`.
+    #[test]
+    fn advisor_echo_replays_prior_advice_without_orphan_function_call() {
+        let req = request_with_advisor_echo(json!({
+            "type": "advisor_result",
+            "text": "Use a channel-based coordination pattern.",
+            "stop_reason": "end_turn"
+        }));
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &replay(ReasoningReplayMode::Off, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        // `InputItem` has no PartialEq derive (adding one creates new clippy
+        // lints), so compare the exact serialized shape instead. This is
+        // also the actual wire representation the upstream receives.
+        assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            json!([
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Do the task"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Let me consult the advisor.\n\
+                                 [Advisor advice from a previous turn: \
+                                 Use a channel-based coordination pattern.]\n\n\
+                                 Here's the implementation."
+                    }]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue"}]
+                }
+            ])
+        );
+    }
+
+    /// Redacted and error results carry NO plaintext advice, so nothing is
+    /// injected. A control with no echo blocks stays clean too.
+    #[test]
+    fn advisor_echo_non_advice_variants_inject_nothing() {
+        for content in [
+            json!({"type": "advisor_redacted_result", "encrypted_content": "BLOB"}),
+            json!({"type": "advisor_tool_result_error", "error_code": "unavailable"}),
+            json!({"type": "advisor_result"}),
+            json!({}),
+        ] {
+            let req = request_with_advisor_echo(content.clone());
+            let (out, _reg) = anthropic_to_responses(
+                &req,
+                None,
+                &PromptCachingConfig::default(),
+                &replay(ReasoningReplayMode::Off, 0),
+            )
+            .unwrap();
+            let items = unwrap_items(out);
+            assert_eq!(
+                serde_json::to_value(&items).unwrap(),
+                json!([
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Do the task"}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Let me consult the advisor.\nHere's the implementation."
+                        }]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Continue"}]
+                    }
+                ]),
+                "content={content}"
+            );
+        }
+
+        // Control: a request with no echoed blocks at all.
+        let mut control = fixture_request();
+        control.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Text("Do the task".into()),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &control,
+            None,
+            &PromptCachingConfig::default(),
+            &replay(ReasoningReplayMode::Off, 0),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 1);
+        let serialized = serde_json::to_string(&items).unwrap();
+        assert!(!serialized.contains("Advisor advice"));
+        assert!(!serialized.contains("function_call"));
     }
 
     #[test]

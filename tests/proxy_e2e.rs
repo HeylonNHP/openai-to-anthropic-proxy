@@ -3986,8 +3986,9 @@ async fn advisor_stream_true_emits_sse() {
 }
 
 /// 6. Claude Code echoes both advisor blocks verbatim on the next request.
-/// `ContentBlockParam::Unknown` already parses them; the proxy must not
-/// 400 and must not emit an orphan `function_call` upstream.
+/// `ContentBlockParam` now parses them explicitly; the proxy must not 400,
+/// must not emit an orphan `function_call` upstream, and must replay the
+/// prior advice (see `advisor_echo_prior_advice_reaches_upstream`).
 #[tokio::test]
 async fn advisor_inbound_echo_does_not_400() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
@@ -4045,6 +4046,108 @@ async fn advisor_inbound_echo_does_not_400() {
             "no synthetic tool result for an echoed block"
         );
     }
+}
+
+/// THE fidelity gap: prior advice must survive into the upstream transcript.
+/// Claude Code echoes `server_tool_use` + `advisor_tool_result` back on the
+/// next turn. With the advisor DISABLED no new consultation fires, so the
+/// upstream sees exactly ONE POST whose assistant `output_text` carries the
+/// prior advice — and no orphan `function_call`. A control request without
+/// the blocks must stay clean.
+#[tokio::test]
+async fn advisor_echo_prior_advice_reaches_upstream() {
+    const PRIOR: &str = "Use a channel-based coordination pattern.";
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_echo2", "ok"));
+    // Advisor DISABLED (make_proxy_config's default). No declaration either,
+    // so the ordinary non-advisor pipeline is used for both requests.
+    let config = make_proxy_config(upstream_addr);
+    assert!(!config.advisor.enabled);
+    let proxy_addr = start_proxy(config).await;
+
+    let with_echo = r#"{
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "messages": [
+            {"role":"user","content":"Do the task"},
+            {"role":"assistant","content":[
+                {"type":"text","text":"Let me consult the advisor."},
+                {"type":"server_tool_use","id":"srvtoolu_echo2",
+                 "name":"advisor","input":{}},
+                {"type":"advisor_tool_result","tool_use_id":"srvtoolu_echo2",
+                 "content":{"type":"advisor_result",
+                            "text":"Use a channel-based coordination pattern."}}
+            ]},
+            {"role":"user","content":"Continue"}
+        ]
+    }"#;
+    let without_echo = r#"{
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "messages": [
+            {"role":"user","content":"Do the task"},
+            {"role":"assistant","content":[
+                {"type":"text","text":"Let me consult the advisor."}
+            ]},
+            {"role":"user","content":"Continue"}
+        ]
+    }"#;
+
+    for (label, body) in [("with echo", with_echo), ("control", without_echo)] {
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(body))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{label}");
+        let answer: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(answer["type"], "message", "{label}");
+        assert_eq!(answer["content"][0]["type"], "text", "{label}");
+        assert_eq!(answer["content"][0]["text"], "ok", "{label}");
+        assert_eq!(answer["stop_reason"], "end_turn", "{label}");
+    }
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent.len(),
+        2,
+        "one upstream POST per request; no consultation"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let items = v["input"].as_array().expect("input is an Items array");
+    let assistant_parts: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|i| i["type"] == "message" && i["role"] == "assistant")
+        .flat_map(|i| i["content"].as_array().unwrap())
+        .collect();
+    assert_eq!(assistant_parts.len(), 1, "one assistant content part");
+    // Responses requires `output_text` on assistant messages (`input_text`
+    // is rejected upstream), so the advice lives in that part's `text`.
+    assert_eq!(assistant_parts[0]["type"], "output_text");
+    let assistant_text = assistant_parts[0]["text"].as_str().unwrap();
+    assert_eq!(
+        assistant_text,
+        format!("Let me consult the advisor.\n[Advisor advice from a previous turn: {PRIOR}]\n"),
+        "prior advice missing or not clearly delimited: {assistant_text:?}"
+    );
+    assert!(
+        items.iter().all(|i| i["type"] != "function_call"),
+        "no orphan function_call from the echoed server_tool_use"
+    );
+    assert!(
+        items.iter().all(|i| i["type"] != "function_call_output"),
+        "no synthetic tool result for the echoed advisor block"
+    );
+
+    let control: serde_json::Value = serde_json::from_slice(&sent[1]).unwrap();
+    let control_text = serde_json::to_string(&control["input"]).unwrap();
+    assert!(
+        !control_text.contains(PRIOR),
+        "control request must carry no advice text"
+    );
+    assert!(!control_text.contains("Advisor advice"));
 }
 
 /// 7. The zero-argument function tool reaches the upstream with an empty
