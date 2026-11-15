@@ -1313,6 +1313,7 @@ mod tests {
             prompt_caching: crate::config::PromptCachingConfig::default(),
             log_to_disk: false,
             proxy_key: None,
+            advisor: crate::config::AdvisorConfig::default(),
         }
     }
 

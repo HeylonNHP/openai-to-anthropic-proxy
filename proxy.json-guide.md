@@ -251,6 +251,28 @@ less of it — but remember the cap is per turn, so the real bound is `turns × 
 - The reasoning item always carries a `summary` field, even when empty, because the upstream's schema marks it required.
 - A reasoning item that carries only a signature (no text) is still emitted, with an empty `summary`. Some endpoints may reject it.
 
+### Advisor (`advisor`)
+
+Optional settings for the server-side advisor (a second-opinion consultation inside one assistant message). **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy makes no extra upstream calls and emits no advisor wire fields. This section only stores the resolved policy; it does not change request behaviour by itself.
+
+```json
+"advisor": {
+  "enabled": false,
+  "model": "beam",
+  "effort": "medium",
+  "max_uses": 2,
+  "max_tokens": 2048,
+  "timeout_secs": 45
+}
+```
+
+- `model` is an **explicit upstream model name**, not an inbound alias. It is written straight into the advisor's own upstream request; `model_aliases.map` is not applied to it. Keep it separate from the executor's alias so the advisor's effort and cost do not couple to the executor's `reasoning.models` entry.
+- **`beam` is the cheap default** ($0.125/M input, $0.40/M output — roughly 25× cheaper on output than `kimi-k3.1-pro`). An advisor consult re-runs the executor, so a wrong model choice multiplies cost. Never use a kimi model as the advisor.
+- `effort` is an optional reasoning effort string for the advisor only. Omit it to send none.
+- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's answer. `timeout_secs` bounds the extra upstream call. A value of `0` for any of these falls back to the default with a WARN rather than failing startup.
+- Every field has an env override with the same **env > file > default** precedence used elsewhere: `ADVISOR_ENABLED`, `ADVISOR_MODEL`, `ADVISOR_EFFORT`, `ADVISOR_MAX_USES`, `ADVISOR_MAX_TOKENS`, `ADVISOR_TIMEOUT_SECS`. `ADVISOR_ENABLED` accepts `1`/`true`/`yes`/`on` (anything else is `false`).
+- The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
+
 ### Model aliases
 
 This object rewrites the model name Claude Code asks for into the model your upstream actually serves.
@@ -279,6 +301,7 @@ If you move from Airia to another upstream, usually change these first:
 2. `upstream_api_key`
 3. `model_aliases.map`
 4. `reasoning.models`
+5. `advisor.model` (if the advisor is enabled)
 
 If the upstream already accepts the model names Claude Code sends, you can leave the alias object empty (omit it entirely).
 

@@ -1,4 +1,5 @@
 // Library entrypoint: re-exports the modules used by `main.rs` and by tests.
+mod advisor;
 pub mod capabilities;
 pub mod config;
 mod error;

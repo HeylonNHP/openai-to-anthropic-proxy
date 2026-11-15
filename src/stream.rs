@@ -374,6 +374,7 @@ impl StreamTranslator {
             } else {
                 None
             },
+            iterations: None,
         }));
         events.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
@@ -467,6 +468,7 @@ impl StreamTranslator {
                 cache_creation_input_tokens_1h: 0,
                 thinking_tokens: 0,
                 server_tool_use: None,
+                iterations: None,
             }
         } else {
             // Legacy placeholder: downstream expects a message_start before
@@ -480,6 +482,7 @@ impl StreamTranslator {
                 cache_creation_input_tokens_1h: 0,
                 thinking_tokens: 0,
                 server_tool_use: None,
+                iterations: None,
             }
         };
         StreamEvent::MessageStart {
@@ -1065,6 +1068,7 @@ fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
             .as_ref()
             .map_or(0, |d| d.reasoning_tokens),
         server_tool_use: None,
+        iterations: None,
     }
 }
 

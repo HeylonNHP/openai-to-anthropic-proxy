@@ -5279,6 +5279,7 @@ pub fn responses_to_anthropic(
             } else {
                 None
             },
+            iterations: None,
         })
         .unwrap_or(AnthropicUsage {
             input_tokens: 0,
@@ -5289,6 +5290,7 @@ pub fn responses_to_anthropic(
             cache_creation_input_tokens_1h: 0,
             thinking_tokens: 0,
             server_tool_use: None,
+            iterations: None,
         });
 
     Message {

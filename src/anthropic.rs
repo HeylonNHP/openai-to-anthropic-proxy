@@ -340,6 +340,14 @@ pub enum ResponseContentBlock {
         #[serde(flatten)]
         block: WebSearchToolResultBlock,
     },
+    /// Generic escape hatch for block types the proxy does not model
+    /// natively (e.g. advisor `server_tool_use` / `advisor_tool_result`).
+    /// `untagged` on an internally-tagged `Serialize` enum emits the
+    /// `Value` verbatim, including its own `type` field — so a future
+    /// Anthropic block needs no new variant here. See §11.6 of
+    /// `ADVISOR_TOOL_RESEARCH.md`.
+    #[serde(untagged)]
+    Raw(Value),
 }
 
 /// A single web search result within a `WebSearchToolResult` block.
@@ -407,6 +415,13 @@ pub struct Usage {
     /// Only present when a server tool was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUseUsage>,
+    /// Per-iteration sampling usage (`{"type":"message",...}` /
+    /// `{"type":"advisor_message",...}`). Anthropic reports advisor
+    /// tokens here rather than in the top-level totals so the client can
+    /// bill each iteration at its own model's rate. Omitted when absent so
+    /// every existing response is byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Vec<Value>>,
 }
 
 const fn is_zero_u32(n: &u32) -> bool {
@@ -510,6 +525,11 @@ pub enum ContentBlockKind {
         #[serde(flatten)]
         block: WebSearchToolResultBlock,
     },
+    /// Generic escape hatch for content-block shells the proxy does not
+    /// model natively. See [`ResponseContentBlock::Raw`] and §11.6 of
+    /// `ADVISOR_TOOL_RESEARCH.md`; `untagged` emits the `Value` verbatim.
+    #[serde(untagged)]
+    Raw(Value),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -713,6 +733,86 @@ mod tests {
             }
             other => panic!("expected a Thinking block, got {other:?}"),
         }
+    }
+
+    // ── Generic wire extension points (§11.6) ────────────────────────
+
+    #[test]
+    fn raw_response_content_block_serializes_verbatim() {
+        // An `untagged` Raw variant on this internally-tagged enum must
+        // emit the Value byte-for-byte, including its own `type` field —
+        // no per-feature enum variants needed for advisor blocks.
+        let raw: Value = serde_json::from_str(
+            r#"{"type":"advisor_tool_result","tool_use_id":"srvtoolu_1",
+                "content":{"type":"advisor_result","text":"advice"}}"#,
+        )
+        .unwrap();
+        let block = ResponseContentBlock::Raw(raw.clone());
+        assert_eq!(serde_json::to_value(&block).unwrap(), raw);
+        // The native variants must be unaffected: they still carry their
+        // snake_case tag from `#[serde(tag = "type")]`.
+        assert_eq!(
+            serde_json::to_value(ResponseContentBlock::Text { text: "hi".into() }).unwrap(),
+            serde_json::json!({"type": "text", "text": "hi"})
+        );
+    }
+
+    #[test]
+    fn raw_content_block_kind_serializes_verbatim() {
+        let raw = serde_json::json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_2",
+            "name": "advisor",
+            "input": {}
+        });
+        assert_eq!(
+            serde_json::to_value(ContentBlockKind::Raw(raw.clone())).unwrap(),
+            raw
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlockKind::Text {
+                text: String::new(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "text", "text": ""})
+        );
+    }
+
+    fn plain_usage() -> Usage {
+        Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens_5m: 0,
+            cache_creation_input_tokens_1h: 0,
+            thinking_tokens: 0,
+            server_tool_use: None,
+            iterations: None,
+        }
+    }
+
+    #[test]
+    fn usage_iterations_none_is_omitted() {
+        // Zero wire change for every existing response.
+        let value = serde_json::to_value(plain_usage()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"input_tokens": 7, "output_tokens": 3})
+        );
+        assert!(!value.as_object().unwrap().contains_key("iterations"));
+    }
+
+    #[test]
+    fn usage_iterations_some_is_forwarded_as_an_array() {
+        let mut usage = plain_usage();
+        let iterations = vec![serde_json::json!({
+            "type": "advisor_message", "model": "beam",
+            "input_tokens": 4, "output_tokens": 2
+        })];
+        usage.iterations = Some(iterations.clone());
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(value["iterations"], serde_json::Value::Array(iterations));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use openai_to_anthropic_proxy::config::{Config, ModelAliases, ReasoningConfig};
+use openai_to_anthropic_proxy::config::{AdvisorConfig, Config, ModelAliases, ReasoningConfig};
 use reqwest::Body as ReqBody;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -165,6 +165,7 @@ fn make_config_with_default_model(
         prompt_caching: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     })
 }
 
@@ -195,6 +196,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     })
 }
 
@@ -596,6 +598,7 @@ async fn per_model_reasoning_effort_lookup() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -683,6 +686,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
     let client = reqwest::Client::new();
@@ -762,6 +766,7 @@ async fn model_alias_rewrites_inbound_model() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -837,6 +842,7 @@ async fn model_not_supported_falls_back_to_default() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -891,6 +897,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -953,6 +960,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1604,6 +1612,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1697,6 +1706,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1768,6 +1778,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         },
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1852,6 +1863,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         prompt_caching: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1938,6 +1950,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
         openai_to_anthropic_proxy::RuntimeMappings::default(),
@@ -2031,6 +2044,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
         openai_to_anthropic_proxy::RuntimeMappings {
@@ -2117,6 +2131,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         reasoning_replay: Default::default(),
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     // Seed the runtime store with an alias so the first request
     // resolves `claude-sonnet-5` → `gpt-5.4-mini`.
@@ -2771,6 +2786,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         },
         log_to_disk: false,
         proxy_key: None,
+        advisor: AdvisorConfig::default(),
     });
     let proxy_addr = start_proxy(config).await;
 

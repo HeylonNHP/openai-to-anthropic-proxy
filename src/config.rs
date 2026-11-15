@@ -32,6 +32,15 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// of the box; operators who need reasoning for non-tool calls can
 /// override via env or JSON.
 const DEFAULT_REASONING_EFFORT: &str = "none";
+/// Cheap advisor model used when `advisor.model` is unset. `beam` is
+/// deliberately the default: it is the cheapest sensible upstream in the
+/// catalogue (§7 of `ADVISOR_TOOL_RESEARCH.md`), and an advisor consult
+/// re-runs the executor, so a wrong default multiplies cost. Never default
+/// to a kimi model.
+const DEFAULT_ADVISOR_MODEL: &str = "beam";
+const DEFAULT_ADVISOR_MAX_USES: u32 = 2;
+const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 2048;
+const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 
 /// Resolved proxy configuration. Cheap to clone (`String`s and a `Duration`).
 #[derive(Debug, Clone)]
@@ -83,6 +92,50 @@ pub struct Config {
     /// postmortem inspection set this to `true` in `proxy.json` or
     /// `LOG_TO_DISK=1` in the env.
     pub log_to_disk: bool,
+    /// Advisor (server-side second opinion) policy. Off by default; see
+    /// [`AdvisorConfig`]. This is resolved config only — the advisor
+    /// feature is not wired into the request pipeline yet.
+    pub advisor: AdvisorConfig,
+}
+
+/// Resolved advisor settings (the `advisor` section of `proxy.json`).
+///
+/// The feature is **off by default**: `enabled: false` means the proxy
+/// makes no advisor calls and emits no advisor wire fields. Enabling it
+/// requires an explicit `"enabled": true` in `proxy.json` (or
+/// `ADVISOR_ENABLED=1`).
+///
+/// **`model` is an explicit UPSTREAM model name, not an inbound alias.**
+/// It is written directly into the advisor's own upstream request; it is
+/// never passed through `RuntimeMappings::resolve` / `model_aliases.map`,
+/// which only run on client-supplied model names. Keeping it separate also
+/// decouples the advisor's effort and cost from the executor's own alias.
+///
+/// `effort` is an optional upstream reasoning effort string, kept separate
+/// from `reasoning.models` (which is keyed on the executor's upstream name).
+/// `max_uses` caps consultations per turn, `max_tokens` caps the advisor's
+/// answer, and `timeout_secs` bounds the extra upstream call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisorConfig {
+    pub enabled: bool,
+    pub model: String,
+    pub effort: Option<String>,
+    pub max_uses: u32,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+}
+
+impl Default for AdvisorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: DEFAULT_ADVISOR_MODEL.to_owned(),
+            effort: None,
+            max_uses: DEFAULT_ADVISOR_MAX_USES,
+            max_tokens: DEFAULT_ADVISOR_MAX_TOKENS,
+            timeout_secs: DEFAULT_ADVISOR_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Inbound → upstream model name aliases.
@@ -453,6 +506,73 @@ impl Config {
             .or_else(|| file.and_then(|f| f.log_to_disk))
             .unwrap_or(false);
 
+        // `advisor`: env > file > default, following `pick_str`. The whole
+        // feature is off unless `enabled` resolves to true. Invalid numeric
+        // values are clamped back to the default with a WARN rather than
+        // failing startup — the same house style as an unusable upstream
+        // value surfacing as a 400 instead of a startup error.
+        let advisor_defaults = AdvisorConfig::default();
+        let advisor_json = file.and_then(|f| f.advisor.as_ref());
+        let advisor_enabled = env
+            .advisor_enabled
+            .or_else(|| advisor_json.and_then(|a| a.enabled))
+            .unwrap_or(advisor_defaults.enabled);
+        let advisor_model = pick_str(
+            advisor_json.and_then(|a| a.model.as_deref()),
+            env.advisor_model.as_deref(),
+        )
+        .unwrap_or(advisor_defaults.model);
+        let advisor_effort = pick_str(
+            advisor_json.and_then(|a| a.effort.as_deref()),
+            env.advisor_effort.as_deref(),
+        );
+        let advisor_max_uses = pick_u64(
+            advisor_json.and_then(|a| a.max_uses).map(u64::from),
+            env.advisor_max_uses.map(u64::from),
+        )
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(advisor_defaults.max_uses);
+        let advisor_max_tokens = pick_u64(
+            advisor_json.and_then(|a| a.max_tokens).map(u64::from),
+            env.advisor_max_tokens.map(u64::from),
+        )
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(advisor_defaults.max_tokens);
+        let advisor_timeout_secs = pick_u64(
+            advisor_json.and_then(|a| a.timeout_secs),
+            env.advisor_timeout_secs,
+        )
+        .unwrap_or(advisor_defaults.timeout_secs);
+
+        // Validate: zero-valued limits/timeout would make the advisor
+        // unusable (or hang), so fall back to the defaults individually.
+        let advisor_max_uses = valid_or_default(
+            advisor_max_uses,
+            advisor_defaults.max_uses,
+            |v| v > 0,
+            "advisor.max_uses",
+        );
+        let advisor_max_tokens = valid_or_default(
+            advisor_max_tokens,
+            advisor_defaults.max_tokens,
+            |v| v > 0,
+            "advisor.max_tokens",
+        );
+        let advisor_timeout_secs = valid_or_default(
+            advisor_timeout_secs,
+            advisor_defaults.timeout_secs,
+            |v| v > 0,
+            "advisor.timeout_secs",
+        );
+        let advisor = AdvisorConfig {
+            enabled: advisor_enabled,
+            model: advisor_model,
+            effort: advisor_effort,
+            max_uses: advisor_max_uses,
+            max_tokens: advisor_max_tokens,
+            timeout_secs: advisor_timeout_secs,
+        };
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -466,6 +586,7 @@ impl Config {
             reasoning_replay,
             proxy_key,
             log_to_disk,
+            advisor,
         })
     }
 
@@ -651,6 +772,20 @@ pub struct EnvInputs {
     pub log_to_disk: Option<bool>,
     /// `PROXY_KEY=<secret>` enables client auth via `X-Proxy-Key`.
     pub proxy_key: Option<String>,
+    /// Advisor overrides. `ADVISOR_ENABLED` uses the same truthy values as
+    /// `LOG_TO_DISK`; numeric values that fail to parse are ignored (the
+    /// file/default value wins) rather than silently disabling the section.
+    pub advisor_enabled: Option<bool>,
+    pub advisor_model: Option<String>,
+    pub advisor_effort: Option<String>,
+    pub advisor_max_uses: Option<u32>,
+    pub advisor_max_tokens: Option<u32>,
+    pub advisor_timeout_secs: Option<u64>,
+}
+
+fn parse_truthy(raw: &str) -> bool {
+    let v = raw.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on")
 }
 
 impl EnvInputs {
@@ -667,11 +802,20 @@ impl EnvInputs {
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
-            log_to_disk: env::var("LOG_TO_DISK").ok().map(|s| {
-                let v = s.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "true" | "yes" | "on")
-            }),
+            log_to_disk: env::var("LOG_TO_DISK").ok().map(|s| parse_truthy(&s)),
             proxy_key: env::var("PROXY_KEY").ok(),
+            advisor_enabled: env::var("ADVISOR_ENABLED").ok().map(|s| parse_truthy(&s)),
+            advisor_model: env::var("ADVISOR_MODEL").ok(),
+            advisor_effort: env::var("ADVISOR_EFFORT").ok(),
+            advisor_max_uses: env::var("ADVISOR_MAX_USES")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            advisor_max_tokens: env::var("ADVISOR_MAX_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            advisor_timeout_secs: env::var("ADVISOR_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }
     }
 }
@@ -693,6 +837,23 @@ fn is_known_upstream_effort(v: &str) -> bool {
 
 fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
     env_value.or(file_value)
+}
+
+/// Keep a resolved numeric config value when the predicate accepts it,
+/// otherwise fall back to `default` with a structured WARN. Invalid values
+/// must not stop the proxy from starting — an operator typo in one advisor
+/// limit should not take the whole deployment down.
+fn valid_or_default<T: Copy + std::fmt::Display>(
+    value: T,
+    default: T,
+    valid: impl Fn(T) -> bool,
+    field: &str,
+) -> T {
+    if valid(value) {
+        return value;
+    }
+    tracing::warn!(field, value = %value, fallback = %default, "invalid advisor config; using default");
+    default
 }
 
 /// JSON representation of `proxy.json`. Every field is optional; missing
@@ -733,6 +894,33 @@ pub struct JsonConfig {
     /// Set to `true` when you want postmortem logs; leave unset (or
     /// `false`) for a clean terminal in interactive use.
     pub log_to_disk: Option<bool>,
+    /// Advisor (server-side second opinion) settings. Off by default.
+    /// See [`AdvisorConfig`].
+    ///
+    /// `skip_serializing_if` is **mandatory**: the TUI rewrites the whole
+    /// `proxy.json` from this struct, and `JsonConfig` is
+    /// `deny_unknown_fields`, so writing an `advisor: null` key would make
+    /// the PREVIOUS binary refuse to start — a rollback hazard for anyone
+    /// who saved from the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<JsonAdvisorConfig>,
+}
+
+/// JSON shape of the `advisor` section of `proxy.json`.
+///
+/// Every field is optional so an operator can set only `enabled`, or only
+/// `model`. `deny_unknown_fields` keeps a typo from being silently ignored.
+/// `model` is an explicit **upstream** model name (default `"beam"`, the
+/// cheap advisor), not an inbound alias — see [`AdvisorConfig`].
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JsonAdvisorConfig {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub max_uses: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub timeout_secs: Option<u64>,
 }
 
 /// JSON shape of `reasoning`.
@@ -1160,6 +1348,250 @@ mod tests {
         assert_eq!(
             reparsed.reasoning_replay.as_ref().and_then(|r| r.max_chars),
             Some(42)
+        );
+    }
+
+    // ── advisor config ────────────────────────────────────────────────
+
+    #[test]
+    fn advisor_is_off_by_default_with_cheap_model() {
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor, AdvisorConfig::default());
+        assert!(!cfg.advisor.enabled, "advisor must be opt-in");
+        assert_eq!(cfg.advisor.model, "beam", "default advisor must be cheap");
+        assert_eq!(cfg.advisor.effort, None);
+        assert_eq!(cfg.advisor.max_uses, 2);
+        assert_eq!(cfg.advisor.max_tokens, 2048);
+        assert_eq!(cfg.advisor.timeout_secs, 45);
+    }
+
+    #[test]
+    fn advisor_json_section_parses_and_resolves() {
+        // The exact shape from §17.2 must parse despite JsonConfig's
+        // deny_unknown_fields, and every value must reach the resolved
+        // config.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": {
+                "enabled": true,
+                "model": "glm-5.3-flash",
+                "effort": "medium",
+                "max_uses": 3,
+                "max_tokens": 1024,
+                "timeout_secs": 20
+            }
+        }"#;
+        let file = JsonConfig::parse(raw).expect("proxy.json with advisor must parse");
+        assert!(file.advisor.is_some());
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(
+            cfg.advisor,
+            AdvisorConfig {
+                enabled: true,
+                model: "glm-5.3-flash".into(),
+                effort: Some("medium".into()),
+                max_uses: 3,
+                max_tokens: 1024,
+                timeout_secs: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn advisor_env_overrides_file_then_default() {
+        let file = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                model: Some("file-model".into()),
+                effort: Some("low".into()),
+                max_uses: Some(5),
+                max_tokens: Some(999),
+                timeout_secs: Some(30),
+            }),
+            ..JsonConfig::default()
+        };
+        let env = EnvInputs {
+            advisor_enabled: Some(false),
+            advisor_model: Some("env-model".into()),
+            advisor_effort: Some("high".into()),
+            advisor_max_uses: Some(1),
+            advisor_max_tokens: Some(77),
+            advisor_timeout_secs: Some(9),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(
+            cfg.advisor,
+            AdvisorConfig {
+                enabled: false,
+                model: "env-model".into(),
+                effort: Some("high".into()),
+                max_uses: 1,
+                max_tokens: 77,
+                timeout_secs: 9,
+            }
+        );
+
+        // With no env override, the file wins; with neither, the defaults.
+        let from_file = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(from_file.advisor.model, "file-model");
+        assert_eq!(from_file.advisor.max_uses, 5);
+        let defaults = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(defaults.advisor, AdvisorConfig::default());
+    }
+
+    #[test]
+    fn advisor_zero_limits_fall_back_to_defaults() {
+        // A zero limit/timeout would make the feature unusable; the house
+        // style is a WARN + default rather than a startup failure.
+        let file = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                max_uses: Some(0),
+                max_tokens: Some(0),
+                timeout_secs: Some(0),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert!(cfg.advisor.enabled, "the section itself stays enabled");
+        assert_eq!(cfg.advisor.max_uses, DEFAULT_ADVISOR_MAX_USES);
+        assert_eq!(cfg.advisor.max_tokens, DEFAULT_ADVISOR_MAX_TOKENS);
+        assert_eq!(cfg.advisor.timeout_secs, DEFAULT_ADVISOR_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_real_proxy_json_with_and_without_the_advisor_section_loads() {
+        // Goes through the real `Config::load_from` entry point (fs read +
+        // JsonConfig::parse + resolve), not just the resolver. Proves the
+        // gate: an operator can drop the new section into proxy.json and the
+        // binary still starts; and a legacy file without it is unchanged.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("phase2-advisor-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy.json");
+
+        let legacy = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k"
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+        let cfg = Config::load_from(&path).expect("legacy proxy.json must load");
+        assert_eq!(cfg.advisor, AdvisorConfig::default());
+        assert!(!cfg.advisor.enabled);
+
+        let with_advisor = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": {
+                "enabled": true,
+                "model": "beam",
+                "effort": "medium",
+                "max_uses": 2,
+                "max_tokens": 2048,
+                "timeout_secs": 45
+            }
+        }"#;
+        std::fs::write(&path, with_advisor).unwrap();
+        let cfg = Config::load_from(&path).expect("proxy.json WITH the advisor section must load");
+        assert_eq!(
+            cfg.advisor,
+            AdvisorConfig {
+                enabled: true,
+                model: "beam".into(),
+                effort: Some("medium".into()),
+                max_uses: 2,
+                max_tokens: 2048,
+                timeout_secs: 45,
+            }
+        );
+        // Every other resolved setting is identical to the legacy file.
+        assert_eq!(cfg.upstream_base_url, "https://api.example.com");
+        assert_eq!(cfg.upstream_path, DEFAULT_UPSTREAM_PATH);
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("none"));
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn advisor_unknown_json_key_is_rejected() {
+        // deny_unknown_fields on the sub-object too: a typo fails fast.
+        let raw = r#"{"advisor": {"enabled": true, "max_use": 1}}"#;
+        assert!(JsonConfig::parse(raw).is_err());
+    }
+
+    #[test]
+    fn advisor_absent_key_is_rollback_safe_and_behaves_as_before() {
+        // (1) A saved config with `advisor: None` must NOT emit the key —
+        // the TUI rewrites proxy.json wholesale and the previous binary's
+        // deny_unknown_fields would refuse to start.
+        let saved = serde_json::to_string_pretty(&JsonConfig::default()).unwrap();
+        assert!(
+            !saved.contains("advisor"),
+            "the saved config carries a key the previous binary rejects: {saved}"
+        );
+        // (2) A file with NO advisor key must resolve to exactly the same
+        // AdvisorConfig as no file at all — zero behaviour change.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k"
+        }"#;
+        let file = JsonConfig::parse(raw).expect("parse");
+        assert!(file.advisor.is_none());
+        let env = env_with_required();
+        let absent = Config::resolve(Some(&file), &env).unwrap();
+        let no_file = Config::resolve(None, &env).unwrap();
+        assert_eq!(absent.advisor, no_file.advisor);
+        assert!(!absent.advisor.enabled);
+    }
+
+    #[test]
+    fn advisor_explicit_section_survives_a_save_round_trip() {
+        let parsed = JsonConfig::parse(
+            r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
+                "advisor":{"enabled":true,"model":"beam","max_uses":2}}"#,
+        )
+        .expect("parse json");
+        let saved = serde_json::to_string_pretty(&parsed).unwrap();
+        assert!(saved.contains("advisor"), "{saved}");
+        let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(
+            reparsed.advisor.as_ref().and_then(|a| a.enabled),
+            Some(true)
+        );
+        assert_eq!(
+            reparsed.advisor.as_ref().and_then(|a| a.model.as_deref()),
+            Some("beam")
+        );
+    }
+
+    #[test]
+    fn advisor_model_is_not_an_inbound_alias() {
+        // The advisor model must be usable verbatim even when the alias map
+        // would rewrite the same string on an ordinary client request.
+        let file = JsonConfig {
+            model_aliases: Some(JsonModelAliases {
+                map: BTreeMap::from([("beam".into(), "gpt-5.6-luna".into())]),
+                ..JsonModelAliases::default()
+            }),
+            advisor: Some(JsonAdvisorConfig {
+                model: Some("beam".into()),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.model, "beam");
+        assert_eq!(
+            cfg.upstream_model_for("beam"),
+            "gpt-5.6-luna",
+            "the alias map still applies to inbound names"
         );
     }
 

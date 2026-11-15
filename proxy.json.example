@@ -48,5 +48,14 @@
   "prompt_caching": {
     "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
     "cache_key": "my-app"
+  },
+
+  "advisor": {
+    "enabled": false,
+    "model": "beam",
+    "effort": "medium",
+    "max_uses": 2,
+    "max_tokens": 2048,
+    "timeout_secs": 45
   }
 }
