@@ -1982,20 +1982,27 @@ operator writes **`0`** explicitly. The same rule holds for the env vars
   `Option<u32>` / `Option<u32>` / `Option<u64>`: **`None` = no limit**.
   `AdvisorConfig::default()` is unchanged in VALUE — `Some(2)` /
   `Some(2048)` / `Some(45)` — so the shipped behaviour does not move.
-* The JSON shape is unchanged (`JsonAdvisorConfig` keeps `Option<u32>` /
-  `Option<u64>`), so `deny_unknown_fields` and the TUI rollback guarantee
-  (§18.5) are unaffected. `proxy.json.example` keeps the safe defaults.
+* The JSON **keys** are unchanged, so `deny_unknown_fields` and the TUI
+  rollback guarantee (§18.5) are unaffected. `proxy.json.example` keeps
+  the safe defaults. The JSON **types** were widened in a later commit
+  (§21.2): `JsonAdvisorConfig::max_uses` / `max_tokens` are `Option<u64>`
+  (they were `Option<u32>`), so an out-of-range number PARSES instead of
+  killing the startup — the serialized shape is identical for every
+  in-range value, so the TUI round-trip is unchanged.
 * `valid_or_default` was **removed**: with `0` now meaningful there is no
   longer any invalid value for these three fields. The WARN-on-overflow
   behaviour moved into the new resolver `resolve_advisor_limit` (a value
-  that does not fit `u32` falls back to the default **with** a WARN, where
-  the old code fell back silently).
+  that does not fit `u32` falls back to the default **with** a warning,
+  where the old code fell back silently). That warning is only VISIBLE
+  since §21.1 — before that fix it was emitted during config resolution
+  and dropped on the floor.
 * `advisor_timeout` now returns `Option<Duration>`: `None` = no
   per-request override (the global `request_timeout` applies), `Some(secs)`
   = `Some(min(secs, request_timeout))`. The clamp is kept, so the advisor
   can never EXTEND the operator's global bound (§11.4).
-* `advisor_request` sends `max_output_tokens: cfg.max_tokens`, so
-  `None` **omits** the field and the upstream's own default applies.
+* `advisor_request` sends `max_output_tokens: effective_limit(cfg.max_tokens)`,
+  so `None` **omits** the field and the upstream's own default applies.
+  (§21.3 made `Some(0)` mean the same as `None` here.)
 
 ### 20.3 "No limit" means something different per field
 
@@ -2020,13 +2027,13 @@ operator writes **`0`** explicitly. The same rule holds for the env vars
 
 ### 20.4 The two WARNs
 
-* **Startup (once).** Emitted from `Config::resolve` when the advisor is
-  enabled with an unlimited `max_uses`. The binary installs the tracing
-  subscriber AFTER the config is loaded, so `src/main.rs` repeats the same
-  warning right after `init_tracing` — on stderr (visible even with
-  `log_to_disk: false`, like the `proxy_key` warning) and as a tracing event
-  (so it lands in `target/logs/proxy.log`). The operator sees it exactly
-  once. The message text lives in one place,
+* **Startup (once).** Raised when the advisor is enabled with an unlimited
+  `max_uses`. Since §21.1 the resolver does NOT emit it: it COLLECTS it
+  on the resolved `Config` (`Config::warnings`) and `src/main.rs` prints it
+  right after `init_tracing` — on stderr (visible even with
+  `log_to_disk: false`, like the `proxy_key` warning) and as a tracing
+  event (so it lands in `target/logs/proxy.log`). The operator sees it
+  exactly once per surface. The message text lives in one place,
   `config::UNBOUNDED_ADVISOR_LOOP_WARNING`.
 * **Runtime (once per turn).** `should_warn_runaway` fires when a turn
   crosses `RUNAWAY_CONSULTATION_THRESHOLD` (10) consultations: one WARN
@@ -2035,6 +2042,104 @@ operator writes **`0`** explicitly. The same rule holds for the env vars
 ### 20.5 Verification
 
 495 tests (417 lib + 2 bin + 76 e2e), all green; `cargo clippy --all-targets`
+7 warnings (the pre-existing set, unchanged); `cargo fmt --check` shows only
+the pre-existing diffs (in files this change does not touch). No new
+dependency, no real API call, and `enabled: false` stays byte-identical
+(the e2e `advisor_disabled_is_byte_for_byte_identical` case still passes).
+
+(§21 supersedes the counts above with the current ones.)
+
+---
+
+## 21. Three defects found by an independent verifier (2026-11-15)
+
+An independent verifier confirmed the CORE semantics of §20 (absent → the
+default, `0` → no limit, `n` → `n`, env override, `enabled: false`
+byte-identical) and found three defects. All three are fixed in the
+`fix(advisor): make config-time warnings visible; align 0-means-unlimited
+semantics` commit.
+
+### 21.1 Config-time warnings were silently dropped (MEDIUM)
+
+**The bug.** `Config::load()` runs BEFORE `init_tracing()` in
+`src/main.rs`, so every `tracing::warn!` emitted during config resolution
+hit NO subscriber and vanished. Proven: `ADVISOR_MAX_USES=4294967296` → the
+value DID fall back to the default, but the log file contained 0 "out of
+range" lines and stderr showed nothing. The unbounded-loop warning had been
+worked around with a duplicate `eprintln!` + re-emit block in `src/main.rs`;
+the out-of-range warning had no such workaround, so it was invisible.
+
+**The fix — ONE mechanism, not two.** The ordering cycle is real:
+`init_tracing(config.log_to_disk)` needs `config.log_to_disk`, which comes
+FROM the config. The cleanest resolution is to **collect** the
+config-resolution warnings on the resolved `Config` (`Config::warnings`, a
+`Vec<ConfigWarning>`) and emit them from `main.rs` AFTER `init_tracing`:
+on stderr (always visible) and as tracing events (so they land in
+`target/logs/proxy.log`). The duplicate `eprintln!` + re-emit block in
+`main.rs` is GONE — there is now ONE path for every config-time warning,
+so a future warning cannot be dropped either. `src/config.rs` carries the
+rule in its module docs: never call `tracing::warn!` while resolving; push
+a `ConfigWarning` instead.
+
+Verified by RUNNING the built binary (no upstream call was ever made):
+
+| case | stderr | `target/logs/proxy.log` |
+| --- | --- | --- |
+| `"max_uses": 4294967296` | 1 warning | 1 warning |
+| `ADVISOR_MAX_USES=4294967296` | 1 warning | 1 warning |
+| `"max_uses": 0`, advisor ENABLED | 1 warning | 1 warning |
+| `"max_uses": 0`, advisor DISABLED | none | none |
+
+### 21.2 An out-of-range JSON value was a HARD STARTUP FAILURE (MEDIUM)
+
+**The bug.** `JsonAdvisorConfig::max_uses` / `max_tokens` were `Option<u32>`,
+so `"max_uses": 4294967296` failed at JSON parse time
+(`invalid value: integer 4294967296, expected u32`) and the proxy EXITED.
+That contradicts the house rule (`src/config.rs`: *"an operator typo in one
+advisor limit should not take the whole deployment down"*) and it
+contradicted §20.2's claim that an out-of-range value falls back to the
+default with a warning. Only the ENV path (`Option<u64>`) ever worked.
+
+**The fix.** `JsonAdvisorConfig::max_uses` / `max_tokens` are now
+`Option<u64>` — wide enough that an out-of-range number PARSES — and the
+resolver keeps the `u32::try_from` range check, so the value falls back to
+the default **with a warning**. `AdvisorConfig`'s own types are unchanged
+(`Option<u32>` / `Option<u32>` / `Option<u64>`): those are the resolved,
+in-range values. The serialized JSON shape is identical for every in-range
+value, so the TUI's rewrite of `proxy.json` (§17.2, §18.5) and its
+rollback guarantee are unaffected — the `skip_serializing_if` behaviour is
+untouched.
+
+### 21.3 `Some(0)` and a configured `0` meant OPPOSITE things (LOW)
+
+**The bug.** The config resolver was the only place that interpreted `0` →
+`None` (unlimited). A directly built `AdvisorConfig { max_uses: Some(0) }`
+meant "zero consultations" (`advisor_cap` → `Some(0)`), and
+`timeout_secs: Some(0)` meant `Duration::ZERO` — an instant timeout. One
+number, two meanings.
+
+**The fix — option (a).** The RESOLVED `AdvisorConfig` now means exactly
+what a CONFIGURED value means: `Some(0)` is "no limit", everywhere. The
+house rule lives in ONE place, `config::effective_limit` (`Option<T>` →
+`None` when the value is `0`), and it is applied at BOTH ends:
+
+* the resolver (a configured `0` → `None`), and
+* the advisor session — `advisor_cap` (`Some(0)` → `usize::MAX`),
+  `advisor_timeout` (`Some(0)` → `None`) and the advisor's own request
+  (`max_tokens: Some(0)` → the field is omitted).
+
+`AdvisorConfig`'s field types are unchanged (`Option<u32>` / `Option<u32>` /
+`Option<u64>`); only the MEANING of `Some(0)` is unified.
+
+The e2e case `cap_terminal_rerun_emits_exactly_one_cap_pair_and_text` used
+`max_uses: Some(0)` to reach the cap path. It now uses
+`max_uses: Some(1)` and has the executor ask TWICE — the cap is forced by
+the executor's behaviour, not by a zero bound — and still asserts exactly
+one cap pair and exactly one text block.
+
+### 21.4 Verification
+
+503 tests (423 lib + 2 bin + 78 e2e), all green; `cargo clippy --all-targets`
 7 warnings (the pre-existing set, unchanged); `cargo fmt --check` shows only
 the pre-existing diffs (in files this change does not touch). No new
 dependency, no real API call, and `enabled: false` stays byte-identical

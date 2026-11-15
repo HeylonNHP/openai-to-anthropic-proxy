@@ -178,6 +178,7 @@ fn make_config_with_default_model(
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     })
 }
 
@@ -209,6 +210,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     })
 }
 
@@ -611,6 +613,7 @@ async fn per_model_reasoning_effort_lookup() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -699,6 +702,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
     let client = reqwest::Client::new();
@@ -779,6 +783,7 @@ async fn model_alias_rewrites_inbound_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -855,6 +860,7 @@ async fn model_not_supported_falls_back_to_default() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -910,6 +916,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -973,6 +980,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1625,6 +1633,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1719,6 +1728,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1791,6 +1801,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1876,6 +1887,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -1963,6 +1975,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
         openai_to_anthropic_proxy::RuntimeMappings::default(),
@@ -2057,6 +2070,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
         openai_to_anthropic_proxy::RuntimeMappings {
@@ -2144,6 +2158,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     // Seed the runtime store with an alias so the first request
     // resolves `claude-sonnet-5` → `gpt-5.4-mini`.
@@ -2799,6 +2814,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
 
@@ -3865,6 +3881,127 @@ async fn advisor_unlimited_max_uses_never_hits_a_cap() {
         CONSULTATIONS * 2 + 1,
         "12 executor calls + 12 advisor calls + the final executor message"
     );
+}
+
+/// DEFECT 3: a resolved `Some(0)` must mean exactly what a CONFIGURED `0`
+/// means — "no limit". Before the fix, `Some(0)` meant "zero
+/// consultations" (the cap fires on the first ask) and "a zero-token
+/// answer", so the same number had two meanings depending on how the
+/// config was built.
+#[tokio::test]
+async fn a_zero_limit_in_a_built_config_means_no_limit() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call1", "call_zero1"),
+            advisor_answer("Advice one."),
+            advisor_call_response("resp_call2", "call_zero2"),
+            advisor_answer("Advice two."),
+            advisor_executor_message("resp_final", "Done after two consultations."),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = Some(0);
+    config.advisor.max_tokens = Some(0);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().unwrap();
+    let results = content
+        .iter()
+        .filter(|b| b["type"] == "advisor_tool_result")
+        .count();
+    assert_eq!(
+        results, 2,
+        "both consultations were answered — `Some(0)` is not a zero-consultation cap"
+    );
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["content"]["error_code"] == "max_uses_exceeded"),
+        "an unlimited max_uses must never produce a cap error"
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(
+        sent.len(),
+        5,
+        "2 executor calls + 2 advisor calls + the final executor message"
+    );
+    let bodies: Vec<serde_json::Value> = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    // `max_tokens: Some(0)` = "no limit" => the proxy omits the cap and the
+    // upstream's own default applies.
+    assert!(
+        bodies[1].get("max_output_tokens").is_none(),
+        "no cap on the advisor's own request: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[3].get("max_output_tokens").is_none(),
+        "no cap on the advisor's own request: {}",
+        bodies[3]
+    );
+}
+
+/// DEFECT 3: `timeout_secs: Some(0)` in a built config means "no limit",
+/// exactly like a configured `0` — no per-request timeout override, so the
+/// GLOBAL `request_timeout` is the only bound. Proof: the advisor POST is
+/// stalled for 2s — longer than the 1s a per-request timeout would allow —
+/// and it still succeeds.
+#[tokio::test]
+async fn a_zero_timeout_in_a_built_config_means_no_limit() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_call", "call_zero_timeout"),
+            advisor_answer("Slow but useful advice."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    // Attempt 1 = executor (fast); attempt 2 = advisor (stalled 2s, which
+    // is LONGER than the 1s per-request timeout the bounded case uses);
+    // attempt 3 = final executor (fast).
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_secs(2), Duration::ZERO]);
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.timeout_secs = Some(0);
+    // The global bound still applies — it is simply the ONLY bound.
+    config.request_timeout = Duration::from_secs(10);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "fail closed on a timeout");
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "advisor_tool_result")
+        .unwrap();
+    assert_eq!(
+        result["content"]["type"], "advisor_result",
+        "the stalled advisor call still completed: no per-request timeout was applied"
+    );
+    assert_eq!(result["content"]["text"], "Slow but useful advice.");
 }
 
 /// `max_tokens = 0` means "no limit": the proxy must OMIT
@@ -5013,27 +5150,32 @@ async fn cap_terminal_rerun_with_another_advisor_call_renders_once() {
     }
 }
 
-/// A cap of ZERO consultations (`max_uses: Some(0)`) with a terminal cap
-/// pair (no successful consultation): exactly
-/// `[server_tool_use, max_uses_exceeded, text]`, id-matched, no duplicate
-/// pair and no POST after the bound.
+/// The consultation cap: the executor asks a SECOND time, the cap is
+/// reached, and the turn still ends with exactly ONE cap pair and ONE
+/// text block.
 ///
-/// NOTE: `Some(0)` is only reachable by constructing the config directly —
-/// a CONFIGURED `0` resolves to `None`, which means "no limit" (an
-/// unbounded loop), the opposite of this cap.
+/// `max_uses: Some(1)` — NOT `Some(0)`: `0` means "no limit" everywhere in
+/// the codebase (the same meaning as `None`), so the cap is forced by the
+/// executor asking twice, not by a zero bound.
 #[tokio::test]
 async fn cap_terminal_rerun_emits_exactly_one_cap_pair_and_text() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
     script(
         &upstream,
         vec![
-            advisor_call_response("resp_cap", "call_cap0"),
-            advisor_call_with_text("resp_terminal", "call_terminal_again", "Terminal answer."),
+            // 1. the executor asks for advice
+            advisor_call_response("resp_call1", "call_first"),
+            // 2. the advisor answers
+            advisor_answer("Advice one."),
+            // 3. the executor asks AGAIN — this hits the cap
+            advisor_call_response("resp_call2", "call_cap"),
+            // 4. the ONE terminal re-run finally answers
+            advisor_executor_message("resp_terminal", "Terminal answer."),
             advisor_executor_message("resp_never", "must not be reached"),
         ],
     );
     let mut config = (*advisor_config(upstream_addr)).clone();
-    config.advisor.max_uses = Some(0);
+    config.advisor.max_uses = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -5052,31 +5194,32 @@ async fn cap_terminal_rerun_emits_exactly_one_cap_pair_and_text() {
         .collect();
     assert_eq!(
         types,
-        vec!["server_tool_use", "advisor_tool_result", "text"],
-        "exact block sequence: one cap pair + one terminal text"
+        vec![
+            "server_tool_use",
+            "advisor_tool_result",
+            "server_tool_use",
+            "advisor_tool_result",
+            "text",
+        ],
+        "exact block sequence: consulted pair + cap pair + ONE terminal text"
     );
-    assert_eq!(content[1]["content"]["error_code"], "max_uses_exceeded");
-    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
-    assert_eq!(content[2]["text"], "Terminal answer.");
-    assert_eq!(
-        content
-            .iter()
-            .filter(|b| b["type"] == "server_tool_use")
-            .count(),
-        1
-    );
-    assert_eq!(
-        content
-            .iter()
-            .filter(|b| b["content"]["error_code"] == "max_uses_exceeded")
-            .count(),
-        1
-    );
+    // EXACTLY ONE cap pair: one `max_uses_exceeded` result, closing the
+    // `server_tool_use` that opened it.
+    let caps: Vec<&serde_json::Value> = content
+        .iter()
+        .filter(|b| b["content"]["error_code"] == "max_uses_exceeded")
+        .collect();
+    assert_eq!(caps.len(), 1, "exactly one cap result");
+    assert_eq!(caps[0]["tool_use_id"], content[2]["id"]);
+    // EXACTLY ONE text block: the terminal answer.
+    let texts: Vec<&serde_json::Value> = content.iter().filter(|b| b["type"] == "text").collect();
+    assert_eq!(texts.len(), 1, "exactly one text block");
+    assert_eq!(texts[0]["text"], "Terminal answer.");
     assert_eq!(body["stop_reason"], "end_turn");
     assert_eq!(
         upstream.received_all.lock().await.len(),
-        2,
-        "no POST beyond the bound"
+        4,
+        "executor + advisor + cap executor + ONE terminal re-run; no 5th POST"
     );
 }
 

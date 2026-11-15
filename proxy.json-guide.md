@@ -291,6 +291,16 @@ These three keys follow one rule, in `proxy.json` and in the env vars alike:
 
 The env vars follow the same `0` = no limit rule (`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
 
+#### An out-of-range value is a warning, not a startup failure
+
+If a limit does not fit the field's range — for example `"max_uses": 4294967296`, which is bigger than the 32-bit value the proxy uses internally — the proxy **starts anyway**, falls back to that limit's shipped default, and prints a warning:
+
+```
+WARNING: advisor.max_uses = 4294967296 is out of range (...); using the default 2
+```
+
+The same applies to the env vars (`ADVISOR_MAX_USES=4294967296`). This follows the house rule: a typo in one advisor limit must not take the whole deployment down. The warning is printed on stderr (so you see it even without file logging) and written to `target/logs/proxy.log` when `log_to_disk` is on.
+
 ### Model aliases
 
 This object rewrites the model name Claude Code asks for into the model your upstream actually serves.

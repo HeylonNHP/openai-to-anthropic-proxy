@@ -24,7 +24,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use openai_to_anthropic_proxy::{
     CapabilityStore, Config, MappingsStore, OutputSink, RuntimeMappings, SessionStatsStore,
-    UNBOUNDED_ADVISOR_LOOP_WARNING,
 };
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -42,18 +41,19 @@ async fn main() -> Result<()> {
     let config = Config::load().context("load configuration")?;
     let _log_guard = init_tracing(config.log_to_disk);
 
-    // The config resolver already warns about an UNBOUNDED advisor
-    // consultation loop (`max_uses` = 0 = "no limit"), but the binary
-    // installs the tracing subscriber AFTER the config is loaded, so that
-    // event was dropped on the floor. Repeat it here: on stderr, so the
-    // operator sees it even with `log_to_disk: false`, and as a tracing
-    // event, so it lands in the log file for postmortems.
-    if config.advisor.enabled && config.advisor.max_uses.is_none() {
-        eprintln!("WARNING: {UNBOUNDED_ADVISOR_LOOP_WARNING}");
+    // Configuration warnings (an out-of-range advisor limit, an unbounded
+    // consultation loop) are COLLECTED by the resolver, because it runs
+    // BEFORE this binary installs the tracing subscriber: a `tracing::warn!`
+    // emitted there would hit no subscriber and vanish. Emit them NOW, once
+    // per occurrence — on stderr (so the operator sees them even with
+    // `log_to_disk: false`, like the `proxy_key` warning below) and as
+    // tracing events (so they land in `target/logs/proxy.log`).
+    for warning in &config.warnings {
+        eprintln!("WARNING: {}", warning.message);
         tracing::warn!(
-            advisor_model = %config.advisor.model,
-            "{}",
-            UNBOUNDED_ADVISOR_LOOP_WARNING
+            details = ?warning.fields,
+            "configuration warning: {}",
+            warning.message
         );
     }
 

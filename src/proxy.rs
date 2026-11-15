@@ -1498,6 +1498,7 @@ mod tests {
             log_to_disk: false,
             proxy_key: None,
             advisor: crate::config::AdvisorConfig::default(),
+            warnings: Vec::new(),
         }
     }
 

@@ -47,7 +47,7 @@ use serde_json::Value;
 
 use crate::advisor::{protocol, scrub_error_body};
 use crate::anthropic::ResponseContentBlock;
-use crate::config::AdvisorConfig;
+use crate::config::{AdvisorConfig, effective_limit};
 use crate::proxy::{
     AppState, Attempt, Outcome, parse_upstream_body, send_upstream_once, token_usage,
 };
@@ -114,25 +114,25 @@ const RUNAWAY_CONSULTATION_THRESHOLD: usize = 10;
 ///
 /// The "0 means no limit" rule is applied where the operator's input
 /// enters — in the config resolver, which turns a configured `0` into
-/// `None`. This function therefore sees `Some(secs)` as "secs seconds".
+/// `None` — AND here, so a hand-built `Some(0)` means exactly the same
+/// thing ("no limit") instead of "zero seconds".
 #[must_use]
 fn advisor_timeout(cfg: &AdvisorConfig, request_timeout: Duration) -> Option<Duration> {
-    cfg.timeout_secs
-        .map(|secs| Duration::from_secs(secs).min(request_timeout))
+    effective_limit(cfg.timeout_secs).map(|secs| Duration::from_secs(secs).min(request_timeout))
 }
 
 /// The consultation cap for one turn.
 ///
-/// `None` (`max_uses` = 0 = "no limit") means the loop is bounded ONLY by
-/// the executor's behaviour: the executor may call `advisor` any number of
-/// times. Every iteration costs TWO upstream calls (the executor re-run and
-/// the advisor), so an executor that keeps asking will spin — the proxy
+/// `None` (and `Some(0)`, which means the same thing) means the loop is
+/// bounded ONLY by the executor's behaviour: the executor may call
+/// `advisor` any number of times. Every iteration costs TWO upstream calls
+/// (the executor re-run and the advisor), so an executor that keeps asking
+/// will spin — the proxy
 /// warns about it (once at startup, and again at runtime past
 /// [`RUNAWAY_CONSULTATION_THRESHOLD`]) but imposes no ceiling of its own.
 #[must_use]
 fn advisor_cap(cfg: &AdvisorConfig) -> usize {
-    cfg.max_uses
-        .map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX))
+    effective_limit(cfg.max_uses).map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX))
 }
 
 /// Build the separate, tool-free advisor request. `model` is the explicit
@@ -163,9 +163,10 @@ fn advisor_request(cfg: &AdvisorConfig, transcript: &str) -> ResponsesRequest {
         text: None,
         temperature: None,
         top_p: None,
-        // `max_tokens: None` = "no limit": OMIT the field so the UPSTREAM's
-        // own default applies (it may well be smaller than 2048).
-        max_output_tokens: cfg.max_tokens,
+        // `max_tokens: None` (and `Some(0)`, which means the same thing) =
+        // "no limit": OMIT the field so the UPSTREAM's own default applies
+        // (it may well be smaller than 2048).
+        max_output_tokens: effective_limit(cfg.max_tokens),
         parallel_tool_calls: None,
         store: None,
         previous_response_id: None,
@@ -627,14 +628,11 @@ mod tests {
             advisor_timeout(&c, Duration::from_secs(30)),
             Some(Duration::from_secs(1))
         );
-        // The config resolver turns a configured `0` into `None` ("no
-        // limit"), so `Some(0)` can only come from a hand-built config —
-        // and it then means literally "zero seconds".
+        // `Some(0)` means the SAME thing as `None` — "no limit" — whether it
+        // came from the resolver or from a hand-built config. `0` has
+        // exactly ONE meaning in the whole codebase.
         c.timeout_secs = Some(0);
-        assert_eq!(
-            advisor_timeout(&c, Duration::from_secs(30)),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(advisor_timeout(&c, Duration::from_secs(30)), None);
     }
 
     #[test]
@@ -647,6 +645,10 @@ mod tests {
             usize::MAX,
             "no limit means the loop is bounded only by the executor"
         );
+        // `Some(0)` is the SAME thing as `None` — "no limit" — so `0` has
+        // one meaning everywhere, not two.
+        c.max_uses = Some(0);
+        assert_eq!(advisor_cap(&c), usize::MAX);
         // A cap that does not fit `usize` on this platform means "no
         // limit" rather than a panic.
         c.max_uses = Some(u32::MAX);
@@ -654,6 +656,45 @@ mod tests {
             advisor_cap(&c),
             usize::try_from(u32::MAX).unwrap_or(usize::MAX)
         );
+    }
+
+    /// DEFECT 3: `Some(0)` in a resolved `AdvisorConfig` must mean exactly
+    /// what a configured `0` means — "no limit" — and NOT "zero
+    /// consultations" / "zero seconds" / "a zero-token answer". One
+    /// interpretation of `0` in the whole codebase.
+    #[test]
+    fn a_zero_limit_means_no_limit_everywhere() {
+        let mut c = cfg();
+
+        // max_uses: 0 = no limit (the loop is bounded only by the executor).
+        c.max_uses = Some(0);
+        assert_eq!(advisor_cap(&c), usize::MAX);
+        c.max_uses = None;
+        assert_eq!(advisor_cap(&c), usize::MAX);
+        // A positive bound still binds.
+        c.max_uses = Some(3);
+        assert_eq!(advisor_cap(&c), 3);
+
+        // timeout_secs: 0 = no per-request override (the global timeout
+        // applies).
+        c.timeout_secs = Some(0);
+        assert_eq!(advisor_timeout(&c, Duration::from_secs(30)), None);
+        c.timeout_secs = Some(7);
+        assert_eq!(
+            advisor_timeout(&c, Duration::from_secs(30)),
+            Some(Duration::from_secs(7))
+        );
+
+        // max_tokens: 0 = the proxy imposes no cap (the field is omitted).
+        c.max_tokens = Some(0);
+        let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
+        assert!(
+            v.get("max_output_tokens").is_none(),
+            "0 means no limit, so the field is omitted: {v}"
+        );
+        c.max_tokens = Some(64);
+        let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
+        assert_eq!(v["max_output_tokens"], 64);
     }
 
     #[test]

@@ -7,6 +7,19 @@
 //!
 //! Environment variables always win over the JSON file. This lets a deployment
 //! override individual values without editing the config file.
+//!
+//! ## Warnings raised while resolving
+//!
+//! The configuration is resolved BEFORE the binary installs the tracing
+//! subscriber (`Config::load()` runs first, `init_tracing()` second), so a
+//! `tracing::warn!` emitted from this module would reach NO subscriber and
+//! vanish — the operator would never learn about it. Warnings raised here
+//! are therefore COLLECTED on the resolved [`Config`] as [`ConfigWarning`]s,
+//! and the binary emits them right after `init_tracing`: on stderr (always
+//! visible) and as tracing events (so they land in the log file).
+//!
+//! **Rule for this module: never call `tracing::warn!` while resolving.**
+//! Push a [`ConfigWarning`] onto the resolver's warning list instead.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -47,6 +60,78 @@ const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 /// `advisor.max_uses` = 0 = "no limit". Shared by the config resolver and
 /// by the binary's startup banner so the two can never drift.
 pub const UNBOUNDED_ADVISOR_LOOP_WARNING: &str = "advisor.max_uses is 0 (no limit): the consultation loop is unbounded — each iteration costs two upstream calls (executor re-run + advisor)";
+
+/// A warning raised while the configuration was resolved.
+///
+/// ## Why this type exists
+///
+/// The configuration is resolved BEFORE the binary installs the tracing
+/// subscriber, so a `tracing::warn!` emitted during resolution hits no
+/// subscriber and disappears. The resolver COLLECTS its warnings here and
+/// the binary emits them right after `init_tracing` — on stderr (always
+/// visible, like the `proxy_key` warning) and as tracing events (so they
+/// land in `target/logs/proxy.log`). ONE mechanism for every config-time
+/// warning, so a new warning can never be silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    /// The operator-facing message. Printed on stderr and written to the
+    /// log file, so it must read well on its own.
+    pub message: String,
+    /// Structured key/value pairs attached to the tracing event, so a
+    /// postmortem can grep for e.g. `field="advisor.max_uses"`.
+    pub fields: Vec<(String, String)>,
+}
+
+impl ConfigWarning {
+    /// A warning with just a message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Attach one structured field to the tracing event.
+    #[must_use]
+    pub fn with_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.fields.push((key.into(), value.into()));
+        self
+    }
+}
+
+/// An integer limit for which `0` means "no limit".
+///
+/// The house rule (`0` = unlimited) is expressed once, here, so every
+/// consumer of a limit applies it the same way.
+pub trait AdvisorLimitValue: Copy + PartialEq {
+    /// The value that means "no limit".
+    const NO_LIMIT: Self;
+}
+
+impl AdvisorLimitValue for u32 {
+    const NO_LIMIT: Self = 0;
+}
+
+impl AdvisorLimitValue for u64 {
+    const NO_LIMIT: Self = 0;
+}
+
+/// The effective bound of an advisor limit, with the house
+/// **"0 means no limit"** rule applied.
+///
+/// * `None` → `None` — no limit;
+/// * `Some(0)` → `None` — no limit, the SAME meaning as `None`;
+/// * `Some(n)` → `Some(n)` — that bound.
+///
+/// The config resolver normalises a configured `0` into `None`, but a
+/// `Some(0)` can still reach the advisor session from a hand-built
+/// `AdvisorConfig` (tests, embedders). Applying the rule at BOTH ends gives
+/// `0` exactly ONE meaning in the whole codebase: **no limit**.
+#[must_use]
+pub fn effective_limit<T: AdvisorLimitValue>(value: Option<T>) -> Option<T> {
+    value.filter(|v| *v != T::NO_LIMIT)
+}
 
 /// Resolved proxy configuration. Cheap to clone (`String`s and a `Duration`).
 #[derive(Debug, Clone)]
@@ -103,6 +188,14 @@ pub struct Config {
     /// request pipeline behaves exactly as it did before the advisor feature
     /// existed (no extra upstream call, no synthesized tool, no wire fields).
     pub advisor: AdvisorConfig,
+    /// Warnings raised while resolving this configuration.
+    ///
+    /// The resolver runs BEFORE the binary installs the tracing
+    /// subscriber, so it cannot emit `tracing` events itself — it
+    /// collects them here and the binary prints each one on stderr and
+    /// emits it as a tracing event right after `init_tracing`. See
+    /// [`ConfigWarning`].
+    pub warnings: Vec<ConfigWarning>,
 }
 
 /// Resolved advisor settings (the `advisor` section of `proxy.json`).
@@ -152,6 +245,15 @@ pub struct Config {
 ///   `request_timeout` still applies (the reqwest client is built with
 ///   `.timeout(config.request_timeout)`), and a *bounded* value is always
 ///   clamped to it, so the advisor can never extend the operator's bound.
+///
+/// ## `Some(0)` means the same as `None`
+///
+/// The RESOLVED struct has ONE interpretation of `0`: **no limit**. The
+/// resolver turns a configured `0` into `None`, and
+/// [`effective_limit`] makes a hand-built `Some(0)` mean exactly the same
+/// thing where the limits are consumed (`advisor_cap` → unbounded,
+/// `advisor_timeout` → no override, `max_output_tokens` → omitted). There
+/// is no "zero consultations" or "zero seconds" anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisorConfig {
     pub enabled: bool,
@@ -177,6 +279,16 @@ impl Default for AdvisorConfig {
             max_tokens: Some(DEFAULT_ADVISOR_MAX_TOKENS),
             timeout_secs: Some(DEFAULT_ADVISOR_TIMEOUT_SECS),
         }
+    }
+}
+
+impl AdvisorConfig {
+    /// True when the consultation loop is UNBOUNDED — i.e. `max_uses` asks
+    /// for no limit. `None` and `Some(0)` mean the SAME thing (see
+    /// [`effective_limit`]), so both count as unbounded.
+    #[must_use]
+    pub fn has_unbounded_loop(&self) -> bool {
+        effective_limit(self.max_uses).is_none()
     }
 }
 
@@ -551,9 +663,14 @@ impl Config {
         // `advisor`: env > file > default, following `pick_str`. The whole
         // feature is off unless `enabled` resolves to true. A limit of `0`
         // means "no limit" (see `AdvisorConfig`); a value that does not fit
-        // the field's integer type falls back to the default with a WARN
+        // the field's integer type falls back to the default with a warning
         // rather than failing startup — the same house style as an unusable
         // upstream value surfacing as a 400 instead of a startup error.
+        //
+        // The warnings are COLLECTED, not emitted: the tracing subscriber
+        // does not exist yet (the binary installs it after this returns), so
+        // a `tracing::warn!` here would hit no subscriber and vanish.
+        let mut warnings: Vec<ConfigWarning> = Vec::new();
         let advisor_defaults = AdvisorConfig::default();
         let advisor_json = file.and_then(|f| f.advisor.as_ref());
         let advisor_enabled = env
@@ -570,20 +687,19 @@ impl Config {
             env.advisor_effort.as_deref(),
         );
         let advisor_max_uses = resolve_advisor_limit(
-            pick_u64(
-                advisor_json.and_then(|a| a.max_uses).map(u64::from),
-                env.advisor_max_uses,
-            ),
+            pick_u64(advisor_json.and_then(|a| a.max_uses), env.advisor_max_uses),
             DEFAULT_ADVISOR_MAX_USES,
             "advisor.max_uses",
+            &mut warnings,
         );
         let advisor_max_tokens = resolve_advisor_limit(
             pick_u64(
-                advisor_json.and_then(|a| a.max_tokens).map(u64::from),
+                advisor_json.and_then(|a| a.max_tokens),
                 env.advisor_max_tokens,
             ),
             DEFAULT_ADVISOR_MAX_TOKENS,
             "advisor.max_tokens",
+            &mut warnings,
         );
         let advisor_timeout_secs = resolve_advisor_limit(
             pick_u64(
@@ -592,6 +708,7 @@ impl Config {
             ),
             DEFAULT_ADVISOR_TIMEOUT_SECS,
             "advisor.timeout_secs",
+            &mut warnings,
         );
 
         let advisor = AdvisorConfig {
@@ -608,11 +725,10 @@ impl Config {
         // an executor that keeps asking would spin. The operator asked for
         // no limit, so the proxy does NOT impose a ceiling — it only makes
         // the hazard visible, once, at startup.
-        if advisor.enabled && advisor.max_uses.is_none() {
-            tracing::warn!(
-                advisor_model = %advisor.model,
-                "{}",
-                UNBOUNDED_ADVISOR_LOOP_WARNING
+        if advisor.enabled && advisor.has_unbounded_loop() {
+            warnings.push(
+                ConfigWarning::new(UNBOUNDED_ADVISOR_LOOP_WARNING.to_owned())
+                    .with_field("advisor_model", advisor.model.clone()),
             );
         }
 
@@ -630,6 +746,7 @@ impl Config {
             proxy_key,
             log_to_disk,
             advisor,
+            warnings,
         })
     }
 
@@ -893,10 +1010,19 @@ fn pick_u64(file_value: Option<u64>, env_value: Option<u64>) -> Option<u64> {
 /// * **`n > 0`** → `Some(n)`.
 ///
 /// A value that does not fit the field's integer type falls back to the
-/// default with a structured WARN: an operator typo must not stop the proxy
-/// from starting. (`0` is meaningful now, so there is no other invalid
-/// value for these three fields.)
-fn resolve_advisor_limit<T>(value: Option<u64>, default: T, field: &str) -> Option<T>
+/// default with a warning: an operator typo must not stop the proxy from
+/// starting. (`0` is meaningful now, so there is no other invalid value
+/// for these three fields.)
+///
+/// The warning is COLLECTED, not emitted: the resolver runs before the
+/// tracing subscriber exists, so a `tracing::warn!` here would vanish.
+/// See [`ConfigWarning`].
+fn resolve_advisor_limit<T>(
+    value: Option<u64>,
+    default: T,
+    field: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Option<T>
 where
     T: Copy + std::fmt::Display + TryFrom<u64>,
     T::Error: std::fmt::Display,
@@ -907,7 +1033,14 @@ where
         Some(v) => match T::try_from(v) {
             Ok(n) => Some(n),
             Err(err) => {
-                tracing::warn!(field, value = %v, error = %err, fallback = %default, "advisor limit out of range; using default");
+                warnings.push(
+                    ConfigWarning::new(format!(
+                        "{field} = {v} is out of range ({err}); using the default {default}"
+                    ))
+                    .with_field("field", field)
+                    .with_field("value", v.to_string())
+                    .with_field("fallback", default.to_string()),
+                );
                 Some(default)
             }
         },
@@ -974,14 +1107,24 @@ pub struct JsonConfig {
 /// An ABSENT `max_uses` / `max_tokens` / `timeout_secs` means the shipped
 /// default; `0` means **no limit**. See [`AdvisorConfig`] for what "no
 /// limit" means per field.
+///
+/// The three limits are `u64` here on purpose. The RESOLVED values are
+/// `u32` / `u32` / `u64` ([`AdvisorConfig`]), but a JSON number that does
+/// not fit `u32` must still PARSE: with a narrow type it would be a hard
+/// startup failure ("invalid value: integer 4294967296, expected u32"),
+/// which contradicts the house rule that an operator typo in one advisor
+/// limit must not take the whole deployment down. Widening the JSON type
+/// lets the resolver range-check the value and fall back to the default
+/// WITH a warning. The serialized shape is unchanged, so `deny_unknown_fields`
+/// and the TUI rollback guarantee are unaffected.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JsonAdvisorConfig {
     pub enabled: Option<bool>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub max_uses: Option<u32>,
-    pub max_tokens: Option<u32>,
+    pub max_uses: Option<u64>,
+    pub max_tokens: Option<u64>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -1590,7 +1733,7 @@ mod tests {
     fn advisor_out_of_range_limit_falls_back_to_the_default() {
         // A value that does not fit `u32` is not silently dropped: it falls
         // back to the default (the house style — a bad value must not stop
-        // the proxy from starting).
+        // the proxy from starting) AND it raises a warning.
         let env = EnvInputs {
             advisor_max_uses: Some(u64::from(u32::MAX) + 1),
             advisor_max_tokens: Some(u64::from(u32::MAX) + 1),
@@ -1599,6 +1742,142 @@ mod tests {
         let cfg = Config::resolve(None, &env).unwrap();
         assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
         assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        // The warning is COLLECTED (the resolver runs before the tracing
+        // subscriber exists, so it cannot emit it itself) and the binary
+        // prints it after `init_tracing`.
+        let warnings: Vec<&str> = cfg.warnings.iter().map(|w| w.message.as_str()).collect();
+        assert_eq!(warnings.len(), 2, "one warning per out-of-range limit");
+        assert!(
+            warnings[0].contains("advisor.max_uses")
+                && warnings[0].contains(&(u64::from(u32::MAX) + 1).to_string()),
+            "the warning names the field and the offending value: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("advisor.max_tokens"),
+            "the warning names the field: {}",
+            warnings[1]
+        );
+        for warning in &cfg.warnings {
+            assert!(
+                warning.message.contains("using the default"),
+                "the warning says what happened: {}",
+                warning.message
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_json_limit_still_loads_and_warns() {
+        // DEFECT 2: an out-of-range JSON number used to be a HARD STARTUP
+        // FAILURE (the JSON type was `u32`, so `"max_uses": 4294967296`
+        // failed to parse and the proxy exited). The JSON type is now wide
+        // enough to parse, and the resolver range-checks it: the proxy
+        // starts, the value falls back to the default, and a warning is
+        // raised.
+        let raw = r#"{
+            "upstream_base_url": "https://api.example.com",
+            "upstream_api_key":  "k",
+            "advisor": {
+                "enabled": true,
+                "max_uses": 4294967296,
+                "max_tokens": 4294967296
+            }
+        }"#;
+        let file = JsonConfig::parse(raw).expect("an out-of-range limit must still parse");
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
+        assert_eq!(cfg.warnings.len(), 2, "both limits warn");
+        assert!(
+            cfg.warnings
+                .iter()
+                .all(|w| w.message.contains("out of range"))
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_json_limit_loads_through_the_real_entry_point() {
+        // Same as above, but through `Config::load_from` (fs read + parse +
+        // resolve) — the path the binary actually takes. The proxy must
+        // START: the file is read, the JSON parses, the limit falls back
+        // to the default, and the warning is collected.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("advisor-out-of-range-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "upstream_base_url": "https://api.example.com",
+                "upstream_api_key":  "k",
+                "advisor": { "enabled": true, "max_uses": 4294967296 }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_from(&path).expect("the proxy must still start");
+        assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
+        assert_eq!(cfg.warnings.len(), 1, "the out-of-range limit warns once");
+        assert!(cfg.warnings[0].message.contains("advisor.max_uses"));
+        assert!(cfg.warnings[0].message.contains("4294967296"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_warnings_carry_the_unbounded_loop_warning_once() {
+        // The unbounded-loop warning is COLLECTED like every other
+        // config-time warning, so the binary can print it after the
+        // tracing subscriber exists (exactly once, on stderr and in the
+        // log file).
+        let file = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(true),
+                max_uses: Some(0),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        let unbounded: Vec<&ConfigWarning> = cfg
+            .warnings
+            .iter()
+            .filter(|w| w.message == UNBOUNDED_ADVISOR_LOOP_WARNING)
+            .collect();
+        assert_eq!(unbounded.len(), 1, "exactly one unbounded warning");
+        assert_eq!(
+            unbounded[0].fields,
+            vec![("advisor_model".to_owned(), "beam".to_owned())]
+        );
+
+        // With the advisor DISABLED the warning is not raised at all: an
+        // unused section must not shout at the operator.
+        let disabled = JsonConfig {
+            advisor: Some(JsonAdvisorConfig {
+                enabled: Some(false),
+                max_uses: Some(0),
+                ..JsonAdvisorConfig::default()
+            }),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&disabled), &env_with_required()).unwrap();
+        assert!(
+            cfg.warnings.is_empty(),
+            "a disabled advisor warns about nothing: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn a_normal_config_raises_no_warnings() {
+        // The collection must stay quiet in the common case, or the startup
+        // banner would fill with noise.
+        let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
     }
 
     #[test]
@@ -1707,6 +1986,45 @@ mod tests {
         assert_eq!(
             reparsed.advisor.as_ref().and_then(|a| a.model.as_deref()),
             Some("beam")
+        );
+    }
+
+    #[test]
+    fn the_widened_json_limits_survive_the_tui_save_round_trip() {
+        // The TUI rewrites `proxy.json` wholesale from the parsed
+        // `JsonConfig` (§17.2). The widened JSON types (`Option<u64>`)
+        // must not change that round-trip: an in-range value is written
+        // back unchanged, and an out-of-range value — which the resolver
+        // falls back on — is PRESERVED verbatim instead of being silently
+        // rewritten, so the operator can still see (and fix) their typo.
+        let raw = r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
+            "advisor":{"enabled":true,"model":"beam","max_uses":2,"max_tokens":2048,
+                       "timeout_secs":45}}"#;
+        let parsed = JsonConfig::parse(raw).expect("parse json");
+        let saved = serde_json::to_string_pretty(&parsed).unwrap();
+        let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        let advisor = reparsed.advisor.as_ref().unwrap();
+        assert_eq!(advisor.max_uses, Some(2));
+        assert_eq!(advisor.max_tokens, Some(2048));
+        assert_eq!(advisor.timeout_secs, Some(45));
+        // The saved form is the plain number an operator wrote — the
+        // widened type does not leak into the file.
+        assert!(saved.contains("\"max_uses\": 2"), "{saved}");
+        assert!(saved.contains("\"max_tokens\": 2048"), "{saved}");
+
+        // An out-of-range value round-trips verbatim (it is NOT clamped
+        // on the way through the file).
+        let oor = JsonConfig::parse(
+            r#"{"upstream_base_url":"https://api.example.com","upstream_api_key":"k",
+                "advisor":{"enabled":true,"max_uses":4294967296}}"#,
+        )
+        .expect("parse json");
+        let saved = serde_json::to_string_pretty(&oor).unwrap();
+        assert!(saved.contains("4294967296"), "{saved}");
+        let reparsed = JsonConfig::parse(&saved).expect("the saved config must re-parse");
+        assert_eq!(
+            reparsed.advisor.as_ref().and_then(|a| a.max_uses),
+            Some(4294967296)
         );
     }
 
