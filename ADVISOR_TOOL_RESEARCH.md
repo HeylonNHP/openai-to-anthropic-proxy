@@ -1594,6 +1594,101 @@ steps 2-6 revert cleanly and step 1 remains as a debt-reducing refactor.
 
 ---
 
+## 17. CONFIRMED PLAN (2026-11-15 13:18) — operator overrides §16
+
+The operator confirmed the plan with four explicit decisions. **This section
+is authoritative and overrides §12.5, §14.1 and §16.1.**
+
+### 17.1 The four decisions
+
+1. **Advisor config lives in `proxy.json` — NOT a separate `advisor.json`.**
+   The operator rejected the module-local config file. So we DO add a config
+   section to `src/config.rs` despite the cost measured in §11.4. This is a
+   deliberate preference for the single-config convention over the
+   dependency-cycle avoidance. Accept the ~125-150 lines and 16 fixture
+   fixups.
+2. **Design A — faithful, detection-triggered.** Consult ONLY when the
+   executor emits `function_call{name:"advisor"}`, bounded by `max_uses`.
+   "It should be as faithful to anthropic as possible." Design B (always
+   consult) is **not** the first implementation; it may remain a later flag.
+3. **The advisor MODEL (`beam`) is configured from `proxy.json`.** Not a
+   hard-coded default buried in the module, not an env-only knob. The exact
+   key is TBD (see §17.2) but it must be readable from the same file as every
+   other deployment setting.
+4. **Every phase is independently testable.** Do NOT run all six steps in one
+   go and test at the end. Each commit gets its own gate: full suite green,
+   targeted new tests green, and (where the step changes behaviour) a real
+   end-to-end check. Stop and report between phases. **Use a cheap model
+   (`beam`) for ALL tests.** Kimi models are expensive; no test may call one.
+
+### 17.2 Concrete config shape (to add in phase 2)
+
+```json
+// proxy.json — add ONE section
+"advisor": {
+  "enabled": false,
+  "model": "beam",
+  "effort": "medium",
+  "max_uses": 2,
+  "max_tokens": 2048,
+  "timeout_secs": 45
+}
+```
+
+Wiring required (all in `src/config.rs`, following the `JsonReasoningConfig`
+pattern at `:790-804`):
+
+| edit | lines |
+|---|---|
+| `use crate::advisor::AdvisorConfig;` (or define `AdvisorConfig` in `config.rs` and have the advisor module take it as a plain parameter — **prefer this**: no `config.rs -> advisor -> Config` cycle, matching `model_rejection.rs`'s primitives-only API) | ~1 |
+| `pub advisor: AdvisorConfig` on `Config` (`:38-86`) + doc comment | ~4 |
+| `pub advisor: Option<JsonAdvisorConfig>` on `JsonConfig` (`:702-736`) with `#[serde(default, skip_serializing_if = "Option::is_none")]` — **`skip_serializing_if` is mandatory**: the TUI rewrites the whole file and `deny_unknown_fields` would make an older binary refuse to start (`:719-725`) | ~5 |
+| `JsonAdvisorConfig` with `#[serde(default, deny_unknown_fields)]`, all six fields `Option<_>` | ~20 |
+| `resolve` branch: env > file > `AdvisorConfig::default()`; validate `max_uses > 0`, `timeout_secs > 0`, `enabled=false` default | ~15 |
+| `+1` line in `Ok(Self { … })` at `:456-469` | 1 |
+| `impl Default for Config` (currently **none**) so `src/proxy.rs:1184` and test helpers can use `..Default::default()` | ~18 |
+| `advisor: Default::default(),` in the **~16** full `Config { … }` literals (`src/proxy.rs:1218`; `tests/proxy_e2e.rs:152, 185, 582, 662, 749, 824, 880, 940, 1591, 1680, 1752, 1835, 1928, 2021, 2107`) | ~16 |
+| `proxy.json-guide.md` + `proxy.json.example` | ~20 |
+| 3-5 in-file config tests (default off, precedence, validation, serialisation roll-back safety) | ~50 |
+
+**`enabled: false` remains the default.** Zero wire-field changes when off.
+`model` is an explicit **upstream** model name (§11.4), not an inbound alias.
+
+### 17.3 Phase gates (each is a commit, each is reported before the next)
+
+| phase | deliverable | test gate |
+|---|---|---|
+| 1 | `Attempt` + `build_outbound` + `execute` refactor, **zero behaviour change**; 4 characterization tests (§13.4) | 355+2+37+4 green; clippy still 7; differential diff of received bodies + log lines enabled/disabled |
+| 2 | `advisor` config section in `proxy.json` + `src/advisor/{mod,config,protocol}.rs` skeleton; feature still unreachable | full suite green; config unit tests; **prove a `proxy.json` WITH the new key still loads on the previous binary's schema** (rollback check) |
+| 3 | Zero-argument `advisor` function tool synthesized from Claude Code's 3-field declaration; `# Advisor Tool` instructions preserved | e2e: upstream sees the tool, empty `{}` schema survives strict sanitization + the fake upstream's validator |
+| 4 | Advisor upstream call + advice injection + `server_tool_use` / `advisor_tool_result` blocks + `usage.iterations[]` | e2e happy path (3 POSTs), 404/timeout -> `unavailable` with the executor answer intact and **no fallback POST**, `max_uses` cap |
+| 5 | Buffered synthetic SSE for `stream:true` | e2e event sequence + Claude Code `--advisor` smoke test (cheap model) |
+| 6 | Inbound echo (`ContentBlockParam`), TUI label, docs | multi-turn smoke test; full suite; clippy baseline |
+
+**All e2e tests use a fake upstream except the two smoke tests, which use
+`beam` and tiny `max_tokens`. No kimi, no expensive model, anywhere.**
+
+### 17.4 What stays from §16
+
+Refactor-first (§13/§14), one assistant message with contiguous blocks and
+`end_turn` (§11.5), buffered synthetic SSE with `src/stream.rs` untouched
+(§11.3), generic `Raw(Value)` wire extension (§11.6), fail closed with
+`unavailable` and no `default_model` (§11.4), off by default, and the deletion
+rule: if phase 4/5 shows the feature is not worth keeping, phases 2-6 revert
+cleanly and phase 1 remains a debt-reducing refactor.
+
+### 17.5 What changed from §16
+
+| §16 said | now |
+|---|---|
+| module-local `advisor.json` + `OnceLock`, "no `Config` field" | **`proxy.json` section; `Config` field added** |
+| "A, with B as a later config flag" | **A only, as faithful as possible** |
+| "default `beam`" in module config | **`beam` set in `proxy.json`, operator-editable** |
+| six commits "each independently green" | **same, but explicitly gated and reported phase by phase; cheap models for all tests** |
+| "step 1 only vs all six" offered | **all six, phase by phase** |
+
+---
+
 ## Sources
 
 **Official docs**
