@@ -184,19 +184,76 @@ upstream SSE/response -> translate::response or ::stream (OpenAI -> Anthropic) -
 
 ## Out of scope
 
-- Vision / image inputs
-- Tool-level and assistant-level prompt-cache control markers
-- Server-side tools (`web_search`, `web_fetch`, `code_execution`)
-- `/v1/models` listing
-- TLS termination
+The proxy implements the core Anthropic Messages API path for Claude Code: streaming,
+client tool use, stop-reason/usage remapping, model aliases, reasoning-effort
+mapping, extended-thinking replay, prompt caching (partial), and the experimental
+advisor tool. The following Claude Code / Anthropic API capabilities are **not**
+supported because they depend on Anthropic-specific behaviour the proxy cannot
+recreate against an OpenAI-compatible upstream.
+
+See also [`README.md`](./README.md#features) for the shorter visitor-facing list.
+
+### Endpoints and transport
+- `/v1/models` listing (and other Anthropic endpoints such as batches/files)
+- TLS termination (bind a plain HTTP listener; put a reverse proxy in front)
+- One upstream target per instance: no multi-tenant or per-user routing
+
+### Vision / image inputs
+- Image inputs are only partially translated; assistant `image` blocks are dropped
+- No image output / vision generation handling
+
+### Extended thinking
+- `redacted_thinking` blobs are dropped (cannot be re-encoded for a non-Anthropic upstream)
+- `thinking.budget_tokens` is parsed but not enforced or forwarded
+
+### Server-side / built-in tools
+- Server-side tools beyond OpenAI's `web_search` (no `web_fetch`, `code_execution`, `tool_search`, etc.)
+- Server-tool continuation loops (`pause_turn` re-sends, mixed server/client turns)
+- Claude Code's standby advisor path (only an explicitly configured `advisorModel` works behind a proxy)
+
+### Request parameters and caching
+- `stop_sequences` are dropped (Responses API has no stop field)
+- `top_k` is parsed but never forwarded; `metadata` carries only `user_id`
+- Tool-level, system-level, and assistant-level `cache_control` markers are not translated (user text/image blocks only, and only for allowlisted models)
+
+### Beta / protocol features
+- Anthropic beta headers are dropped, so beta-gated features cannot rely on them
+- Anthropic-specific server-side tool envelopes and iteration billing beyond what the proxy synthesises
 
 > Extended thinking blocks **are** supported on the response side (the proxy
 > generates them from the upstream's `reasoning` output item) and are replayed
-> back upstream on the next request — see
+> back upstream on the next request - see
 > [Reasoning replay](./proxy.json-guide.md#reasoning-replay). What is *not*
 > supported is the Anthropic-specific `redacted_thinking` blob, which cannot be
 > re-encoded for a non-Anthropic upstream and is dropped with a warning.
 
-## License
+## Suggested next work (not committed)
+
+This is a planning note for future changes. It is separate from the current
+"out of scope" list above, which describes hard limits of the design.
+
+### Best next improvement: image / vision input support
+
+Reasoning: highest user-facing value for the lowest implementation risk. Claude
+Code users frequently paste screenshots and diagrams; today those requests are
+only partially handled (assistant `image` blocks are dropped). A v1 can be
+request-side only — Anthropic image blocks translated to OpenAI `input_image`
+data URLs — while keeping text-only responses and deferring assistant-image replay.
+
+Caveats: requires a vision-capable upstream; output remains text-only; keep the
+change bounded so it does not grow into full multimodal output support.
+
+### Runner-up for "easiest": `/v1/models`
+
+Small, self-contained route that improves compatibility with tools and model
+selectors, but it does not unlock a new user workflow.
+
+### De-prioritise for now
+- TLS termination: better handled by a reverse proxy (Caddy/nginx/Traefik).
+- Server-side tools (`web_fetch`, `code_execution`, etc.): high value, but
+  require upstream loops and are not cheap.
+- `redacted_thinking`, `stop_sequences`: need upstream semantics OpenAI-compatible
+  APIs mostly do not expose.
+
 
 This is a personal/professional project; no license is granted by default. Add one if you intend to distribute.
