@@ -24,12 +24,15 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `LISTEN_ADDR` | `0.0.0.0:8085` | no | socket address to bind |
 | `UPSTREAM_PATH` | `/v1/responses` | no | appended to the base URL |
 | `REQUEST_TIMEOUT_SECS` | `600` | no | per-request timeout |
+| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | positive whole-number byte cap for `/v1/messages`; invalid numeric values warn and use the default |
 | `PROMPT_CACHING_ENABLED` | `false` | no | set `true` to forward OpenAI prompt-cache hints |
 | `PROMPT_CACHE_KEY` | - | no | optional stable key for `prompt_cache_key` |
 | `PROXY_KEY` | - | no | shared secret for `X-Proxy-Key` auth (see "Client auth" below) |
 | `LOG_TO_DISK` | `false` | no | set `1`/`true`/`yes` to write `target/logs/proxy.log` |
 
 `proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
+
+`max_request_body_bytes` (overridden by `MAX_REQUEST_BODY_BYTES`) is a positive whole number of bytes; its default is 33,554,432 bytes (32 MiB). Numeric values that are zero, negative, fractional, or out of range produce a warning and fall back to the default without failing startup. Non-numeric `MAX_REQUEST_BODY_BYTES` text is ignored, so the file value or default applies.
 
 ### Client auth (`proxy_key` / `PROXY_KEY`)
 

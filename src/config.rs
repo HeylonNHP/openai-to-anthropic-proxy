@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8085";
 const DEFAULT_UPSTREAM_PATH: &str = "/v1/responses";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Maximum accepted inbound `/v1/messages` body size, in bytes (32 MiB).
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Prompt caching is opt-in and off by default. When disabled, the
 /// proxy does not emit any OpenAI prompt-cache fields, so the feature
 /// has zero impact on upstreams that don't understand it.
@@ -141,6 +143,8 @@ pub struct Config {
     pub upstream_api_key: String,
     pub upstream_path: String,
     pub request_timeout: Duration,
+    /// Maximum accepted inbound `/v1/messages` body size, in bytes.
+    pub max_request_body_bytes: usize,
     /// Outbound `reasoning_effort` for Responses requests. See
     /// [`DEFAULT_REASONING_EFFORT`] for why this exists. Forwarded to
     /// the upstream as `reasoning: { effort: "..." }` (the Responses
@@ -704,6 +708,19 @@ impl Config {
         // a `tracing::warn!` here would hit no subscriber and vanish.
         let mut warnings: Vec<ConfigWarning> = Vec::new();
 
+        // Env > file > default. The request body limit must be a positive
+        // whole number of bytes; invalid numeric values warn and use the
+        // default rather than making startup fail.
+        let max_request_body_bytes = resolve_positive_usize(
+            pick_limit(
+                file.and_then(|f| f.max_request_body_bytes.as_ref()),
+                env.max_request_body_bytes.as_ref(),
+            ),
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            "max_request_body_bytes",
+            &mut warnings,
+        );
+
         // `tool_result_images`: one of `array` (default — the Responses
         // API's array-of-parts form), `lift` (text-only tool output +
         // images in a following user message, for gateways that reject
@@ -818,6 +835,7 @@ impl Config {
             upstream_api_key,
             upstream_path,
             request_timeout: Duration::from_secs(request_timeout_secs),
+            max_request_body_bytes,
             reasoning_effort,
             reasoning,
             model_aliases,
@@ -1003,6 +1021,8 @@ pub struct EnvInputs {
     pub upstream_api_key: Option<String>,
     pub upstream_path: Option<String>,
     pub request_timeout_secs: Option<u64>,
+    /// Raw numeric override; invalid numbers are warned about by the resolver.
+    pub max_request_body_bytes: Option<serde_json::Number>,
     pub reasoning_effort: Option<String>,
     pub prompt_caching_models: Option<String>,
     pub prompt_cache_key: Option<String>,
@@ -1051,6 +1071,9 @@ impl EnvInputs {
             request_timeout_secs: env::var("REQUEST_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            max_request_body_bytes: env::var("MAX_REQUEST_BODY_BYTES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
             tool_result_images: env::var("TOOL_RESULT_IMAGES").ok(),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
@@ -1264,6 +1287,55 @@ fn parse_env_limit(raw: &str) -> Option<serde_json::Number> {
     }
 }
 
+/// Resolve a positive whole-number byte limit. Unlike advisor limits, zero
+/// is invalid here: a zero-byte body limit would effectively disable the
+/// endpoint. Invalid numeric values fall back with a collected warning.
+fn resolve_positive_usize(
+    value: Option<serde_json::Number>,
+    default: usize,
+    field: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) -> usize {
+    let Some(number) = value.as_ref() else {
+        return default;
+    };
+    let raw = match classify_limit(number) {
+        RawLimit::Whole(v) if v > 0 => v,
+        RawLimit::Whole(_) => {
+            push_invalid_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it must be greater than zero",
+            );
+            return default;
+        }
+        RawLimit::Negative => {
+            push_invalid_limit_warning(warnings, field, number, default, "it is negative");
+            return default;
+        }
+        RawLimit::Fractional => {
+            push_invalid_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it is not a whole number",
+            );
+            return default;
+        }
+        RawLimit::TooLarge => {
+            push_invalid_limit_warning(warnings, field, number, default, "it is out of range");
+            return default;
+        }
+    };
+    usize::try_from(raw).unwrap_or_else(|_| {
+        push_invalid_limit_warning(warnings, field, number, default, "it is out of range");
+        default
+    })
+}
+
 /// JSON representation of `proxy.json`. Every field is optional; missing
 /// fields fall through to env vars and then to defaults.
 ///
@@ -1278,6 +1350,11 @@ pub struct JsonConfig {
     pub upstream_api_key: Option<String>,
     pub upstream_path: Option<String>,
     pub request_timeout_secs: Option<u64>,
+    /// Positive whole-number `/v1/messages` body limit in bytes. Raw JSON
+    /// number retained so invalid values can warn and fall back at resolve
+    /// time rather than failing config parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<serde_json::Number>,
     pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared
@@ -1516,7 +1593,9 @@ mod tests {
 
     #[test]
     fn defaults_apply_when_only_required_set() {
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 33_554_432);
         let cfg = Config::resolve(None, &env_with_required()).unwrap();
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
         assert_eq!(cfg.listen_addr.to_string(), DEFAULT_LISTEN_ADDR);
         assert_eq!(cfg.upstream_path, DEFAULT_UPSTREAM_PATH);
         assert_eq!(
@@ -1524,6 +1603,105 @@ mod tests {
             Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
         );
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn max_request_body_limit_resolves_file_then_env_then_default() {
+        let file = JsonConfig {
+            max_request_body_bytes: limit(12_345),
+            ..JsonConfig::default()
+        };
+        let from_file = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(from_file.max_request_body_bytes, 12_345);
+
+        let env = EnvInputs {
+            max_request_body_bytes: limit(67_890),
+            ..env_with_required()
+        };
+        let from_env = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(from_env.max_request_body_bytes, 67_890);
+        assert!(from_env.warnings.is_empty());
+    }
+
+    #[test]
+    fn invalid_max_request_body_numeric_values_warn_and_fall_back() {
+        // Zero, negative, fractional, and out-of-u64-range values all remain
+        // parseable raw JSON numbers and are rejected by the resolver.
+        for raw in ["0", "-1", "2.5", "18446744073709551616"] {
+            let number: serde_json::Number = serde_json::from_str(raw).unwrap();
+            let env = EnvInputs {
+                max_request_body_bytes: Some(number),
+                ..env_with_required()
+            };
+            let cfg = Config::resolve(None, &env).unwrap();
+            assert_eq!(
+                cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES,
+                "raw={raw}"
+            );
+            assert_eq!(cfg.warnings.len(), 1, "raw={raw}");
+            assert!(cfg.warnings[0].message.contains("max_request_body_bytes"));
+            assert!(cfg.warnings[0].message.contains("using the default"));
+
+            let raw_file = format!(r#"{{"max_request_body_bytes":{raw}}}"#);
+            let file = JsonConfig::parse(&raw_file).expect("raw numeric file value parses");
+            let from_file = Config::resolve(Some(&file), &env_with_required()).unwrap();
+            assert_eq!(
+                from_file.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES,
+                "file raw={raw}"
+            );
+            assert_eq!(from_file.warnings.len(), 1, "file raw={raw}");
+        }
+
+        // An invalid environment number still overrides the file, and thus
+        // falls back to the default rather than accepting the file's value.
+        let file = JsonConfig {
+            max_request_body_bytes: limit(8192),
+            ..JsonConfig::default()
+        };
+        let env = EnvInputs {
+            max_request_body_bytes: limit(0),
+            ..env_with_required()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.warnings.len(), 1);
+    }
+
+    #[test]
+    fn non_numeric_body_limit_env_value_is_ignored() {
+        let env = EnvInputs {
+            max_request_body_bytes: parse_env_limit("not-a-number"),
+            ..env_with_required()
+        };
+        assert!(env.max_request_body_bytes.is_none());
+        // The capture convention means non-numeric env text contributes no
+        // override, so normal file/default resolution applies.
+        let file = JsonConfig {
+            max_request_body_bytes: limit(8192),
+            ..JsonConfig::default()
+        };
+        let cfg = Config::resolve(Some(&file), &env).unwrap();
+        assert_eq!(cfg.max_request_body_bytes, 8192);
+    }
+
+    #[test]
+    fn max_request_body_limit_field_is_optional_and_round_trips_for_tui() {
+        let saved_default = serde_json::to_value(JsonConfig::default()).unwrap();
+        assert!(saved_default.get("max_request_body_bytes").is_none());
+
+        let parsed = JsonConfig::parse(r#"{"max_request_body_bytes":12345}"#).unwrap();
+        let saved = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(saved["max_request_body_bytes"], 12345);
+
+        // Invalid raw values must also survive the TUI's whole-file rewrite
+        // verbatim, even though the resolver will warn and use the default.
+        for raw in ["0", "-1", "2.5"] {
+            let text = format!(r#"{{"max_request_body_bytes":{raw}}}"#);
+            let parsed = JsonConfig::parse(&text).expect("raw numeric value parses");
+            let saved = serde_json::to_string(&parsed).unwrap();
+            assert!(saved.contains(raw), "raw value {raw} was changed: {saved}");
+            assert_eq!(JsonConfig::parse(&saved).unwrap(), parsed);
+        }
     }
 
     #[test]

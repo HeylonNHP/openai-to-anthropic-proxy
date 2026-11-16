@@ -33,12 +33,6 @@ use crate::stream::StreamTranslator;
 use crate::translate;
 use crate::tui::MappingsStore;
 
-/// Maximum accepted size of an inbound `/v1/messages` body, in bytes.
-///
-/// 32 MiB matches Anthropic's own request-size ceiling; base64 images
-/// inflate by ~4/3, so this is the practical limit for screenshot-heavy
-/// tool results.
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
 
@@ -146,6 +140,8 @@ pub fn router_with_stores(
     stats: Arc<crate::tui::SessionStatsStore>,
     capabilities: Arc<CapabilityStore>,
 ) -> Router {
+    // Save the route-local body limit before moving `config` into state.
+    let max_request_body_bytes = config.max_request_body_bytes;
     let state = AppState {
         config,
         mappings,
@@ -156,14 +152,12 @@ pub fn router_with_stores(
         capabilities,
     };
     Router::new()
-        // Cap request bodies at 32 MiB. Anthropic caps requests at 32 MB; a
-        // base64 screenshot inflates by ~37%, so the axum default (2 MiB)
-        // would reject real Claude Code requests carrying tool-result
-        // images with a 413 before translation ever runs.
+        // A configurable route-local cap keeps large tool-result screenshots
+        // possible while rejecting oversized bodies before translation.
         .route(
             "/v1/messages",
             post(handle_messages)
-                .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)),
+                .layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes)),
         )
         .route("/healthz", get(handle_health))
         .with_state(state)
@@ -1506,6 +1500,7 @@ mod tests {
             upstream_api_key: "test".into(),
             upstream_path: "/v1/responses".into(),
             request_timeout: std::time::Duration::from_secs(60),
+            max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
             reasoning_effort: None,
             reasoning: crate::config::ReasoningConfig::default(),
             reasoning_replay: crate::config::ReasoningReplayConfig::default(),

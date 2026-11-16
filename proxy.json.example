@@ -2,6 +2,7 @@
   "upstream_base_url": "https://integrate.api.nvidia.com/",
   "upstream_api_key":  "your-nvapi-key-here",
   "request_timeout_secs": 600,
+  "max_request_body_bytes": 33554432,
 
   "reasoning": {
     "default": "none",

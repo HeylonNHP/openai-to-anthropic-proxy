@@ -84,11 +84,15 @@ in [`REFERENCE.md`](./REFERENCE.md).
 | `UPSTREAM_API_KEY` | — | yes | bearer token for the upstream |
 | `LISTEN_ADDR` | `0.0.0.0:8085` | no | socket to bind |
 | `UPSTREAM_PATH` | `/v1/responses` | no | appended to base URL |
+| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | positive whole-number byte cap for `/v1/messages`; invalid numeric values warn and use the default |
 | `PROXY_KEY` | — | no | shared secret; see below |
 | `LOG_TO_DISK` | `false` | no | write `target/logs/proxy.log` |
 
-The proxy also reads `proxy.json` (same field names, snake_case). Unknown fields
-fail fast at startup.
+The proxy also reads `proxy.json` (same field names, snake_case), including
+`max_request_body_bytes` (positive whole number of bytes; defaults to 33,554,432
+bytes / 32 MiB). `MAX_REQUEST_BODY_BYTES` overrides the file. Invalid numeric
+values (zero, negative, fractional, or out of range) warn and fall back to the
+default; non-numeric environment text is ignored. Unknown fields fail fast at startup.
 
 ### If the proxy is configured with `proxy_key`
 

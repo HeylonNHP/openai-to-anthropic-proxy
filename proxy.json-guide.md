@@ -56,6 +56,7 @@ Every field is optional. If you only need the basics, a two-field file is enough
 
 ### Upstream connection
 
+- `max_request_body_bytes` limits the inbound `/v1/messages` body to a positive whole number of bytes. The default is **33,554,432 bytes (32 MiB)**; set this lower or higher for your deployment. `MAX_REQUEST_BODY_BYTES` overrides the file value. A numeric value of `0`, a negative or fractional value, or a value outside the platform's `usize` range produces a warning and falls back to the default without stopping startup. Non-numeric environment text is ignored, so the file value/default applies. Requests are buffered in memory before handling; raising this limit increases the memory a single request can consume, and concurrent large requests multiply that cost.
 - `upstream_base_url` is the gateway URL the proxy sends requests to. The default upstream path is `/v1/responses`; the proxy appends it for you.
 - `upstream_api_key` is the upstream bearer token. Keep it out of docs and out of git — `proxy.json` is in `.gitignore`.
 - `request_timeout_secs` controls how long the proxy waits before giving up on a single request. The default is 600 (10 minutes).
@@ -231,9 +232,11 @@ Notes:
   modes.
 - Tool results carried in **text only** look exactly the same as before this
   option existed — a bare string `output`, byte for byte.
-- Requests are capped at **32 MiB** (Anthropic's own ceiling); a base64 image
-  inflates ~37% over its binary size, so a ~24 MB screenshot is roughly the
-  largest image a single tool result can carry.
+- Requests default to a **32 MiB (33,554,432-byte)** cap; configure it with
+  `max_request_body_bytes` or `MAX_REQUEST_BODY_BYTES`. A base64 image inflates
+  ~37% over its binary size, so the default allows roughly a 24 MB screenshot
+  in one tool result. This cap applies to the inbound `/v1/messages` body; it
+  does not change the fake upstream test server's separate test-only limit.
 
 ### Reasoning replay
 

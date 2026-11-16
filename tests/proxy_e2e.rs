@@ -169,6 +169,7 @@ fn make_config_with_default_model(
         upstream_api_key: "test-key".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         reasoning_replay: Default::default(),
@@ -206,6 +207,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: Default::default(),
@@ -606,6 +608,7 @@ async fn per_model_reasoning_effort_lookup() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: None,
         reasoning: ReasoningConfig {
             default: Some("medium".into()),
@@ -689,6 +692,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: None,
         reasoning: ReasoningConfig {
             default: Some("high".into()), // fixed fallback when no signal
@@ -779,6 +783,7 @@ async fn model_alias_rewrites_inbound_model() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: ModelAliases {
@@ -857,6 +862,7 @@ async fn model_not_supported_falls_back_to_default() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: ModelAliases {
@@ -916,6 +922,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         // Note: no default_model — fallback disabled.
@@ -979,6 +986,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: ModelAliases {
@@ -1633,6 +1641,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: ModelAliases {
@@ -1725,6 +1734,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: None,
         reasoning: ReasoningConfig {
             default: Some("low".into()),
@@ -1800,6 +1810,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         reasoning_replay: Default::default(),
@@ -1886,6 +1897,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         reasoning_replay: openai_to_anthropic_proxy::config::ReasoningReplayConfig {
@@ -1982,6 +1994,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: Default::default(),
@@ -2078,6 +2091,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: Default::default(),
@@ -2167,6 +2181,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         upstream_api_key: "sk-fake".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: Some("none".into()),
         reasoning: Default::default(),
         model_aliases: Default::default(),
@@ -2810,6 +2825,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         upstream_api_key: "test-key".into(),
         upstream_path: "/v1/responses".into(),
         request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
         reasoning_effort: None,
         reasoning: ReasoningConfig {
             default: Some("low".into()),
@@ -6117,8 +6133,34 @@ async fn tool_result_image_drop_mode_keeps_text_only() {
 }
 
 /// A full-screen screenshot routinely exceeds axum's default 2 MiB body
-/// limit once base64-encoded. The proxy must accept large bodies, or Claude
-/// Code's screenshot tool breaks with a 413 before translation ever runs.
+/// limit once base64-encoded. The 32 MiB default must accept large bodies, or
+/// Claude Code's screenshot tool breaks with a 413 before translation runs.
+#[tokio::test]
+async fn configured_small_request_body_limit_returns_413() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(CANNED_RESPONSE.to_string());
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.max_request_body_bytes = 64;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        *upstream.request_count.lock().await,
+        0,
+        "oversized body must be rejected before upstream forwarding"
+    );
+}
+
 #[tokio::test]
 async fn large_tool_result_image_is_accepted() {
     let (proxy_addr, _upstream_addr, upstream) = setup_with_images(None).await;
