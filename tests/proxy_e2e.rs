@@ -6132,9 +6132,8 @@ async fn tool_result_image_drop_mode_keeps_text_only() {
     assert_eq!(fco["output"], "screenshot attached");
 }
 
-/// A full-screen screenshot routinely exceeds axum's default 2 MiB body
-/// limit once base64-encoded. The 32 MiB default must accept large bodies, or
-/// Claude Code's screenshot tool breaks with a 413 before translation runs.
+/// A configured body limit must reject an oversized body with a 413 before
+/// anything is forwarded upstream.
 #[tokio::test]
 async fn configured_small_request_body_limit_returns_413() {
     let (upstream_addr, upstream) = start_fake_upstream().await;
@@ -6159,6 +6158,41 @@ async fn configured_small_request_body_limit_returns_413() {
         0,
         "oversized body must be rejected before upstream forwarding"
     );
+}
+
+/// The `X-Proxy-Key` check must run BEFORE the body is buffered. With a body
+/// limit smaller than the request, an unauthenticated client gets 401 (the
+/// body was never read); if auth only ran after buffering, the body-limit
+/// rejection (413) would win. An authenticated client still gets the 413.
+#[tokio::test]
+async fn proxy_key_is_checked_before_the_body_is_read() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(CANNED_RESPONSE.to_string());
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.max_request_body_bytes = 64;
+    config.proxy_key = Some("s3cret".to_string());
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let body =
+        r#"{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#;
+
+    let unauth = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let authed = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-proxy-key", "s3cret")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]

@@ -151,16 +151,38 @@ pub fn router_with_stores(
         stats,
         capabilities,
     };
+    // The shared-secret check is a route middleware, NOT a line in the
+    // handler: axum runs the handler's `Bytes` extractor first, so a check
+    // inside the handler only happens after the whole body (up to
+    // `max_request_body_bytes`) has been buffered. As middleware it runs
+    // before the body is touched, so an unauthenticated client cannot make
+    // the proxy hold a large body in memory.
+    let auth_state = state.clone();
     Router::new()
         // A configurable route-local cap keeps large tool-result screenshots
         // possible while rejecting oversized bodies before translation.
         .route(
             "/v1/messages",
             post(handle_messages)
-                .layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes)),
+                .layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    auth_state,
+                    require_proxy_key,
+                )),
         )
         .route("/healthz", get(handle_health))
         .with_state(state)
+}
+
+/// Reject a request whose `X-Proxy-Key` is missing or wrong, before the
+/// body is read. A no-op when no `proxy_key` is configured.
+async fn require_proxy_key(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, AppError> {
+    check_proxy_key(&state.config, request.headers())?;
+    Ok(next.run(request).await)
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────
@@ -174,11 +196,8 @@ async fn handle_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    // Auth check: if `proxy_key` is set, the client must include a
-    // matching `X-Proxy-Key` header. The check happens before any
-    // body parsing so an unauthorized client can't even probe for
-    // valid request shapes.
-    check_proxy_key(&state.config, &headers)?;
+    // Authentication (`X-Proxy-Key`) is enforced by the `require_proxy_key`
+    // route middleware, which runs before this extractor buffers the body.
 
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
