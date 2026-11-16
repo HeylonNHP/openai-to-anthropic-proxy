@@ -210,8 +210,8 @@ and prints a warning.
 
 - **License:** none granted by default — see [`REFERENCE.md`](./REFERENCE.md#license)
   before redistributing.
-- **Development:** `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`;
-  `cargo fmt --all -- --check` (details in [`REFERENCE.md`](./REFERENCE.md)).
+- **Development:** `cargo test`; `cargo clippy --all-targets`; `cargo fmt --all -- --check`
+  (details in [`REFERENCE.md`](./REFERENCE.md#development)).
 - **Architecture, translation overview, out-of-scope notes:** [`REFERENCE.md`](./REFERENCE.md).
 
 ---

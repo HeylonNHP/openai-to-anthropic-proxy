@@ -179,8 +179,42 @@ Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4
 ## Development
 
 - `cargo test` runs unit and e2e tests.
-- `cargo clippy --all-targets --all-features -- -D warnings` keeps the code lint-clean.
+- `cargo clippy --all-targets` is the lint gate. There are **5 known
+  pre-existing warnings** (in the test modules); no new ones are allowed.
 - `cargo fmt --all -- --check` checks formatting.
+
+### Test layout (project standard)
+
+**Every unit-test module lives in its own file.** The source file declares the
+module; the body lives next door:
+
+```text
+src/translate.rs          ← the code
+src/translate/tests.rs    ← the unit tests
+```
+
+```rust
+// end of src/translate.rs
+#[cfg(test)]
+mod tests;
+```
+
+- A module `NAME` declared in `src/thing.rs` or `src/thing/mod.rs` lives in
+  `src/thing/NAME.rs` — Rust's own module layout.
+- A module declared in a crate root (`src/lib.rs`, `src/main.rs`) lives in
+  `src/NAME.rs`.
+- The test module is still a **child** module, so `use super::*;` works and
+  private items stay testable. That is why unit tests do **not** go in
+  `tests/` (those are separate crates and can only see the public API).
+- `tests/` holds integration tests only — separate crates, public API only
+  (`tests/proxy_e2e.rs`). `tests/project_layout.rs` is a repo-hygiene test
+  that checks this convention.
+
+There is no "is the file big enough to split?" judgement: the rule is uniform,
+so the layout is predictable, `git blame` points at the test file rather than
+a 7,000-line source file, and a normal build never parses the test code.
+`tests/project_layout.rs` enforces it — an inline `#[cfg(test)] mod X { … }`
+fails the test run.
 
 ## Translation overview
 
