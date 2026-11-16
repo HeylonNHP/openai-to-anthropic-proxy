@@ -1491,9 +1491,13 @@ fn append_user_message(
             // `cache_control: {type: "ephemeral"}` block, so we can emit
             // an OpenAI `prompt_cache_breakpoint` marker on it.
             let mut parts: Vec<(InputContentPart, bool)> = Vec::new();
+            // Images lifted out of `tool_result` blocks (`lift` mode),
+            // waiting for the run of consecutive tool results to end.
+            let mut lifted: Vec<InputContentPart> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
+                        flush_lifted_images(out, &mut lifted);
                         let ephemeral =
                             !prompt_caching.models.is_empty() && is_ephemeral(&t.cache_control);
                         // Append text to the last part if it's also text
@@ -1527,16 +1531,23 @@ fn append_user_message(
                         });
                         if !translated.lifted_images.is_empty() {
                             // The upstream cannot carry images inside
-                            // `function_call_output`, so the images go in
-                            // a follow-up user message, the same shape a
-                            // fresh user turn uses.
-                            out.push(InputItem::Message {
-                                role: "user".into(),
-                                content: translated.lifted_images,
+                            // `function_call_output`, so the images go in a
+                            // follow-up user message. They are NOT emitted
+                            // here: with several tool results in one turn
+                            // that would wedge a user message between the
+                            // `function_call_output` items, which strict
+                            // gateways reject. They are held and emitted
+                            // once the run of tool results ends, each
+                            // group labelled with the call it belongs to.
+                            lifted.push(InputContentPart::InputText {
+                                text: format!("Image(s) returned by tool call {}:", tr.tool_use_id),
+                                prompt_cache_breakpoint: None,
                             });
+                            lifted.extend(translated.lifted_images);
                         }
                     }
                     ContentBlockParam::Image(img) => {
+                        flush_lifted_images(out, &mut lifted);
                         if let Some(image_part) = convert_image_block(img) {
                             let ephemeral = !prompt_caching.models.is_empty()
                                 && is_ephemeral(&img.cache_control);
@@ -1581,9 +1592,21 @@ fn append_user_message(
                     }
                 }
             }
+            flush_lifted_images(out, &mut lifted);
             flush_user_parts(out, &mut parts);
             Ok(())
         }
+    }
+}
+
+/// Emit the images lifted out of tool results as one user message, then
+/// clear the buffer. A no-op when nothing was lifted.
+fn flush_lifted_images(out: &mut Vec<InputItem>, lifted: &mut Vec<InputContentPart>) {
+    if !lifted.is_empty() {
+        out.push(InputItem::Message {
+            role: "user".into(),
+            content: std::mem::take(lifted),
+        });
     }
 }
 

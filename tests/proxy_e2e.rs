@@ -6086,9 +6086,11 @@ async fn tool_result_image_lift_mode_sends_follow_up_user_message() {
     let lifted = &items[fco_pos + 1];
     assert_eq!(lifted["type"], "message");
     assert_eq!(lifted["role"], "user");
-    assert_eq!(lifted["content"][0]["type"], "input_image");
+    // First part labels which tool call the image came from.
+    assert_eq!(lifted["content"][0]["type"], "input_text");
+    assert_eq!(lifted["content"][1]["type"], "input_image");
     assert_eq!(
-        lifted["content"][0]["image_url"],
+        lifted["content"][1]["image_url"],
         "data:image/png;base64,iVBORw0KGgo="
     );
 }

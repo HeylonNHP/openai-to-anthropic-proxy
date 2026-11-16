@@ -1636,8 +1636,14 @@ fn tool_result_image_lift_mode_sends_images_in_follow_up_user_message() {
     match &items[1] {
         InputItem::Message { role, content } => {
             assert_eq!(role, "user");
-            assert_eq!(content.len(), 1);
+            assert_eq!(content.len(), 2);
             match &content[0] {
+                InputContentPart::InputText { text, .. } => {
+                    assert_eq!(text, "Image(s) returned by tool call toolu_1:")
+                }
+                other => panic!("expected label first, got {other:?}"),
+            }
+            match &content[1] {
                 InputContentPart::InputImage { image_url, .. } => {
                     assert_eq!(image_url, "data:image/png;base64,iVBORw0KGgo=")
                 }
@@ -3675,4 +3681,70 @@ fn prompt_caching_non_ephemeral_followed_by_ephemeral_merges() {
         }
         _ => panic!("expected message"),
     }
+}
+
+#[test]
+fn lift_mode_keeps_parallel_tool_outputs_adjacent_and_labels_images() {
+    let mut req = fixture_request();
+    req.messages = vec![MessageParam {
+        role: MessageRole::User,
+        content: MessageContent::Blocks(vec![
+            ContentBlockParam::ToolResult(ToolResultBlockParam {
+                tool_use_id: "toolu_a".into(),
+                content: Some(ToolResultContent::Blocks(vec![
+                    json!({"type": "text", "text": "A"}),
+                    tool_result_image_json("image/png", "AAAA"),
+                ])),
+                is_error: None,
+            }),
+            ContentBlockParam::ToolResult(ToolResultBlockParam {
+                tool_use_id: "toolu_b".into(),
+                content: Some(ToolResultContent::Blocks(vec![
+                    json!({"type": "text", "text": "B"}),
+                    tool_result_image_json("image/png", "BBBB"),
+                ])),
+                is_error: None,
+            }),
+            ContentBlockParam::Text(TextBlockParam {
+                text: "thanks".into(),
+                cache_control: None,
+            }),
+        ]),
+    }];
+    let (out, _reg) = anthropic_to_responses_with(
+        &req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+        ToolResultImages::Lift,
+    )
+    .unwrap();
+    let items = unwrap_items(out);
+    assert_eq!(items.len(), 4, "got {items:?}");
+    assert!(
+        matches!(&items[0], InputItem::FunctionCallOutput { call_id, .. } if call_id == "toolu_a")
+    );
+    assert!(
+        matches!(&items[1], InputItem::FunctionCallOutput { call_id, .. } if call_id == "toolu_b")
+    );
+    let InputItem::Message { content, .. } = &items[2] else {
+        panic!("expected lifted images message, got {:?}", items[2])
+    };
+    // label A, image A, label B, image B — in order, each tied to its call.
+    assert_eq!(content.len(), 4);
+    assert!(
+        matches!(&content[0], InputContentPart::InputText { text, .. } if text.contains("toolu_a"))
+    );
+    assert!(
+        matches!(&content[1], InputContentPart::InputImage { image_url, .. } if image_url.ends_with("AAAA"))
+    );
+    assert!(
+        matches!(&content[2], InputContentPart::InputText { text, .. } if text.contains("toolu_b"))
+    );
+    assert!(
+        matches!(&content[3], InputContentPart::InputImage { image_url, .. } if image_url.ends_with("BBBB"))
+    );
+    // The trailing user text comes after the lifted images.
+    assert!(matches!(&items[3], InputItem::Message { content, .. }
+        if matches!(&content[0], InputContentPart::InputText { text, .. } if text == "thanks")));
 }
