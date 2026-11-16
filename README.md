@@ -2,7 +2,7 @@
 
 Run **Claude Code** on *any* **OpenAI-compatible** model — streaming, tool-use, extended
 thinking, and the experimental advisor tool included. Point Claude Code at a small Rust
-proxy on `localhost:8085`; it translates Anthropic Messages requests into OpenAI
+proxy listening on port `8085` (all interfaces by default — see [`proxy_key`](#if-the-proxy-is-configured-with-proxy_key)); it translates Anthropic Messages requests into OpenAI
 Responses API calls, forwards them to the upstream you choose (OpenAI, NVIDIA NIM,
 vLLM, an internal gateway …), and translates the answers back.
 

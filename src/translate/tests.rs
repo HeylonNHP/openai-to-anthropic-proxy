@@ -3782,3 +3782,47 @@ fn lift_mode_image_only_result_gets_a_placeholder_output_not_an_empty_string() {
     assert!(text.contains("following message"));
     assert!(matches!(&items[1], InputItem::Message { .. }));
 }
+
+#[test]
+fn array_form_error_marker_leads_even_when_an_image_comes_first_and_empty_text_is_skipped() {
+    let mut req = fixture_request();
+    req.messages = vec![MessageParam {
+        role: MessageRole::User,
+        content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+            ToolResultBlockParam {
+                tool_use_id: "toolu_1".into(),
+                content: Some(ToolResultContent::Blocks(vec![
+                    json!({"type": "text", "text": ""}),
+                    tool_result_image_json("image/png", "AAAA"),
+                    json!({"type": "text", "text": "boom"}),
+                ])),
+                is_error: Some(true),
+            },
+        )]),
+    }];
+    let (out, _reg) = anthropic_to_responses(
+        &req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+    )
+    .unwrap();
+    let items = unwrap_items(out);
+    let InputItem::FunctionCallOutput {
+        output: FunctionCallOutputBody::Parts(parts),
+        ..
+    } = &items[0]
+    else {
+        panic!("expected array output, got {:?}", items[0])
+    };
+    assert_eq!(
+        parts.len(),
+        3,
+        "empty text dropped, marker added: {parts:?}"
+    );
+    assert!(
+        matches!(&parts[0], InputContentPart::InputText { text, .. } if text == "[TOOL_ERROR]\n")
+    );
+    assert!(matches!(&parts[1], InputContentPart::InputImage { .. }));
+    assert!(matches!(&parts[2], InputContentPart::InputText { text, .. } if text == "boom"));
+}

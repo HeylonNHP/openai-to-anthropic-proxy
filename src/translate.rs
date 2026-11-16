@@ -1722,10 +1722,15 @@ fn tool_result_output(
 
     let mut push_text = |text: String, ordered: &mut Vec<InputContentPart>| {
         text_parts.push(text.clone());
-        ordered.push(InputContentPart::InputText {
-            text,
-            prompt_cache_breakpoint: None,
-        });
+        // An empty `input_text` part carries nothing and some upstreams
+        // reject it; the joined text above still sees it, so the text-only
+        // form is unchanged.
+        if !text.is_empty() {
+            ordered.push(InputContentPart::InputText {
+                text,
+                prompt_cache_breakpoint: None,
+            });
+        }
     };
 
     match &tr.content {
@@ -1800,24 +1805,20 @@ fn tool_result_output(
 
     // The `[TOOL_ERROR]` marker must reach the model in every mode.
     if is_error {
-        let prefixed = ordered
-            .iter_mut()
-            .find_map(|p| match p {
-                InputContentPart::InputText { text, .. } => Some(text),
-                _ => None,
-            })
-            .is_some_and(|t| {
-                *t = format!("[TOOL_ERROR]\n{t}");
-                true
-            });
-        if !prefixed {
-            ordered.insert(
+        // Only a text part that LEADS the array can carry the marker: if an
+        // image comes first, prefixing a later text part would put the
+        // marker after the image, so lead with a marker part instead.
+        match ordered.first_mut() {
+            Some(InputContentPart::InputText { text, .. }) => {
+                *text = format!("[TOOL_ERROR]\n{text}");
+            }
+            _ => ordered.insert(
                 0,
                 InputContentPart::InputText {
                     text: "[TOOL_ERROR]\n".to_string(),
                     prompt_cache_breakpoint: None,
                 },
-            );
+            ),
         }
     }
     let text = if is_error {
