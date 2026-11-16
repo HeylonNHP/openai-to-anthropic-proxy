@@ -3748,3 +3748,37 @@ fn lift_mode_keeps_parallel_tool_outputs_adjacent_and_labels_images() {
     assert!(matches!(&items[3], InputItem::Message { content, .. }
         if matches!(&content[0], InputContentPart::InputText { text, .. } if text == "thanks")));
 }
+
+#[test]
+fn lift_mode_image_only_result_gets_a_placeholder_output_not_an_empty_string() {
+    let mut req = fixture_request();
+    req.messages = vec![MessageParam {
+        role: MessageRole::User,
+        content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+            ToolResultBlockParam {
+                tool_use_id: "toolu_1".into(),
+                content: Some(ToolResultContent::Blocks(vec![tool_result_image_json(
+                    "image/png",
+                    "AAAA",
+                )])),
+                is_error: None,
+            },
+        )]),
+    }];
+    let (out, _reg) = anthropic_to_responses_with(
+        &req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+        ToolResultImages::Lift,
+    )
+    .unwrap();
+    let items = unwrap_items(out);
+    let InputItem::FunctionCallOutput { output, .. } = &items[0] else {
+        panic!("expected function_call_output, got {:?}", items[0])
+    };
+    let text = output.text();
+    assert!(!text.is_empty(), "image-only lift output must not be empty");
+    assert!(text.contains("following message"));
+    assert!(matches!(&items[1], InputItem::Message { .. }));
+}

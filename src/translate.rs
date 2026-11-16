@@ -1839,7 +1839,14 @@ fn tool_result_output(
             lifted_images: Vec::new(),
         },
         ToolResultImages::Lift => TranslatedToolResult {
-            output: FunctionCallOutputBody::Text(text),
+            // An image-only result would otherwise be an empty-string
+            // output, which some upstreams reject (and which tells the model
+            // nothing). Point it at the follow-up message instead.
+            output: FunctionCallOutputBody::Text(if text.is_empty() {
+                "(the tool returned image output; see the following message)".to_string()
+            } else {
+                text
+            }),
             lifted_images: images,
         },
         ToolResultImages::Drop => {
