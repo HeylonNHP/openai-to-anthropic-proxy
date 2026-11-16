@@ -19,3 +19,42 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code
+#
+# The PROJECT .claude/ folder holds team configuration that is MEANT to be
+# committed — settings.json (shared permissions, hooks, env), skills/,
+# agents/, rules/, workflows/, output-styles/. So the folder is not ignored
+# wholesale: only the runtime state and the per-developer files are. See
+# https://code.claude.com/docs/en/claude-directory for what belongs where.
+
+# Git worktrees Claude Code creates for parallel agents. Each one is a full
+# checkout with its own build directory — 4.7 GB across 13 of them here.
+# Disposable by definition, and each is a nested git repository.
+/.claude/worktrees/
+
+# Per-developer overrides. Claude Code writes saved "don't ask again" Bash
+# approvals here VERBATIM, so the file can hold tokens and passwords.
+# Claude Code adds it to the GLOBAL git excludes, which does not travel with
+# the repo — a fresh clone or CI checkout can stage it — so the rule belongs
+# here, in the repository.
+/.claude/settings.local.json
+
+# Runtime state Claude Code writes while working.
+/.claude/debug/
+/.claude/file-history/
+/.claude/shell-snapshots/
+/.claude/history.jsonl
+/.claude/stats-cache.json
+/.claude/skills/.cache/
+/.claude/skills/state/
+/.claude/skills/tmp/
+/.claude/skills/*.log
+
+# Private project notes, loaded alongside CLAUDE.md but personal. The
+# official docs ask for this one to be ignored.
+/CLAUDE.local.md
+
+# An ignore rule does NOT untrack a file that is already committed. If a
+# local settings file was ever added, remove it from the index explicitly:
+#   git rm --cached .claude/settings.local.json
