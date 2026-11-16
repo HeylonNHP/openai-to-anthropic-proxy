@@ -187,6 +187,54 @@ Environment variable: `PROMPT_CACHING_MODELS` — a comma-separated list (e.g. `
 
 Because unknown JSON fields are silently ignored by most OpenAI-compatible endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM upstreams. Those endpoints will simply ignore the extra fields.
 
+### Tool result images (`tool_result_images`)
+
+A tool can return images (a screenshot from a browser tool, an image produced by
+a script, …). Anthropic packs those `image` blocks into the `tool_result` content,
+and this setting decides what the proxy does with them:
+
+- `array` (**default**) — send the tool output as an **array of content parts**
+  (`input_text` + `input_image`), in the order the client sent them. This is the
+  form the Responses API documents for `function_call_output.output`, and
+  OpenAI and DeepSeek accept it.
+- `lift` — for gateways that only accept the **plain string** form of
+  `function_call_output.output` and reject the array form with a 400. The tool
+  output carries only the text; the images are moved into a follow-up `user`
+  message sent immediately after the tool result.
+- `drop` — discard the images and keep only their text. This is the behaviour
+  before this option existed.
+
+```json
+{
+  "tool_result_images": "array"
+}
+```
+
+Environment variable: `TOOL_RESULT_IMAGES` (accepts `array`, `lift` or `drop`,
+case-insensitive). Env wins over the file. An unrecognised value does **not**
+stop the proxy — it falls back to `array` with a warning, the same house rule
+as the advisor limits.
+
+Notes:
+
+- Images in **user** messages are always forwarded as `input_image` parts
+  (base64 `data:` URIs or passthrough URLs) and do not depend on this setting.
+- Images in **assistant** turns are dropped with a warning — the Responses API
+  has no assistant-image content part to map them to.
+- This setting only governs images **inside `tool_result` blocks**. If your
+  gateway is not vision-capable at all, the images are still transmitted;
+  whether the upstream can read them is an upstream question, not a proxy one.
+- An `image` block whose `source` the proxy cannot decode (unknown type,
+  missing fields) is dropped with a warning; the rest of the tool result is
+  unaffected.
+- `is_error: true` still prefixes the text with `[TOOL_ERROR]` in all three
+  modes.
+- Tool results carried in **text only** look exactly the same as before this
+  option existed — a bare string `output`, byte for byte.
+- Requests are capped at **32 MiB** (Anthropic's own ceiling); a base64 image
+  inflates ~37% over its binary size, so a ~24 MB screenshot is roughly the
+  largest image a single tool result can carry.
+
 ### Reasoning replay
 
 `reasoning_replay` controls how the proxy sends a prior turn's **extended thinking** back to the upstream.

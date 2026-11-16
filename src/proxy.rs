@@ -32,6 +32,13 @@ use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
 use crate::tui::MappingsStore;
+
+/// Maximum accepted size of an inbound `/v1/messages` body, in bytes.
+///
+/// 32 MiB matches Anthropic's own request-size ceiling; base64 images
+/// inflate by ~4/3, so this is the practical limit for screenshot-heavy
+/// tool results.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
 
@@ -149,7 +156,15 @@ pub fn router_with_stores(
         capabilities,
     };
     Router::new()
-        .route("/v1/messages", post(handle_messages))
+        // Cap request bodies at 32 MiB. Anthropic caps requests at 32 MB; a
+        // base64 screenshot inflates by ~37%, so the axum default (2 MiB)
+        // would reject real Claude Code requests carrying tool-result
+        // images with a 413 before translation ever runs.
+        .route(
+            "/v1/messages",
+            post(handle_messages)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)),
+        )
         .route("/healthz", get(handle_health))
         .with_state(state)
 }
@@ -438,11 +453,12 @@ fn build_outbound(
         config.reasoning_for_request(model, requested_effort, thinking_disabled);
     let prompt_caching = config.prompt_caching_for_model(model);
     let reasoning_replay = config.reasoning_replay_for_model(model);
-    let (mut outbound, registry) = translate::anthropic_to_responses(
+    let (mut outbound, registry) = translate::anthropic_to_responses_with(
         req,
         Some(reasoning_decision),
         &prompt_caching,
         &reasoning_replay,
+        config.tool_result_images,
     )
     .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // The translator copies the inbound model name verbatim; rewrite
@@ -1498,6 +1514,7 @@ mod tests {
             log_to_disk: false,
             proxy_key: None,
             advisor: crate::config::AdvisorConfig::default(),
+            tool_result_images: crate::config::ToolResultImages::default(),
             warnings: Vec::new(),
         }
     }

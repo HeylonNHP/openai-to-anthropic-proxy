@@ -7,12 +7,19 @@
 //!
 //! ## Scope
 //!
-//! Covered: text content, tool use, tool results, system prompt, stop reasons,
+//! Covered: text content, tool use, tool results, image content, system
+//! prompt, stop reasons,
 //! usage, and the full streaming SSE event set.
 //!
+//! Image blocks (`image`) are parsed and forwarded to the upstream as
+//! `input_image` parts: user messages always, `tool_result` blocks per the
+//! `tool_result_images` config (see `proxy.json-guide.md`). `image` blocks in
+//! assistant turns have no counterpart in the Responses API and are dropped
+//! with a warning.
+//!
 //! Out of scope (will produce a `serde` deserialization error if Claude
-//! sends them): vision/image blocks, extended thinking budget enforcement,
-//! prompt caching, server tools, container reuse, service tier. Note that
+//! sends them): extended thinking budget enforcement, prompt caching,
+//! server tools, container reuse, service tier. Note that
 //! `output_config.effort` and `thinking.type = "disabled"` **are** parsed
 //! (see [`OutputConfig`] / [`ThinkingConfig`]); they drive the upstream
 //! reasoning-effort selection rather than being rejected.
@@ -279,8 +286,12 @@ pub struct TextBlockParam {
     pub cache_control: Option<CacheControl>,
 }
 
-/// Image input — accepted for deserialization, but the proxy does not
-/// forward images to OpenAI (out of scope for MVP).
+/// Image input (base64 `data:` URIs or passthrough URLs).
+///
+/// Translated to an `input_image` part upstream: always for user messages,
+/// and for `tool_result` blocks per the `tool_result_images` setting
+/// (`array` by default). In assistant turns the blocks are dropped, because
+/// the Responses API has no assistant-image content part.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageBlockParam {
     pub source: Value,

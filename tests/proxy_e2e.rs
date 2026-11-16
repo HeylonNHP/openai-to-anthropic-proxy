@@ -19,7 +19,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use openai_to_anthropic_proxy::config::{AdvisorConfig, Config, ModelAliases, ReasoningConfig};
+use openai_to_anthropic_proxy::config::{
+    AdvisorConfig, Config, ModelAliases, ReasoningConfig, ToolResultImages,
+};
 use reqwest::Body as ReqBody;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -178,6 +180,7 @@ fn make_config_with_default_model(
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
 }
@@ -186,6 +189,7 @@ async fn start_fake_upstream() -> (SocketAddr, FakeUpstream) {
     let state = FakeUpstream::default();
     let app = Router::new()
         .route("/v1/responses", post(handle_fake))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -210,6 +214,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
 }
@@ -613,6 +618,7 @@ async fn per_model_reasoning_effort_lookup() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -702,6 +708,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -783,6 +790,7 @@ async fn model_alias_rewrites_inbound_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -860,6 +868,7 @@ async fn model_not_supported_falls_back_to_default() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -916,6 +925,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -980,6 +990,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1633,6 +1644,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1728,6 +1740,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1801,6 +1814,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1887,6 +1901,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1975,6 +1990,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
@@ -2070,6 +2086,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
@@ -2158,6 +2175,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     // Seed the runtime store with an alias so the first request
@@ -2814,6 +2832,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -5924,5 +5943,217 @@ async fn two_sections_enabled_declaration_preserves_both_sections() {
             .count(),
         1,
         "exactly one synthesized advisor tool"
+    );
+}
+
+/// Anthropic request whose single user message carries a tool_result with
+/// an `image` block — the shape Claude Code emits when a tool returns a
+/// screenshot (e.g. a browser/computer-use tool).
+fn request_with_image_tool_result() -> String {
+    r#"{
+        "model":"claude-sonnet-5",
+        "max_tokens":16,
+        "stream":false,
+        "messages":[
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_01","content":[
+                    {"type":"text","text":"screenshot attached"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}
+                ]}
+            ]}
+        ]
+    }"#
+    .to_string()
+}
+
+const CANNED_RESPONSE: &str = r#"{
+    "id":"resp_img",
+    "object":"response",
+    "created_at":1,
+    "status":"completed",
+    "model":"any",
+    "output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
+    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+}"#;
+
+async fn setup_with_images(
+    mode: Option<ToolResultImages>,
+) -> (SocketAddr, SocketAddr, FakeUpstream) {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(CANNED_RESPONSE.to_string());
+    let base = make_proxy_config(upstream_addr);
+    let config = match mode {
+        Some(m) => {
+            let mut c = (*base).clone();
+            c.tool_result_images = m;
+            Arc::new(c)
+        }
+        None => base,
+    };
+    let proxy_addr = start_proxy(config).await;
+    (proxy_addr, upstream_addr, upstream)
+}
+
+#[tokio::test]
+async fn tool_result_image_reaches_upstream_as_array_form() {
+    let (proxy_addr, _upstream_addr, upstream) = setup_with_images(None).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_with_image_tool_result())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        *upstream.request_count.lock().await,
+        1,
+        "proxy must not retry"
+    );
+
+    let sent = upstream
+        .received
+        .lock()
+        .await
+        .clone()
+        .expect("upstream was not called");
+    let body: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+    let items = body["input"].as_array().expect("input is an array");
+    let fco = items
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .expect("expected a function_call_output item");
+    // Default mode: the output is the array-of-parts form with an
+    // input_image part carrying the data URI.
+    let output = fco["output"].as_array().expect("output must be an array");
+    let parts: Vec<&str> = output.iter().map(|p| p["type"].as_str().unwrap()).collect();
+    assert_eq!(parts, ["input_text", "input_image"]);
+    assert_eq!(output[0]["text"], "screenshot attached");
+    assert_eq!(output[1]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+}
+
+#[tokio::test]
+async fn tool_result_image_lift_mode_sends_follow_up_user_message() {
+    let (proxy_addr, _upstream_addr, upstream) =
+        setup_with_images(Some(ToolResultImages::Lift)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_with_image_tool_result())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        *upstream.request_count.lock().await,
+        1,
+        "proxy must not retry"
+    );
+
+    let sent = upstream
+        .received
+        .lock()
+        .await
+        .clone()
+        .expect("upstream was not called");
+    let body: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+    let items = body["input"].as_array().unwrap();
+    let fco_pos = items
+        .iter()
+        .position(|i| i["type"] == "function_call_output")
+        .expect("expected a function_call_output item");
+    assert_eq!(items[fco_pos]["output"], "screenshot attached");
+    // The image must be forwarded in a user message immediately after the
+    // tool output.
+    let lifted = &items[fco_pos + 1];
+    assert_eq!(lifted["type"], "message");
+    assert_eq!(lifted["role"], "user");
+    assert_eq!(lifted["content"][0]["type"], "input_image");
+    assert_eq!(
+        lifted["content"][0]["image_url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+}
+
+#[tokio::test]
+async fn tool_result_image_drop_mode_keeps_text_only() {
+    let (proxy_addr, _upstream_addr, upstream) =
+        setup_with_images(Some(ToolResultImages::Drop)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(request_with_image_tool_result())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        *upstream.request_count.lock().await,
+        1,
+        "proxy must not retry"
+    );
+
+    let sent = upstream
+        .received
+        .lock()
+        .await
+        .clone()
+        .expect("upstream was not called");
+    let body: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+    let text = String::from_utf8_lossy(&sent);
+    assert!(
+        !text.contains("input_image"),
+        "drop mode must not emit any image part: {text}"
+    );
+    let items = body["input"].as_array().unwrap();
+    let fco = items
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(fco["output"], "screenshot attached");
+}
+
+/// A full-screen screenshot routinely exceeds axum's default 2 MiB body
+/// limit once base64-encoded. The proxy must accept large bodies, or Claude
+/// Code's screenshot tool breaks with a 413 before translation ever runs.
+#[tokio::test]
+async fn large_tool_result_image_is_accepted() {
+    let (proxy_addr, _upstream_addr, upstream) = setup_with_images(None).await;
+
+    // ~6 MB of base64 (~4.5 MB of binary image data).
+    let big_b64 = "A".repeat(6 * 1024 * 1024);
+    let body = format!(
+        r#"{{"model":"claude-sonnet-5","max_tokens":16,"stream":false,"messages":[
+            {{"role":"user","content":[
+                {{"type":"tool_result","tool_use_id":"toolu_big","content":[
+                    {{"type":"text","text":"screenshot attached"}},
+                    {{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{big_b64}"}}}}
+                ]}}
+            ]}}
+        ]}}"#
+    );
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream
+        .received
+        .lock()
+        .await
+        .clone()
+        .expect("upstream was not called");
+    let text = String::from_utf8_lossy(&sent);
+    assert!(
+        text.contains("\"input_image\""),
+        "image part must reach the upstream"
     );
 }

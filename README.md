@@ -14,14 +14,16 @@ flowchart LR
   B --> A
 ```
 
-**Not for you if** you need vision/image inputs, Claude's server-side tools
-(`web_search`, `web_fetch`, `code_execution`), `/v1/models`, or TLS termination —
-those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
+**Not for you if** you need model-generated images, full multimodal assistant
+turns, Claude's server-side tools (`web_search`, `web_fetch`, `code_execution`),
+`/v1/models`, or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
+Images *sent to* the model — including images inside tool results — are supported.
 
 ## Features
 
 - Streaming SSE end to end.
 - Tool-use round trips: `tool_use` ↔ `tool_calls`, `tool_result` ↔ `tool` messages.
+- Image input support: `image` blocks in user messages and in `tool_result` are forwarded upstream (see `tool_result_images` in [proxy.json-guide.md](./proxy.json-guide.md#tool-result-images-tool_result_images)).
 - Stop-reason and token-usage remapping into Anthropic shape.
 - `model_aliases` with a `default_model` safety net if an upstream rejects a model.
 - Reasoning-effort mapping (`low`/`medium`/`high`/`xhigh`/`max`) plus extended-thinking replay.

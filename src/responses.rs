@@ -106,9 +106,18 @@ pub enum InputItem {
         name: String,
         arguments: String,
     },
-    /// The result of a function call, fed back to the model. `output` is
-    /// always a string.
-    FunctionCallOutput { call_id: String, output: String },
+    /// The result of a function call, fed back to the model.
+    ///
+    /// The Responses API accepts two shapes for `output`: a plain string,
+    /// or an **array of content parts** (`input_text` / `input_image` /
+    /// `input_file`) — this is how tools return images and files alongside
+    /// text. The proxy keeps text-only results in the string form
+    /// (byte-identical to earlier behaviour) and uses the array form only
+    /// when the tool result actually carries an image.
+    FunctionCallOutput {
+        call_id: String,
+        output: FunctionCallOutputBody,
+    },
     /// A reasoning item replayed from a previous turn.
     ///
     /// The Responses API accepts `type: "reasoning"` items in `input`:
@@ -144,6 +153,60 @@ pub enum InputItem {
     ItemReference { id: String },
 }
 
+/// Wire representation of `function_call_output.output`.
+///
+/// The Responses API defines `output` as either a plain string or an
+/// array of content parts (`input_text` / `input_image` / `input_file`).
+/// OpenAI accepts the array form, and DeepSeek's Responses implementation
+/// explicitly allows `input_image` inside it. Some third-party gateways
+/// only accept the string form; those upstreams can either be told to
+/// tolerate the array or the proxy can lift images into a following user
+/// message (see `TOOL_RESULT_IMAGES` / `tool_result_images` in
+/// `proxy.json-guide.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FunctionCallOutputBody {
+    /// Text-only tool output, serialised as a JSON string. This is the
+    /// shape the proxy has always emitted for text-only results, and the
+    /// only shape older gateways are guaranteed to accept.
+    Text(String),
+    /// Multimodal tool output, serialised as a JSON array of parts.
+    Parts(Vec<InputContentPart>),
+}
+
+impl From<String> for FunctionCallOutputBody {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<Vec<InputContentPart>> for FunctionCallOutputBody {
+    fn from(parts: Vec<InputContentPart>) -> Self {
+        Self::Parts(parts)
+    }
+}
+
+impl FunctionCallOutputBody {
+    /// The concatenated text of the parts, if any — used by the
+    /// `drop` fallback to keep the textual payload when images are
+    /// stripped, and by tests.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    InputContentPart::InputText { text, .. } => Some(text.as_str()),
+                    InputContentPart::OutputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
 /// Plain-text reasoning content part of a `reasoning` input item.
 ///
 /// Serialises as `{"type":"reasoning_text","text":"…"}`. This is the shape
@@ -168,7 +231,7 @@ pub struct ReasoningSummaryPart {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputContentPart {
     /// Used in `role: "user"` / `"system"` / `"developer"` messages.
@@ -235,7 +298,7 @@ pub struct PromptCacheOptions {
 }
 
 /// Marks the end of a reusable prompt prefix for OpenAI prompt caching.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PromptCacheBreakpoint {
     pub mode: String,
 }
@@ -564,4 +627,78 @@ pub enum ResponsesStreamEvent {
     /// Anything else — round-trip only.
     #[serde(other)]
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_call_output_serializes_text_as_a_bare_string() {
+        let item = InputItem::FunctionCallOutput {
+            call_id: "call_1".into(),
+            output: FunctionCallOutputBody::from("72F sunny".to_string()),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["output"], "72F sunny");
+    }
+
+    #[test]
+    fn function_call_output_serializes_parts_as_an_array() {
+        let item = InputItem::FunctionCallOutput {
+            call_id: "call_1".into(),
+            output: FunctionCallOutputBody::from(vec![
+                InputContentPart::InputText {
+                    text: "see image".into(),
+                    prompt_cache_breakpoint: None,
+                },
+                InputContentPart::InputImage {
+                    image_url: "data:image/png;base64,AAAA".into(),
+                    detail: None,
+                    prompt_cache_breakpoint: None,
+                },
+            ]),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["output"][0]["type"], "input_text");
+        assert_eq!(json["output"][0]["text"], "see image");
+        assert_eq!(json["output"][1]["type"], "input_image");
+        assert_eq!(json["output"][1]["image_url"], "data:image/png;base64,AAAA");
+        assert!(json["output"][1].get("detail").is_none());
+    }
+
+    #[test]
+    fn function_call_output_round_trips_both_forms() {
+        let text = InputItem::FunctionCallOutput {
+            call_id: "c".into(),
+            output: FunctionCallOutputBody::Text("hi".into()),
+        };
+        let back: InputItem = serde_json::from_str(&serde_json::to_string(&text).unwrap()).unwrap();
+        match back {
+            InputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(output, FunctionCallOutputBody::Text("hi".into()))
+            }
+            _ => panic!("wrong item type"),
+        }
+
+        let parts = InputItem::FunctionCallOutput {
+            call_id: "c".into(),
+            output: FunctionCallOutputBody::Parts(vec![InputContentPart::InputImage {
+                image_url: "https://example.com/x.png".into(),
+                detail: Some("low".into()),
+                prompt_cache_breakpoint: None,
+            }]),
+        };
+        let back: InputItem =
+            serde_json::from_str(&serde_json::to_string(&parts).unwrap()).unwrap();
+        match back {
+            InputItem::FunctionCallOutput { output, .. } => match output {
+                FunctionCallOutputBody::Parts(p) => {
+                    assert_eq!(p.len(), 1)
+                }
+                other => panic!("expected parts, got {other:?}"),
+            },
+            _ => panic!("wrong item type"),
+        }
+    }
 }

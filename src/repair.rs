@@ -599,7 +599,8 @@ pub fn append_corrective_input(
                      schema: {violation}. Re-issue the call with arguments that conform \
                      to the schema. For optional parameters you have no real value for, \
                      send null (or omit them if the schema allows)."
-                ),
+                )
+                .into(),
             });
         }
     }

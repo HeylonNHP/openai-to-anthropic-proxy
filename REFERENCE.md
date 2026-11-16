@@ -112,6 +112,9 @@ For multiple custom headers, separate them with newlines (a single line is enoug
   [`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor).
 - `advisor.model` is an **explicit upstream model name**, not an inbound
   alias; `model_aliases.map` is not applied to it.
+- `tool_result_images` controls how `image` blocks inside a `tool_result`
+  are forwarded upstream (`array`, `lift` or `drop`; default `array`). See
+  [`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).
 
 A small example of these in `proxy.json`:
 
@@ -182,15 +185,20 @@ Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4
 
 - `system` becomes the first system message.
 - User text becomes user messages.
-- `tool_result` blocks become OpenAI `tool` messages.
-- Assistant text plus `tool_use` blocks become an assistant message with `tool_calls`.
+- `tool_result` blocks become `function_call_output` input items. Text-only
+  results keep the plain-string `output`; results carrying `image` blocks are
+  forwarded as an array of `input_text`/`input_image` parts by default
+  (see `tool_result_images` in
+  [proxy.json-guide.md](./proxy.json-guide.md#tool-result-images-tool_result_images)).
+- Assistant text becomes `output_text`, and `tool_use` blocks become
+  `function_call` items emitted after the assistant message.
 - `tool_use.input` is serialized to JSON for OpenAI `arguments`.
 - `tools[]` is mapped through with JSON Schema parameters preserved.
 - `tool_choice`, `temperature`, `top_p`, and `max_tokens` are forwarded.
 - `stop_sequences` are **not** forwarded — the Responses API has no `stop` field. The proxy logs a warning when it drops them.
 - Assistant `thinking` blocks (extended thinking) are replayed upstream according to `[reasoning_replay]`: by default the reasoning text is folded into the assistant message, so the model keeps its memory of its own prior reasoning. See [proxy.json-guide.md](./proxy.json-guide.md#reasoning-replay).
 - `stream: true` also enables usage reporting from the upstream.
-- `cache_control` on user/system text and image blocks is translated to OpenAI `prompt_cache_breakpoint` when `[prompt_caching]` is enabled.
+- `cache_control` on user text and image blocks is translated to OpenAI `prompt_cache_breakpoint` when `[prompt_caching]` is enabled (an `ephemeral` marker on an image inside a `tool_result` is honoured too).
 - `cache_control` on system prompts, tools, and assistant content is currently not translated; OpenAI caches eligible prefixes automatically.
 
 ### Response: OpenAI Responses → Anthropic
@@ -229,8 +237,9 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 - One upstream target per instance: no multi-tenant or per-user routing
 
 ### Vision / image inputs
-- Image inputs are only partially translated; assistant `image` blocks are dropped
-- No image output / vision generation handling
+- Images in *user* messages and inside `tool_result` blocks are translated to OpenAI `input_image` parts (base64 data URIs or passthrough URLs); a vision-capable upstream is still required. `tool_result` images are sent in the `function_call_output` array form by default — see [`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).
+- `image` blocks in *assistant* turns are dropped with a warning; the Responses API has no assistant-image content part to map them to.
+- No image output / vision generation handling (text-only responses from the upstream)
 
 ### Extended thinking
 - `redacted_thinking` blobs are dropped (cannot be re-encoded for a non-Anthropic upstream)
@@ -262,21 +271,13 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 This is a planning note for future changes. It is separate from the current
 "out of scope" list above, which describes hard limits of the design.
 
-### Best next improvement: image / vision input support
-
-Reasoning: highest user-facing value for the lowest implementation risk. Claude
-Code users frequently paste screenshots and diagrams; today those requests are
-only partially handled (assistant `image` blocks are dropped). A v1 can be
-request-side only — Anthropic image blocks translated to OpenAI `input_image`
-data URLs — while keeping text-only responses and deferring assistant-image replay.
-
-Caveats: requires a vision-capable upstream; output remains text-only; keep the
-change bounded so it does not grow into full multimodal output support.
-
-### Runner-up for "easiest": `/v1/models`
+### Best next improvement: `/v1/models`
 
 Small, self-contained route that improves compatibility with tools and model
-selectors, but it does not unlock a new user workflow.
+selectors. (Image input support has since landed: user-message images were
+already forwarded, and `tool_result` images now reach the upstream too — see
+[`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).)
+It does not unlock a new user workflow on its own.
 
 ### De-prioritise for now
 - TLS termination: better handled by a reverse proxy (Caddy/nginx/Traefik).

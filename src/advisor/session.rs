@@ -319,7 +319,7 @@ fn inject(attempt: &mut Attempt, call_id: &str, arguments: &str, output: &str) {
         });
         items.push(InputItem::FunctionCallOutput {
             call_id: call_id.to_owned(),
-            output: output.to_owned(),
+            output: output.to_owned().into(),
         });
     }
 }

@@ -168,6 +168,11 @@ pub struct Config {
     /// How a prior turn's extended thinking is replayed back to the
     /// upstream. See [`ReasoningReplayConfig`] for the modes.
     pub reasoning_replay: ReasoningReplayConfig,
+    /// How `image` blocks inside a `tool_result` are forwarded. See
+    /// [`ToolResultImages`]. Defaults to [`ToolResultImages::Array`],
+    /// the encoding the Responses API specifies; `lift` and `drop` are
+    /// escape hatches for gateways that only accept string tool outputs.
+    pub tool_result_images: ToolResultImages,
     /// Shared secret required on the inbound `X-Proxy-Key` header.
     /// `None` means no client authentication (current behavior); a
     /// warning is printed at startup. `Some(_)` means every request
@@ -452,6 +457,43 @@ pub enum ReasoningReplayMode {
     Native,
 }
 
+/// How the proxy handles `image` blocks that appear **inside a `tool_result`**
+/// on the way to the upstream.
+///
+/// The Responses API lets a `function_call_output` carry `input_image` parts,
+/// so a tool that returns a screenshot does not have to lose the pixels.
+/// Third-party gateways that only understand the string form, however, may
+/// reject the array form outright — hence the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolResultImages {
+    /// Send `output` as an array of `input_text` / `input_image` parts.
+    /// This is what OpenAI and DeepSeek's Responses APIs accept. Default.
+    #[default]
+    Array,
+    /// Send text-only in `function_call_output` and pass the images in a
+    /// follow-up `user` message carrying the `input_image` parts. For
+    /// gateways that reject array-form tool outputs.
+    Lift,
+    /// Drop the images (with a warning). This is what the proxy did before
+    /// the feature existed.
+    Drop,
+}
+
+impl ToolResultImages {
+    /// Lenient parse used by the config resolver. Matching is
+    /// case-insensitive; anything else returns `None` so the caller can
+    /// fall back to the default with a warning.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "array" => Some(Self::Array),
+            "lift" => Some(Self::Lift),
+            "drop" => Some(Self::Drop),
+            _ => None,
+        }
+    }
+}
+
 /// Reasoning-replay settings.
 ///
 /// `models` holds per-upstream-model overrides keyed by the **alias-resolved
@@ -657,6 +699,41 @@ impl Config {
         )
         .and_then(|key| (!key.trim().is_empty()).then_some(key));
 
+        // The warnings are COLLECTED, not emitted: the tracing subscriber
+        // does not exist yet (the binary installs it after this returns), so
+        // a `tracing::warn!` here would hit no subscriber and vanish.
+        let mut warnings: Vec<ConfigWarning> = Vec::new();
+
+        // `tool_result_images`: one of `array` (default — the Responses
+        // API's array-of-parts form), `lift` (text-only tool output +
+        // images in a following user message, for gateways that reject
+        // array form) or `drop` (strip images, the pre-fix behaviour).
+        // Env wins over file. An unrecognised value falls back to the
+        // default WITH a warning rather than failing startup.
+        // An empty/whitespace value counts as unset everywhere, so
+        // `TOOL_RESULT_IMAGES=` cannot silently force a fallback.
+        let file_v = file
+            .and_then(|f| f.tool_result_images.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let env_v = env
+            .tool_result_images
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let raw = env_v.or(file_v);
+        let tool_result_images = raw.map_or_else(ToolResultImages::default, |v| {
+                ToolResultImages::parse(v).unwrap_or_else(|| {
+                    warnings.push(
+                        ConfigWarning::new(format!(
+                            "tool_result_images = {v:?} is not one of \"array\", \"lift\" or \"drop\"; using the default \"array\""
+                        ))
+                        .with_field("tool_result_images", v.to_owned()),
+                    );
+                    ToolResultImages::default()
+                })
+            });
+
         // `log_to_disk`: env wins over file, then default to `false`.
         // For a boolean we can't reuse `pick_str`; do it inline.
         let log_to_disk = env
@@ -671,11 +748,6 @@ impl Config {
         // falls back to the default with a warning rather than failing
         // startup — the same house style as an unusable upstream value
         // surfacing as a 400 instead of a startup error.
-        //
-        // The warnings are COLLECTED, not emitted: the tracing subscriber
-        // does not exist yet (the binary installs it after this returns), so
-        // a `tracing::warn!` here would hit no subscriber and vanish.
-        let mut warnings: Vec<ConfigWarning> = Vec::new();
         let advisor_defaults = AdvisorConfig::default();
         let advisor_json = file.and_then(|f| f.advisor.as_ref());
         let advisor_enabled = env
@@ -751,6 +823,7 @@ impl Config {
             model_aliases,
             prompt_caching,
             reasoning_replay,
+            tool_result_images,
             proxy_key,
             log_to_disk,
             advisor,
@@ -940,6 +1013,11 @@ pub struct EnvInputs {
     pub log_to_disk: Option<bool>,
     /// `PROXY_KEY=<secret>` enables client auth via `X-Proxy-Key`.
     pub proxy_key: Option<String>,
+    /// `TOOL_RESULT_IMAGES=array|lift|drop`. See [`ToolResultImages`].
+    /// A value that is not one of the three is judged by the resolver, the
+    /// same as a bad value in `proxy.json` (warn + fall back to the
+    /// default), never a hard startup failure.
+    pub tool_result_images: Option<String>,
     /// Advisor overrides. `ADVISOR_ENABLED` uses the same truthy values as
     /// `LOG_TO_DISK`; a value that is not a number at all is ignored (the
     /// file/default value wins) rather than silently disabling the section.
@@ -973,6 +1051,7 @@ impl EnvInputs {
             request_timeout_secs: env::var("REQUEST_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            tool_result_images: env::var("TOOL_RESULT_IMAGES").ok(),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
@@ -1217,6 +1296,12 @@ pub struct JsonConfig {
     /// to start — a rollback hazard for anyone who saved from the TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_replay: Option<JsonReasoningReplayConfig>,
+    /// How `image` blocks inside a `tool_result` are forwarded.
+    /// See [`ToolResultImages`]. `skip_serializing_if` keeps an unset key
+    /// out of the file the TUI rewrites, so a config file that never sets
+    /// it round-trips unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_images: Option<String>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).
@@ -1701,6 +1786,77 @@ mod tests {
             "reasoning_replay": {"defualt": "text"}
         }"#;
         assert!(JsonConfig::parse(json_raw).is_err());
+    }
+
+    // ── tool_result_images ──────────────────────────────────
+
+    #[test]
+    fn tool_result_images_defaults_to_array() {
+        let cfg = cfg_from_json(
+            r#"{"upstream_base_url": "https://api.example.com",
+                 "upstream_api_key": "k"}"#,
+        );
+        assert_eq!(cfg.tool_result_images, ToolResultImages::Array);
+        assert!(cfg.warnings.is_empty());
+    }
+
+    #[test]
+    fn tool_result_images_accepts_lift_and_drop() {
+        for (raw, want) in [
+            ("lift", ToolResultImages::Lift),
+            ("drop", ToolResultImages::Drop),
+        ] {
+            let cfg = cfg_from_json(&format!(
+                r#"{{"upstream_base_url": "https://api.example.com",
+                     "upstream_api_key": "k",
+                     "tool_result_images": "{raw}"}}"#
+            ));
+            assert_eq!(cfg.tool_result_images, want);
+            assert!(cfg.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_result_images_value_is_case_insensitive() {
+        let cfg = cfg_from_json(
+            r#"{"upstream_base_url": "https://api.example.com",
+                 "upstream_api_key": "k",
+                 "tool_result_images": "LIFT"}"#,
+        );
+        assert_eq!(cfg.tool_result_images, ToolResultImages::Lift);
+    }
+
+    #[test]
+    fn tool_result_images_unknown_value_falls_back_to_array_with_a_warning() {
+        let cfg = cfg_from_json(
+            r#"{"upstream_base_url": "https://api.example.com",
+                 "upstream_api_key": "k",
+                 "tool_result_images": "banana"}"#,
+        );
+        assert_eq!(cfg.tool_result_images, ToolResultImages::Array);
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(
+            cfg.warnings[0]
+                .fields
+                .iter()
+                .any(|(k, v)| k == "tool_result_images" && v == "banana")
+        );
+    }
+
+    #[test]
+    fn tool_result_images_env_overrides_file() {
+        let parsed = JsonConfig::parse(
+            r#"{"upstream_base_url": "https://api.example.com",
+                 "upstream_api_key": "k",
+                 "tool_result_images": "drop"}"#,
+        )
+        .unwrap();
+        let env = EnvInputs {
+            tool_result_images: Some("lift".to_string()),
+            ..EnvInputs::default()
+        };
+        let cfg = Config::resolve(Some(&parsed), &env).unwrap();
+        assert_eq!(cfg.tool_result_images, ToolResultImages::Lift);
     }
 
     #[test]

@@ -1,21 +1,28 @@
 //! Translation between Anthropic Messages API and OpenAI Responses.
 //!
 //! Three entry points:
-//! - [`anthropic_to_responses`] — inbound request, used by the proxy's
+//! - [`anthropic_to_responses_with`] — inbound request, used by the proxy's
 //!   `/v1/messages` handler. Converts Claude Code's request into the
-//!   shape the upstream expects.
+//!   shape the upstream expects. (`anthropic_to_responses` is a thin
+//!   convenience wrapper used by the unit tests.)
 //! - [`responses_to_anthropic`] — non-streaming response. The upstream
 //!   returned a full `ResponsesResponse`; we map it to Anthropic's
 //!   `Message` and ship it back to the client.
 //! - [`StreamTranslator`] (in `crate::stream`) — turns an OpenAI
 //!   Responses SSE event stream into Anthropic SSE events.
 //!
-//! Out-of-scope fields (vision, image inputs, structured outputs,
-//! server-side state via `previous_response_id`) are silently dropped on
-//! the request side. On the response side, OpenAI's `usage.input_tokens`
-//! becomes Anthropic's `input_tokens`, `output_tokens` becomes
-//! `output_tokens`, and `output_tokens_details.reasoning_tokens` becomes
-//! `thinking_tokens`; cache fields are 0.
+//! Note: image blocks in *user* messages are translated to `input_image`
+//! parts (`base64` data URIs or passthrough URLs). Image blocks inside a
+//! `tool_result` are handled per [`ToolResultImages`]: forwarded inline as
+//! `input_image` parts in the `function_call_output` array form (default),
+//! lifted into a follow-up user message for gateways that reject array
+//! outputs, or dropped. Images in *assistant* turns have no valid home in
+//! the Responses API and are dropped with a warning.
+//!
+//! On the response side, OpenAI's `usage.input_tokens` becomes Anthropic's
+//! `input_tokens`, `output_tokens` stays `output_tokens`, and
+//! `output_tokens_details.reasoning_tokens` becomes `thinking_tokens`;
+//! cache fields are 0.
 
 use crate::anthropic::{
     CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
@@ -23,14 +30,17 @@ use crate::anthropic::{
     StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::config::{PromptCachingConfig, ReasoningDecision, ReasoningReplay, ReasoningReplayMode};
+use crate::config::{
+    PromptCachingConfig, ReasoningDecision, ReasoningReplay, ReasoningReplayMode, ToolResultImages,
+};
 use crate::responses::{
-    Input, InputContentPart, InputItem, PromptCacheBreakpoint, ReasoningConfig,
-    ReasoningSummaryPart, ReasoningTextPart, ResponsesRequest, ResponsesResponse, ResponsesTool,
-    ToolChoice as ResponsesToolChoice, ToolDefinition, WebSearchTool,
+    FunctionCallOutputBody, Input, InputContentPart, InputItem, PromptCacheBreakpoint,
+    ReasoningConfig, ReasoningSummaryPart, ReasoningTextPart, ResponsesRequest, ResponsesResponse,
+    ResponsesTool, ToolChoice as ResponsesToolChoice, ToolDefinition, WebSearchTool,
 };
 use crate::schema_refs::resolve_local_refs;
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// Hard cap on the length of the `user` field we send to the upstream
@@ -93,8 +103,9 @@ fn truncate_user_id(s: String) -> String {
 /// - `messages[]` → `input: Items(...)`. Walk in order:
 ///   - `user` text → one `Message { role: "user", content: [InputTextPart] }`.
 ///   - `user` block content → one Message per run of text blocks; for each
-///     `ToolResult`, emit a `FunctionCallOutput { call_id, output: <text> }`
-///     *after* any pending text. Image blocks are dropped with a warn.
+///     `ToolResult`, emit a `FunctionCallOutput { call_id, output }` *after*
+///     any pending text. Text-only results keep the string form; results
+///     carrying images use the array-of-parts form per `tool_result_images`.
 ///   - `assistant` text → `Message { role: "assistant", content: [OutputTextPart { text }] }`.
 ///   - `assistant` text + `tool_use` → `Message { content: [OutputTextPart] }` followed by
 ///     `FunctionCall { call_id: id, name, arguments: json_string }` per tool use, in order.
@@ -123,11 +134,33 @@ fn truncate_user_id(s: String) -> String {
 ///   first, then the visible answer); in [`ReasoningReplayMode::Native`] a
 ///   Responses `reasoning` input item is emitted immediately before the
 ///   assistant message; in [`ReasoningReplayMode::Off`] the block is dropped.
+///
+/// Unit-test convenience wrapper around [`anthropic_to_responses_with`]; the
+/// proxy itself calls `_with` with the configured `tool_result_images` mode.
+#[allow(dead_code)]
 pub fn anthropic_to_responses(
     req: &CreateMessageRequest,
     reasoning_decision: Option<ReasoningDecision>,
     prompt_caching: &PromptCachingConfig,
     replay: &ReasoningReplay,
+) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
+    anthropic_to_responses_with(
+        req,
+        reasoning_decision,
+        prompt_caching,
+        replay,
+        ToolResultImages::default(),
+    )
+}
+
+/// As [`anthropic_to_responses`], with an explicit `tool_result_images`
+/// mode (the proxy passes the operator's configured value).
+pub fn anthropic_to_responses_with(
+    req: &CreateMessageRequest,
+    reasoning_decision: Option<ReasoningDecision>,
+    prompt_caching: &PromptCachingConfig,
+    replay: &ReasoningReplay,
+    tool_result_images: ToolResultImages,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
@@ -137,7 +170,14 @@ pub fn anthropic_to_responses(
     let mut instructions = req.system.as_ref().map(system_text).unwrap_or_default();
 
     for msg in &req.messages {
-        append_message_translation(&mut items, &mut instructions, msg, prompt_caching, replay)?;
+        append_message_translation(
+            &mut items,
+            &mut instructions,
+            msg,
+            prompt_caching,
+            replay,
+            &tool_result_images,
+        )?;
     }
 
     if instructions.is_empty() {
@@ -204,15 +244,15 @@ pub fn anthropic_to_responses(
     }
 
     let (tool_choice, parallel_tool_calls) = req.tool_choice.as_ref().map_or((None, None), |c| {
-            let (tc, disable) = map_tool_choice(c);
-            // Anthropic's `disable_parallel_tool_use: true` means "the
-            // model may call at most one tool per turn." On Responses,
-            // that's `parallel_tool_calls: false`. We only forward the
-            // field when the client explicitly set the Anthropic side
-            // — `None` leaves it to the upstream's default.
-            let parallel = disable.map(|d| !d);
-            (Some(tc), parallel)
-        });
+        let (tc, disable) = map_tool_choice(c);
+        // Anthropic's `disable_parallel_tool_use: true` means "the
+        // model may call at most one tool per turn." On Responses,
+        // that's `parallel_tool_calls: false`. We only forward the
+        // field when the client explicitly set the Anthropic side
+        // — `None` leaves it to the upstream's default.
+        let parallel = disable.map(|d| !d);
+        (Some(tc), parallel)
+    });
 
     let user = req
         .metadata
@@ -1413,9 +1453,12 @@ fn append_message_translation(
     msg: &MessageParam,
     prompt_caching: &PromptCachingConfig,
     replay: &ReasoningReplay,
+    tool_result_images: &ToolResultImages,
 ) -> Result<()> {
     match msg.role {
-        MessageRole::User => append_user_message(out, &msg.content, prompt_caching),
+        MessageRole::User => {
+            append_user_message(out, &msg.content, prompt_caching, tool_result_images)
+        }
         MessageRole::Assistant => append_assistant_message(out, &msg.content, replay),
         MessageRole::System => append_system_message(instructions, &msg.content),
     }
@@ -1425,6 +1468,7 @@ fn append_user_message(
     out: &mut Vec<InputItem>,
     content: &MessageContent,
     prompt_caching: &PromptCachingConfig,
+    tool_result_images: &ToolResultImages,
 ) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
@@ -1476,11 +1520,21 @@ fn append_user_message(
                     }
                     ContentBlockParam::ToolResult(tr) => {
                         flush_user_parts(out, &mut parts);
-                        let output = tool_result_output(tr);
+                        let translated = tool_result_output(tr, tool_result_images, prompt_caching);
                         out.push(InputItem::FunctionCallOutput {
                             call_id: tr.tool_use_id.clone(),
-                            output,
+                            output: translated.output,
                         });
+                        if !translated.lifted_images.is_empty() {
+                            // The upstream cannot carry images inside
+                            // `function_call_output`, so the images go in
+                            // a follow-up user message, the same shape a
+                            // fresh user turn uses.
+                            out.push(InputItem::Message {
+                                role: "user".into(),
+                                content: translated.lifted_images,
+                            });
+                        }
                     }
                     ContentBlockParam::Image(img) => {
                         if let Some(image_part) = convert_image_block(img) {
@@ -1606,31 +1660,175 @@ fn convert_image_block(img: &ImageBlockParam) -> Option<InputContentPart> {
     }
 }
 
-fn tool_result_text(content: &Option<ToolResultContent>) -> String {
-    match content {
-        Some(ToolResultContent::Text(s)) => s.clone(),
-        Some(ToolResultContent::Blocks(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
-    }
+/// What the translation of one `tool_result` block produced.
+struct TranslatedToolResult {
+    /// The value for `FunctionCallOutput.output`. Text-only results keep
+    /// the plain-string form (byte-identical to the pre-multimode
+    /// behaviour); results carrying images use the array form.
+    output: FunctionCallOutputBody,
+    /// Images lifted out of the result for [`ToolResultImages::Lift`]:
+    /// the caller emits these as a follow-up `user` message after the
+    /// `FunctionCallOutput`. Empty in the other modes.
+    lifted_images: Vec<InputContentPart>,
 }
 
-/// Render a `ToolResultBlockParam` as the `output` string for a
-/// Responses `FunctionCallOutput`. When `is_error: true` is set, the
-/// OpenAI Responses API has no first-class error field, so we prefix
-/// the output with `[TOOL_ERROR]` so the model can distinguish a
-/// tool failure from a successful result. Without the prefix the
-/// model treats the exception as a successful return value and may
-/// build further calls on top of it.
-fn tool_result_output(tr: &ToolResultBlockParam) -> String {
-    let text = tool_result_text(&tr.content);
-    if tr.is_error == Some(true) {
-        format!("[TOOL_ERROR]\n{text}")
+/// Translate a `tool_result` block into its wire form. When
+/// `is_error: true` the text is prefixed with `[TOOL_ERROR]` so the model
+/// can distinguish a tool failure from a successful result (the Responses
+/// API has no first-class error field).
+///
+/// Images inside the tool result (`image` blocks) are carried per
+/// `tool_result_images`:
+/// - [`ToolResultImages::Array`] (default): `output` becomes an array of
+///   `input_text` / `input_image` parts, the shape the Responses API
+///   defines for tool outputs.
+/// - [`ToolResultImages::Lift`]: text stays in `output`; the images are
+///   returned in `lifted_images` so the caller can append a user message
+///   carrying them (for upstreams that reject array-form tool outputs).
+/// - [`ToolResultImages::Drop`]: images are dropped with a warning (the
+///   historical behaviour).
+fn tool_result_output(
+    tr: &ToolResultBlockParam,
+    mode: &ToolResultImages,
+    prompt_caching: &PromptCachingConfig,
+) -> TranslatedToolResult {
+    let mut ordered: Vec<InputContentPart> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut images: Vec<InputContentPart> = Vec::new();
+    let mut image_count = 0usize;
+
+    let mut push_text = |text: String, ordered: &mut Vec<InputContentPart>| {
+        text_parts.push(text.clone());
+        ordered.push(InputContentPart::InputText {
+            text,
+            prompt_cache_breakpoint: None,
+        });
+    };
+
+    match &tr.content {
+        Some(ToolResultContent::Text(s)) => {
+            push_text(s.clone(), &mut ordered);
+        }
+        Some(ToolResultContent::Blocks(blocks)) => {
+            for block in blocks {
+                let is_image = block.get("type").and_then(Value::as_str) == Some("image");
+                if is_image {
+                    // `&Value` implements `Deserializer`, so the block is
+                    // decoded in place without cloning the base64 payload.
+                    match ImageBlockParam::deserialize(block)
+                        .ok()
+                        .and_then(|img| convert_image_block(&img).map(|p| (img, p)))
+                    {
+                        Some((img, mut part)) => {
+                            // Honour an ephemeral cache breakpoint on the
+                            // image block, exactly as the user-message
+                            // path does, but only when the operator has
+                            // allowlisted the model for caching.
+                            if !prompt_caching.models.is_empty()
+                                && let InputContentPart::InputImage {
+                                    prompt_cache_breakpoint,
+                                    ..
+                                } = &mut part
+                                && is_ephemeral(&img.cache_control)
+                            {
+                                *prompt_cache_breakpoint = Some(PromptCacheBreakpoint {
+                                    mode: "explicit".into(),
+                                });
+                            }
+                            image_count += 1;
+                            // Route the part by mode; no intermediate clones.
+                            match mode {
+                                ToolResultImages::Array => ordered.push(part),
+                                ToolResultImages::Lift => images.push(part),
+                                ToolResultImages::Drop => {}
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                "dropping image block in tool_result that could not be decoded"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // Any other block with a string `text` contributes it,
+                // matching the previous behaviour (which kept text from
+                // blocks of any type).
+                match block.get("text").and_then(Value::as_str) {
+                    Some(t) => push_text(t.to_owned(), &mut ordered),
+                    None => {
+                        let block_type = block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        tracing::warn!(
+                            block_type,
+                            "dropping non-text, non-image block in tool_result"
+                        );
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+
+    let joined = text_parts.join("\n");
+    let is_error = tr.is_error == Some(true);
+
+    // The `[TOOL_ERROR]` marker must reach the model in every mode.
+    if is_error {
+        let prefixed = ordered
+            .iter_mut()
+            .find_map(|p| match p {
+                InputContentPart::InputText { text, .. } => Some(text),
+                _ => None,
+            })
+            .is_some_and(|t| {
+                *t = format!("[TOOL_ERROR]\n{t}");
+                true
+            });
+        if !prefixed {
+            ordered.insert(
+                0,
+                InputContentPart::InputText {
+                    text: "[TOOL_ERROR]\n".to_string(),
+                    prompt_cache_breakpoint: None,
+                },
+            );
+        }
+    }
+    let text = if is_error {
+        format!("[TOOL_ERROR]\n{joined}")
     } else {
-        text
+        joined
+    };
+
+    if image_count == 0 {
+        return TranslatedToolResult {
+            output: FunctionCallOutputBody::Text(text),
+            lifted_images: Vec::new(),
+        };
+    }
+
+    match mode {
+        ToolResultImages::Array => TranslatedToolResult {
+            output: FunctionCallOutputBody::Parts(ordered),
+            lifted_images: Vec::new(),
+        },
+        ToolResultImages::Lift => TranslatedToolResult {
+            output: FunctionCallOutputBody::Text(text),
+            lifted_images: images,
+        },
+        ToolResultImages::Drop => {
+            tracing::warn!(
+                count = image_count,
+                "dropping image(s) in tool_result (tool_result_images = \"drop\")"
+            );
+            TranslatedToolResult {
+                output: FunctionCallOutputBody::Text(text),
+                lifted_images: Vec::new(),
+            }
+        }
     }
 }
 
@@ -2448,7 +2646,10 @@ suffix";
         match &items[3] {
             InputItem::FunctionCallOutput { call_id, output } => {
                 assert_eq!(call_id, "toolu_01");
-                assert_eq!(output, "72F sunny");
+                assert_eq!(
+                    output,
+                    &FunctionCallOutputBody::Text("72F sunny".to_string())
+                );
             }
             _ => panic!("expected function_call_output item"),
         }
@@ -3312,7 +3513,10 @@ suffix";
         match &items[1] {
             InputItem::FunctionCallOutput { call_id, output } => {
                 assert_eq!(call_id, "toolu_01");
-                assert_eq!(output, "first result");
+                assert_eq!(
+                    output,
+                    &FunctionCallOutputBody::Text("first result".to_string())
+                );
             }
             _ => panic!(),
         }
@@ -3326,7 +3530,10 @@ suffix";
         match &items[3] {
             InputItem::FunctionCallOutput { call_id, output } => {
                 assert_eq!(call_id, "toolu_02");
-                assert_eq!(output, "second result");
+                assert_eq!(
+                    output,
+                    &FunctionCallOutputBody::Text("second result".to_string())
+                );
             }
             _ => panic!(),
         }
@@ -3542,12 +3749,17 @@ suffix";
             content: Some(ToolResultContent::Text("division by zero".into())),
             is_error: Some(true),
         };
-        let out = tool_result_output(&tr);
-        assert!(
-            out.starts_with("[TOOL_ERROR]\n"),
-            "expected [TOOL_ERROR] prefix, got {out:?}"
+        let out = tool_result_output(
+            &tr,
+            &ToolResultImages::default(),
+            &PromptCachingConfig::default(),
         );
-        assert!(out.contains("division by zero"));
+        let text = out.output.text();
+        assert!(
+            text.starts_with("[TOOL_ERROR]\n"),
+            "expected [TOOL_ERROR] prefix, got {text:?}"
+        );
+        assert!(text.contains("division by zero"));
     }
 
     #[test]
@@ -3559,8 +3771,12 @@ suffix";
             content: Some(ToolResultContent::Text("ok".into())),
             is_error: Some(false),
         };
-        let out = tool_result_output(&tr);
-        assert_eq!(out, "ok");
+        let out = tool_result_output(
+            &tr,
+            &ToolResultImages::default(),
+            &PromptCachingConfig::default(),
+        );
+        assert_eq!(out.output, FunctionCallOutputBody::Text("ok".to_string()));
     }
 
     #[test]
@@ -3572,8 +3788,277 @@ suffix";
             content: Some(ToolResultContent::Text("72F sunny".into())),
             is_error: None,
         };
-        let out = tool_result_output(&tr);
-        assert_eq!(out, "72F sunny");
+        let out = tool_result_output(
+            &tr,
+            &ToolResultImages::default(),
+            &PromptCachingConfig::default(),
+        );
+        assert_eq!(
+            out.output,
+            FunctionCallOutputBody::Text("72F sunny".to_string())
+        );
+    }
+
+    fn tool_result_image_json(media: &str, data: &str) -> serde_json::Value {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media, "data": data }
+        })
+    }
+
+    #[test]
+    fn tool_result_with_image_emits_array_form_by_default() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        json!({"type": "text", "text": "screenshot attached"}),
+                        tool_result_image_json("image/png", "iVBORw0KGgo="),
+                    ])),
+                    is_error: None,
+                },
+            )]),
+        }];
+
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        let InputItem::FunctionCallOutput { call_id, output } = &items[0] else {
+            panic!("expected function_call_output, got {:?}", items[0])
+        };
+        assert_eq!(call_id, "toolu_1");
+        match output {
+            FunctionCallOutputBody::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    InputContentPart::InputText { text, .. } => {
+                        assert_eq!(text, "screenshot attached")
+                    }
+                    other => panic!("expected input_text first, got {other:?}"),
+                }
+                match &parts[1] {
+                    InputContentPart::InputImage {
+                        image_url, detail, ..
+                    } => {
+                        assert_eq!(image_url, "data:image/png;base64,iVBORw0KGgo=");
+                        assert_eq!(detail, &None);
+                    }
+                    other => panic!("expected input_image second, got {other:?}"),
+                }
+            }
+            FunctionCallOutputBody::Text(t) => panic!("expected array output, got text {t:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_image_url_source_passes_through() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![json!({
+                        "type": "image",
+                        "source": {"type": "url", "url": "https://example.com/cat.png"}
+                    })])),
+                    is_error: None,
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::FunctionCallOutput { output, .. } => match output {
+                FunctionCallOutputBody::Parts(parts) => {
+                    assert_eq!(parts.len(), 1);
+                    match &parts[0] {
+                        InputContentPart::InputImage { image_url, .. } => {
+                            assert_eq!(image_url, "https://example.com/cat.png")
+                        }
+                        other => panic!("expected input_image, got {other:?}"),
+                    }
+                }
+                other => panic!("expected array output, got {other:?}"),
+            },
+            other => panic!("expected function_call_output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_image_lift_mode_sends_images_in_follow_up_user_message() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        json!({"type": "text", "text": "screenshot attached"}),
+                        tool_result_image_json("image/png", "iVBORw0KGgo="),
+                    ])),
+                    is_error: None,
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses_with(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+            ToolResultImages::Lift,
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(
+            items.len(),
+            2,
+            "expected output + lifted user message, got {items:?}"
+        );
+        match &items[0] {
+            InputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(
+                    *output,
+                    FunctionCallOutputBody::Text("screenshot attached".to_string())
+                )
+            }
+            other => panic!("expected function_call_output first, got {other:?}"),
+        }
+        match &items[1] {
+            InputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    InputContentPart::InputImage { image_url, .. } => {
+                        assert_eq!(image_url, "data:image/png;base64,iVBORw0KGgo=")
+                    }
+                    other => panic!("expected input_image, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_image_drop_mode_drops_images_and_keeps_text() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        json!({"type": "text", "text": "screenshot attached"}),
+                        tool_result_image_json("image/png", "iVBORw0KGgo="),
+                    ])),
+                    is_error: None,
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses_with(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+            ToolResultImages::Drop,
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        assert_eq!(items.len(), 1, "drop mode must not add a user message");
+        match &items[0] {
+            InputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(
+                    *output,
+                    FunctionCallOutputBody::Text("screenshot attached".to_string())
+                )
+            }
+            other => panic!("expected function_call_output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_error_prefix_applied_in_array_form() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        json!({"type": "text", "text": "boom"}),
+                        tool_result_image_json("image/png", "iVBORw0KGgo="),
+                    ])),
+                    is_error: Some(true),
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::FunctionCallOutput { output, .. } => match output {
+                FunctionCallOutputBody::Parts(parts) => {
+                    let InputContentPart::InputText { text, .. } = &parts[0] else {
+                        panic!("expected input_text first, got {parts:?}")
+                    };
+                    assert!(text.starts_with("[TOOL_ERROR]\n"), "got {text:?}");
+                    assert!(text.contains("boom"));
+                }
+                other => panic!("expected array output, got {other:?}"),
+            },
+            other => panic!("expected function_call_output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_with_only_undecodable_image_falls_back_to_text() {
+        let mut req = fixture_request();
+        req.messages = vec![MessageParam {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlockParam::ToolResult(
+                ToolResultBlockParam {
+                    tool_use_id: "toolu_1".into(),
+                    content: Some(ToolResultContent::Blocks(vec![
+                        json!({"type": "image", "source": {"type": "teleport"}}),
+                        json!({"type": "text", "text": "after"}),
+                    ])),
+                    is_error: None,
+                },
+            )]),
+        }];
+        let (out, _reg) = anthropic_to_responses(
+            &req,
+            None,
+            &PromptCachingConfig::default(),
+            &ReasoningReplay::default(),
+        )
+        .unwrap();
+        let items = unwrap_items(out);
+        match &items[0] {
+            InputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(output, &FunctionCallOutputBody::Text("after".to_string()))
+            }
+            other => panic!("expected function_call_output, got {other:?}"),
+        }
     }
 
     #[test]
