@@ -6155,6 +6155,17 @@ async fn configured_small_request_body_limit_returns_413() {
         .unwrap();
 
     assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // The rejection is an Anthropic-shaped JSON error that names the knob,
+    // not axum's bare plain-text 413.
+    let json: serde_json::Value = res.json().await.expect("413 body must be JSON");
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "request_too_large");
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("max_request_body_bytes"),
+        "got {message:?}"
+    );
+    assert!(message.contains("64"), "got {message:?}");
     assert_eq!(
         *upstream.request_count.lock().await,
         0,

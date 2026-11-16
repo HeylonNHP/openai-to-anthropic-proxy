@@ -158,6 +158,7 @@ pub fn router_with_stores(
     // before the body is touched, so an unauthenticated client cannot make
     // the proxy hold a large body in memory.
     let auth_state = state.clone();
+    let limit_state = state.clone();
     Router::new()
         // A configurable route-local cap keeps large tool-result screenshots
         // possible while rejecting oversized bodies before translation.
@@ -168,10 +169,39 @@ pub fn router_with_stores(
                 .route_layer(axum::middleware::from_fn_with_state(
                     auth_state,
                     require_proxy_key,
+                ))
+                .route_layer(axum::middleware::map_response_with_state(
+                    limit_state,
+                    explain_body_limit_rejection,
                 )),
         )
         .route("/healthz", get(handle_health))
         .with_state(state)
+}
+
+/// axum rejects an over-limit body with a bare `413` and a plain-text
+/// message. Anthropic clients expect their JSON error envelope, and the
+/// operator needs to be told which setting to raise, so rewrite that one
+/// rejection. Responses that are already JSON (an upstream 413 passed
+/// through as an [`AppError`]) are left alone.
+async fn explain_body_limit_rejection(
+    State(state): State<AppState>,
+    response: Response,
+) -> Response {
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE || is_json {
+        return response;
+    }
+    let limit = state.config.max_request_body_bytes;
+    AppError::PayloadTooLarge(format!(
+        "request body exceeds the proxy's limit of {limit} bytes; raise \
+         `max_request_body_bytes` (or MAX_REQUEST_BODY_BYTES) to accept larger requests"
+    ))
+    .into_response()
 }
 
 /// Reject a request whose `X-Proxy-Key` is missing or wrong, before the

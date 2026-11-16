@@ -25,6 +25,12 @@ pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// The inbound body exceeded `max_request_body_bytes`. 413 with an
+    /// Anthropic-shaped `request_too_large` body, so clients get a message
+    /// they can act on instead of axum's bare plain-text rejection.
+    #[error("request too large: {0}")]
+    PayloadTooLarge(String),
+
     /// The upstream returned a non-success status. The status is preserved
     /// so the client sees the same code Anthropic would have returned.
     #[error("upstream returned {status}: {body}")]
@@ -48,6 +54,7 @@ impl AppError {
         match err {
             Self::BadRequest(msg) => Self::BadRequest(scrub(&msg)),
             Self::Unauthorized => Self::Unauthorized,
+            Self::PayloadTooLarge(msg) => Self::PayloadTooLarge(scrub(&msg)),
             Self::Upstream { status, body } => Self::Upstream {
                 status,
                 body: scrub(&body),
@@ -63,6 +70,7 @@ impl AppError {
                 "authentication_error",
                 "missing or invalid X-Proxy-Key header".to_owned(),
             ),
+            Self::PayloadTooLarge(msg) => ("request_too_large", msg.clone()),
             Self::Upstream { status, body } => {
                 let kind = match status.as_u16() {
                     401 | 403 => "authentication_error",
@@ -91,6 +99,7 @@ impl IntoResponse for AppError {
         let status = match &self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             // 4xx and 5xx upstream statuses are passed through, but if the
             // status itself is informational (1xx) or a success code (2xx/3xx)
             // we collapse to 502 — something is wrong if we got here.
