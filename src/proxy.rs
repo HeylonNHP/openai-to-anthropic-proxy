@@ -422,8 +422,8 @@ pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = mp + if mp < 10 { 3 } else { -9 };
-    let mon = if mo <= 2 { mo + 12 } else { mo };
-    let year = if mo > 2 { y } else { y - 1 };
+    let year = if mp >= 10 { y + 1 } else { y };
+    let mon = mo;
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, mon, d, h, m, s
