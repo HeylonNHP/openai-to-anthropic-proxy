@@ -209,6 +209,8 @@ pub struct Config {
     /// `crate::tools::web_fetch`. When `enabled` is false the proxy never fetches
     /// a URL on the model's behalf and the request pipeline is unchanged.
     pub web_fetch: WebFetchConfig,
+    /// When true, prefix claude- to every model id returned by /v1/models so Claude Code auto-discovers them (it only adds ids beginning with claude/anthropic).
+    pub prefix_models_for_discovery: bool,
     /// Warnings raised while resolving this configuration.
     ///
     /// The resolver runs BEFORE the binary installs the tracing
@@ -932,6 +934,11 @@ impl Config {
             max_content_bytes: web_fetch_max_content_bytes,
         };
 
+        let prefix_models_for_discovery = env.prefix_models_for_discovery.unwrap_or_else(|| {
+            file.and_then(|f| f.prefix_models_for_discovery)
+                .unwrap_or(false)
+        });
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -949,6 +956,7 @@ impl Config {
             log_to_disk,
             advisor,
             web_fetch,
+            prefix_models_for_discovery,
             warnings,
         })
     }
@@ -1164,6 +1172,7 @@ pub struct EnvInputs {
     pub web_fetch_timeout_secs: Option<serde_json::Number>,
     pub web_fetch_max_bytes: Option<serde_json::Number>,
     pub web_fetch_max_content_bytes: Option<serde_json::Number>,
+    pub prefix_models_for_discovery: Option<bool>,
 }
 
 fn parse_truthy(raw: &str) -> bool {
@@ -1213,6 +1222,9 @@ impl EnvInputs {
             web_fetch_max_content_bytes: env::var("WEB_FETCH_MAX_CONTENT_BYTES")
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
+            prefix_models_for_discovery: env::var("PREFIX_MODELS_FOR_DISCOVERY")
+                .ok()
+                .map(|s| parse_truthy(&s)),
         }
     }
 }
@@ -1605,6 +1617,8 @@ pub struct JsonConfig {
     /// See [`WebFetchConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_fetch: Option<JsonWebFetchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_models_for_discovery: Option<bool>,
 }
 
 /// JSON shape of the `web_fetch` section of `proxy.json`.

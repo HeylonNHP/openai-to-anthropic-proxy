@@ -182,6 +182,7 @@ fn make_config_with_default_model(
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
@@ -218,6 +219,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
@@ -624,6 +626,7 @@ async fn per_model_reasoning_effort_lookup() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -716,6 +719,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -800,6 +804,7 @@ async fn model_alias_rewrites_inbound_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -880,6 +885,7 @@ async fn model_not_supported_falls_back_to_default() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -939,6 +945,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1006,6 +1013,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1662,6 +1670,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1760,6 +1769,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1836,6 +1846,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1925,6 +1936,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2016,6 +2028,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2114,6 +2127,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2205,6 +2219,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2864,6 +2879,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });

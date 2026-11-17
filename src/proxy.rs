@@ -313,9 +313,16 @@ async fn handle_models(
         if !seen.insert(m.id.clone()) {
             continue;
         }
+        let id = if state.config.prefix_models_for_discovery
+            && !(m.id.starts_with("claude") || m.id.starts_with("anthropic"))
+        {
+            format!("claude-{}", m.id)
+        } else {
+            m.id.clone()
+        };
         data.push(AnthropicModelInfo {
             r#type: "model",
-            id: m.id.clone(),
+            id,
             display_name: m.id.clone(),
             created_at: epoch_to_rfc3339(m.created as u64),
         });
@@ -457,7 +464,21 @@ async fn handle_messages(
     // effect: the static `Config::model_aliases` is the startup-only
     // seed, while `mappings_snapshot` is what the operator sees when
     // they hit `e` in the TUI.
-    let upstream_model = mappings_snapshot.resolve(&req.model);
+    let upstream_model = {
+        let resolved = mappings_snapshot.resolve(&req.model);
+        if resolved == req.model
+            && state.config.prefix_models_for_discovery
+            && (req.model.starts_with("claude-") || req.model.starts_with("anthropic-"))
+        {
+            req.model
+                .strip_prefix("claude-")
+                .or_else(|| req.model.strip_prefix("anthropic-"))
+                .unwrap_or(&req.model)
+                .to_owned()
+        } else {
+            resolved
+        }
+    };
     // An inbound name that is not in the alias map is passed through
     // unchanged. That is legitimate when the upstream serves the name
     // itself, but it is also exactly how a request ends up 404ing — and
