@@ -16,7 +16,8 @@ flowchart LR
 
 **Not for you if** you need model-generated images, full multimodal assistant
 turns, Claude's other server-side tools (`web_search`, `code_execution`),
-`/v1/models`, or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
+or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
+`GET /v1/models` is implemented (for gateway model discovery).
 Images *sent to* the model — including images inside tool results — are supported.
 The server-side `web_fetch` tool *is* implemented (the proxy fetches the page
 itself) — see [Enabling the web_fetch tool](#enabling-the-web_fetch-tool).
@@ -32,6 +33,7 @@ itself) — see [Enabling the web_fetch tool](#enabling-the-web_fetch-tool).
 - Unlocking 1M-context upstreams via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
 - Server-side `web_fetch`: the proxy fetches the URL, extracts the readable text, and hands it back to the model (opt-in).
 - `GET /healthz` for liveness checks.
+- `GET /v1/models` for Claude Code's gateway model discovery (opt-in via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`).
 - Optional shared-secret `proxy_key` auth for a bind-all listener.
 
 ## Quick start
@@ -248,3 +250,26 @@ and prints a warning.
 ---
 
 *Built as a personal/professional tool. Bug reports and ideas welcome as issues.*
+
+### Enabling gateway model discovery (`/v1/models`)
+
+Claude Code does not query `/v1/models` by default. To populate the `/model`
+autocomplete from the proxy instead of typing alias names by hand, set, in your
+shell __before__ launching `claude`:
+
+    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+
+Or in `~/.claude/settings.json` so subagents, MCP and background agents inherit
+it (the same way `env` is already documented there):
+
+    {
+      "env": {
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+      }
+    }
+
+The proxy answers `GET /v1/models` by forwarding to the upstream OpenAI-style
+`/v1/models`, translating each entry (id, display name, creation time) to the
+Anthropic shape. With an upstream lacking that endpoint, it returns the
+configured `model_aliases.map` keys plus `default_model`. Claude Code applies its
+own `availableModels` allow-list; no proxy config change is required.
