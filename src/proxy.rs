@@ -540,6 +540,12 @@ fn build_outbound(
     // through this function, so neither can lose the tool or accidentally
     // re-enable upstream streaming.
     crate::advisor::prepare(req, &mut outbound, &config.advisor);
+    // Same for the server-side `web_fetch` tool: the client declares it
+    // without an input_schema, so the translator drops it. Synthesize the
+    // function tool the executor calls to request a fetch, and force the
+    // outbound request to be buffered (the executor must be re-run with
+    // the fetched text before the turn can end).
+    crate::web_fetch::prepare(req, &mut outbound, &config.web_fetch);
     Ok((outbound, registry, reasoning_replay))
 }
 
@@ -782,6 +788,26 @@ impl Attempt {
 
     async fn run(mut self) -> Result<Response, AppError> {
         let url = self.url();
+        // Off by default AND detection-triggered: with `web_fetch.enabled =
+        // false` (the shipped default) this branch is never taken, so every
+        // ordinary request follows the exact same path as before.
+        //
+        // The `web_fetch` path is checked BEFORE the advisor path: a
+        // request that declares BOTH server tools needs one loop that can
+        // serve both, and the `web_fetch` loop is the one that owns the
+        // fetch. (In practice Claude Code declares at most one.)
+        if crate::web_fetch::active(&self.state.config.web_fetch, &self.req) {
+            let cfg = self.state.config.web_fetch.clone();
+            return match crate::web_fetch::session::run(&mut self, &cfg).await {
+                Ok(crate::web_fetch::session::SessionOutcome::UnexpectedStreaming(resp)) => {
+                    render_streaming(self, resp)
+                }
+                Ok(crate::web_fetch::session::SessionOutcome::Complete(result)) => {
+                    render_web_fetch(&self, *result)
+                }
+                Err(err) => Err(err),
+            };
+        }
         // Off by default AND detection-triggered: with `advisor.enabled =
         // false` (the shipped default) this branch is never taken, so every
         // ordinary request follows the exact same path as before.
@@ -944,6 +970,75 @@ fn render_advisor(
             .header(header::CACHE_CONTROL, "no-cache")
             .body(body)
             .map_err(|e| AppError::Internal(format!("build advisor streaming response: {e}")));
+    }
+    Ok(Json(anth).into_response())
+}
+
+/// Render the assembled `web_fetch` turn.
+///
+/// The `web_fetch` path buffers the whole chain (`prepare` forced upstream
+/// `stream:false`), so a client that asked for SSE gets ONE synthetic
+/// Anthropic event sequence — one `message_start`, one `message_stop`, no
+/// `[DONE]`.
+///
+/// The Content-Type is HARD-CODED: the upstream answered `application/json`,
+/// so forwarding its header (as `render_streaming` does) would be wrong.
+fn render_web_fetch(
+    attempt: &Attempt,
+    result: crate::web_fetch::session::SessionResult,
+) -> Result<Response, AppError> {
+    let crate::web_fetch::session::SessionResult {
+        final_resp,
+        prefix_blocks,
+    } = result;
+
+    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
+
+    // Claude Code must see `server_tool_use` + `web_fetch_tool_result`
+    // (Raw blocks), not a client `tool_use` named "web_fetch". Drop only
+    // that name.
+    anth.content.retain(
+        |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "web_fetch"),
+    );
+
+    // Splice the accumulated intermediate executor content plus the
+    // contiguous server-tool pairs at the FRONT, in real turn order. The
+    // executor's final text follows.
+    anth.content.splice(0..0, prefix_blocks);
+
+    // Preserve any TERMINAL stop reason that came from
+    // `responses_to_anthropic`. Only override when a client tool_use
+    // remains, or when the reason is absent / EndTurn. NEVER emit
+    // PauseTurn.
+    let has_client_tool_use = anth
+        .content
+        .iter()
+        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
+    if has_client_tool_use {
+        anth.stop_reason = Some(StopReason::ToolUse);
+    } else if !matches!(
+        anth.stop_reason,
+        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::StopSequence)
+    ) {
+        anth.stop_reason = Some(StopReason::EndTurn);
+    }
+
+    // Same stats/log block as the ordinary buffered path: reads the LAST
+    // executor response's authoritative usage exactly once.
+    record_json_stats(attempt, &final_resp);
+
+    if attempt.req.stream == Some(true) {
+        let events = crate::advisor::sse::message_to_events(anth);
+        let chunks = events
+            .into_iter()
+            .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .map_err(|e| AppError::Internal(format!("build web_fetch streaming response: {e}")));
     }
     Ok(Json(anth).into_response())
 }

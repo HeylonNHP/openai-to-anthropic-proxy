@@ -15,9 +15,11 @@ flowchart LR
 ```
 
 **Not for you if** you need model-generated images, full multimodal assistant
-turns, Claude's server-side tools (`web_search`, `web_fetch`, `code_execution`),
+turns, Claude's other server-side tools (`web_search`, `code_execution`),
 `/v1/models`, or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
 Images *sent to* the model — including images inside tool results — are supported.
+The server-side `web_fetch` tool *is* implemented (the proxy fetches the page
+itself) — see [Enabling the web_fetch tool](#enabling-the-web_fetch-tool).
 
 ## Features
 
@@ -28,6 +30,7 @@ Images *sent to* the model — including images inside tool results — are supp
 - `model_aliases` with a `default_model` safety net if an upstream rejects a model.
 - Reasoning-effort mapping (`low`/`medium`/`high`/`xhigh`/`max`) plus extended-thinking replay.
 - Unlocking 1M-context upstreams via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
+- Server-side `web_fetch`: the proxy fetches the URL, extracts the readable text, and hands it back to the model (opt-in).
 - `GET /healthz` for liveness checks.
 - Optional shared-secret `proxy_key` auth for a bind-all listener.
 
@@ -151,6 +154,34 @@ consultation runs.
 
 Deep protocol notes, reverse-engineering, and implementation history:
 [`ADVISOR_TOOL_RESEARCH.md`](./ADVISOR_TOOL_RESEARCH.md).
+
+### Enabling the web_fetch tool
+
+Anthropic's `web_fetch` is a *server* tool: the client declares it and the
+server does the HTTP GET. The proxy implements it, off by default. Turn it on in
+`proxy.json`:
+
+```json
+{ "web_fetch": { "enabled": true } }
+```
+
+When a client declares the server-side tool and the model asks for a URL, the
+proxy fetches the page, strips the navigation and other chrome, and hands the
+readable text back to the model so it can answer with the page in context.
+
+- `timeout_secs` (default 20) bounds the whole fetch — connect, read, extract.
+- `max_bytes` and `max_content_bytes` are **unlimited** by default; set either
+  to cap the download or the extracted text.
+- There is no domain allow-list and no URL-length limit — the proxy fetches any
+  `http`/`https` URL the model asks for. It does refuse private and reserved
+  addresses (loopback, LAN, cloud metadata …) and re-checks every redirect.
+- A failed fetch never fails the request: the model is told the fetch failed and
+  the turn continues.
+
+Note: **Claude Code CLI does not declare this tool** — it has its own client-side
+`WebFetch` tool and does the fetching itself. This is for Anthropic-API clients
+that declare the server tool (the Claude Agent SDK, direct Messages API calls,
+gateways that add it for the client). Details: [`REFERENCE.md`](./REFERENCE.md#server-side-web_fetch).
 
 #### Removing the limits
 

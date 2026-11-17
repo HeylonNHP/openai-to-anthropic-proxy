@@ -5,11 +5,11 @@ edition = "2024"
 
 [dependencies]
 # Async runtime + HTTP
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "charset"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +21,15 @@ serde_with = { version = "3", features = ["json"] }
 # Byte buffers (re-exported by reqwest, but we name the type in
 # `Body::from_stream` item type)
 bytes = "1"
+
+# Readable-content extraction for the server-side `web_fetch` tool:
+# `dom_smoothie` is a Readability (readability.js) port; `fast_html2md`
+# (imported as `html2md`) is the full-page Markdown fallback.
+# `dom_query` is the DOM `dom_smoothie` builds on — declared explicitly
+# (same version) because the extractor reads the document title from it.
+dom_smoothie = "0.19"
+fast_html2md = "0.0.66"
+dom_query = "0.29"
 
 # SSE parsing for the streaming path
 eventsource-stream = "0.2"

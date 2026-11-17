@@ -13,6 +13,7 @@ pub mod repair;
 mod schema_refs;
 mod translate;
 pub mod tui;
+pub mod web_fetch;
 
 pub use capabilities::{CapabilityRegistry, CapabilityStore, RequestParam};
 pub use config::{Config, UNBOUNDED_ADVISOR_LOOP_WARNING};

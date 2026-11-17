@@ -11,6 +11,7 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 - Error translation from OpenAI `{error: {...}}` envelopes and HTTP statuses into Anthropic-shaped errors.
 - Usage translation from OpenAI `usage` into Anthropic `usage`.
 - Optional prompt-caching translation from Anthropic `cache_control` to OpenAI `prompt_cache_breakpoint`.
+- The server-side `web_fetch` tool, implemented by the proxy: it fetches the URL itself, extracts the readable text, and returns it as an Anthropic `web_fetch_tool_result` (see "Server-side `web_fetch`" below).
 - `GET /healthz` for liveness checks.
 
 ## Configuration
@@ -29,6 +30,7 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `PROMPT_CACHE_KEY` | - | no | optional stable key for `prompt_cache_key` |
 | `PROXY_KEY` | - | no | shared secret for `X-Proxy-Key` auth (see "Client auth" below) |
 | `LOG_TO_DISK` | `false` | no | set `1`/`true`/`yes` to write `target/logs/proxy.log` |
+| `WEB_FETCH_ENABLED` | `false` | no | let the proxy serve the server-side `web_fetch` tool |
 
 `proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
 
@@ -157,6 +159,59 @@ A small example of these in `proxy.json`:
 }
 ```
 
+### Server-side `web_fetch`
+
+Anthropic's `web_fetch` is a **server** tool: the client declares it in `tools[]`
+with a versioned `type` (`web_fetch_20250910` and later) and **no**
+`input_schema`, and the SERVER performs the HTTP GET and feeds the extracted
+text back to the model. The upstream this proxy talks to is an OpenAI-compatible
+Responses API, which has no `web_fetch` of its own — so the proxy is that server.
+
+The implementation lives in `src/web_fetch/`:
+
+| module | what it owns |
+|---|---|
+| `mod.rs` | activation (`has_server_side_web_fetch`, `active`) and `prepare` (synthesize the function tool, force buffering) |
+| `fetch.rs` | the outbound HTTP request: URL validation, SSRF guard, DNS pinning, redirect re-validation, streaming read with a byte cap |
+| `extract.rs` | `dom_smoothie` (Readability) primary extraction, `fast_html2md` full-page fallback |
+| `protocol.rs` | the pure wire builders (`server_tool_use`, `web_fetch_tool_result`, the error result) |
+| `session.rs` | the executor loop: detect the call, fetch, inject the result, re-run |
+
+**The loop.** `prepare` forces `stream: false` on the outbound request, because a
+fetch means the executor MUST be re-run with the page text before the turn can
+end. The chain is buffered and, for a streaming client, converted to a single
+synthetic Anthropic SSE sequence (the same `advisor::sse::message_to_events`
+adapter the advisor uses). `src/stream.rs` is untouched.
+
+**Activation.** `web_fetch.enabled` (default `false`) AND an inbound tool named
+`web_fetch` with no `input_schema`. A client function tool that happens to be
+named `web_fetch` (with a schema) is an ordinary tool and is forwarded upstream
+untouched.
+
+**Failure.** A failed fetch never fails the client request: it becomes a
+`web_fetch_tool_result` error block with an Anthropic error code
+(`invalid_tool_input`, `url_not_allowed`, `url_not_accessible`, `unavailable`),
+the executor is told the fetch failed, and the turn continues.
+
+**SSRF.** The URL comes from a model, so the fetch layer treats it as hostile:
+`http`/`https` only, no credentials in the URL, every resolved address checked
+against the private/reserved ranges, the checked address pinned for the
+connection (so DNS rebinding cannot slip a different address past the check),
+and every redirect hop re-validated. There is deliberately **no** domain
+allow-list and **no** URL-length limit.
+
+**Not enforced by the proxy:** the `max_uses` the client declares — the proxy
+fetches as many URLs as the executor asks for, and a turn that passes ten
+fetches is logged with a warning rather than stopped.
+
+> **Claude Code CLI does not send this tool.** It ships a *client-side*
+> `WebFetch` tool (capitalised, with an `input_schema`) and does the HTTP GET
+> itself; it never declares the server-side `web_fetch`. This feature is for
+> Anthropic-API clients that DO declare the server tool — the Claude Agent SDK,
+> direct Messages API calls, and gateways that add the server tool on the
+> client's behalf. Claude Code's own `WebFetch` continues to work through the
+> ordinary client-tool path and is unaffected by this feature.
+
 ## Launching Claude Code
 
 - `scripts/start-claude-code.sh` is the Linux/macOS launcher.
@@ -261,10 +316,11 @@ upstream SSE/response -> translate::response or ::stream (OpenAI -> Anthropic) -
 
 The proxy implements the core Anthropic Messages API path for Claude Code: streaming,
 client tool use, stop-reason/usage remapping, model aliases, reasoning-effort
-mapping, extended-thinking replay, prompt caching (partial), and the experimental
-advisor tool. The following Claude Code / Anthropic API capabilities are **not**
-supported because they depend on Anthropic-specific behaviour the proxy cannot
-recreate against an OpenAI-compatible upstream.
+mapping, extended-thinking replay, prompt caching (partial), the experimental
+advisor tool, and the server-side `web_fetch` tool. The following Claude Code /
+Anthropic API capabilities are **not** supported because they depend on
+Anthropic-specific behaviour the proxy cannot recreate against an
+OpenAI-compatible upstream.
 
 See also [`README.md`](./README.md#features) for the shorter visitor-facing list.
 
@@ -283,7 +339,7 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 - `thinking.budget_tokens` is parsed but not enforced or forwarded
 
 ### Server-side / built-in tools
-- Server-side tools beyond OpenAI's `web_search` (no `web_fetch`, `code_execution`, `tool_search`, etc.)
+- Server-side tools beyond OpenAI's `web_search` and the proxy's own `web_fetch` (no `code_execution`, `tool_search`, etc.)
 - Server-tool continuation loops (`pause_turn` re-sends, mixed server/client turns)
 - Claude Code's standby advisor path (only an explicitly configured `advisorModel` works behind a proxy)
 
@@ -307,6 +363,9 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 
 This is a planning note for future changes. It is separate from the current
 "out of scope" list above, which describes hard limits of the design.
+
+> **Done:** the server-side `web_fetch` tool (image input support landed
+> earlier) — see "Server-side `web_fetch`" above.
 
 ### Best next improvement: `/v1/models`
 

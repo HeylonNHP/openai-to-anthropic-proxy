@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
 use openai_to_anthropic_proxy::config::{
-    AdvisorConfig, Config, ModelAliases, ReasoningConfig, ToolResultImages,
+    AdvisorConfig, Config, ModelAliases, ReasoningConfig, ToolResultImages, WebFetchConfig,
 };
 use reqwest::Body as ReqBody;
 use tokio::net::TcpListener;
@@ -181,6 +181,7 @@ fn make_config_with_default_model(
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
@@ -216,6 +217,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     })
@@ -621,6 +623,7 @@ async fn per_model_reasoning_effort_lookup() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -712,6 +715,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -795,6 +799,7 @@ async fn model_alias_rewrites_inbound_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -874,6 +879,7 @@ async fn model_not_supported_falls_back_to_default() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -932,6 +938,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -998,6 +1005,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1653,6 +1661,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1750,6 +1759,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1825,6 +1835,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -1913,6 +1924,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2003,6 +2015,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2100,6 +2113,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2190,6 +2204,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -2848,6 +2863,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         log_to_disk: false,
         proxy_key: None,
         advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
     });
@@ -6245,4 +6261,362 @@ async fn large_tool_result_image_is_accepted() {
         text.contains("\"input_image\""),
         "image part must reach the upstream"
     );
+}
+
+// ─── Server-side `web_fetch` ───────────────────────────────────────────────
+//
+// The Anthropic server-side `web_fetch` tool: the client declares it in
+// `tools[]` with a versioned `type` and NO `input_schema`, and the SERVER
+// does the HTTP fetch. The proxy is that server.
+//
+// The fetch itself cannot be pointed at a loopback test server — the SSRF
+// guard correctly refuses private addresses, because the URL comes from a
+// model. These tests therefore cover the PROXY side of the contract (tool
+// synthesis, call interception, error degradation, wire shape); the fetch
+// layer itself is covered by `src/web_fetch/fetch/live_tests.rs`, which uses
+// the test-only permissive address policy.
+
+/// The Anthropic server-side `web_fetch` declaration: a name, a versioned
+/// `type`, and NO `input_schema` (that is what makes it a server tool).
+const WEB_FETCH_DECLARATION: &str =
+    r#"{"type":"web_fetch_20250910","name":"web_fetch","max_uses":10}"#;
+
+/// A request that declares the server-side `web_fetch` tool.
+fn web_fetch_request(stream: bool) -> String {
+    format!(
+        r#"{{
+            "model": "gpt-4o-mini",
+            "max_tokens": 64,
+            "stream": {stream},
+            "tools": [{WEB_FETCH_DECLARATION}],
+            "messages": [{{"role": "user", "content": "Summarize the page"}}]
+        }}"#
+    )
+}
+
+/// A Responses body whose output is one `function_call` for `web_fetch`.
+fn web_fetch_call_response(url: &str) -> String {
+    serde_json::json!({
+        "id": "resp_fetch",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "gpt-4o-mini",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "web_fetch",
+            "arguments": serde_json::json!({ "url": url }).to_string(),
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    })
+    .to_string()
+}
+
+/// A proxy config with `web_fetch` enabled.
+fn web_fetch_config(upstream: SocketAddr) -> Arc<Config> {
+    let mut config = (*make_proxy_config(upstream)).clone();
+    config.web_fetch = WebFetchConfig {
+        enabled: true,
+        timeout_secs: Some(2),
+        max_bytes: None,
+        max_content_bytes: None,
+    };
+    Arc::new(config)
+}
+
+/// With `web_fetch` disabled, the request must be byte-for-byte identical to
+/// the pre-feature path: no synthesized tool, no forced buffering, no extra
+/// upstream call.
+#[tokio::test]
+async fn web_fetch_disabled_is_byte_for_byte_identical() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_same", "same answer"));
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.web_fetch.enabled = false;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "id": "msg_resp_same",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "same answer"}],
+            "model": "gpt-4o-mini",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 3
+            }
+        }),
+        "the client response must be unchanged when web_fetch is disabled"
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "no extra upstream POSTs");
+}
+
+/// With `web_fetch` enabled and the tool declared, the proxy must
+/// synthesize the function tool and force the upstream request to be
+/// buffered (the executor has to be re-run with the fetched text).
+#[tokio::test]
+async fn web_fetch_enabled_synthesizes_the_tool_and_buffers() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_done", "done"));
+    let config = web_fetch_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(true)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1);
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    // The upstream request is buffered so the executor can be re-run.
+    assert_eq!(received["stream"], false);
+    // The synthesized function tool is present, with the URL parameter.
+    let tools = received["tools"].as_array().expect("tools");
+    let fetch_tool = tools
+        .iter()
+        .find(|t| t["name"] == "web_fetch")
+        .expect("the web_fetch function tool must be synthesized");
+    assert_eq!(fetch_tool["type"], "function");
+    assert_eq!(fetch_tool["parameters"]["required"][0], "url");
+}
+
+/// The full loop: the upstream asks for a fetch, the fetch fails (the SSRF
+/// guard refuses the private address), and the proxy must DEGRADE — emitting
+/// a `web_fetch_tool_result` error block, re-running the executor, and still
+/// answering the client with HTTP 200.
+#[tokio::test]
+async fn a_failed_fetch_degrades_to_an_error_block_and_the_turn_continues() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    // Attempt 1: the executor asks for the page. Attempt 2: the executor
+    // answers with the failure in context.
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_fetch_call_response("http://127.0.0.1:9/page")),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id(
+                "resp_after",
+                "I could not retrieve it.",
+            )),
+        },
+    ]);
+
+    let config = web_fetch_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().expect("content");
+
+    // The `server_tool_use` block opens the pair.
+    let use_block = content
+        .iter()
+        .find(|b| b["type"] == "server_tool_use")
+        .expect("a server_tool_use block must be present");
+    assert_eq!(use_block["name"], "web_fetch");
+    assert!(use_block["input"]["url"].is_string());
+
+    // The paired result is an ERROR, because the private address is
+    // refused by the SSRF guard.
+    let result = content
+        .iter()
+        .find(|b| b["type"] == "web_fetch_tool_result")
+        .expect("a web_fetch_tool_result block must be present");
+    assert_eq!(result["tool_use_id"], use_block["id"]);
+    assert_eq!(result["content"]["type"], "web_fetch_tool_result_error");
+    assert_eq!(result["content"]["error_code"], "url_not_allowed");
+
+    // The executor's final answer is still delivered.
+    assert!(
+        content
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "I could not retrieve it."),
+        "the executor's answer must survive the failed fetch: {content:?}"
+    );
+
+    // Two upstream calls: the executor asked, then the executor answered.
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 2);
+}
+
+/// The client must never see a `tool_use` for `web_fetch`: it is a SERVER
+/// tool, and the client only knows the `server_tool_use` /
+/// `web_fetch_tool_result` pair.
+#[tokio::test]
+async fn the_client_never_sees_a_web_fetch_tool_use() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_fetch_call_response("http://127.0.0.1:9/page")),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "answer")),
+        },
+    ]);
+
+    let config = web_fetch_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(false)))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().expect("content");
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "web_fetch"),
+        "the internal web_fetch call must not surface as a client tool_use: {content:?}"
+    );
+}
+
+/// A streaming client gets ONE synthetic Anthropic SSE sequence.
+#[tokio::test]
+async fn a_streaming_client_gets_one_synthetic_sse_sequence() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_fetch_call_response("http://127.0.0.1:9/page")),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "streamed answer")),
+        },
+    ]);
+
+    let config = web_fetch_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(true)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "a streaming client must get an SSE response"
+    );
+
+    let body = res.text().await.unwrap();
+    assert_eq!(
+        body.matches("\"type\":\"message_start\"").count(),
+        1,
+        "exactly one message_start"
+    );
+    assert_eq!(
+        body.matches("\"type\":\"message_stop\"").count(),
+        1,
+        "exactly one message_stop"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "the synthetic sequence must not carry a [DONE] sentinel"
+    );
+}
+
+/// A request that declares a CLIENT function tool named `web_fetch` (with
+/// an `input_schema`) must not activate the server-tool pipeline.
+#[tokio::test]
+async fn a_client_function_tool_named_web_fetch_does_not_activate_the_pipeline() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_plain", "plain answer"));
+    let config = web_fetch_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let request = r#"{
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "tools": [{"name":"web_fetch","description":"d","input_schema":{"type":"object","properties":{"url":{"type":"string"}}}}],
+        "messages": [{"role": "user", "content": "hello"}]
+    }"#;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "no re-run: the pipeline must not activate");
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    // The client's own tool is forwarded upstream, unchanged.
+    let tools = received["tools"].as_array().expect("tools");
+    assert!(
+        tools.iter().any(|t| t["name"] == "web_fetch"),
+        "the client tool must be forwarded: {tools:?}"
+    );
+}
+
+/// A `web_fetch` declaration with the shipped default config must not
+/// change the pipeline at all: the feature is off by default.
+#[tokio::test]
+async fn the_default_config_leaves_the_pipeline_alone() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_plain", "plain answer"));
+    // The shipped default is `enabled: false`.
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(web_fetch_request(true)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "no extra upstream POSTs");
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    // Streaming is NOT forced off when the feature is off.
+    assert_eq!(received["stream"], true);
 }

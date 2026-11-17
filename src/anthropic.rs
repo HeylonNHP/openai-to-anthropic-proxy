@@ -174,6 +174,15 @@ pub enum ContentBlockParam {
     /// opaque: `advisor_result{text}`, `advisor_redacted_result{
     /// encrypted_content}`, `advisor_tool_result_error{error_code}`.
     AdvisorToolResult(AdvisorToolResultBlockParam),
+    /// The `web_fetch` paired result block, echoed by Claude Code on the
+    /// next turn: `{"type":"web_fetch_tool_result","tool_use_id":"…",
+    /// "content":{…}}`.
+    ///
+    /// `content` is kept opaque (it is a nested union), but the fields
+    /// the translator needs — the URL and the extracted text — are also
+    /// flattened into named fields so the replay does not have to dig
+    /// through the union.
+    WebFetchToolResult(WebFetchToolResultBlockParam),
     /// Unknown block types round-trip as raw JSON; the translator drops them
     /// when forwarding to OpenAI (with a tracing warning).
     #[serde(other)]
@@ -250,6 +259,42 @@ pub struct AdvisorToolResultBlockParam {
     /// Opaque result union: `advisor_result{text}`,
     /// `advisor_redacted_result{encrypted_content}`, or
     /// `advisor_tool_result_error{error_code}` (plus future fields).
+    #[serde(default)]
+    pub content: Value,
+    /// All unrecognised fields, preserved for verbatim round-tripping.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Anthropic `web_fetch_tool_result` block as echoed back by Claude Code.
+///
+/// The full block is:
+/// ```json
+/// {
+///   "type": "web_fetch_tool_result",
+///   "tool_use_id": "srvtoolu_…",
+///   "content": {
+///     "type": "web_fetch_result",
+///     "url": "https://example.com/article",
+///     "content": {
+///       "type": "document",
+///       "source": { "type": "text", "media_type": "text/plain", "data": "…" }
+///     },
+///     "retrieved_at": "2025-08-25T10:30:00Z"
+///   }
+/// }
+/// ```
+///
+/// The whole `content` is kept opaque, and the two fields the translator
+/// needs (the URL and the text) are dug out of it by
+/// `translate::web_fetch_result_fields`. Every field is defaulted, so a
+/// partial or future-shaped block never fails the request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebFetchToolResultBlockParam {
+    /// Id of the preceding `server_tool_use` block.
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub tool_use_id: String,
+    /// The opaque `web_fetch_result` union.
     #[serde(default)]
     pub content: Value,
     /// All unrecognised fields, preserved for verbatim round-tripping.

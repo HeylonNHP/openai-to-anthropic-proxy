@@ -57,6 +57,14 @@ const DEFAULT_ADVISOR_MAX_USES: u32 = 2;
 const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 2048;
 const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 
+/// Default total timeout for one `web_fetch` request, in seconds.
+///
+/// The proxy performs the fetch ITSELF (it is the server-side tool), so
+/// this bound covers the whole operation: connect, read, extract. It is
+/// the wall-clock ceiling for a single fetch, not a per-byte or
+/// per-redirect budget.
+const DEFAULT_WEB_FETCH_TIMEOUT_SECS: u64 = 20;
+
 /// Warning text for an advisor whose consultation loop is UNBOUNDED.
 ///
 /// `advisor.max_uses` = 0 = "no limit". Shared by the config resolver and
@@ -197,6 +205,10 @@ pub struct Config {
     /// request pipeline behaves exactly as it did before the advisor feature
     /// existed (no extra upstream call, no synthesized tool, no wire fields).
     pub advisor: AdvisorConfig,
+    /// Server-side `web_fetch` policy. See [`WebFetchConfig`] and
+    /// `crate::web_fetch`. When `enabled` is false the proxy never fetches
+    /// a URL on the model's behalf and the request pipeline is unchanged.
+    pub web_fetch: WebFetchConfig,
     /// Warnings raised while resolving this configuration.
     ///
     /// The resolver runs BEFORE the binary installs the tracing
@@ -280,6 +292,46 @@ pub struct AdvisorConfig {
     /// Per-request timeout for the advisor's upstream call. `None` = no
     /// per-request override; the global `request_timeout` applies.
     pub timeout_secs: Option<u64>,
+}
+
+/// Resolved `web_fetch` settings (the `web_fetch` section of `proxy.json`).
+///
+/// The proxy is the SERVER for Anthropic's server-side `web_fetch` tool:
+/// it performs the HTTP fetch itself and hands the extracted text back to
+/// the executor model. Every knob here therefore bounds OUTBOUND work the
+/// proxy does on the model's behalf.
+///
+/// The defaults are deliberately permissive — there is no domain allowlist
+/// and no URL-length limit — because the operator asked for "fetch any URL
+/// the model asks for". The bounds that remain are the ones that protect
+/// the PROCESS (timeout) and the ones the operator can tighten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFetchConfig {
+    /// Whether the proxy will fetch URLs on the model's behalf.
+    pub enabled: bool,
+    /// Total wall-clock budget for ONE fetch (connect + read + extract).
+    /// `None` = no timeout.
+    pub timeout_secs: Option<u64>,
+    /// Maximum number of bytes read from the network for one fetch.
+    /// `None` = unlimited.
+    pub max_bytes: Option<u64>,
+    /// Maximum size of the EXTRACTED text, in bytes, before it is
+    /// truncated at a paragraph boundary. `None` = no truncation.
+    ///
+    /// This is separate from [`Self::max_bytes`]: `max_bytes` bounds the
+    /// network read, this one bounds what is handed to the model.
+    pub max_content_bytes: Option<u64>,
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: Some(DEFAULT_WEB_FETCH_TIMEOUT_SECS),
+            max_bytes: None,
+            max_content_bytes: None,
+        }
+    }
 }
 
 impl Default for AdvisorConfig {
@@ -829,6 +881,57 @@ impl Config {
             );
         }
 
+        // `web_fetch`: env > file > default, exactly like `advisor`.
+        //
+        // The three limits use the same RAW-number discipline (the resolver
+        // judges them, an invalid value warns instead of failing startup)
+        // and the same house rule that `0` means "no limit".
+        //
+        // The DEFAULTS are permissive on purpose: `max_bytes` and
+        // `max_content_bytes` are UNLIMITED unless the operator sets them,
+        // because the operator asked for "fetch any URL" with no
+        // arbitrary limits. Only the timeout has a shipped default.
+        let web_fetch_defaults = WebFetchConfig::default();
+        let web_fetch_json = file.and_then(|f| f.web_fetch.as_ref());
+        let web_fetch_enabled = env
+            .web_fetch_enabled
+            .or_else(|| web_fetch_json.and_then(|w| w.enabled))
+            .unwrap_or(web_fetch_defaults.enabled);
+        let web_fetch_timeout_secs = resolve_web_fetch_limit(
+            pick_limit(
+                web_fetch_json.and_then(|w| w.timeout_secs.as_ref()),
+                env.web_fetch_timeout_secs.as_ref(),
+            ),
+            web_fetch_defaults.timeout_secs,
+            "web_fetch.timeout_secs",
+            &mut warnings,
+        );
+        let web_fetch_max_bytes = resolve_web_fetch_limit(
+            pick_limit(
+                web_fetch_json.and_then(|w| w.max_bytes.as_ref()),
+                env.web_fetch_max_bytes.as_ref(),
+            ),
+            web_fetch_defaults.max_bytes,
+            "web_fetch.max_bytes",
+            &mut warnings,
+        );
+        let web_fetch_max_content_bytes = resolve_web_fetch_limit(
+            pick_limit(
+                web_fetch_json.and_then(|w| w.max_content_bytes.as_ref()),
+                env.web_fetch_max_content_bytes.as_ref(),
+            ),
+            web_fetch_defaults.max_content_bytes,
+            "web_fetch.max_content_bytes",
+            &mut warnings,
+        );
+
+        let web_fetch = WebFetchConfig {
+            enabled: web_fetch_enabled,
+            timeout_secs: web_fetch_timeout_secs,
+            max_bytes: web_fetch_max_bytes,
+            max_content_bytes: web_fetch_max_content_bytes,
+        };
+
         Ok(Self {
             listen_addr,
             upstream_base_url,
@@ -845,6 +948,7 @@ impl Config {
             proxy_key,
             log_to_disk,
             advisor,
+            web_fetch,
             warnings,
         })
     }
@@ -1053,6 +1157,13 @@ pub struct EnvInputs {
     pub advisor_max_uses: Option<serde_json::Number>,
     pub advisor_max_tokens: Option<serde_json::Number>,
     pub advisor_timeout_secs: Option<serde_json::Number>,
+    /// `web_fetch` overrides. `WEB_FETCH_ENABLED` uses the same truthy
+    /// values as `LOG_TO_DISK`; the three limits are read as RAW numbers
+    /// so the resolver judges them exactly like the file's values.
+    pub web_fetch_enabled: Option<bool>,
+    pub web_fetch_timeout_secs: Option<serde_json::Number>,
+    pub web_fetch_max_bytes: Option<serde_json::Number>,
+    pub web_fetch_max_content_bytes: Option<serde_json::Number>,
 }
 
 fn parse_truthy(raw: &str) -> bool {
@@ -1090,6 +1201,16 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             advisor_timeout_secs: env::var("ADVISOR_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_fetch_enabled: env::var("WEB_FETCH_ENABLED").ok().map(|s| parse_truthy(&s)),
+            web_fetch_timeout_secs: env::var("WEB_FETCH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_fetch_max_bytes: env::var("WEB_FETCH_MAX_BYTES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_fetch_max_content_bytes: env::var("WEB_FETCH_MAX_CONTENT_BYTES")
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
         }
@@ -1251,6 +1372,87 @@ where
     }
 }
 
+/// Resolve one `web_fetch` limit from its raw JSON/env value.
+///
+/// Same discipline as [`resolve_advisor_limit`], with one difference: the
+/// default is an `Option`, because two of the three `web_fetch` limits
+/// default to UNLIMITED (`None`).
+///
+/// * **absent** → the shipped default (which may itself be `None`);
+/// * **`0`** → **no limit** (`None`), the house rule;
+/// * **`n > 0`** → `Some(n)`;
+/// * **anything else** → the shipped default WITH a warning.
+fn resolve_web_fetch_limit(
+    value: Option<serde_json::Number>,
+    default: Option<u64>,
+    field: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Option<u64> {
+    let Some(number) = value.as_ref() else {
+        return default;
+    };
+    let v = match classify_limit(number) {
+        RawLimit::Whole(v) => v,
+        RawLimit::Negative => {
+            push_invalid_web_fetch_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it is negative",
+            );
+            return default;
+        }
+        RawLimit::Fractional => {
+            push_invalid_web_fetch_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it is not a whole number",
+            );
+            return default;
+        }
+        RawLimit::TooLarge => {
+            push_invalid_web_fetch_limit_warning(
+                warnings,
+                field,
+                number,
+                default,
+                "it is out of range",
+            );
+            return default;
+        }
+    };
+    if v == 0 {
+        // `0` = no limit (the house rule).
+        return None;
+    }
+    Some(v)
+}
+
+/// Record the warning for a `web_fetch` limit that cannot be a limit.
+///
+/// The fallback is an `Option`, so it is rendered as "unlimited" rather
+/// than a number — `Option<u64>` is not `Display`.
+fn push_invalid_web_fetch_limit_warning(
+    warnings: &mut Vec<ConfigWarning>,
+    field: &str,
+    number: &serde_json::Number,
+    default: Option<u64>,
+    reason: &str,
+) {
+    let fallback = default.map_or_else(|| "unlimited".to_owned(), |v| v.to_string());
+    warnings.push(
+        ConfigWarning::new(format!(
+            "{field} = {number} is not a valid limit ({reason}); using the default {fallback}"
+        ))
+        .with_field("field", field)
+        .with_field("value", number.to_string())
+        .with_field("fallback", fallback),
+    );
+}
+
 /// Record the warning for an advisor limit that cannot be a limit
 /// (negative, fractional, too large). COLLECTED, not emitted — see
 /// [`ConfigWarning`].
@@ -1399,6 +1601,35 @@ pub struct JsonConfig {
     /// who saved from the TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advisor: Option<JsonAdvisorConfig>,
+    /// Server-side `web_fetch` settings. Off by default.
+    /// See [`WebFetchConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_fetch: Option<JsonWebFetchConfig>,
+}
+
+/// JSON shape of the `web_fetch` section of `proxy.json`.
+///
+/// Every field is optional. `deny_unknown_fields` keeps a typo from being
+/// silently ignored.
+///
+/// The limits are RAW numbers (same rationale as [`JsonAdvisorConfig`]):
+/// the RESOLVER is the only place that interprets one, so a negative or
+/// fractional value produces a WARNING instead of stopping the proxy.
+///
+/// There is deliberately **no** domain allowlist and **no** URL-length
+/// limit: the operator asked for "fetch any URL the model asks for".
+/// The bounds that exist are the timeout, the network read cap, and the
+/// extracted-content cap.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct JsonWebFetchConfig {
+    pub enabled: Option<bool>,
+    /// Raw limit, exactly as written. The RESOLVER judges it.
+    pub timeout_secs: Option<serde_json::Number>,
+    /// Raw limit, exactly as written. The RESOLVER judges it.
+    pub max_bytes: Option<serde_json::Number>,
+    /// Raw limit, exactly as written. The RESOLVER judges it.
+    pub max_content_bytes: Option<serde_json::Number>,
 }
 
 /// JSON shape of the `advisor` section of `proxy.json`.

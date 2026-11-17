@@ -108,6 +108,7 @@ fn test_config_minimal() -> Config {
         log_to_disk: false,
         proxy_key: None,
         advisor: crate::config::AdvisorConfig::default(),
+        web_fetch: crate::config::WebFetchConfig::default(),
         tool_result_images: crate::config::ToolResultImages::default(),
         warnings: Vec::new(),
     }

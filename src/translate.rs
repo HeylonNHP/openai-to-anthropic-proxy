@@ -1577,13 +1577,15 @@ fn append_user_message(
                         );
                     }
                     ContentBlockParam::ServerToolUse(_)
-                    | ContentBlockParam::AdvisorToolResult(_) => {
-                        // Advisor echo blocks belong to an assistant turn.
-                        // Folding them into the user's voice would attribute
-                        // the prior consultation to the user, so drop them
-                        // just as the old `Unknown` fallback did.
+                    | ContentBlockParam::AdvisorToolResult(_)
+                    | ContentBlockParam::WebFetchToolResult(_) => {
+                        // Server tool echo blocks belong to an assistant
+                        // turn. Folding them into the user's voice would
+                        // attribute the prior consultation or the fetched
+                        // page to the user, so drop them just as the old
+                        // `Unknown` fallback did.
                         tracing::warn!(
-                            "dropping advisor echo block from user message \
+                            "dropping server tool echo block from user message \
                              (server tool blocks belong in assistant turns)"
                         );
                     }
@@ -1876,6 +1878,58 @@ const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
 const ADVISOR_ADVICE_PREFIX: &str = "[Advisor advice from a previous turn: ";
 const ADVISOR_ADVICE_SUFFIX: &str = "]\n";
 
+/// Delimiters around the page text replayed from an echoed
+/// `web_fetch_tool_result` block.
+///
+/// The text is the CONTENT OF A WEB PAGE the model fetched on a previous
+/// turn, not something the assistant said. Folding it into the
+/// assistant's own `output_text` without a delimiter would attribute a
+/// web page's words to the assistant — and a page can contain anything,
+/// including text that looks like instructions. The delimiters make the
+/// provenance explicit.
+const WEB_FETCH_CONTENT_PREFIX: &str = "[Web page content fetched earlier: ";
+const WEB_FETCH_CONTENT_SUFFIX: &str = "]\n";
+
+/// Pull the URL and the extracted text out of an echoed
+/// `web_fetch_tool_result` block's opaque `content` union.
+///
+/// The shape Anthropic sends is:
+///
+/// ```json
+/// {
+///   "type": "web_fetch_result",
+///   "url": "https://example.com/article",
+///   "content": {
+///     "type": "document",
+///     "source": { "type": "text", "media_type": "text/plain", "data": "…" }
+///   }
+/// }
+/// ```
+///
+/// An ERROR result carries no text (`content.type` is
+/// `web_fetch_tool_result_error`), so it yields an empty string and the
+/// caller replays nothing — an error is not page content.
+#[must_use]
+pub fn web_fetch_result_fields(content: &Value) -> (String, String) {
+    // Only a successful result carries content.
+    if content.get("type").and_then(Value::as_str) != Some("web_fetch_result") {
+        return (String::new(), String::new());
+    }
+    let url = content
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let text = content
+        .get("content")
+        .and_then(|c| c.get("source"))
+        .and_then(|s| s.get("data"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    (url, text)
+}
+
 /// Neutralise the reasoning fence inside replayed reasoning text.
 ///
 /// The reasoning is model output from a *previous* turn, and the model may
@@ -1984,6 +2038,11 @@ fn append_assistant_message(
             // order. Kept so the paired result below can be attributed; they
             // must NOT become Responses `function_call` items (see below).
             let mut advisor_consultation_ids: Vec<String> = Vec::new();
+            // Ids of echoed `server_tool_use{name:"web_fetch"}` blocks, in
+            // wire order. Same rule as the advisor's: they must NOT become
+            // Responses `function_call` items, because the paired RESULT
+            // block carries the page text into context instead.
+            let mut web_fetch_use_ids: Vec<String> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
@@ -2050,6 +2109,16 @@ fn append_assistant_message(
                                 id = %stu.id,
                                 "echoed advisor server_tool_use; no function_call emitted"
                             );
+                        } else if stu.name == crate::web_fetch::WEB_FETCH_TOOL_NAME {
+                            // Same rule for the server-side `web_fetch`
+                            // tool: the paired RESULT block carries the
+                            // page text into context, so no `function_call`
+                            // is emitted for the echoed use.
+                            web_fetch_use_ids.push(stu.id.clone());
+                            tracing::debug!(
+                                id = %stu.id,
+                                "echoed web_fetch server_tool_use; no function_call emitted"
+                            );
                         } else {
                             tracing::warn!(
                                 name = %stu.name,
@@ -2104,6 +2173,38 @@ fn append_assistant_message(
                                 kind = ?kind,
                                 "echoed advisor result carries no plaintext advice"
                             ),
+                        }
+                    }
+                    ContentBlockParam::WebFetchToolResult(res) => {
+                        // The echoed `web_fetch_tool_result`. The page text
+                        // it carries is what the model needs in context on
+                        // the NEXT turn, so it is folded into the same
+                        // assistant `output_text` part — delimited, so the
+                        // upstream can tell it from the assistant's own
+                        // words.
+                        let (url, page_text) = web_fetch_result_fields(&res.content);
+                        if page_text.trim().is_empty() {
+                            tracing::debug!(
+                                kind = ?res.content.get("type").and_then(|v| v.as_str()),
+                                "echoed web_fetch result carries no page text"
+                            );
+                        } else {
+                            let paired = web_fetch_use_ids.iter().any(|id| id == &res.tool_use_id);
+                            if !paired {
+                                tracing::debug!(
+                                    tool_use_id = %res.tool_use_id,
+                                    "echoed web_fetch result has no preceding \
+                                     server_tool_use in this message"
+                                );
+                            }
+                            text.push('\n');
+                            text.push_str(WEB_FETCH_CONTENT_PREFIX);
+                            if !url.is_empty() {
+                                text.push_str(&url);
+                                text.push_str(": ");
+                            }
+                            text.push_str(&page_text);
+                            text.push_str(WEB_FETCH_CONTENT_SUFFIX);
                         }
                     }
                     ContentBlockParam::Image(_)

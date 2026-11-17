@@ -302,6 +302,31 @@ less of it — but remember the cap is per turn, so the real bound is `turns × 
 - The reasoning item always carries a `summary` field, even when empty, because the upstream's schema marks it required.
 - A reasoning item that carries only a signature (no text) is still emitted, with an empty `summary`. Some endpoints may reject it.
 
+### Web fetch (`web_fetch`)
+
+Optional settings for the server-side `web_fetch` tool — Anthropic's "fetch this URL for me" server tool, which the proxy implements itself. **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy fetches nothing, synthesizes no tool, and every ordinary request is byte-for-byte unchanged.
+
+When enabled, a fetch happens only if the client declared the **server-side** `web_fetch` tool (a tool named `web_fetch` with **no** `input_schema`) **and** the executor emits `function_call{name:"web_fetch"}`. The proxy performs the HTTP GET itself, extracts the readable text, and hands it back to the executor so the model can answer with the page in context.
+
+```json
+"web_fetch": {
+  "enabled": false,
+  "timeout_secs": 20,
+  "max_bytes": null,
+  "max_content_bytes": null
+}
+```
+
+- `timeout_secs` bounds the **whole** fetch — connect, read and extract — as one wall-clock budget. The default is 20 seconds.
+- `max_bytes` caps how many bytes are read from the network for one fetch. **`null` (the default) means unlimited.**
+- `max_content_bytes` caps the size of the **extracted text** that is handed to the model, truncating at a paragraph boundary. **`null` (the default) means no truncation.**
+- There is deliberately **no domain allow-list and no URL-length limit**: the proxy fetches any `http`/`https` URL the model asks for.
+- There **is** an SSRF guard, and it is not configurable: only `http`/`https` are allowed, a URL may not carry credentials, every resolved address is checked against the private/reserved ranges (loopback, RFC1918, link-local including the cloud metadata address, CGNAT, unique-local, multicast, …), the checked address is the one the connection uses (so DNS rebinding cannot smuggle a different one past the check), and every redirect hop is re-validated the same way.
+- A failed fetch never fails the request. It becomes a `web_fetch_tool_result` error block (with an Anthropic error code such as `url_not_allowed` or `url_not_accessible`), the executor is told the fetch failed, and the turn continues — the same contract Anthropic's own server-side tools have.
+- The number of fetches per turn is **not** capped by the proxy. The client may declare `max_uses`, but the proxy does not enforce it; a turn that fetches ten URLs is logged with a warning rather than stopped.
+- Every field has an env override with the same **env > file > default** precedence used elsewhere: `WEB_FETCH_ENABLED`, `WEB_FETCH_TIMEOUT_SECS`, `WEB_FETCH_MAX_BYTES`, `WEB_FETCH_MAX_CONTENT_BYTES`. `WEB_FETCH_ENABLED` accepts `1`/`true`/`yes`/`on`.
+- The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
+
 ### Advisor (`advisor`)
 
 Optional settings for the server-side advisor (a second-opinion consultation inside one assistant message). **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy makes no extra upstream calls, synthesizes no tool, and emits no advisor wire fields — every ordinary request is byte-for-byte unchanged. When enabled, a consultation happens only if the client declared a tool named `advisor` **and** the executor emits `function_call{name:"advisor"}`; it is bounded by `max_uses` (set `max_uses` to `0` to remove that bound — see below) and degrades to `error_code: "unavailable"` on any advisor failure without failing the client request.
