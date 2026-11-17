@@ -43,6 +43,7 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `WEB_FETCH_TIMEOUT_SECS` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
 | `WEB_FETCH_MAX_BYTES` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
 | `WEB_FETCH_MAX_CONTENT_BYTES` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
+| `PREFIX_MODELS_FOR_DISCOVERY` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. Also settable as the `prefix_models_for_discovery` field in `proxy.json`. |
 
 
 `proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
