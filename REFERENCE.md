@@ -18,35 +18,38 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 
 The proxy reads environment variables first, then an optional `proxy.json`, then built-in defaults. Environment variables win on conflict.
 
-| Variable | Default | Required? | Description |
-|---|---|---|---|
-| `UPSTREAM_BASE_URL` | (none) | yes | Upstream OpenAI-compatible base URL (e.g. `https://api.openai.com`). Required. |
-| `UPSTREAM_API_KEY` | (none) | yes | Bearer token for the upstream. Required. |
-| `LISTEN_ADDR` | `0.0.0.0:8085` | no | Socket address the proxy binds. |
-| `UPSTREAM_PATH` | `/v1/responses` | no | Path appended to the upstream base URL. |
-| `REQUEST_TIMEOUT_SECS` | `600` | no | Per-request timeout in seconds (also clamps `advisor`/`web_fetch` budgets when those set higher). |
-| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | Positive whole-number byte cap for `POST /v1/messages`. Invalid/zero/negative/fractional/out-of-range values warn and fall back to the default; non-numeric strings are ignored. |
-| `REASONING_EFFORT` | (none) | no | Default reasoning effort label applied to inbound requests (e.g. `low`/`medium`/`high`/`xhigh`/`max`/`none`). |
-| `PROMPT_CACHING_ENABLED` | `false` | no | Set `true` to forward OpenAI prompt-cache hints. |
-| `PROMPT_CACHING_MODELS` | (none) | no | Comma-separated inbound model IDs that the cache path is allowed for. |
-| `PROMPT_CACHE_KEY` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
-| `TOOL_RESULT_IMAGES` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, or `drop`). |
-| `LOG_TO_DISK` | `false` | no | Set `1`/`true`/`yes` to also write `target/logs/proxy.log`. |
-| `PROXY_KEY` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |
-| `ADVISOR_ENABLED` | `false` | no | Enable the experimental advisor tool. Accepts `1`/`true`/`yes`/`on`. |
-| `ADVISOR_MODEL` | `beam` | no | Upstream model name the advisor is routed to (not alias-resolved; written as-is into the advisor request). |
-| `ADVISOR_EFFORT` | (none) | no | Reasoning-effort string applied to the advisor request only. Omit to send none. |
-| `ADVISOR_MAX_USES` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative/fractional/out-of-range values fall back to the default + a warning. |
-| `ADVISOR_MAX_TOKENS` | `2048` | no | Cap on the advisor answer (output tokens). `0` removes the cap (upstream default then applies). |
-| `ADVISOR_TIMEOUT_SECS` | `45` | no | Per-advisor-call timeout. `0` uses the global budget only. |
-| `WEB_FETCH_ENABLED` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1`/`true`/`yes`/`on`. |
-| `WEB_FETCH_TIMEOUT_SECS` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
-| `WEB_FETCH_MAX_BYTES` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
-| `WEB_FETCH_MAX_CONTENT_BYTES` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
-| `PREFIX_MODELS_FOR_DISCOVERY` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. Also settable as the `prefix_models_for_discovery` field in `proxy.json`. |
+| Environment Variable | `proxy.json` field | Default | Required? | Notes |
+|---|---|---|---|---|
+| `UPSTREAM_BASE_URL` | `upstream_base_url` | (none) | yes | Upstream OpenAI-compatible base URL (e.g. `https://api.openai.com`). |
+| `UPSTREAM_API_KEY` | `upstream_api_key` | (none) | yes | Bearer token for the upstream. |
+| `LISTEN_ADDR` | `listen_addr` | `0.0.0.0:8085` | no | Socket address the proxy binds. |
+| `UPSTREAM_PATH` | `upstream_path` | `/v1/responses` | no | Path appended to the upstream base URL (`null` = fall back to default). |
+| `REQUEST_TIMEOUT_SECS` | `request_timeout_secs` | `600` | no | Per-request timeout in seconds (also clamps `advisor` / `web_fetch` budgets when those set higher). |
+| `MAX_REQUEST_BODY_BYTES` | `max_request_body_bytes` | `33554432` (32 MiB) | no | Positive whole-number byte cap for `POST /v1/messages`. Invalid/zero/negative/fractional/out-of-range values warn and fall back to the default; non-numeric strings are ignored. |
+| `REASONING_EFFORT` | `reasoning_effort` | (none) | no | Default reasoning effort label applied to inbound requests (`low` / `medium` / `high` / `xhigh` / `max` / `none`). |
+| `PROMPT_CACHING_ENABLED` | `prompt_caching` (object) | `false` | no | Set `true` to forward OpenAI prompt-cache hints; also see `prompt_caching`. |
+| `PROMPT_CACHING_MODELS` | `prompt_caching.models` | (none) | no | Comma-separated inbound model IDs that the cache path is allowed for. |
+| `PROMPT_CACHE_KEY` | `prompt_cache_key` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
+| `TOOL_RESULT_IMAGES` | `tool_result_images` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, `drop`). |
+| `LOG_TO_DISK` | `log_to_disk` | `false` | no | Set `1` / `true` / `yes` to also write `target/logs/proxy.log`. |
+| `PROXY_KEY` | `proxy_key` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |
+| `ADVISOR_ENABLED` | `advisor.enabled` | `false` | no | Enable the experimental advisor tool. Accepts `1` / `true` / `yes` / `on`. |
+| `ADVISOR_MODEL` | `advisor.model` | `beam` | no | Upstream model name the advisor is routed to (not alias-resolved; written as-is into the advisor request). |
+| `ADVISOR_EFFORT` | `advisor.effort` | (none) | no | Reasoning-effort string applied to the advisor request only. Omit to send none. |
+| `ADVISOR_MAX_USES` | `advisor.max_uses` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative / fractional / out-of-range values fall back to the default + warning. |
+| `ADVISOR_MAX_TOKENS` | `advisor.max_tokens` | `2048` | no | Cap on the advisor answer (output tokens). `0` removes the cap (upstream default then applies). |
+| `ADVISOR_TIMEOUT_SECS` | `advisor.timeout_secs` | `45` | no | Per-advisor-call timeout. `0` uses the global budget only. |
+| `WEB_FETCH_ENABLED` | `web_fetch.enabled` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1` / `true` / `yes` / `on`. |
+| `WEB_FETCH_TIMEOUT_SECS` | `web_fetch.timeout_secs` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
+| `WEB_FETCH_MAX_BYTES` | `web_fetch.max_bytes` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
+| `WEB_FETCH_MAX_CONTENT_BYTES` | `web_fetch.max_content_bytes` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
+| `PREFIX_MODELS_FOR_DISCOVERY` | `prefix_models_for_discovery` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. |
 
 
-`proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
+`proxy.json` uses the same field names in snake_case.
+
+**Important:** the `proxy.json` field names are lower-case snake_case (second column). The uppercase strings in the first column are ENVIRONMENT VARIABLES only. Pasting uppercase names such as `UPSTREAM_BASE_URL` as JSON object keys makes the proxy reject the file (`deny_unknown_fields`). Environment variables win on conflict, then the JSON file, then built-in defaults.
+ See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
 
 `max_request_body_bytes` (overridden by `MAX_REQUEST_BODY_BYTES`) is a positive whole number of bytes; its default is 33,554,432 bytes (32 MiB). Numeric values that are zero, negative, fractional, or out of range produce a warning and fall back to the default without failing startup. Non-numeric `MAX_REQUEST_BODY_BYTES` text is ignored, so the file value or default applies.
 
