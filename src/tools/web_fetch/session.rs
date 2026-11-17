@@ -42,8 +42,8 @@ use crate::anthropic::ResponseContentBlock;
 use crate::config::WebFetchConfig;
 use crate::proxy::{Attempt, Outcome};
 use crate::responses::{Input, InputItem, OutputItem, ResponsesResponse};
-use crate::tui::{LogKind, LogLine};
 use crate::tools::web_fetch::{fetch, protocol};
+use crate::tui::{LogKind, LogLine};
 
 /// What the loop produced.
 pub(crate) enum SessionOutcome {

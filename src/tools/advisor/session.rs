@@ -45,7 +45,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::tools::advisor::{protocol, scrub_error_body};
 use crate::anthropic::ResponseContentBlock;
 use crate::config::{AdvisorConfig, effective_limit};
 use crate::proxy::{
@@ -55,6 +54,7 @@ use crate::responses::{
     Input, InputContentPart, InputItem, OutputContentPart, OutputItem, ReasoningConfig,
     ResponsesRequest, ResponsesResponse, ResponsesUsage,
 };
+use crate::tools::advisor::{protocol, scrub_error_body};
 use crate::translate;
 use crate::tui::{LogKind, LogLine};
 
@@ -388,12 +388,13 @@ fn complete(
     })))
 }
 
-/// Run the whole detection-triggered turn. The FIRST executor failure is an
-/// ordinary upstream failure and propagates (the caller scrubs any advisor
-/// beta/tool tokens from the body before it reaches the client); every LATER
-/// executor failure degrades to the last good response. Advisor failures
-/// never propagate.
-pub async fn run(
+/// Run the whole detection-triggered turn.
+///
+/// The FIRST executor failure is an ordinary upstream failure and propagates
+/// (the caller scrubs any advisor beta/tool tokens from the body before it
+/// reaches the client); every LATER executor failure degrades to the last
+/// good response. Advisor failures never propagate.
+pub(crate) async fn run(
     attempt: &mut Attempt,
     cfg: &AdvisorConfig,
 ) -> Result<SessionOutcome, crate::error::AppError> {

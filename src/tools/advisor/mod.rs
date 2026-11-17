@@ -83,6 +83,7 @@ pub fn scrub_error_body(body: &str) -> String {
 }
 
 /// Whether the client declared a tool named `advisor`, whatever its shape.
+///
 /// The translator uses this NAME-ONLY check to decide whether it may keep
 /// the `# Advisor Tool` system section (an ordinary function tool with that
 /// name is forwarded upstream and can be called). `build_outbound` also

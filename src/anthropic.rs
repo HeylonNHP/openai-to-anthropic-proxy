@@ -662,5 +662,28 @@ pub struct MessageDeltaPayload {
     pub stop_sequence: Option<String>,
 }
 
+/// A single model entry in the Anthropic `GET /v1/models` response.
+///
+/// The CLI uses `id` when it echoes the model back in `model: ...` fields and
+/// `display_name` for the human-facing `/model` picker.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnthropicModelInfo {
+    pub r#type: &'static str,
+    pub id: String,
+    pub display_name: String,
+    pub created_at: String,
+}
+
+/// `GET /v1/models` response shape (Anthropic's List Models endpoint).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnthropicModelsList {
+    pub data: Vec<AnthropicModelInfo>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests;

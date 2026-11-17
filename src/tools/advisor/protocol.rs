@@ -19,9 +19,11 @@ pub const ERROR_CODE_TOO_MANY_REQUESTS: &str = "too_many_requests";
 pub const ERROR_CODE_OVERLOADED: &str = "overloaded";
 pub const ERROR_CODE_PROMPT_TOO_LONG: &str = "prompt_too_long";
 pub const ERROR_CODE_EXECUTION_TIME_EXCEEDED: &str = "execution_time_exceeded";
-/// The generic, fail-closed code. Every advisor failure degrades to this so
-/// the client never sees a 400 naming the advisor tool/beta (which would
-/// latch the feature off for the whole Claude Code process, §11.5).
+/// The generic, fail-closed code.
+///
+/// Every advisor failure degrades to this so the client never sees a 400
+/// naming the advisor tool/beta (which would latch the feature off for the
+/// whole Claude Code process, §11.5).
 pub const ERROR_CODE_UNAVAILABLE: &str = "unavailable";
 /// Listed in Anthropic's SDK but **not** recognised by Claude Code. Kept as
 /// a constant only so a future version can avoid inventing a string; it
@@ -112,9 +114,11 @@ pub fn max_uses_exceeded(id: &str) -> Value {
     error_result(id, ERROR_CODE_MAX_USES_EXCEEDED)
 }
 
-/// Collision-resistant id for one consultation. `srvtoolu_` is the real
-/// prefix; Claude Code does no format validation beyond non-empty + equal
-/// `tool_use_id`, but matching the real shape keeps logs honest.
+/// Collision-resistant id for one consultation.
+///
+/// `srvtoolu_` is the real prefix; Claude Code does no format validation
+/// beyond non-empty + equal `tool_use_id`, but matching the real shape keeps
+/// logs honest.
 ///
 /// Uses `SystemTime` nanoseconds plus a process-local atomic counter — no
 /// new dependency, no `rand` crate. The counter makes ids unique even when
@@ -142,9 +146,10 @@ fn token_counts(usage: &ResponsesUsage) -> (u32, u32, u32, u32) {
     )
 }
 
-/// An `advisor_message` entry for `usage.iterations[]`. Advisor tokens are
-/// billed at the advisor model's rate and must NOT be folded into the
-/// top-level totals (§3.5). `cache_creation` is the explicit `null` Claude
+/// An `advisor_message` entry for `usage.iterations[]`.
+///
+/// Advisor tokens are billed at the advisor model's rate and must NOT be folded
+/// into the top-level totals (§3.5). `cache_creation` is the explicit `null` Claude
 /// Code sees on the wire for an advisor iteration.
 #[must_use]
 pub fn advisor_iteration(model: &str, usage: &ResponsesUsage) -> Value {

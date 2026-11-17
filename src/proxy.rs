@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,7 +22,8 @@ use futures_util::{Stream, StreamExt};
 use std::time::Duration;
 
 use crate::anthropic::{
-    CreateMessageRequest, Message, ResponseContentBlock, StopReason, StreamEvent,
+    AnthropicModelsList, CreateMessageRequest, Message, ResponseContentBlock, StopReason,
+    StreamEvent,
 };
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
@@ -176,6 +177,13 @@ pub fn router_with_stores(
                 )),
         )
         .route("/healthz", get(handle_health))
+        .route(
+            "/v1/models",
+            get(handle_models).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_proxy_key,
+            )),
+        )
         .with_state(state)
 }
 
@@ -219,6 +227,207 @@ async fn require_proxy_key(
 
 async fn handle_health() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct ModelsQuery {
+    #[serde(rename = "after_id")]
+    _after_id: Option<String>,
+    #[serde(rename = "before_id")]
+    _before_id: Option<String>,
+    #[serde(rename = "limit")]
+    _limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct OpenAIModelsResponse {
+    #[serde(default)]
+    #[allow(dead_code)]
+    object: String,
+    #[serde(default)]
+    data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAIModel {
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    object: String,
+    #[serde(default)]
+    created: i64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    _owned_by: String,
+}
+
+async fn handle_models(
+    State(state): State<AppState>,
+    Query(_q): Query<ModelsQuery>,
+    headers: HeaderMap,
+) -> Result<Json<AnthropicModelsList>, AppError> {
+    use crate::anthropic::{AnthropicModelInfo, AnthropicModelsList};
+    let url = format!(
+        "{}/v1/models",
+        state.config.upstream_base_url.trim_end_matches('/')
+    );
+    let mut req = state.client.get(&url);
+    let path_lower = state.config.upstream_api_key.clone();
+    let key = if path_lower.is_empty() {
+        None
+    } else {
+        Some(path_lower.as_str())
+    };
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    // Forward anthropic-version if present (harmless upstream).
+    if let Some(v) = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        req = req.header("anthropic-version", v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // Fall back to a list derived solely from configured aliases + default_model
+        // when the upstream does not expose /v1/models (common for some gateways).
+        if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(Json(build_models_list_from_aliases(&state)));
+        }
+        return Err(map_upstream_error(status, &body));
+    }
+    let upstream: OpenAIModelsResponse = match resp.json().await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("upstream /v1/models returned non-JSON body: {e}");
+            return Ok(Json(build_models_list_from_aliases(&state)));
+        }
+    };
+
+    let mut data: Vec<AnthropicModelInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in upstream.data {
+        if !seen.insert(m.id.clone()) {
+            continue;
+        }
+        data.push(AnthropicModelInfo {
+            r#type: "model",
+            id: m.id.clone(),
+            display_name: m.id.clone(),
+            created_at: epoch_to_rfc3339(m.created as u64),
+        });
+    }
+
+    // Merge in configured alias keys (the inbound names like claude-sonnet-5)
+    // so they show up in the /model picker and resolve through the alias map.
+    let (alias_map, default_model) = load_live_mappings(&state);
+    for inbound in alias_map.keys() {
+        if !seen.insert(inbound.clone()) {
+            continue;
+        }
+        data.push(AnthropicModelInfo {
+            r#type: "model",
+            id: inbound.clone(),
+            display_name: inbound.clone(),
+            created_at: epoch_to_rfc3339(0),
+        });
+    }
+    if let Some(fb) = default_model
+        && seen.insert(fb.clone())
+    {
+        data.push(AnthropicModelInfo {
+            r#type: "model",
+            id: fb.clone(),
+            display_name: fb,
+            created_at: epoch_to_rfc3339(0),
+        });
+    }
+
+    // OpenAI items with created==0
+    // rather than faking timestamps. Sort by id for stable output.
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let first_id = data.first().map(|m| m.id.clone());
+    let last_id = data.last().map(|m| m.id.clone());
+    Ok(Json(AnthropicModelsList {
+        data,
+        has_more: false,
+        first_id,
+        last_id,
+    }))
+}
+
+fn build_models_list_from_aliases(state: &AppState) -> AnthropicModelsList {
+    use crate::anthropic::{AnthropicModelInfo, AnthropicModelsList};
+    let mut data: Vec<AnthropicModelInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (alias_map, default_model) = load_live_mappings(state);
+    for inbound in alias_map.keys() {
+        if seen.insert(inbound.clone()) {
+            data.push(AnthropicModelInfo {
+                r#type: "model",
+                id: inbound.clone(),
+                display_name: inbound.clone(),
+                created_at: epoch_to_rfc3339(0),
+            });
+        }
+    }
+    if let Some(fb) = default_model
+        && seen.insert(fb.clone())
+    {
+        data.push(AnthropicModelInfo {
+            r#type: "model",
+            id: fb.clone(),
+            display_name: fb,
+            created_at: epoch_to_rfc3339(0),
+        });
+    }
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    let first_id = data.first().map(|m| m.id.clone());
+    let last_id = data.last().map(|m| m.id.clone());
+    AnthropicModelsList {
+        data,
+        has_more: false,
+        first_id,
+        last_id,
+    }
+}
+
+// Map* hold the configured alias keys in their canonical form.
+fn load_live_mappings(
+    state: &AppState,
+) -> (std::collections::BTreeMap<String, String>, Option<String>) {
+    let rt = state.mappings.load_live();
+    (rt.map.clone(), rt.default_model.clone())
+}
+
+/// Convert a Unix timestamp (seconds) into an RFC3339 string in UTC.
+// (Howard Hinnant civil-from-days algorithm, no external deps.)
+pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // civil from days
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = mp + if mp < 10 { 3 } else { -9 };
+    let mon = if mo <= 2 { mo + 12 } else { mo };
+    let year = if mo > 2 { y } else { y - 1 };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, mon, d, h, m, s
+    )
 }
 
 async fn handle_messages(
