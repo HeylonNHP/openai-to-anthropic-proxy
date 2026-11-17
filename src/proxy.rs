@@ -519,8 +519,8 @@ fn build_outbound(
     // SECOND unrelated section and break byte identity with 17f8329.
     // When the pipeline is active, the synthesized tool is usable so both
     // sections are deliberately preserved.
-    if crate::advisor::has_inbound_advisor_tool(req)
-        && !crate::advisor::active(config, req)
+    if crate::tools::advisor::has_inbound_advisor_tool(req)
+        && !crate::tools::advisor::active(config, req)
         && let Some(instructions) = outbound.instructions.as_mut()
     {
         translate::strip_advisor_tool_instructions(instructions);
@@ -539,13 +539,13 @@ fn build_outbound(
     // Both the first attempt AND a default_model fallback re-translation go
     // through this function, so neither can lose the tool or accidentally
     // re-enable upstream streaming.
-    crate::advisor::prepare(req, &mut outbound, &config.advisor);
+    crate::tools::advisor::prepare(req, &mut outbound, &config.advisor);
     // Same for the server-side `web_fetch` tool: the client declares it
     // without an input_schema, so the translator drops it. Synthesize the
     // function tool the executor calls to request a fetch, and force the
     // outbound request to be buffered (the executor must be re-run with
     // the fetched text before the turn can end).
-    crate::web_fetch::prepare(req, &mut outbound, &config.web_fetch);
+    crate::tools::web_fetch::prepare(req, &mut outbound, &config.web_fetch);
     Ok((outbound, registry, reasoning_replay))
 }
 
@@ -736,7 +736,7 @@ impl Attempt {
     /// only: streaming bytes are already flowing at that point.
     /// `pub(crate)` so the advisor session can re-run the WHOLE pipe
     /// (including capabilities / fallback / corrective retry) without
-    /// duplicating any of it. See `src/advisor/session.rs` for why this is
+    /// duplicating any of it. See `src/tools/advisor/session.rs` for why this is
     /// architecture choice (a) rather than a second loop in `proxy.rs`.
     pub(crate) async fn execute(&mut self, url: &str) -> Result<Outcome, AppError> {
         let upstream_resp = self.send_success(url).await?;
@@ -796,13 +796,13 @@ impl Attempt {
         // request that declares BOTH server tools needs one loop that can
         // serve both, and the `web_fetch` loop is the one that owns the
         // fetch. (In practice Claude Code declares at most one.)
-        if crate::web_fetch::active(&self.state.config.web_fetch, &self.req) {
+        if crate::tools::web_fetch::active(&self.state.config.web_fetch, &self.req) {
             let cfg = self.state.config.web_fetch.clone();
-            return match crate::web_fetch::session::run(&mut self, &cfg).await {
-                Ok(crate::web_fetch::session::SessionOutcome::UnexpectedStreaming(resp)) => {
+            return match crate::tools::web_fetch::session::run(&mut self, &cfg).await {
+                Ok(crate::tools::web_fetch::session::SessionOutcome::UnexpectedStreaming(resp)) => {
                     render_streaming(self, resp)
                 }
-                Ok(crate::web_fetch::session::SessionOutcome::Complete(result)) => {
+                Ok(crate::tools::web_fetch::session::SessionOutcome::Complete(result)) => {
                     render_web_fetch(&self, *result)
                 }
                 Err(err) => Err(err),
@@ -811,17 +811,17 @@ impl Attempt {
         // Off by default AND detection-triggered: with `advisor.enabled =
         // false` (the shipped default) this branch is never taken, so every
         // ordinary request follows the exact same path as before.
-        if crate::advisor::active(self.state.config.as_ref(), &self.req) {
+        if crate::tools::advisor::active(self.state.config.as_ref(), &self.req) {
             let cfg = self.state.config.advisor.clone();
             // B1: even the FIRST executor error can carry an upstream 400
             // naming the advisor beta/tool. Scrub those tokens from ANY
             // error body that could reach the client on this path so Claude
             // Code cannot latch the feature off for the whole process.
-            return match crate::advisor::session::run(&mut self, &cfg).await {
-                Ok(crate::advisor::session::SessionOutcome::UnexpectedStreaming(resp)) => {
+            return match crate::tools::advisor::session::run(&mut self, &cfg).await {
+                Ok(crate::tools::advisor::session::SessionOutcome::UnexpectedStreaming(resp)) => {
                     render_streaming(self, resp)
                 }
-                Ok(crate::advisor::session::SessionOutcome::Complete(result)) => {
+                Ok(crate::tools::advisor::session::SessionOutcome::Complete(result)) => {
                     render_advisor(&self, *result)
                 }
                 Err(err) => Err(AppError::scrub_advisor_error(err)),
@@ -903,9 +903,9 @@ fn render_json(
 /// so forwarding its header (as `render_streaming` does) would be wrong.
 fn render_advisor(
     attempt: &Attempt,
-    result: crate::advisor::session::SessionResult,
+    result: crate::tools::advisor::session::SessionResult,
 ) -> Result<Response, AppError> {
-    let crate::advisor::session::SessionResult {
+    let crate::tools::advisor::session::SessionResult {
         final_resp,
         prefix_blocks,
         iterations,
@@ -959,7 +959,7 @@ fn render_advisor(
     record_json_stats(attempt, &final_resp);
 
     if attempt.req.stream == Some(true) {
-        let events = crate::advisor::sse::message_to_events(anth);
+        let events = crate::tools::advisor::sse::message_to_events(anth);
         let chunks = events
             .into_iter()
             .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));
@@ -985,9 +985,9 @@ fn render_advisor(
 /// so forwarding its header (as `render_streaming` does) would be wrong.
 fn render_web_fetch(
     attempt: &Attempt,
-    result: crate::web_fetch::session::SessionResult,
+    result: crate::tools::web_fetch::session::SessionResult,
 ) -> Result<Response, AppError> {
-    let crate::web_fetch::session::SessionResult {
+    let crate::tools::web_fetch::session::SessionResult {
         final_resp,
         prefix_blocks,
     } = result;
@@ -1028,7 +1028,7 @@ fn render_web_fetch(
     record_json_stats(attempt, &final_resp);
 
     if attempt.req.stream == Some(true) {
-        let events = crate::advisor::sse::message_to_events(anth);
+        let events = crate::tools::advisor::sse::message_to_events(anth);
         let chunks = events
             .into_iter()
             .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));

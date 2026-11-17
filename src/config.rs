@@ -201,12 +201,12 @@ pub struct Config {
     /// `LOG_TO_DISK=1` in the env.
     pub log_to_disk: bool,
     /// Advisor (server-side second opinion) policy. Off by default; see
-    /// [`AdvisorConfig`] and `crate::advisor`. When `enabled` is false the
+    /// [`AdvisorConfig`] and `crate::tools::advisor`. When `enabled` is false the
     /// request pipeline behaves exactly as it did before the advisor feature
     /// existed (no extra upstream call, no synthesized tool, no wire fields).
     pub advisor: AdvisorConfig,
     /// Server-side `web_fetch` policy. See [`WebFetchConfig`] and
-    /// `crate::web_fetch`. When `enabled` is false the proxy never fetches
+    /// `crate::tools::web_fetch`. When `enabled` is false the proxy never fetches
     /// a URL on the model's behalf and the request pipeline is unchanged.
     pub web_fetch: WebFetchConfig,
     /// Warnings raised while resolving this configuration.
@@ -225,7 +225,7 @@ pub struct Config {
 /// makes no advisor calls and emits no advisor wire fields. Enabling it
 /// requires an explicit `"enabled": true` in `proxy.json` (or
 /// `ADVISOR_ENABLED=1`) AND an inbound tool declaration named `advisor`.
-/// The consultation loop lives in `crate::advisor::session`.
+/// The consultation loop lives in `crate::tools::advisor::session`.
 ///
 /// **`model` is an explicit UPSTREAM model name, not an inbound alias.**
 /// It is written directly into the advisor's own upstream request; it is

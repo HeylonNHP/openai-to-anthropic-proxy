@@ -6273,7 +6273,7 @@ async fn large_tool_result_image_is_accepted() {
 // guard correctly refuses private addresses, because the URL comes from a
 // model. These tests therefore cover the PROXY side of the contract (tool
 // synthesis, call interception, error degradation, wire shape); the fetch
-// layer itself is covered by `src/web_fetch/fetch/live_tests.rs`, which uses
+// layer itself is covered by `src/tools/web_fetch/fetch/live_tests.rs`, which uses
 // the test-only permissive address policy.
 
 /// The Anthropic server-side `web_fetch` declaration: a name, a versioned

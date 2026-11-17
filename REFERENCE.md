@@ -167,7 +167,7 @@ with a versioned `type` (`web_fetch_20250910` and later) and **no**
 text back to the model. The upstream this proxy talks to is an OpenAI-compatible
 Responses API, which has no `web_fetch` of its own — so the proxy is that server.
 
-The implementation lives in `src/web_fetch/`:
+The implementation lives in `src/tools/web_fetch/`:
 
 | module | what it owns |
 |---|---|

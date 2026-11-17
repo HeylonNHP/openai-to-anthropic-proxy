@@ -43,7 +43,7 @@ use crate::config::WebFetchConfig;
 use crate::proxy::{Attempt, Outcome};
 use crate::responses::{Input, InputItem, OutputItem, ResponsesResponse};
 use crate::tui::{LogKind, LogLine};
-use crate::web_fetch::{fetch, protocol};
+use crate::tools::web_fetch::{fetch, protocol};
 
 /// What the loop produced.
 pub(crate) enum SessionOutcome {
@@ -197,7 +197,7 @@ fn find_web_fetch_call(output: &[OutputItem]) -> Option<WebFetchCall> {
             name,
             arguments,
             ..
-        } if name == crate::web_fetch::WEB_FETCH_TOOL_NAME => {
+        } if name == crate::tools::web_fetch::WEB_FETCH_TOOL_NAME => {
             let url = parse_url_argument(arguments)?;
             Some(WebFetchCall {
                 call_id: call_id.clone(),
@@ -231,7 +231,7 @@ fn intermediate_blocks(resp: &ResponsesResponse, attempt: &Attempt) -> Vec<Respo
         !matches!(
             block,
             ResponseContentBlock::ToolUse { name, .. }
-                if name == crate::web_fetch::WEB_FETCH_TOOL_NAME
+                if name == crate::tools::web_fetch::WEB_FETCH_TOOL_NAME
         )
     });
     blocks
@@ -246,7 +246,7 @@ fn inject(attempt: &mut Attempt, call_id: &str, arguments: &str, output: &str) {
     if let Input::Items(items) = &mut attempt.outbound.input {
         items.push(InputItem::FunctionCall {
             call_id: call_id.to_owned(),
-            name: crate::web_fetch::WEB_FETCH_TOOL_NAME.to_owned(),
+            name: crate::tools::web_fetch::WEB_FETCH_TOOL_NAME.to_owned(),
             arguments: arguments.to_owned(),
         });
         items.push(InputItem::FunctionCallOutput {

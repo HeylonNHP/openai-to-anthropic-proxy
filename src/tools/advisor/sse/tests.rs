@@ -1,5 +1,5 @@
 use super::*;
-use crate::advisor::protocol;
+use crate::tools::advisor::protocol;
 use crate::anthropic::{StopReason, Usage};
 use serde_json::json;
 

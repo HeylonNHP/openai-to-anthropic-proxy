@@ -118,7 +118,7 @@ pub fn active(config: &WebFetchConfig, req: &CreateMessageRequest) -> bool {
 /// end, so the whole chain is buffered (§11.3 of
 /// `ADVISOR_TOOL_RESEARCH.md`): a streaming client gets ONE synthetic
 /// Anthropic SSE sequence at the end, produced by
-/// [`crate::advisor::sse::message_to_events`].
+/// [`crate::tools::advisor::sse::message_to_events`].
 ///
 /// Called from `proxy::build_outbound`, which BOTH the first attempt and
 /// the `default_model` fallback re-translation go through — so a fallback

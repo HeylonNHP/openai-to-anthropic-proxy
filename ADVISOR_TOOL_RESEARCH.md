@@ -990,7 +990,7 @@ type. This is the key to keeping the feature out of the shared wire types.
 ### 12.1 Module layout
 
 ```
-src/advisor/
+src/tools/advisor/
   mod.rs        //! docs: off-by-default, fail-closed, single-message protocol
                 pub(crate) fn enabled() -> bool
                 pub(crate) fn try_handle(...) -> Option<Response>   // THE one hook
@@ -1026,7 +1026,7 @@ its own sake.
 translation and before `handle_messages_inner`:
 
 ```rust
-if let Some(resp) = crate::advisor::try_handle(&state, &headers, &body, &req).await {
+if let Some(resp) = crate::tools::advisor::try_handle(&state, &headers, &body, &req).await {
     return resp;                 // Ok(Response) | Err(AppError)
 }
 // … existing path, completely unchanged …
@@ -1144,7 +1144,7 @@ cheaper on output than `kimi-k3.1-pro`, and it accepts `xhigh` natively.
 
 ### 12.6 Verification plan (house two-layer pattern)
 
-**In-file unit tests (`src/advisor/`):** config default/precedence; disabled →
+**In-file unit tests (`src/tools/advisor/`):** config default/precedence; disabled →
 `try_handle` returns `None`; `build_advisor_request` asserts no `temperature`,
 no `top_p`, `stream:false`, explicit model, no tools; all 3 result-content
 variants + `unavailable` error; id pairing; `iteration_usage` shape;
@@ -1175,7 +1175,7 @@ inbound tool name).
 
 | step | deliverable | gate |
 |---|---|---|
-| 1 | `src/advisor/{mod,config,protocol}.rs` + wire extension points; `try_handle` returns `None` always | full suite green; **zero behaviour change** |
+| 1 | `src/tools/advisor/{mod,config,protocol}.rs` + wire extension points; `try_handle` returns `None` always | full suite green; **zero behaviour change** |
 | 2 | `prompt.rs` + `upstream.rs`, non-streaming happy path (1 consult) behind `enabled` | e2e tests 1-2; no streaming yet |
 | 3 | `sse.rs` + `message_to_events`, `stream:true` support | e2e test 3; Claude Code smoke test with `--advisor opus` |
 | 4 | failure paths, `max_uses`, `usage.iterations`, TUI label | e2e tests 4-6 |
@@ -1560,7 +1560,7 @@ full).
 1. `Attempt` refactor of `handle_messages_inner` with **zero behaviour change**
    + the 4 characterization tests (§13.4). Gate: 355+2+37+4 green, clippy
    still 7, differential diff of received bodies + log lines.
-2. `src/advisor/` skeleton: `mod`, `config` (OnceLock, off), `protocol`
+2. `src/tools/advisor/` skeleton: `mod`, `config` (OnceLock, off), `protocol`
    (block constructors as `Value`), wire extension points. `try/execute`
    still unreachable. Gate: full suite green, no behaviour change.
 3. Zero-argument `advisor` function tool synthesized from the 3-field
@@ -1640,7 +1640,7 @@ pattern at `:790-804`):
 
 | edit | lines |
 |---|---|
-| `use crate::advisor::AdvisorConfig;` (or define `AdvisorConfig` in `config.rs` and have the advisor module take it as a plain parameter — **prefer this**: no `config.rs -> advisor -> Config` cycle, matching `model_rejection.rs`'s primitives-only API) | ~1 |
+| `use crate::tools::advisor::AdvisorConfig;` (or define `AdvisorConfig` in `config.rs` and have the advisor module take it as a plain parameter — **prefer this**: no `config.rs -> advisor -> Config` cycle, matching `model_rejection.rs`'s primitives-only API) | ~1 |
 | `pub advisor: AdvisorConfig` on `Config` (`:38-86`) + doc comment | ~4 |
 | `pub advisor: Option<JsonAdvisorConfig>` on `JsonConfig` (`:702-736`) with `#[serde(default, skip_serializing_if = "Option::is_none")]` — **`skip_serializing_if` is mandatory**: the TUI rewrites the whole file and `deny_unknown_fields` would make an older binary refuse to start (`:719-725`) | ~5 |
 | `JsonAdvisorConfig` with `#[serde(default, deny_unknown_fields)]`, all six fields `Option<_>` | ~20 |
@@ -1659,7 +1659,7 @@ pattern at `:790-804`):
 | phase | deliverable | test gate |
 |---|---|---|
 | 1 | `Attempt` + `build_outbound` + `execute` refactor, **zero behaviour change**; 4 characterization tests (§13.4) | 355+2+37+4 green; clippy still 7; differential diff of received bodies + log lines enabled/disabled |
-| 2 | `advisor` config section in `proxy.json` + `src/advisor/{mod,config,protocol}.rs` skeleton; feature still unreachable | full suite green; config unit tests; **prove a `proxy.json` WITH the new key still loads on the previous binary's schema** (rollback check) |
+| 2 | `advisor` config section in `proxy.json` + `src/tools/advisor/{mod,config,protocol}.rs` skeleton; feature still unreachable | full suite green; config unit tests; **prove a `proxy.json` WITH the new key still loads on the previous binary's schema** (rollback check) |
 | 3 | Zero-argument `advisor` function tool synthesized from Claude Code's 3-field declaration; `# Advisor Tool` instructions preserved | e2e: upstream sees the tool, empty `{}` schema survives strict sanitization + the fake upstream's validator |
 | 4 | Advisor upstream call + advice injection + `server_tool_use` / `advisor_tool_result` blocks + `usage.iterations[]` | e2e happy path (3 POSTs), 404/timeout -> `unavailable` with the executor answer intact and **no fallback POST**, `max_uses` cap |
 | 5 | Buffered synthetic SSE for `stream:true` | e2e event sequence + Claude Code `--advisor` smoke test (cheap model) |
@@ -1842,7 +1842,7 @@ the gates. It is the as-built counterpart to §17's plan.
 | commit | what |
 |---|---|
 | `ee2673f` | `Attempt` / `build_outbound` / `execute` refactor; 4 characterization tests. Zero behavior change; deletes the existing first-attempt/fallback policy duplication |
-| `622a968` | `proxy.json` `advisor` config, `Raw(Value)` wire extension points, `Usage.iterations`, `src/advisor/{mod,protocol,sse}.rs` skeleton. Unreachable |
+| `622a968` | `proxy.json` `advisor` config, `Raw(Value)` wire extension points, `Usage.iterations`, `src/tools/advisor/{mod,protocol,sse}.rs` skeleton. Unreachable |
 | `033b3a2` | full integration: zero-arg tool, detection loop, advice injection, `usage.iterations`, buffered synthetic SSE, 11 e2e tests |
 | `7933758` | **12 verifier-confirmed bugs fixed** (B1-B12), +15 e2e / +6 unit tests |
 | `ddac5de` | inbound echo: `ContentBlockParam::{ServerToolUse, AdvisorToolResult}`, prior advice replays into the upstream transcript |
@@ -1854,7 +1854,7 @@ flow untouched (only 4 `iterations: None` literals). No new crate dependency.
 ### 19.2 As-built architecture
 
 - **One clean pipe** (§13/§14): `Attempt::execute` is called 2-3 times by
-  `src/advisor/session.rs`; no bypass, no duplicated proxy policy.
+  `src/tools/advisor/session.rs`; no bypass, no duplicated proxy policy.
 - **Config** in `proxy.json`: `advisor.{enabled,model,effort,max_uses,
   max_tokens,timeout_secs}`, defaults `enabled:false`, `model:"beam"`,
   `max_uses:2`, `max_tokens:2048`, `timeout_secs:45`. `JsonConfig.advisor`

@@ -2109,7 +2109,7 @@ fn append_assistant_message(
                                 id = %stu.id,
                                 "echoed advisor server_tool_use; no function_call emitted"
                             );
-                        } else if stu.name == crate::web_fetch::WEB_FETCH_TOOL_NAME {
+                        } else if stu.name == crate::tools::web_fetch::WEB_FETCH_TOOL_NAME {
                             // Same rule for the server-side `web_fetch`
                             // tool: the paired RESULT block carries the
                             // page text into context, so no `function_call`

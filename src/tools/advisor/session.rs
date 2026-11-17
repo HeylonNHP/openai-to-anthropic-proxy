@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::advisor::{protocol, scrub_error_body};
+use crate::tools::advisor::{protocol, scrub_error_body};
 use crate::anthropic::ResponseContentBlock;
 use crate::config::{AdvisorConfig, effective_limit};
 use crate::proxy::{

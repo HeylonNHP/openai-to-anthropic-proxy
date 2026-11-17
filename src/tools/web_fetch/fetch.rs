@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use crate::config::WebFetchConfig;
-use crate::web_fetch::extract;
+use crate::tools::web_fetch::extract;
 
 /// The user agent the proxy sends when fetching a page.
 ///

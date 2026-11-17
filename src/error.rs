@@ -50,7 +50,7 @@ impl AppError {
     /// Only the client-visible bodies are touched; log messages keep their
     /// original text.
     pub(crate) fn scrub_advisor_error(err: Self) -> Self {
-        let scrub = crate::advisor::scrub_error_body;
+        let scrub = crate::tools::advisor::scrub_error_body;
         match err {
             Self::BadRequest(msg) => Self::BadRequest(scrub(&msg)),
             Self::Unauthorized => Self::Unauthorized,
