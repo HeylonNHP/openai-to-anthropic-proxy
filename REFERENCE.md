@@ -18,19 +18,32 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 
 The proxy reads environment variables first, then an optional `proxy.json`, then built-in defaults. Environment variables win on conflict.
 
-| Variable | Default | Required? | Notes |
+| Variable | Default | Required? | Description |
 |---|---|---|---|
-| `UPSTREAM_BASE_URL` | - | yes | e.g. `https://api.openai.com` |
-| `UPSTREAM_API_KEY` | - | yes | bearer token for the upstream |
-| `LISTEN_ADDR` | `0.0.0.0:8085` | no | socket address to bind |
-| `UPSTREAM_PATH` | `/v1/responses` | no | appended to the base URL |
-| `REQUEST_TIMEOUT_SECS` | `600` | no | per-request timeout |
-| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | positive whole-number byte cap for `/v1/messages`; invalid numeric values warn and use the default |
-| `PROMPT_CACHING_ENABLED` | `false` | no | set `true` to forward OpenAI prompt-cache hints |
-| `PROMPT_CACHE_KEY` | - | no | optional stable key for `prompt_cache_key` |
-| `PROXY_KEY` | - | no | shared secret for `X-Proxy-Key` auth (see "Client auth" below) |
-| `LOG_TO_DISK` | `false` | no | set `1`/`true`/`yes` to write `target/logs/proxy.log` |
-| `WEB_FETCH_ENABLED` | `false` | no | let the proxy serve the server-side `web_fetch` tool |
+| `UPSTREAM_BASE_URL` | (none) | yes | Upstream OpenAI-compatible base URL (e.g. `https://api.openai.com`). Required. |
+| `UPSTREAM_API_KEY` | (none) | yes | Bearer token for the upstream. Required. |
+| `LISTEN_ADDR` | `0.0.0.0:8085` | no | Socket address the proxy binds. |
+| `UPSTREAM_PATH` | `/v1/responses` | no | Path appended to the upstream base URL. |
+| `REQUEST_TIMEOUT_SECS` | `600` | no | Per-request timeout in seconds (also clamps `advisor`/`web_fetch` budgets when those set higher). |
+| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | Positive whole-number byte cap for `POST /v1/messages`. Invalid/zero/negative/fractional/out-of-range values warn and fall back to the default; non-numeric strings are ignored. |
+| `REASONING_EFFORT` | (none) | no | Default reasoning effort label applied to inbound requests (e.g. `low`/`medium`/`high`/`xhigh`/`max`/`none`). |
+| `PROMPT_CACHING_ENABLED` | `false` | no | Set `true` to forward OpenAI prompt-cache hints. |
+| `PROMPT_CACHING_MODELS` | (none) | no | Comma-separated inbound model IDs that the cache path is allowed for. |
+| `PROMPT_CACHE_KEY` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
+| `TOOL_RESULT_IMAGES` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, or `drop`). |
+| `LOG_TO_DISK` | `false` | no | Set `1`/`true`/`yes` to also write `target/logs/proxy.log`. |
+| `PROXY_KEY` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |
+| `ADVISOR_ENABLED` | `false` | no | Enable the experimental advisor tool. Accepts `1`/`true`/`yes`/`on`. |
+| `ADVISOR_MODEL` | `beam` | no | Upstream model name the advisor is routed to (not alias-resolved; written as-is into the advisor request). |
+| `ADVISOR_EFFORT` | (none) | no | Reasoning-effort string applied to the advisor request only. Omit to send none. |
+| `ADVISOR_MAX_USES` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative/fractional/out-of-range values fall back to the default + a warning. |
+| `ADVISOR_MAX_TOKENS` | `2048` | no | Cap on the advisor answer (output tokens). `0` removes the cap (upstream default then applies). |
+| `ADVISOR_TIMEOUT_SECS` | `45` | no | Per-advisor-call timeout. `0` uses the global budget only. |
+| `WEB_FETCH_ENABLED` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1`/`true`/`yes`/`on`. |
+| `WEB_FETCH_TIMEOUT_SECS` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
+| `WEB_FETCH_MAX_BYTES` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
+| `WEB_FETCH_MAX_CONTENT_BYTES` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
+
 
 `proxy.json` uses the same field names in snake_case. See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
 
