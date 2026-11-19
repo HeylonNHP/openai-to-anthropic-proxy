@@ -484,3 +484,21 @@ async fn an_octet_stream_that_is_really_text_is_still_read() {
         .expect("fetch");
     assert_eq!(page.text, "just a text file served with the wrong type");
 }
+
+#[tokio::test]
+async fn a_name_whose_first_address_is_unreachable_falls_back_to_the_next() {
+    // The server listens on IPv4 loopback only. `localhost` resolves to
+    // `::1` AND `127.0.0.1` on a typical dual-stack host, often `::1`
+    // first; pinning only the first address used to make this fetch fail
+    // with "connection refused" although `127.0.0.1` would have answered.
+    let server = TestServer::start(200, "reached over the second address").await;
+    let addrs: Vec<_> = tokio::net::lookup_host(("localhost", server.addr.port()))
+        .await
+        .expect("localhost resolves")
+        .collect();
+    let url = format!("http://localhost:{}/", server.addr.port());
+    let page = fetch_with_policy(&url, &test_config(), AddressPolicy::AllowPrivate)
+        .await
+        .unwrap_or_else(|e| panic!("fetch over {addrs:?} failed: {e:?}"));
+    assert_eq!(page.text, "reached over the second address");
+}

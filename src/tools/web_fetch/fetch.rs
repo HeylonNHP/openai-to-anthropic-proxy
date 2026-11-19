@@ -212,7 +212,7 @@ async fn fetch_inner(
     let mut previous: Option<ValidatedUrl> = None;
 
     loop {
-        let client = build_client(cfg, &target.host, pinned, Arc::clone(&cookie_jar))?;
+        let client = build_client(cfg, &target.host, &pinned, Arc::clone(&cookie_jar))?;
         let current_url = target.to_url();
         let referer = previous.as_ref().map(|prev| {
             if prev.host == target.host && prev.scheme == target.scheme && prev.port == target.port
@@ -395,15 +395,25 @@ impl ValidatedUrl {
         })
     }
 
-    /// Resolve the host and pin the address the connection will use.
+    /// Resolve the host and pin the addresses the connection may use.
     ///
-    /// The returned address has already been checked against the private
-    /// and reserved ranges (unless the policy says otherwise).
-    async fn pin(&self, policy: AddressPolicy) -> Result<std::net::SocketAddr, FetchError> {
+    /// EVERY resolved address is pinned, not just the first, so the
+    /// connector can fall back from one to the next (and race IPv6 against
+    /// IPv4) exactly as an unpinned client would: a dual-stack host whose
+    /// first address is unreachable from here (typically IPv6 on a machine
+    /// without an IPv6 route) is still fetched over the next one. Every
+    /// returned address has already been checked against the private and
+    /// reserved ranges (unless the policy says otherwise), and the whole
+    /// host is refused if any one of them fails the check.
+    async fn pin(&self, policy: AddressPolicy) -> Result<Vec<std::net::SocketAddr>, FetchError> {
         let addrs = resolve_and_check(&self.host, self.port, policy).await?;
-        addrs.first().copied().ok_or_else(|| {
-            FetchError::new("url_not_accessible", "host resolved to no usable address")
-        })
+        if addrs.is_empty() {
+            return Err(FetchError::new(
+                "url_not_accessible",
+                "host resolved to no usable address",
+            ));
+        }
+        Ok(addrs)
     }
 
     /// Render the URL back to a string.
@@ -584,7 +594,7 @@ struct FetchHttpClient {
 fn build_client(
     cfg: &WebFetchConfig,
     host: &str,
-    pinned: std::net::SocketAddr,
+    pinned: &[std::net::SocketAddr],
     cookie_jar: Arc<reqwest::cookie::Jar>,
 ) -> Result<FetchHttpClient, FetchError> {
     let mut builder = reqwest::Client::builder()
@@ -610,7 +620,7 @@ fn build_client(
     // NAME; an IP-literal host needs no override because the connection
     // already goes to that literal.
     if host.parse::<IpAddr>().is_err() {
-        builder = builder.resolve(host, pinned);
+        builder = builder.resolve_to_addrs(host, pinned);
     }
 
     let client = builder
