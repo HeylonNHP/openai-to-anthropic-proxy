@@ -565,6 +565,56 @@ fn is_public_ipv6(v6: Ipv6Addr) -> bool {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return is_public_ipv4(v4);
     }
+    let seg = v6.segments();
+    // The low 32 bits as an IPv4 address, for the prefixes that embed one.
+    let low_v4 = Ipv4Addr::from((u32::from(seg[6]) << 16) | u32::from(seg[7]));
+    // ::/96 — IPv4-compatible (deprecated, RFC 4291). Never a real
+    // destination; some stacks still route it to the embedded IPv4 address.
+    if seg[..6] == [0, 0, 0, 0, 0, 0] {
+        return false;
+    }
+    // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052). On a NAT64
+    // network this reaches the embedded IPv4 address, so judge THAT:
+    // `64:ff9b::a9fe:a9fe` is the cloud metadata address.
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return is_public_ipv4(low_v4);
+    }
+    // 64:ff9b:1::/48 — NAT64 local-use prefix (RFC 8215): the IPv4 side is
+    // network-specific, so refuse it.
+    if seg[..3] == [0x64, 0xff9b, 1] {
+        return false;
+    }
+    // 2002::/16 — 6to4 (RFC 3056). Reaches the IPv4 address in bits 16–47.
+    if seg[0] == 0x2002 {
+        return is_public_ipv4(Ipv4Addr::from(
+            (u32::from(seg[1]) << 16) | u32::from(seg[2]),
+        ));
+    }
+    // 2001::/23 — IETF protocol assignments, including Teredo (2001::/32,
+    // which tunnels to an obfuscated IPv4 address), benchmarking
+    // (2001:2::/48) and ORCHID. Not web servers.
+    if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0 {
+        return false;
+    }
+    // 2001:db8::/32 and 3fff::/20 — documentation.
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return false;
+    }
+    if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0 {
+        return false;
+    }
+    // 100::/64 — discard-only (RFC 6666).
+    if seg[..4] == [0x100, 0, 0, 0] {
+        return false;
+    }
+    // 5f00::/16 — SRv6 segment identifiers (RFC 9602).
+    if seg[0] == 0x5f00 {
+        return false;
+    }
+    // fec0::/10 — site-local (deprecated, RFC 3879; still private in effect).
+    if (seg[0] & 0xffc0) == 0xfec0 {
+        return false;
+    }
     // fc00::/7 — unique local.
     if (v6.segments()[0] & 0xfe00) == 0xfc00 {
         return false;

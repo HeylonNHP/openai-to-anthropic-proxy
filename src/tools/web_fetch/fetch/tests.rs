@@ -87,6 +87,58 @@ fn ipv4_mapped_ipv6_is_judged_as_ipv4() {
 #[test]
 fn public_ipv6_is_allowed() {
     assert!(is_public_ip(v6("2606:2800:220:1:248:1893:25c8:1946")));
+    assert!(is_public_ip(v6("2001:4860:4860::8888")), "Google DNS");
+    assert!(is_public_ip(v6("2a00:1450:4001::1")));
+    assert!(
+        is_public_ip(v6("2001:200::1")),
+        "the block just past 2001::/23"
+    );
+}
+
+#[test]
+fn ipv6_prefixes_that_embed_an_ipv4_address_are_judged_by_it() {
+    // NAT64 well-known prefix: reaches the embedded IPv4 address.
+    assert!(
+        !is_public_ip(v6("64:ff9b::169.254.169.254")),
+        "metadata via NAT64"
+    );
+    assert!(!is_public_ip(v6("64:ff9b::7f00:1")), "loopback via NAT64");
+    assert!(!is_public_ip(v6("64:ff9b::10.0.0.5")), "private via NAT64");
+    assert!(
+        is_public_ip(v6("64:ff9b::93.184.216.34")),
+        "public via NAT64"
+    );
+    // 6to4: the IPv4 address is in bits 16-47.
+    assert!(!is_public_ip(v6("2002:7f00:1::1")), "loopback via 6to4");
+    assert!(!is_public_ip(v6("2002:a9fe:a9fe::")), "metadata via 6to4");
+    assert!(
+        !is_public_ip(v6("2002:c0a8:101::1")),
+        "192.168.1.1 via 6to4"
+    );
+    assert!(
+        is_public_ip(v6("2002:5db8:d822::1")),
+        "93.184.216.34 via 6to4"
+    );
+}
+
+#[test]
+fn reserved_ipv6_ranges_are_blocked() {
+    assert!(!is_public_ip(v6("::127.0.0.1")), "IPv4-compatible");
+    assert!(
+        !is_public_ip(v6("::8.8.8.8")),
+        "IPv4-compatible, even public"
+    );
+    assert!(!is_public_ip(v6("64:ff9b:1::a00:1")), "NAT64 local-use");
+    assert!(!is_public_ip(v6("2001::1")), "Teredo");
+    assert!(!is_public_ip(v6("2001:0:4136:e378::1")), "Teredo");
+    assert!(!is_public_ip(v6("2001:2::1")), "benchmarking");
+    assert!(!is_public_ip(v6("2001:20::1")), "ORCHIDv2");
+    assert!(!is_public_ip(v6("2001:db8::1")), "documentation");
+    assert!(!is_public_ip(v6("3fff::1")), "documentation (2024)");
+    assert!(!is_public_ip(v6("100::1")), "discard-only");
+    assert!(!is_public_ip(v6("5f00::1")), "SRv6 SIDs");
+    assert!(!is_public_ip(v6("fec0::1")), "site-local");
+    assert!(!is_public_ip(v6("feff::1")), "site-local upper end");
 }
 
 #[test]
