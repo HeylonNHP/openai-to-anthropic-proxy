@@ -274,6 +274,13 @@ it:
   global `request_timeout_secs` still bounds the call. A *finite*
   `timeout_secs` is always clamped to that global bound.
 
+The advisor's prompt (the executor's whole conversation) is also held to a
+fixed built-in budget of 1,200,000 characters, roughly 400,000 tokens, so a
+long session cannot overflow the advisor model's context window. Tool results,
+then long strings, then the oldest items are trimmed; the user's task and the
+latest items are always kept. It is not configurable; see
+[`proxy.json-guide.md`](./proxy.json-guide.md#the-advisor-prompt-is-trimmed-to-a-fixed-size).
+
 An invalid limit (negative, fractional, or too large) is never a startup
 failure: the proxy starts anyway, falls back to that limit's shipped default,
 and prints a warning.

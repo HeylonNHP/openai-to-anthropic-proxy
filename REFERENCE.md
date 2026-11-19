@@ -125,6 +125,12 @@ For multiple custom headers, separate them with newlines (a single line is enoug
   **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 2048,
   `timeout_secs` 45). The same rule applies to the `ADVISOR_MAX_USES`,
   `ADVISOR_MAX_TOKENS` and `ADVISOR_TIMEOUT_SECS` env vars.
+- **The advisor prompt is trimmed to a fixed 1,200,000 characters** (roughly
+  400,000 tokens; `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`). It
+  is a built-in constant with no config key or env var. Over budget, tool
+  results are shortened (16,000 / 4,000 / 1,000 bytes), then every long string
+  is capped at 20,000 bytes, then the oldest items are dropped; the first item
+  and the latest items are kept.
 
   ```json
   "advisor": {

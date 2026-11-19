@@ -414,6 +414,19 @@ These three keys follow one rule, in `proxy.json` and in the env vars alike:
 
 The env vars follow the same `0` = no limit rule (`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
 
+#### The advisor prompt is trimmed to a fixed size
+
+The advisor is sent the executor's whole conversation, which grows without bound in a long session. To keep it inside the advisor model's context window, the proxy holds that prompt to a **fixed budget of 1,200,000 characters (roughly 400,000 tokens)**. This is a built-in constant, **not** a `proxy.json` key or an env var. A prompt within the budget is sent whole; a larger one is trimmed in stages, stopping at the first stage that fits:
+
+| stage | what is trimmed |
+| --- | --- |
+| always | inline `data:` blobs (images) are replaced by a short placeholder, and the JSON is compact (not pretty-printed) |
+| 1 | **tool results** are shortened, gentlest cap first: 16,000, then 4,000, then 1,000 bytes each |
+| 2 | **every remaining long string** is capped at 20,000 bytes |
+| 3 | the **oldest items** are dropped and replaced by one marker line. The first item (the user's task) and the most recent items are always kept |
+
+The executor's own instructions are capped at a quarter of the budget (300,000 characters) so they cannot crowd out the conversation. Each cut states how many bytes it removed, and a trimmed prompt is logged at `info` with its size before and after. If you point `advisor.model` at a model whose context window is much smaller than about 400,000 tokens, this budget is too large for it and its calls will still be rejected as "prompt is too long"; the constant is `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`.
+
 #### An invalid value is a warning, not a startup failure
 
 A limit must be a **whole number that is not negative**. Anything else is invalid, and an invalid value never stops the proxy: it **starts anyway**, falls back to that limit's shipped default, and prints a warning. (The judgement is on the VALUE: `2` and `2.0` are the same valid limit; `-1` and `2.5` are not.)
