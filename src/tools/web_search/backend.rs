@@ -59,6 +59,10 @@ impl LiveBackend {
         domains: DomainRules,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
+            .http1_title_case_headers()
+            // This endpoint is the operator-configured search service, not an
+            // arbitrary URL fetched on a model's behalf. System proxy support
+            // is safe here; page fetches use their separate pinned client.
             .timeout(Duration::from_secs(cfg.search_timeout_secs))
             .redirect(reqwest::redirect::Policy::limited(3))
             .build()

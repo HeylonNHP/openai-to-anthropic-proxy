@@ -19,6 +19,7 @@
 
 pub mod advisor;
 pub mod domains;
+pub mod http_profile;
 pub mod server_loop;
 pub mod web_fetch;
 pub mod web_search;

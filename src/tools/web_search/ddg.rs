@@ -9,6 +9,8 @@
 
 use dom_query::{Document, Selection};
 
+use crate::tools::http_profile;
+
 /// One organic search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
@@ -24,10 +26,6 @@ pub struct ParsedPage {
     /// DuckDuckGo answered with its bot challenge instead of results.
     pub challenged: bool,
 }
-
-/// A browser-like UA: DuckDuckGo serves its challenge page to obvious bots.
-const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// A failed search. A plain message: it becomes tool output, never a client
 /// error.
@@ -208,12 +206,12 @@ pub async fn search(
     region: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>, SearchError> {
-    let response = client
-        .post(endpoint)
-        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
-        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
-        .header(reqwest::header::REFERER, endpoint)
-        .form(&[("q", query), ("b", ""), ("kl", region)])
+    let request = http_profile::apply_form_submit(client.post(endpoint), endpoint).form(&[
+        ("q", query),
+        ("b", ""),
+        ("kl", region),
+    ]);
+    let response = request
         .send()
         .await
         .map_err(|e| SearchError(format!("search request failed: {e}")))?;

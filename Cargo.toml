@@ -9,7 +9,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "gzip", "brotli", "deflate", "charset", "http2", "cookies", "system-proxy", "query", "form"] }
+reqwest-middleware = "0.5"
+reqwest-retry = "0.9"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

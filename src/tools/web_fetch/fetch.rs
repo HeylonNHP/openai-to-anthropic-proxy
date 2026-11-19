@@ -31,21 +31,16 @@
 //! are the total timeout and the optional byte cap.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::Duration;
+
+use reqwest_middleware::{ClientBuilder as MiddlewareClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
 
 use crate::config::WebFetchConfig;
 use crate::tools::domains::DomainRules;
+use crate::tools::http_profile::{self, FetchSite, Navigation};
 use crate::tools::web_fetch::extract;
-
-/// The user agent the proxy sends when fetching a page.
-///
-/// A real, honest UA. Some sites serve a degraded page to an obviously
-/// bot-like UA, and there is no reason to pretend to be anything else.
-const USER_AGENT: &str = concat!(
-    "openai-to-anthropic-proxy/",
-    env!("CARGO_PKG_VERSION"),
-    " (web_fetch)"
-);
 
 /// How many redirects are followed before giving up.
 const MAX_REDIRECTS: usize = 5;
@@ -56,6 +51,21 @@ const MAX_REDIRECTS: usize = 5;
 /// the overall timeout, and reqwest words a timeout as "error sending
 /// request". Both are the same thing to the model, so a timeout is always
 /// reported as one.
+fn transport_middleware_error(
+    what: &str,
+    err: &reqwest_middleware::Error,
+    timeout_secs: Option<u64>,
+) -> FetchError {
+    if err.is_timeout() {
+        let detail = timeout_secs.map_or_else(
+            || "fetch timed out".to_owned(),
+            |secs| format!("fetch timed out after {secs}s"),
+        );
+        return FetchError::new("url_not_accessible", detail);
+    }
+    FetchError::new("url_not_accessible", format!("{what}: {err}"))
+}
+
 fn transport_error(what: &str, err: &reqwest::Error, timeout_secs: Option<u64>) -> FetchError {
     if err.is_timeout() {
         let detail = timeout_secs.map_or_else(
@@ -197,15 +207,43 @@ async fn fetch_inner(
     check_domain(rules, &target)?;
     let mut pinned = target.pin(policy).await?;
 
+    let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
     let mut hops = 0usize;
+    let mut previous: Option<ValidatedUrl> = None;
 
     loop {
-        let client = build_client(cfg, &target.host, pinned)?;
+        let client = build_client(cfg, &target.host, pinned, Arc::clone(&cookie_jar))?;
+        let current_url = target.to_url();
+        let referer = previous.as_ref().map(|prev| {
+            if prev.host == target.host && prev.scheme == target.scheme && prev.port == target.port
+            {
+                prev.to_url()
+            } else {
+                format!("{}://{}:{}/", prev.scheme, prev.host, prev.port)
+            }
+        });
+        let navigation = Navigation {
+            site: previous.as_ref().map_or(FetchSite::None, |prev| {
+                if prev.host == target.host
+                    && prev.scheme == target.scheme
+                    && prev.port == target.port
+                {
+                    FetchSite::SameOrigin
+                } else {
+                    FetchSite::CrossSite
+                }
+            }),
+            referer: referer.as_deref(),
+            user_gesture: previous.is_none(),
+        };
+        let request = http_profile::apply(client.raw.get(current_url), Some(navigation))
+            .build()
+            .map_err(|e| transport_error("request build failed", &e, cfg.timeout_secs))?;
         let response = client
-            .get(target.to_url())
-            .send()
+            .retry
+            .execute(request)
             .await
-            .map_err(|e| transport_error("request failed", &e, cfg.timeout_secs))?;
+            .map_err(|e| transport_middleware_error("request failed", &e, cfg.timeout_secs))?;
 
         let status = response.status();
         if status.is_redirection() {
@@ -230,6 +268,7 @@ async fn fetch_inner(
             // a public URL must not be able to redirect into the private
             // network, or onto another scheme.
             let next = resolve_redirect(&target.to_url(), location)?;
+            previous = Some(target);
             target = ValidatedUrl::parse(&next)?;
             check_domain(rules, &target)?;
             // Re-resolve and re-check: the redirect may point at a
@@ -511,14 +550,28 @@ fn is_public_ipv6(v6: Ipv6Addr) -> bool {
 /// exact address that was validated above. `redirect(Policy::none())`
 /// because the proxy follows redirects ITSELF, so it can re-validate
 /// every hop.
+struct FetchHttpClient {
+    raw: reqwest::Client,
+    retry: ClientWithMiddleware,
+}
+
 fn build_client(
     cfg: &WebFetchConfig,
     host: &str,
     pinned: std::net::SocketAddr,
-) -> Result<reqwest::Client, FetchError> {
+    cookie_jar: Arc<reqwest::cookie::Jar>,
+) -> Result<FetchHttpClient, FetchError> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
+        .http1_title_case_headers()
+        // The reqwest `system-proxy` feature is enabled for configured clients,
+        // including web search, but system proxies resolve destination names
+        // remotely; reqwest's local .resolve override cannot pin that lookup.
+        // Disable proxies on this SSRF-hardened path to preserve the validated
+        // DNS pin and strict boundary. Do not remove this without replacing
+        // the destination-validation guarantee.
+        .no_proxy()
+        .cookie_provider(cookie_jar)
         // The per-request timeout is a backstop; the outer
         // `tokio::time::timeout` is the authoritative bound.
         .timeout(
@@ -534,9 +587,47 @@ fn build_client(
         builder = builder.resolve(host, pinned);
     }
 
-    builder
+    let client = builder
         .build()
-        .map_err(|e| FetchError::new("unavailable", format!("could not build HTTP client: {e}")))
+        .map_err(|e| FetchError::new("unavailable", format!("could not build HTTP client: {e}")))?;
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(Duration::from_millis(200), Duration::from_secs(2))
+        .jitter(Jitter::Full)
+        .build_with_max_retries(2);
+    let retry = MiddlewareClientBuilder::new(client.clone())
+        .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+            retry_policy,
+            FetchRetryStrategy,
+        ))
+        .build();
+    Ok(FetchHttpClient { raw: client, retry })
+}
+
+/// Retry only idempotent-fetch transient statuses and transport failures.
+/// 403 and other non-transient 4xx responses are never retried. Retry-After
+/// is not interpreted by reqwest-retry's policy and is therefore ignored.
+struct FetchRetryStrategy;
+
+impl reqwest_retry::RetryableStrategy for FetchRetryStrategy {
+    fn handle(
+        &self,
+        result: &Result<reqwest::Response, reqwest_middleware::Error>,
+    ) -> Option<reqwest_retry::Retryable> {
+        use reqwest_retry::Retryable;
+        match result {
+            Ok(response)
+                if matches!(
+                    response.status().as_u16(),
+                    408 | 425 | 429 | 500 | 502 | 503 | 504
+                ) =>
+            {
+                Some(Retryable::Transient)
+            }
+            Ok(_) => Some(Retryable::Fatal),
+            Err(error) if error.is_connect() || error.is_timeout() => Some(Retryable::Transient),
+            Err(_) => Some(Retryable::Fatal),
+        }
+    }
 }
 
 /// Read the response body, stopping at `max_bytes` when one is set.
