@@ -85,3 +85,80 @@ fn the_page_title_is_reported_when_there_is_one() {
     let (title, _) = extract(html.as_bytes(), PAGE_URL, Some("text/html"));
     assert_eq!(title.as_deref(), Some("My Title"));
 }
+
+#[test]
+fn content_types_are_classified() {
+    use ContentKind::{NonText, Text, Unknown};
+    for ct in [
+        "text/html; charset=utf-8",
+        "text/plain",
+        "TEXT/CSV",
+        "application/json",
+        "application/ld+json",
+        "application/atom+xml",
+        "image/svg+xml",
+        "application/javascript",
+    ] {
+        assert_eq!(content_kind(Some(ct)), Text, "{ct}");
+    }
+    for ct in [
+        "application/pdf",
+        "image/png",
+        "application/zip",
+        "audio/mpeg",
+        "video/mp4",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ] {
+        assert_eq!(content_kind(Some(ct)), NonText, "{ct}");
+    }
+    assert_eq!(content_kind(None), Unknown);
+    assert_eq!(content_kind(Some("")), Unknown);
+    assert_eq!(content_kind(Some("application/octet-stream")), Unknown);
+}
+
+#[test]
+fn a_nul_byte_marks_an_undeclared_body_as_binary() {
+    assert!(looks_binary(b"%PDF-1.7\n\x00\x01binary"));
+    assert!(!looks_binary(b"plain text, nothing odd"));
+    assert!(!looks_binary(b""));
+}
+
+#[test]
+fn the_non_text_notice_names_the_type_and_size() {
+    let notice = non_text_notice(Some("application/pdf"), Some(1234));
+    assert!(notice.contains("application/pdf"), "{notice}");
+    assert!(notice.contains("1234 bytes"), "{notice}");
+    let unknown = non_text_notice(None, None);
+    assert!(unknown.contains("unknown"), "{unknown}");
+}
+
+#[test]
+fn a_declared_header_charset_is_used_to_decode() {
+    // "café" in ISO-8859-1: the é is the single byte 0xE9.
+    let (_, text) = extract(b"caf\xe9", PAGE_URL, Some("text/plain; charset=ISO-8859-1"));
+    assert_eq!(text, "café");
+}
+
+#[test]
+fn a_meta_charset_is_used_when_the_header_has_none() {
+    let html = b"<html><head><meta charset=\"windows-1252\"><title>Caf\xe9</title></head><body><p>x</p></body></html>";
+    let (title, _) = extract(html, PAGE_URL, Some("text/html"));
+    assert_eq!(title.as_deref(), Some("Café"));
+}
+
+#[test]
+fn a_meta_like_string_in_plain_text_does_not_change_the_decoding() {
+    let text = "the header charset=latin1 is mentioned here: café";
+    let (_, out) = extract(text.as_bytes(), PAGE_URL, Some("text/plain"));
+    assert_eq!(out, text);
+}
+
+#[test]
+fn a_utf16_body_with_a_bom_is_decoded() {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "hello".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let (_, text) = extract(&bytes, PAGE_URL, Some("text/plain"));
+    assert_eq!(text, "hello");
+}

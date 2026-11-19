@@ -1621,6 +1621,7 @@ dependencies = [
  "crossterm",
  "dom_query",
  "dom_smoothie",
+ "encoding_rs",
  "eventsource-stream",
  "fast_html2md",
  "futures-util",

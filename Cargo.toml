@@ -32,6 +32,9 @@ bytes = "1"
 dom_smoothie = "0.19"
 fast_html2md = "0.0.66"
 dom_query = "0.29"
+# Decoding fetched pages in the charset they declare (already in the tree
+# through reqwest's `charset` feature).
+encoding_rs = "0.8"
 
 # SSE parsing for the streaming path
 eventsource-stream = "0.2"

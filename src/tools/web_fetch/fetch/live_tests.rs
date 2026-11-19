@@ -431,3 +431,56 @@ async fn retries_503_but_not_403() {
     assert!(error.detail.contains("403"));
     assert_eq!(forbidden.hits(), 1);
 }
+
+#[tokio::test]
+async fn a_declared_non_text_body_is_reported_by_its_type() {
+    let server = CapturingServer::start(vec![(
+        200,
+        vec![("Content-Type", "application/pdf")],
+        b"%PDF-1.7\n\x00\x01\x02 binary".to_vec(),
+    )])
+    .await;
+    let page = fetch_with_policy(&server.url(), &test_config(), AddressPolicy::AllowPrivate)
+        .await
+        .expect("a non-text page is not an error");
+    assert!(page.text.contains("application/pdf"), "{:?}", page.text);
+    assert!(
+        !page.text.contains("PDF-1.7"),
+        "the body is not shown: {:?}",
+        page.text
+    );
+    assert_eq!(page.title, None);
+}
+
+#[tokio::test]
+async fn an_undeclared_binary_body_is_reported_as_non_text() {
+    let server = CapturingServer::start(vec![(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec(),
+    )])
+    .await;
+    let page = fetch_with_policy(&server.url(), &test_config(), AddressPolicy::AllowPrivate)
+        .await
+        .expect("fetch");
+    assert!(page.text.contains("non-text content"), "{:?}", page.text);
+    assert!(
+        page.text.contains("application/octet-stream"),
+        "{:?}",
+        page.text
+    );
+}
+
+#[tokio::test]
+async fn an_octet_stream_that_is_really_text_is_still_read() {
+    let server = CapturingServer::start(vec![(
+        200,
+        vec![("Content-Type", "application/octet-stream")],
+        b"just a text file served with the wrong type".to_vec(),
+    )])
+    .await;
+    let page = fetch_with_policy(&server.url(), &test_config(), AddressPolicy::AllowPrivate)
+        .await
+        .expect("fetch");
+    assert_eq!(page.text, "just a text file served with the wrong type");
+}

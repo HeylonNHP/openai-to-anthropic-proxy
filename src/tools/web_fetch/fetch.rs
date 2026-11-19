@@ -290,7 +290,20 @@ async fn fetch_inner(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
+        // A body that is not text (a PDF, an image, an archive) is not
+        // decoded into garbage for the model: it is told what the URL holds
+        // instead, so it can find another way to read it. A declared
+        // non-text type is not even downloaded.
+        let declared = extract::content_kind(content_type.as_deref());
+        let length = response.content_length();
+        if declared == extract::ContentKind::NonText {
+            return Ok(non_text_page(&target, content_type.as_deref(), length));
+        }
+
         let bytes = read_capped(response, cfg.max_bytes).await?;
+        if declared == extract::ContentKind::Unknown && extract::looks_binary(&bytes) {
+            return Ok(non_text_page(&target, content_type.as_deref(), length));
+        }
         let (title, text) = extract::extract(&bytes, &target.to_url(), content_type.as_deref());
         let text = truncate(text, cfg.max_content_bytes);
 
@@ -299,6 +312,19 @@ async fn fetch_inner(
             title,
             text,
         });
+    }
+}
+
+/// The page reported for a response whose body is not text.
+fn non_text_page(
+    target: &ValidatedUrl,
+    content_type: Option<&str>,
+    length: Option<u64>,
+) -> FetchedPage {
+    FetchedPage {
+        final_url: target.to_url(),
+        title: None,
+        text: extract::non_text_notice(content_type, length),
     }
 }
 
