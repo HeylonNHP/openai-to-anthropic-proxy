@@ -67,6 +67,34 @@ impl TestServer {
         Self { addr, hits }
     }
 
+    /// Start a server that accepts connections and reads the request but never
+    /// answers, so a client can only get out by timing out.
+    async fn start_stalling() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    // Hold the connection open, silent, for as long as the
+                    // test runs.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        Self { addr, hits }
+    }
+
     /// The URL of a path on this server.
     fn url(&self, path: &str) -> String {
         format!("http://{}{path}", self.addr)
@@ -200,11 +228,24 @@ async fn a_private_address_is_refused_under_the_strict_policy() {
 #[tokio::test]
 async fn a_timeout_is_reported_as_an_error() {
     let mut cfg = test_config();
-    // A zero-second budget cannot be met by any real request.
-    cfg.timeout_secs = Some(0);
-    let server = TestServer::start(200, "body").await;
+    cfg.timeout_secs = Some(1);
+    // A server that never answers: the only way out is the timeout. (A
+    // zero-second budget against a server that answers at once is a RACE: the
+    // timer does not fire before the next millisecond tick, so a fast
+    // loopback response could win.)
+    let server = TestServer::start_stalling().await;
+
+    let started = std::time::Instant::now();
     let err = fetch_with_policy(&server.url("/"), &cfg, AddressPolicy::AllowPrivate)
         .await
         .expect_err("the request must time out");
+
     assert_eq!(err.code, "url_not_accessible");
+    assert!(err.detail.contains("timed out after 1s"), "{}", err.detail);
+    assert_eq!(server.hits(), 1, "the request did reach the server");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the budget must bound the fetch, took {:?}",
+        started.elapsed()
+    );
 }

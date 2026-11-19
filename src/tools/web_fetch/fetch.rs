@@ -50,6 +50,23 @@ const USER_AGENT: &str = concat!(
 /// How many redirects are followed before giving up.
 const MAX_REDIRECTS: usize = 5;
 
+/// A failed request or read, described for the model.
+///
+/// The client's own request timeout (a backstop beside the overall one) races
+/// the overall timeout, and reqwest words a timeout as "error sending
+/// request". Both are the same thing to the model, so a timeout is always
+/// reported as one.
+fn transport_error(what: &str, err: &reqwest::Error, timeout_secs: Option<u64>) -> FetchError {
+    if err.is_timeout() {
+        let detail = timeout_secs.map_or_else(
+            || "fetch timed out".to_owned(),
+            |secs| format!("fetch timed out after {secs}s"),
+        );
+        return FetchError::new("url_not_accessible", detail);
+    }
+    FetchError::new("url_not_accessible", format!("{what}: {err}"))
+}
+
 /// Refuse a URL the client's domain rules do not allow.
 fn check_domain(rules: &DomainRules, target: &ValidatedUrl) -> Result<(), FetchError> {
     if rules.allows(&target.to_url()) {
@@ -184,10 +201,11 @@ async fn fetch_inner(
 
     loop {
         let client = build_client(cfg, &target.host, pinned)?;
-        let response =
-            client.get(target.to_url()).send().await.map_err(|e| {
-                FetchError::new("url_not_accessible", format!("request failed: {e}"))
-            })?;
+        let response = client
+            .get(target.to_url())
+            .send()
+            .await
+            .map_err(|e| transport_error("request failed", &e, cfg.timeout_secs))?;
 
         let status = response.status();
         if status.is_redirection() {
@@ -535,8 +553,7 @@ async fn read_capped(
     let mut stream = response.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| FetchError::new("url_not_accessible", format!("read failed: {e}")))?;
+        let chunk = chunk.map_err(|e| transport_error("read failed", &e, None))?;
         if let Some(max) = max_bytes {
             let room = max.saturating_sub(buf.len() as u64);
             if room == 0 {
