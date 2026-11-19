@@ -28,7 +28,8 @@ pub(crate) fn render(attempt: &Attempt, result: SessionResult) -> Result<Respons
     let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
     assemble(&mut anth, prefix_blocks, &tools, paused);
 
-    // Reads the LAST executor response's authoritative usage exactly once.
+    // Records the turn's usage exactly once: `run` has already replaced the
+    // final response's usage with the sum over every executor run.
     record_json_stats(attempt, &final_resp);
 
     Ok(Json(anth).into_response())

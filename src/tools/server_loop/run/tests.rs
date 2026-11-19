@@ -265,3 +265,48 @@ fn every_internal_call_is_stripped_from_a_refused_final_response() {
     assert_eq!(resp.output.len(), 1);
     assert!(matches!(&resp.output[0], OutputItem::FunctionCall { name, .. } if name == "Bash"));
 }
+
+fn usage(input: u32, output: u32, cached: Option<u32>, reasoning: Option<u32>) -> ResponsesUsage {
+    ResponsesUsage {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input + output,
+        input_tokens_details: cached.map(|c| crate::responses::InputTokensDetails {
+            cached_tokens: c,
+            cache_write_tokens: 1,
+        }),
+        output_tokens_details: reasoning.map(|r| crate::responses::OutputTokensDetails {
+            reasoning_tokens: r,
+        }),
+    }
+}
+
+#[test]
+fn the_turn_usage_is_the_sum_of_every_run() {
+    let mut total = None;
+    add_usage(&mut total, Some(&usage(100, 10, None, None)));
+    add_usage(&mut total, None);
+    add_usage(&mut total, Some(&usage(250, 20, Some(80), Some(5))));
+    add_usage(&mut total, Some(&usage(300, 30, Some(200), None)));
+    let total = total.expect("three runs reported usage");
+    assert_eq!(total.input_tokens, 650);
+    assert_eq!(total.output_tokens, 60);
+    assert_eq!(total.total_tokens, 710);
+    let details = total.input_tokens_details.expect("cache details summed");
+    assert_eq!(details.cached_tokens, 280);
+    assert_eq!(details.cache_write_tokens, 2);
+    assert_eq!(
+        total
+            .output_tokens_details
+            .expect("reasoning")
+            .reasoning_tokens,
+        5
+    );
+}
+
+#[test]
+fn a_turn_with_no_reported_usage_has_none() {
+    let mut total = None;
+    add_usage(&mut total, None);
+    assert!(total.is_none());
+}

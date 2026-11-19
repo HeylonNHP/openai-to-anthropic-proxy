@@ -3564,11 +3564,26 @@ async fn advisor_happy_path() {
     assert_eq!(iterations[1]["input_tokens"], 21);
     assert_eq!(iterations[1]["output_tokens"], 13);
     assert_eq!(iterations[2]["type"], "message");
+    // Top-level usage is the sum of the EXECUTOR iterations (as in
+    // Anthropic's own example: 412 + 1348 = 1760), and never includes the
+    // advisor's tokens.
+    let executor_sum = |field: &str| {
+        iterations
+            .iter()
+            .filter(|i| i["type"] == "message")
+            .map(|i| i[field].as_u64().unwrap())
+            .sum::<u64>()
+    };
     assert_eq!(
-        body["usage"]["input_tokens"], 7,
-        "last executor response only"
+        body["usage"]["input_tokens"],
+        executor_sum("input_tokens"),
+        "every executor run, not only the last"
     );
-    assert_eq!(body["usage"]["output_tokens"], 3);
+    assert_eq!(
+        body["usage"]["output_tokens"],
+        executor_sum("output_tokens")
+    );
+    assert_eq!(body["usage"]["input_tokens"], 16);
 }
 
 /// 3. Fail closed. A 404 from the advisor (a model rejection shape!) must

@@ -24,7 +24,10 @@ use crate::anthropic::{Message, ResponseContentBlock};
 use crate::error::AppError;
 use crate::proxy::{Attempt, Outcome};
 use crate::repair::ToolSchemaRegistry;
-use crate::responses::{Input, InputItem, OutputItem, ResponsesResponse};
+use crate::responses::{
+    Input, InputItem, InputTokensDetails, OutputItem, OutputTokensDetails, ResponsesResponse,
+    ResponsesUsage,
+};
 use crate::tools::server_loop::handler::{Call, ServerTool};
 use crate::tui::{LogKind, LogLine};
 
@@ -150,7 +153,8 @@ pub(crate) enum AfterRound {
 
 /// The buffered result of the whole turn.
 pub(crate) struct SessionResult {
-    /// The LAST executor response, the one that answered the user.
+    /// The LAST executor response, the one that answered the user. Its
+    /// `usage` is the whole turn's: the sum over every executor run.
     pub final_resp: ResponsesResponse,
     /// Intermediate executor content interleaved with each tool's result
     /// blocks, in the order they happened.
@@ -207,6 +211,10 @@ pub(crate) async fn drive(
     let mut rounds = 0usize;
     let mut limit_hit = false;
     let mut terminal = false;
+    // Every executor run in the turn is billed, not just the last: the
+    // response's top-level usage is the sum of them all, as Anthropic
+    // reports for a server-tool turn.
+    let mut total_usage: Option<ResponsesUsage> = None;
 
     loop {
         // Nobody is listening any more: stop spending upstream calls.
@@ -233,7 +241,10 @@ pub(crate) async fn drive(
             other => other,
         };
         let resp = match outcome {
-            Ok(Outcome::Buffered(body)) => body,
+            Ok(Outcome::Buffered(body)) => {
+                add_usage(&mut total_usage, body.usage.as_ref());
+                body
+            }
             Ok(Outcome::Streaming(_)) => unreachable!("handled above"),
             Err(err) => {
                 let Some(last) = last_good.take() else {
@@ -245,7 +256,14 @@ pub(crate) async fn drive(
                         tool.on_rerun_failure(&mut prefix_blocks);
                     }
                 }
-                return Ok(complete(last, prefix_blocks, tools, false, out.emitted));
+                return Ok(complete(
+                    last,
+                    total_usage,
+                    prefix_blocks,
+                    tools,
+                    false,
+                    out.emitted,
+                ));
             }
         };
         out.start(|| {
@@ -272,7 +290,14 @@ pub(crate) async fn drive(
             } else {
                 strip_exhausted(&mut resp, &tools);
             }
-            return Ok(complete(resp, prefix_blocks, tools, false, out.emitted));
+            return Ok(complete(
+                resp,
+                total_usage,
+                prefix_blocks,
+                tools,
+                false,
+                out.emitted,
+            ));
         }
 
         // Everything the executor said in this sampling is an INTERMEDIATE
@@ -319,6 +344,7 @@ pub(crate) async fn drive(
                 );
                 return Ok(complete(
                     without_output(&resp),
+                    total_usage,
                     prefix_blocks,
                     tools,
                     true,
@@ -344,12 +370,18 @@ pub(crate) async fn drive(
 }
 
 fn complete(
-    final_resp: ResponsesResponse,
+    mut final_resp: ResponsesResponse,
+    total_usage: Option<ResponsesUsage>,
     prefix_blocks: Vec<ResponseContentBlock>,
     tools: Vec<Box<dyn ServerTool>>,
     paused: bool,
     emitted: usize,
 ) -> SessionOutcome {
+    // The response the client gets (and the stats) carry the whole turn's
+    // usage, not only the last run's.
+    if total_usage.is_some() {
+        final_resp.usage = total_usage;
+    }
     SessionOutcome::Complete(Box::new(SessionResult {
         final_resp,
         prefix_blocks,
@@ -357,6 +389,42 @@ fn complete(
         paused,
         emitted,
     }))
+}
+
+/// Add one executor run's usage to the turn's running total.
+///
+/// Every field is a count, so the turn's usage is the field-wise sum of its
+/// runs (saturating: a turn cannot overflow `u32` in practice, but must not
+/// panic if it did). A run that reported no usage adds nothing.
+pub(crate) fn add_usage(total: &mut Option<ResponsesUsage>, run: Option<&ResponsesUsage>) {
+    let Some(run) = run else {
+        return;
+    };
+    let Some(sum) = total.as_mut() else {
+        *total = Some(run.clone());
+        return;
+    };
+    sum.input_tokens = sum.input_tokens.saturating_add(run.input_tokens);
+    sum.output_tokens = sum.output_tokens.saturating_add(run.output_tokens);
+    sum.total_tokens = sum.total_tokens.saturating_add(run.total_tokens);
+    if let Some(run_in) = &run.input_tokens_details {
+        let d = sum.input_tokens_details.get_or_insert(InputTokensDetails {
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        });
+        d.cached_tokens = d.cached_tokens.saturating_add(run_in.cached_tokens);
+        d.cache_write_tokens = d
+            .cache_write_tokens
+            .saturating_add(run_in.cache_write_tokens);
+    }
+    if let Some(run_out) = &run.output_tokens_details {
+        let d = sum
+            .output_tokens_details
+            .get_or_insert(OutputTokensDetails {
+                reasoning_tokens: 0,
+            });
+        d.reasoning_tokens = d.reasoning_tokens.saturating_add(run_out.reasoning_tokens);
+    }
 }
 
 /// Let every tool clean an upstream error before it can reach the client.

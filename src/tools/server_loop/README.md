@@ -58,7 +58,8 @@ intermediate text, each tool's `server_tool_use` / result pair, any client
 * `stop_reason` is `end_turn`, or `tool_use` if a *client* tool is pending.
   A terminal reason from the model (`max_tokens`, `refusal`, `stop_sequence`)
   is kept. `pause_turn` is only sent when [enabled](#the-round-limit).
-* `usage` is the LAST executor response's, plus what each tool adds:
+* `usage` is the SUM of every executor run in the turn (each run is billed
+  upstream), plus what each tool adds:
   `server_tool_use.web_search_requests` / `web_fetch_requests` (a zero count is
   left out) and, for the advisor, `iterations[]`.
 
