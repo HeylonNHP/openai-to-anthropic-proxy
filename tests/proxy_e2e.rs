@@ -20,7 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
 use openai_to_anthropic_proxy::config::{
-    AdvisorConfig, Config, ModelAliases, ReasoningConfig, ToolResultImages, WebFetchConfig,
+    AdvisorConfig, Config, ModelAliases, ReasoningConfig, ServerToolsConfig, ToolResultImages,
+    WebFetchConfig, WebSearchConfig,
 };
 use reqwest::Body as ReqBody;
 use tokio::net::TcpListener;
@@ -182,6 +183,8 @@ fn make_config_with_default_model(
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -219,6 +222,8 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -626,6 +631,8 @@ async fn per_model_reasoning_effort_lookup() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -719,6 +726,8 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -804,6 +813,8 @@ async fn model_alias_rewrites_inbound_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -885,6 +896,8 @@ async fn model_not_supported_falls_back_to_default() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -945,6 +958,8 @@ async fn model_not_supported_without_default_passes_error_through() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -1013,6 +1028,8 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -1670,6 +1687,8 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -1769,6 +1788,8 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -1846,6 +1867,8 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -1936,6 +1959,8 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -2028,6 +2053,8 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -2127,6 +2154,8 @@ async fn runtime_alias_deletion_restores_pass_through() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -2219,6 +2248,8 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -2879,6 +2910,8 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         proxy_key: None,
         advisor: AdvisorConfig::default(),
         web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
         warnings: Vec::new(),
@@ -3881,9 +3914,10 @@ async fn advisor_max_uses_caps_the_loop() {
 /// `max_uses = 0` means "no limit": the consultation loop is bounded ONLY
 /// by the executor's behaviour. This test drives the executor to ask 12
 /// times (past the runaway threshold of 10) and proves that EVERY ask is
-/// answered — no `max_uses_exceeded`, no early stop. The proxy does not
-/// impose a ceiling of its own; it only warns (once at startup, and once
-/// per turn past 10 consultations).
+/// answered — no `max_uses_exceeded`, no early stop. The advisor imposes no
+/// ceiling of its own; it only warns (once at startup, and once per turn past
+/// 10 consultations). The SHARED round limit (`server_tools.max_rounds`, 10 by
+/// default) is lifted too, or it would end the turn first.
 #[tokio::test]
 async fn advisor_unlimited_max_uses_never_hits_a_cap() {
     const CONSULTATIONS: usize = 12;
@@ -3904,6 +3938,9 @@ async fn advisor_unlimited_max_uses_never_hits_a_cap() {
 
     let mut config = (*advisor_config(upstream_addr)).clone();
     config.advisor.max_uses = None;
+    // Unlimited consultations also need the shared round limit lifted: by
+    // default a turn runs at most 10 rounds, like Anthropic's own loop.
+    config.server_tools.max_rounds = None;
     let proxy_addr = start_proxy(Arc::new(config)).await;
 
     let res = reqwest::Client::new()
@@ -5489,7 +5526,7 @@ async fn b6_intermediate_content_and_sibling_tool_use_survive() {
 }
 
 /// B7: a terminal `incomplete` / `max_output_tokens` reason must survive
-/// `render_advisor` (not be clobbered to `end_turn`); a normal `completed`
+/// the response assembly (not be clobbered to `end_turn`); a normal `completed`
 /// response still yields `end_turn`.
 #[tokio::test]
 async fn b7_stop_reason_is_preserved_for_incomplete_and_completed() {
@@ -6635,4 +6672,1498 @@ async fn the_default_config_leaves_the_pipeline_alone() {
     let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
     // Streaming is NOT forced off when the feature is off.
     assert_eq!(received["stream"], true);
+}
+
+// ─── Proxy-native `web_search` ─────────────────────────────────────────────
+//
+// With `web_search.enabled`, the client's server-side `web_search` tool is
+// answered by the PROXY (DuckDuckGo scraping + page fetching) instead of the
+// upstream's built-in search. A mock "DuckDuckGo" serves the results here; the
+// result pages themselves point at a loopback address, which the SSRF guard
+// refuses, so these tests cover the failed-page path. Page fetching, parsing
+// and compaction are covered by the unit tests in `src/tools/web_search/`.
+
+/// The Anthropic server-side `web_search` declaration (no `input_schema`).
+const WEB_SEARCH_DECLARATION: &str =
+    r#"{"type":"web_search_20250305","name":"web_search","max_uses":8}"#;
+
+fn web_search_request(stream: bool) -> String {
+    format!(
+        r#"{{
+            "model": "gpt-4o-mini",
+            "max_tokens": 64,
+            "stream": {stream},
+            "tools": [{WEB_SEARCH_DECLARATION}],
+            "messages": [{{"role": "user", "content": "What is new in Rust?"}}]
+        }}"#
+    )
+}
+
+/// A Responses body whose output is one `proxy_web_search` function call.
+fn web_search_call_response(queries: &[&str]) -> String {
+    serde_json::json!({
+        "id": "resp_search",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "gpt-4o-mini",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_s1",
+            "name": "proxy_web_search",
+            "arguments": serde_json::json!({ "queries": queries }).to_string(),
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    })
+    .to_string()
+}
+
+/// A mock DuckDuckGo: records every form body and answers with `html`.
+async fn start_fake_search_engine(html: &'static str) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app = Router::new()
+        .route(
+            "/html/",
+            post(
+                move |State(seen): State<Arc<Mutex<Vec<String>>>>, body: Bytes| async move {
+                    seen.lock()
+                        .await
+                        .push(String::from_utf8_lossy(&body).into_owned());
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(Body::from(html))
+                        .unwrap()
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, seen)
+}
+
+const FAKE_RESULTS_HTML: &str = r#"<div id="links">
+  <div class="result web-result"><h2><a href="//duckduckgo.com/l/?uddg=http%3A%2F%2F127.0.0.1%3A9%2Fone">First hit</a></h2>
+    <a class="result__snippet">first snippet</a></div>
+  <div class="result web-result"><h2><a href="//duckduckgo.com/l/?uddg=http%3A%2F%2F127.0.0.1%3A9%2Ftwo">Second hit</a></h2>
+    <a class="result__snippet">second snippet</a></div>
+</div>"#;
+
+const FAKE_CAPTCHA_HTML: &str = r#"<form id="challenge-form"></form>"#;
+
+fn web_search_config(upstream: SocketAddr, engine: SocketAddr) -> Arc<Config> {
+    let mut config = (*make_proxy_config(upstream)).clone();
+    config.web_search = WebSearchConfig {
+        enabled: true,
+        search_endpoint: format!("http://{engine}/html/"),
+        page_timeout_secs: 2,
+        search_timeout_secs: 2,
+        ..WebSearchConfig::default()
+    };
+    Arc::new(config)
+}
+
+async fn post_messages(proxy: SocketAddr, body: String) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(body))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Disabled (the default): the upstream's built-in search is used, exactly as
+/// before — no function tool, no forced buffering.
+#[tokio::test]
+async fn web_search_disabled_keeps_the_upstreams_builtin_search() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_same", "same answer"));
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1);
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let tools = received["tools"].as_array().expect("tools");
+    assert!(tools.iter().any(|t| t["type"] == "web_search"));
+    assert!(!tools.iter().any(|t| t["name"] == "proxy_web_search"));
+}
+
+/// Enabled: the built-in search is replaced by the function tool and the
+/// request is buffered.
+#[tokio::test]
+async fn web_search_enabled_replaces_the_builtin_tool_and_buffers() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_done", "done"));
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(true)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    assert_eq!(received["stream"], false);
+    let tools = received["tools"].as_array().expect("tools");
+    assert!(!tools.iter().any(|t| t["type"] == "web_search"));
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == "proxy_web_search")
+        .expect("the proxy_web_search function tool must be synthesized");
+    assert_eq!(tool["parameters"]["required"][0], "queries");
+}
+
+/// The whole loop: two queries are searched, each yields a
+/// `server_tool_use`/`web_search_tool_result` pair for the client, the
+/// executor is re-run with the formatted results (the unreachable pages are
+/// reported, not fatal), and the answer is delivered.
+#[tokio::test]
+async fn web_search_runs_each_query_and_feeds_the_results_back() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["rust news", "rust 2026"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "Rust is great.")),
+        },
+    ]);
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().expect("content");
+
+    let uses: Vec<_> = content
+        .iter()
+        .filter(|b| b["type"] == "server_tool_use")
+        .collect();
+    let results: Vec<_> = content
+        .iter()
+        .filter(|b| b["type"] == "web_search_tool_result")
+        .collect();
+    assert_eq!(uses.len(), 2, "one pair per query: {content:?}");
+    assert_eq!(results.len(), 2);
+    assert_eq!(uses[0]["name"], "web_search");
+    assert_eq!(uses[0]["input"]["query"], "rust news");
+    assert_eq!(uses[1]["input"]["query"], "rust 2026");
+    assert_eq!(results[0]["tool_use_id"], uses[0]["id"]);
+    assert_eq!(results[0]["content"][0]["title"], "First hit");
+    assert_eq!(results[0]["content"][0]["url"], "http://127.0.0.1:9/one");
+    assert_eq!(body["usage"]["server_tool_use"]["web_search_requests"], 2);
+
+    assert!(
+        !content
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "proxy_web_search"),
+        "the internal call must not surface as a client tool_use"
+    );
+    assert!(
+        content
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "Rust is great.")
+    );
+
+    // The search engine saw both queries, as form posts.
+    let forms = searched.lock().await.clone();
+    assert_eq!(forms.len(), 2);
+    assert!(forms.iter().any(|f| f.contains("q=rust+news")));
+
+    // The re-run executor was handed the results, with the failed pages named.
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 2);
+    let second = String::from_utf8_lossy(&sent[1]).into_owned();
+    assert!(second.contains("function_call_output"));
+    assert!(second.contains("web_search_results"));
+    assert!(second.contains("failed to fetch page"));
+    assert!(second.contains("http://127.0.0.1:9/one"));
+}
+
+/// More queries than `max_queries` are not run.
+#[tokio::test]
+async fn web_search_caps_the_number_of_queries() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["a", "b", "c", "d", "e"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "ok")),
+        },
+    ]);
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let mut config = (*web_search_config(upstream_addr, engine)).clone();
+    config.web_search.max_queries = 2;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert_eq!(searched.lock().await.len(), 2);
+    let sent = upstream.received_all.lock().await.clone();
+    let second = String::from_utf8_lossy(&sent[1]).into_owned();
+    assert!(second.contains("3 further queries were NOT run"));
+}
+
+/// A CAPTCHA from the search engine degrades to an error result; the turn
+/// still completes with HTTP 200.
+#[tokio::test]
+async fn web_search_captcha_degrades_to_an_error_result() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["blocked"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id(
+                "resp_after",
+                "I could not search.",
+            )),
+        },
+    ]);
+    let (engine, _) = start_fake_search_engine(FAKE_CAPTCHA_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = body["content"].as_array().expect("content");
+
+    let result = content
+        .iter()
+        .find(|b| b["type"] == "web_search_tool_result")
+        .expect("a result block");
+    assert_eq!(result["content"]["type"], "web_search_tool_result_error");
+    assert_eq!(result["content"]["error_code"], "unavailable");
+    assert!(content.iter().any(|b| b["text"] == "I could not search."));
+
+    let sent = upstream.received_all.lock().await.clone();
+    let second = String::from_utf8_lossy(&sent[1]).into_owned();
+    assert!(second.contains("search_error"));
+    assert!(second.contains("CAPTCHA"));
+}
+
+/// A streaming client gets ONE synthetic SSE sequence containing the pair.
+#[tokio::test]
+async fn web_search_streaming_client_gets_a_synthetic_sse_sequence() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["rust"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "streamed answer")),
+        },
+    ]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(true)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let text = res.text().await.unwrap();
+
+    assert_eq!(text.matches("event: message_start").count(), 1);
+    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert!(text.contains("\"type\":\"server_tool_use\""));
+    assert!(text.contains("\"type\":\"web_search_tool_result\""));
+    assert!(text.contains("streamed answer"));
+    assert!(!text.contains("proxy_web_search"));
+}
+
+// ─── Shared server-tool loop: Anthropic-faithful behaviour ─────────────────
+//
+// These tests describe how the proxy must behave when several server-side
+// tools (`web_search`, `web_fetch`, `advisor`) are declared in ONE request,
+// and where the proxy must honour the options the client sends with a tool.
+// They were written BEFORE the implementation (plan step 1) and are
+// `#[ignore]`d with the step that makes each one pass; that step removes the
+// attribute. Tests that need a config knob that does not exist yet (the
+// `pause_turn` round limit) are added together with that knob.
+
+/// A request declaring several server tools at once.
+fn server_tools_request(stream: bool, declarations: &[&str]) -> String {
+    format!(
+        r#"{{
+            "model": "gpt-4o-mini",
+            "max_tokens": 64,
+            "stream": {stream},
+            "tools": [{}],
+            "messages": [{{"role": "user", "content": "Research this"}}]
+        }}"#,
+        declarations.join(",")
+    )
+}
+
+/// A Responses body whose output is the given function calls, in order:
+/// `(tool name, call id, arguments)`.
+fn function_calls_response(id: &str, calls: &[(&str, &str, serde_json::Value)]) -> String {
+    let output: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, call_id, args))| {
+            serde_json::json!({
+                "type": "function_call",
+                "id": format!("fc_{i}"),
+                "call_id": call_id,
+                "name": name,
+                "arguments": args.to_string(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": id,
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "gpt-4o-mini",
+        "output": output,
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    })
+    .to_string()
+}
+
+fn ok_response(body: String) -> FakeResponse {
+    FakeResponse {
+        status: StatusCode::OK,
+        body: Some(body),
+    }
+}
+
+/// `web_search`, `web_fetch` and the advisor all enabled.
+fn all_server_tools_config(upstream: SocketAddr, engine: SocketAddr) -> Arc<Config> {
+    let mut config = (*web_search_config(upstream, engine)).clone();
+    config.web_fetch = WebFetchConfig {
+        enabled: true,
+        timeout_secs: Some(2),
+        max_bytes: None,
+        max_content_bytes: None,
+    };
+    config.advisor = AdvisorConfig {
+        enabled: true,
+        model: "beam".into(),
+        effort: None,
+        max_uses: Some(2),
+        max_tokens: Some(64),
+        timeout_secs: Some(2),
+    };
+    Arc::new(config)
+}
+
+/// The names of the function tools the upstream was offered.
+fn offered_tool_names(request: &[u8]) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_slice(request).unwrap();
+    value["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn content_of(body: &serde_json::Value) -> &Vec<serde_json::Value> {
+    body["content"].as_array().expect("content array")
+}
+
+fn blocks_of_type<'a>(content: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+    content.iter().filter(|b| b["type"] == kind).collect()
+}
+
+const ADVISOR_DECL: &str = r#"{"type":"advisor_20260301","name":"advisor","model":"beam"}"#;
+const FETCH_DECL: &str = r#"{"type":"web_fetch_20250910","name":"web_fetch"}"#;
+const SEARCH_DECL: &str = r#"{"type":"web_search_20250305","name":"web_search"}"#;
+
+// ── Step 2: the tool options the client sends are read ──
+
+/// With the proxy's own search OFF, the client's `allowed_domains` and
+/// `user_location` must still reach the upstream's built-in search.
+#[tokio::test]
+async fn client_search_options_reach_the_upstreams_native_search() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_native", "ok"));
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+
+    let decl = r#"{"type":"web_search_20250305","name":"web_search","max_uses":3,
+        "allowed_domains":["rust-lang.org"],
+        "user_location":{"type":"approximate","country":"GB","city":"London"}}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let received: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let tool = received["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "web_search")
+        .expect("the native search tool");
+    // OpenAI's only domain control is an allow-list under `filters`.
+    assert_eq!(tool["filters"]["allowed_domains"][0], "rust-lang.org");
+    assert_eq!(tool["user_location"]["country"], "GB");
+}
+
+/// Anthropic rejects a search tool that sets both domain lists.
+#[tokio::test]
+async fn allowed_and_blocked_domains_together_is_a_400() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_x", "ok"));
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+
+    let decl = r#"{"type":"web_search_20250305","name":"web_search",
+        "allowed_domains":["a.example"],"blocked_domains":["b.example"]}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        upstream.received_all.lock().await.is_empty(),
+        "an invalid request must not reach the upstream"
+    );
+}
+
+// ── Steps 3-6: several server tools in one turn ──
+
+/// With all three tools declared and enabled, the executor is offered all
+/// three (today `web_search` hides the other two).
+#[tokio::test]
+async fn all_three_server_tools_are_offered_together() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_done", "done"));
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let decls = [SEARCH_DECL, FETCH_DECL, ADVISOR_DECL];
+    let res = post_messages(proxy_addr, server_tools_request(false, &decls)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let names = offered_tool_names(&sent[0]);
+    for expected in ["proxy_web_search", "web_fetch", "advisor"] {
+        assert!(names.iter().any(|n| n == expected), "{expected}: {names:?}");
+    }
+}
+
+/// A turn can search, then fetch a page, then answer — the model is never
+/// refused a server tool because another one was used first.
+#[tokio::test]
+async fn a_turn_can_search_then_fetch_then_answer() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[(
+                    "proxy_web_search",
+                    "call_s",
+                    serde_json::json!({"queries": ["rust"]}),
+                )],
+            )),
+            ok_response(function_calls_response(
+                "r2",
+                &[(
+                    "web_fetch",
+                    "call_f",
+                    serde_json::json!({"url": "http://127.0.0.1:9/page"}),
+                )],
+            )),
+            ok_response(completed_response_with_id("r3", "All done.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, FETCH_DECL]),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 1);
+    assert_eq!(blocks_of_type(content, "web_fetch_tool_result").len(), 1);
+    // Search first, fetch second, then the answer — in the order they happened.
+    let kinds: Vec<&str> = content.iter().filter_map(|b| b["type"].as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "server_tool_use",
+            "web_search_tool_result",
+            "server_tool_use",
+            "web_fetch_tool_result",
+            "text"
+        ]
+    );
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(upstream.received_all.lock().await.len(), 3);
+}
+
+/// Two different server tools called in ONE response are both served, and
+/// both outputs reach the executor on the re-run.
+#[tokio::test]
+async fn two_server_tool_calls_in_one_response_are_both_served() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[
+                    (
+                        "proxy_web_search",
+                        "call_s",
+                        serde_json::json!({"queries": ["rust"]}),
+                    ),
+                    (
+                        "web_fetch",
+                        "call_f",
+                        serde_json::json!({"url": "http://127.0.0.1:9/page"}),
+                    ),
+                ],
+            )),
+            ok_response(completed_response_with_id("r2", "Both done.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, FETCH_DECL]),
+    )
+    .await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 1);
+    assert_eq!(blocks_of_type(content, "web_fetch_tool_result").len(), 1);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 2, "one executor re-run, not one per call");
+    let rerun: serde_json::Value = serde_json::from_slice(&sent[1]).unwrap();
+    let outputs: Vec<&str> = rerun["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .filter_map(|i| i["call_id"].as_str())
+        .collect();
+    assert!(outputs.contains(&"call_s") && outputs.contains(&"call_f"));
+}
+
+/// `web_fetch` used to serve only the FIRST call of a response and silently
+/// drop the rest; every call must be served.
+#[tokio::test]
+async fn web_fetch_serves_every_call_in_one_response() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[
+                    (
+                        "web_fetch",
+                        "call_1",
+                        serde_json::json!({"url": "http://127.0.0.1:9/a"}),
+                    ),
+                    (
+                        "web_fetch",
+                        "call_2",
+                        serde_json::json!({"url": "http://127.0.0.1:9/b"}),
+                    ),
+                ],
+            )),
+            ok_response(completed_response_with_id("r2", "Fetched both.")),
+        ],
+    );
+    let proxy_addr = start_proxy(web_fetch_config(upstream_addr)).await;
+
+    let res = post_messages(proxy_addr, web_fetch_request(false)).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+    assert_eq!(blocks_of_type(content, "server_tool_use").len(), 2);
+    assert_eq!(blocks_of_type(content, "web_fetch_tool_result").len(), 2);
+}
+
+/// The advisor and a search used in the same turn.
+#[tokio::test]
+async fn advisor_and_web_search_work_in_the_same_turn() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("r1", "call_adv"),
+            advisor_answer("Search before answering."),
+            ok_response(function_calls_response(
+                "r3",
+                &[(
+                    "proxy_web_search",
+                    "call_s",
+                    serde_json::json!({"queries": ["rust"]}),
+                )],
+            )),
+            ok_response(completed_response_with_id("r4", "Final answer.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, ADVISOR_DECL]),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+    assert_eq!(blocks_of_type(content, "advisor_tool_result").len(), 1);
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 1);
+    assert!(content.iter().any(|b| b["text"] == "Final answer."));
+    // The advisor's tokens are still billed in iterations[].
+    let iterations = body["usage"]["iterations"].as_array().unwrap();
+    assert!(iterations.iter().any(|i| i["type"] == "advisor_message"));
+}
+
+/// A streaming client gets ONE well-formed sequence containing every pair.
+#[tokio::test]
+async fn a_mixed_turn_streams_one_sequence_with_every_pair() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[(
+                    "proxy_web_search",
+                    "call_s",
+                    serde_json::json!({"queries": ["rust"]}),
+                )],
+            )),
+            ok_response(function_calls_response(
+                "r2",
+                &[(
+                    "web_fetch",
+                    "call_f",
+                    serde_json::json!({"url": "http://127.0.0.1:9/page"}),
+                )],
+            )),
+            ok_response(completed_response_with_id("r3", "streamed final")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(true, &[SEARCH_DECL, FETCH_DECL]),
+    )
+    .await;
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let text = res.text().await.unwrap();
+    assert_eq!(text.matches("event: message_start").count(), 1);
+    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert!(text.contains("\"type\":\"web_search_tool_result\""));
+    assert!(text.contains("\"type\":\"web_fetch_tool_result\""));
+    assert!(text.contains("streamed final"));
+    assert!(!text.contains("proxy_web_search"));
+}
+
+/// A re-run that fails AFTER a server tool was served must not turn the
+/// whole request into an error: the client gets what was already produced.
+#[tokio::test]
+async fn a_failed_later_run_returns_the_work_already_done() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[(
+                    "proxy_web_search",
+                    "call_s",
+                    serde_json::json!({"queries": ["rust"]}),
+                )],
+            )),
+            FakeResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: Some(r#"{"error":{"message":"boom"}}"#.to_owned()),
+            },
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 1);
+}
+
+/// Anthropic reports `web_fetch_requests` next to `web_search_requests`.
+#[tokio::test]
+async fn usage_counts_web_fetch_requests() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_fetch_call_response("http://127.0.0.1:9/page")),
+            ok_response(completed_response_with_id("r2", "done")),
+        ],
+    );
+    let proxy_addr = start_proxy(web_fetch_config(upstream_addr)).await;
+
+    let res = post_messages(proxy_addr, web_fetch_request(false)).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["usage"]["server_tool_use"]["web_fetch_requests"], 1);
+}
+
+// ── Step 7: the client's tool options are applied ──
+
+/// The client's `max_uses` counts queries: the one over the limit gets a
+/// `max_uses_exceeded` result and the turn carries on.
+#[tokio::test]
+async fn web_search_honours_the_clients_max_uses() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["one", "two"])),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let decl = r#"{"type":"web_search_20250305","name":"web_search","max_uses":1}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let results = blocks_of_type(content_of(&body), "web_search_tool_result");
+    assert_eq!(results.len(), 2);
+    assert!(results[0]["content"].is_array(), "the first query ran");
+    assert_eq!(results[1]["content"]["error_code"], "max_uses_exceeded");
+    assert_eq!(
+        searched.lock().await.len(),
+        1,
+        "only one query was searched"
+    );
+}
+
+/// `allowed_domains`: results from other hosts are dropped.
+#[tokio::test]
+async fn web_search_honours_allowed_domains() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["rust"])),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    // The mock engine only returns 127.0.0.1 results.
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let decl =
+        r#"{"type":"web_search_20250305","name":"web_search","allowed_domains":["rust-lang.org"]}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = &blocks_of_type(content_of(&body), "web_search_tool_result")[0];
+    assert_eq!(result["content"].as_array().map(Vec::len), Some(0));
+
+    // The executor is told nothing matched, and no page was fetched.
+    let sent = upstream.received_all.lock().await.clone();
+    let rerun = String::from_utf8_lossy(&sent[1]).into_owned();
+    assert!(!rerun.contains("http://127.0.0.1:9/one"));
+}
+
+/// `blocked_domains`: results from the blocked host are dropped.
+#[tokio::test]
+async fn web_search_honours_blocked_domains() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["rust"])),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let decl =
+        r#"{"type":"web_search_20250305","name":"web_search","blocked_domains":["127.0.0.1"]}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = &blocks_of_type(content_of(&body), "web_search_tool_result")[0];
+    assert_eq!(result["content"].as_array().map(Vec::len), Some(0));
+}
+
+/// `user_location` picks the search engine's region.
+#[tokio::test]
+async fn web_search_sends_the_users_region_to_the_engine() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["weather"])),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let decl = r#"{"type":"web_search_20250305","name":"web_search",
+        "user_location":{"type":"approximate","country":"GB"}}"#;
+    let _ = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    let forms = searched.lock().await.clone();
+    // `wt-wt` is DuckDuckGo's "no region" default.
+    assert!(
+        forms[0].contains("kl=") && !forms[0].contains("kl=wt-wt"),
+        "the user's region was not sent: {}",
+        forms[0]
+    );
+}
+
+/// `web_fetch` `allowed_domains`: a URL outside the list is refused BEFORE
+/// any network access. `.invalid` never resolves, so without the rule the
+/// error would be `url_not_accessible`.
+#[tokio::test]
+async fn web_fetch_honours_allowed_domains() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_fetch_call_response("https://other.invalid/page")),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    let proxy_addr = start_proxy(web_fetch_config(upstream_addr)).await;
+
+    let decl = r#"{"type":"web_fetch_20250910","name":"web_fetch","allowed_domains":["docs.rs"]}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let result = &blocks_of_type(content_of(&body), "web_fetch_tool_result")[0];
+    assert_eq!(result["content"]["error_code"], "url_not_allowed");
+}
+
+/// `web_fetch` `max_uses`: the fetch over the limit is refused.
+#[tokio::test]
+async fn web_fetch_honours_the_clients_max_uses() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(function_calls_response(
+                "r1",
+                &[
+                    (
+                        "web_fetch",
+                        "c1",
+                        serde_json::json!({"url": "http://127.0.0.1:9/a"}),
+                    ),
+                    (
+                        "web_fetch",
+                        "c2",
+                        serde_json::json!({"url": "http://127.0.0.1:9/b"}),
+                    ),
+                ],
+            )),
+            ok_response(completed_response_with_id("r2", "ok")),
+        ],
+    );
+    let proxy_addr = start_proxy(web_fetch_config(upstream_addr)).await;
+
+    let decl = r#"{"type":"web_fetch_20250910","name":"web_fetch","max_uses":1}"#;
+    let res = post_messages(proxy_addr, server_tools_request(false, &[decl])).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    let results = blocks_of_type(content_of(&body), "web_fetch_tool_result");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[1]["content"]["error_code"], "max_uses_exceeded");
+}
+
+// ── Step 8: results stay in context on later turns ──
+
+/// An earlier `web_search` result echoed back by the client (from the
+/// upstream's native search, so the proxy did not make it) must reach the
+/// model instead of being dropped.
+#[tokio::test]
+async fn an_echoed_native_search_result_reaches_the_model() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("r1", "ok"));
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+
+    let request = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "tools": [serde_json::from_str::<serde_json::Value>(SEARCH_DECL).unwrap()],
+        "messages": [
+            {"role": "user", "content": "What is new in Rust?"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                 "input": {"query": "rust news"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                    {"type": "web_search_result", "title": "Rust 2026 released",
+                     "url": "https://blog.rust-lang.org/2026", "page_age": null,
+                     "encrypted_content": "opaque-not-ours"}
+                ]},
+                {"type": "text", "text": "Rust 2026 shipped."}
+            ]},
+            {"role": "user", "content": "Tell me more"}
+        ]
+    });
+    let res = post_messages(proxy_addr, request.to_string()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let upstream_body = String::from_utf8_lossy(&sent[0]).into_owned();
+    assert!(upstream_body.contains("Rust 2026 released"), "title lost");
+    assert!(
+        upstream_body.contains("https://blog.rust-lang.org/2026"),
+        "url lost"
+    );
+}
+
+/// The whole round trip through the proxy's own search: what the model saw
+/// on turn one is back in its context on turn two, using only the blocks the
+/// client was given.
+#[tokio::test]
+async fn search_results_survive_into_the_next_turn() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["rust news"])),
+            ok_response(completed_response_with_id("r2", "First answer.")),
+            ok_response(completed_response_with_id("r3", "Second answer.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let first = post_messages(proxy_addr, web_search_request(false)).await;
+    let first: serde_json::Value = first.json().await.unwrap();
+
+    let second_request = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "tools": [serde_json::from_str::<serde_json::Value>(SEARCH_DECL).unwrap()],
+        "messages": [
+            {"role": "user", "content": "What is new in Rust?"},
+            {"role": "assistant", "content": first["content"].clone()},
+            {"role": "user", "content": "Tell me more"}
+        ]
+    });
+    let res = post_messages(proxy_addr, second_request.to_string()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let last: serde_json::Value = serde_json::from_slice(sent.last().unwrap()).unwrap();
+    let third = last["input"].to_string();
+    assert!(
+        third.contains("first snippet"),
+        "turn-one results were lost"
+    );
+    assert!(
+        !third.contains("proxy_web_search"),
+        "the internal tool must not appear in the replayed history"
+    );
+}
+
+// ── Step 10: blocks are streamed as they happen ──
+
+/// The first bytes of a streaming reply must arrive while the turn is still
+/// running, not after the last executor call.
+#[tokio::test]
+async fn a_streaming_reply_starts_before_the_turn_finishes() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(web_search_call_response(&["rust"])),
+            ok_response(completed_response_with_id("r2", "late answer")),
+        ],
+    );
+    // Stall the SECOND executor call.
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_millis(1500)]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let started = std::time::Instant::now();
+    let mut res = post_messages(proxy_addr, web_search_request(true)).await;
+    let first_chunk = res.chunk().await.unwrap().expect("a first chunk");
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the stream only started after {:?}",
+        started.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&first_chunk).contains("message_start"));
+}
+
+/// The advisor's cap stops ONLY the advisor: once it is refused, the executor
+/// can still search, and a further advisor call in the same response is
+/// dropped rather than served or leaked to the client.
+#[tokio::test]
+async fn the_advisor_cap_does_not_stop_the_other_tools() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("r1", "call_a1"),
+            advisor_answer("First advice."),
+            advisor_call_response("r2", "call_a2"),
+            advisor_answer("Second advice."),
+            // The third call is over `max_uses: 2` and is refused.
+            advisor_call_response("r3", "call_a3"),
+            // The executor ignores the refusal AND asks to search.
+            ok_response(function_calls_response(
+                "r4",
+                &[
+                    ("advisor", "call_a4", serde_json::json!({})),
+                    (
+                        "proxy_web_search",
+                        "call_s",
+                        serde_json::json!({"queries": ["rust"]}),
+                    ),
+                ],
+            )),
+            ok_response(completed_response_with_id("r5", "Final answer.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, ADVISOR_DECL]),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+
+    let advisor_results = blocks_of_type(content, "advisor_tool_result");
+    assert_eq!(advisor_results.len(), 3, "two answers and one refusal");
+    assert_eq!(
+        advisor_results[2]["content"]["error_code"],
+        "max_uses_exceeded"
+    );
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 1);
+    assert!(content.iter().any(|b| b["text"] == "Final answer."));
+    assert!(
+        !content.iter().any(|b| b["type"] == "tool_use"),
+        "no internal call may reach the client: {content:?}"
+    );
+    // r1, advice, r2, advice, r3, r4, r5.
+    assert_eq!(upstream.received_all.lock().await.len(), 7);
+}
+
+/// The advisor's error scrubbing still applies when other tools are active:
+/// an upstream 400 naming the advisor beta must never reach the client.
+#[tokio::test]
+async fn advisor_tokens_are_scrubbed_in_a_mixed_turn() {
+    const BETA_400: &str = r#"{"error":{"type":"invalid_request_error","message":"Input tag 'advisor_20260301' found; advisor-tool-2026-03-01 beta required"}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(BETA_400.into()),
+        }],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, FETCH_DECL, ADVISOR_DECL]),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let raw = res.text().await.unwrap();
+    for token in ["advisor_20260301", "advisor-tool-2026-03-01", "Input tag"] {
+        assert!(!raw.contains(token), "{token} leaked in a mixed turn");
+    }
+}
+
+// ── The server-tool round limit and `pause_turn` ──
+
+/// A search config with the loop's round limit set.
+fn rounds_config(
+    upstream: SocketAddr,
+    engine: SocketAddr,
+    max_rounds: usize,
+    pause_turn: bool,
+) -> Arc<Config> {
+    let mut config = (*web_search_config(upstream, engine)).clone();
+    config.server_tools = ServerToolsConfig {
+        max_rounds: Some(max_rounds),
+        pause_turn,
+    };
+    Arc::new(config)
+}
+
+fn search_round(id: &str, call_id: &str, query: &str) -> FakeResponse {
+    ok_response(function_calls_response(
+        id,
+        &[(
+            "proxy_web_search",
+            call_id,
+            serde_json::json!({"queries": [query]}),
+        )],
+    ))
+}
+
+/// At the limit (the default behaviour) the model is told to answer: the
+/// extra search it asks for is refused, it gets one last run, and the client
+/// sees an ordinary finished turn.
+#[tokio::test]
+async fn at_the_round_limit_the_model_is_made_to_answer() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            search_round("r2", "c2", "two"),
+            // Over the limit of 2: this call is refused, not run.
+            search_round("r3", "c3", "three"),
+            ok_response(completed_response_with_id("r4", "Answering now.")),
+        ],
+    );
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 2, false)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 2);
+    assert!(content.iter().any(|b| b["text"] == "Answering now."));
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert!(!content.iter().any(|b| b["type"] == "tool_use"));
+    assert_eq!(searched.lock().await.len(), 2, "the third search never ran");
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 4);
+    let last: serde_json::Value = serde_json::from_slice(&sent[3]).unwrap();
+    assert!(
+        last["input"]
+            .to_string()
+            .contains("limit for this request was reached"),
+        "the model must be told why"
+    );
+}
+
+/// A model that answers on its own before the limit is not affected at all.
+#[tokio::test]
+async fn a_turn_under_the_limit_is_untouched() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            ok_response(completed_response_with_id("r2", "Done.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 5, true)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(upstream.received_all.lock().await.len(), 2);
+}
+
+/// With `pause_turn` on, the limit returns the work so far with
+/// `stop_reason: "pause_turn"`, and makes no further upstream call.
+#[tokio::test]
+async fn pause_turn_returns_the_work_so_far_at_the_limit() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            search_round("r2", "c2", "two"),
+            ok_response(completed_response_with_id("r3", "never reached")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 2, true)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let content = content_of(&body);
+
+    assert_eq!(body["stop_reason"], "pause_turn");
+    assert_eq!(blocks_of_type(content, "server_tool_use").len(), 2);
+    assert_eq!(blocks_of_type(content, "web_search_tool_result").len(), 2);
+    assert!(
+        !content.iter().any(|b| b["type"] == "text"),
+        "no answer yet"
+    );
+    assert_eq!(
+        upstream.received_all.lock().await.len(),
+        2,
+        "no run is spent after the limit"
+    );
+}
+
+/// The same, to a streaming client.
+#[tokio::test]
+async fn pause_turn_is_streamed_as_one_sequence() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            search_round("r2", "c2", "two"),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 2, true)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(true)).await;
+    let text = res.text().await.unwrap();
+    assert_eq!(text.matches("event: message_start").count(), 1);
+    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert!(text.contains("\"stop_reason\":\"pause_turn\""), "{text}");
+}
+
+/// A client tool the model asked for in the paused round still wins: the
+/// client must run it, and sending its result resumes the turn.
+#[tokio::test]
+async fn a_pending_client_tool_beats_pause_turn() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![ok_response(function_calls_response(
+            "r1",
+            &[
+                (
+                    "proxy_web_search",
+                    "c1",
+                    serde_json::json!({"queries": ["one"]}),
+                ),
+                ("Bash", "c2", serde_json::json!({"command": "ls"})),
+            ],
+        ))],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 1, true)).await;
+
+    let bash = r#"{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}"#;
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[SEARCH_DECL, bash]),
+    )
+    .await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert!(
+        content_of(&body)
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["name"] == "Bash")
+    );
+}
+
+/// Resuming: the client resends the paused assistant message as the last one.
+/// The proxy accepts it and the model sees what was found.
+#[tokio::test]
+async fn a_paused_turn_can_be_resumed() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            ok_response(completed_response_with_id("r2", "Resumed and answered.")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(rounds_config(upstream_addr, engine, 1, true)).await;
+
+    let first = post_messages(proxy_addr, web_search_request(false)).await;
+    let first: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(first["stop_reason"], "pause_turn");
+
+    let resume = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "max_tokens": 64,
+        "tools": [serde_json::from_str::<serde_json::Value>(SEARCH_DECL).unwrap()],
+        "messages": [
+            {"role": "user", "content": "What is new in Rust?"},
+            {"role": "assistant", "content": first["content"].clone()},
+        ]
+    });
+    let res = post_messages(proxy_addr, resume.to_string()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        content_of(&body)
+            .iter()
+            .any(|b| b["text"] == "Resumed and answered.")
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    let resumed: serde_json::Value = serde_json::from_slice(sent.last().unwrap()).unwrap();
+    assert!(
+        resumed["input"].to_string().contains("first snippet"),
+        "the model must still see what the search found"
+    );
+}
+
+// ── Streaming as it happens ──
+
+/// The search blocks reach a streaming client while the model is still working
+/// on the answer, not together with it.
+#[tokio::test]
+async fn search_blocks_arrive_before_the_final_run_finishes() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            ok_response(completed_response_with_id("r2", "late answer")),
+        ],
+    );
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_millis(1500)]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let started = std::time::Instant::now();
+    let mut res = post_messages(proxy_addr, web_search_request(true)).await;
+    let mut seen = String::new();
+    while !seen.contains("web_search_tool_result") {
+        let chunk = res.chunk().await.unwrap().expect("stream ended early");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the result only arrived after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !seen.contains("late answer"),
+        "the answer was not ready yet"
+    );
+
+    // The rest follows, in one well-formed message.
+    seen.push_str(&res.text().await.unwrap());
+    assert!(seen.contains("late answer"));
+    assert_eq!(seen.matches("event: message_start").count(), 1);
+    assert_eq!(seen.matches("event: message_stop").count(), 1);
+}
+
+/// Block indices run on across the pieces the stream is sent in.
+#[tokio::test]
+async fn streamed_blocks_have_contiguous_indices() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            search_round("r2", "c2", "two"),
+            ok_response(completed_response_with_id("r3", "answer")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let text = post_messages(proxy_addr, web_search_request(true))
+        .await
+        .text()
+        .await
+        .unwrap();
+    let starts: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .filter(|v| v["type"] == "content_block_start")
+        .map(|v| v["index"].as_u64().unwrap())
+        .collect();
+    // Two pairs and the answer.
+    assert_eq!(starts, [0, 1, 2, 3, 4]);
+}
+
+/// A failure of the FIRST model run is still an HTTP error with its status
+/// (which clients retry on), not a 200 with an error buried in the stream. The
+/// advisor tokens are still scrubbed.
+#[tokio::test]
+async fn a_streaming_turn_whose_first_run_fails_is_an_http_error() {
+    const BETA_400: &str = r#"{"error":{"type":"invalid_request_error","message":"Input tag 'advisor_20260301' found; advisor-tool-2026-03-01 beta required"}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Some(BETA_400.into()),
+        }],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let res = post_messages(proxy_addr, advisor_request(true)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let raw = res.text().await.unwrap();
+    assert!(!raw.contains("advisor_20260301"), "{raw}");
+}
+
+/// A client that goes away stops the turn: the proxy does not keep paying for
+/// upstream calls nobody will read.
+#[tokio::test]
+async fn a_client_that_disconnects_stops_the_turn() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            search_round("r1", "c1", "one"),
+            search_round("r2", "c2", "two"),
+            ok_response(completed_response_with_id("r3", "never wanted")),
+        ],
+    );
+    // Round 2 is slow enough for the client to leave during it.
+    *upstream.delay_per_attempt.lock().await =
+        VecDeque::from([Duration::ZERO, Duration::from_millis(400), Duration::ZERO]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let mut res = post_messages(proxy_addr, web_search_request(true)).await;
+    // Leave once the first search has been delivered: round 2 is in flight.
+    let mut seen = String::new();
+    while !seen.contains("web_search_tool_result") {
+        let chunk = res.chunk().await.unwrap().expect("stream ended early");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    drop(res);
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        upstream.received_all.lock().await.len(),
+        2,
+        "no third run for a client that left"
+    );
 }

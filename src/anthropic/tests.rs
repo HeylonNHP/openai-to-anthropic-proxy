@@ -437,3 +437,138 @@ fn unknown_block_type_still_maps_to_unknown() {
     assert_eq!(blocks.len(), 1);
     assert!(matches!(blocks[0], ContentBlockParam::Unknown));
 }
+
+fn tool(json: &str) -> Tool {
+    serde_json::from_str(json).expect("parse Tool")
+}
+
+#[test]
+fn a_search_declaration_keeps_its_type_and_options() {
+    let t = tool(
+        r#"{"type":"web_search_20250305","name":"web_search","max_uses":5,
+            "allowed_domains":["rust-lang.org"],
+            "user_location":{"type":"approximate","country":"GB"}}"#,
+    );
+    assert_eq!(t.kind.as_deref(), Some("web_search_20250305"));
+    assert_eq!(t.options.max_uses, Some(5));
+    assert_eq!(
+        t.options.allowed_domains.as_deref(),
+        Some(&["rust-lang.org".to_owned()][..])
+    );
+    assert!(t.options.blocked_domains.is_none());
+    assert_eq!(t.options.user_location.unwrap()["country"], "GB");
+}
+
+#[test]
+fn a_fetch_declaration_keeps_its_options() {
+    let t = tool(
+        r#"{"type":"web_fetch_20250910","name":"web_fetch","max_content_tokens":1000,
+            "blocked_domains":["x.example"],"citations":{"enabled":true}}"#,
+    );
+    assert_eq!(t.options.max_content_tokens, Some(1000));
+    assert_eq!(t.options.blocked_domains.unwrap()[0], "x.example");
+    assert_eq!(t.options.citations.unwrap()["enabled"], true);
+}
+
+#[test]
+fn a_client_function_tool_has_no_options() {
+    let t = tool(r#"{"name":"Bash","description":"d","input_schema":{"type":"object"}}"#);
+    assert!(t.kind.is_none());
+    assert!(t.options.max_uses.is_none() && t.options.allowed_domains.is_none());
+}
+
+#[test]
+fn unknown_declaration_fields_are_ignored() {
+    // Claude Code adds fields such as `cache_control`; they must not break parsing.
+    let t = tool(
+        r#"{"type":"custom","name":"Bash","input_schema":{},"cache_control":{"type":"ephemeral"}}"#,
+    );
+    assert_eq!(t.kind.as_deref(), Some("custom"));
+}
+
+#[test]
+fn a_schemaless_tool_is_a_server_tool_by_name() {
+    let t = tool(r#"{"name":"web_fetch"}"#);
+    assert!(t.is_server_tool("web_fetch", "web_fetch_"));
+    assert!(!t.is_server_tool("web_search", "web_search_"));
+}
+
+#[test]
+fn a_versioned_type_marks_a_server_tool_even_with_a_schema() {
+    let t = tool(
+        r#"{"type":"web_fetch_20260309","name":"web_fetch","input_schema":{"type":"object"}}"#,
+    );
+    assert!(t.is_server_tool("web_fetch", "web_fetch_"));
+}
+
+#[test]
+fn a_function_tool_with_a_server_tools_name_is_not_a_server_tool() {
+    for json in [
+        r#"{"name":"web_fetch","input_schema":{"type":"object"}}"#,
+        r#"{"type":"custom","name":"web_fetch","input_schema":{"type":"object"}}"#,
+    ] {
+        assert!(
+            !tool(json).is_server_tool("web_fetch", "web_fetch_"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn both_domain_lists_are_rejected() {
+    for name_type in [
+        ("web_search", "web_search_20250305"),
+        ("web_fetch", "web_fetch_20250910"),
+    ] {
+        let t = tool(&format!(
+            r#"{{"type":"{}","name":"{}","allowed_domains":["a.example"],"blocked_domains":["b.example"]}}"#,
+            name_type.1, name_type.0
+        ));
+        let err = validate_server_tool_options(&[t]).unwrap_err();
+        assert!(
+            err.contains(name_type.0) && err.contains("allowed_domains"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn one_domain_list_or_none_is_accepted() {
+    let tools = [
+        tool(
+            r#"{"type":"web_search_20250305","name":"web_search","allowed_domains":["a.example"]}"#,
+        ),
+        tool(r#"{"type":"web_fetch_20250910","name":"web_fetch","blocked_domains":["b.example"]}"#),
+        tool(r#"{"type":"web_search_20250305","name":"web_search"}"#),
+    ];
+    assert!(validate_server_tool_options(&tools).is_ok());
+}
+
+#[test]
+fn a_function_tool_with_both_fields_is_not_validated_as_a_server_tool() {
+    let t = tool(
+        r#"{"name":"web_fetch","input_schema":{"type":"object"},
+            "allowed_domains":["a"],"blocked_domains":["b"]}"#,
+    );
+    assert!(validate_server_tool_options(&[t]).is_ok());
+}
+
+#[test]
+fn server_tool_usage_omits_a_zero_count() {
+    let only_search = ServerToolUseUsage {
+        web_search_requests: 2,
+        ..ServerToolUseUsage::default()
+    };
+    assert_eq!(
+        serde_json::to_value(only_search).unwrap(),
+        serde_json::json!({"web_search_requests": 2})
+    );
+    let both = ServerToolUseUsage {
+        web_search_requests: 1,
+        web_fetch_requests: 3,
+    };
+    assert_eq!(
+        serde_json::to_value(both).unwrap(),
+        serde_json::json!({"web_search_requests": 1, "web_fetch_requests": 3})
+    );
+}

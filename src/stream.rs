@@ -359,23 +359,26 @@ impl StreamTranslator {
         // final stop_reason and usage. Build it here, after any
         // late-arriving usage from the terminal `Completed` event has
         // been recorded.
-        let usage = self.usage.clone().or(Some(AnthropicUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens_5m: 0,
-            cache_creation_input_tokens_1h: 0,
-            thinking_tokens: 0,
-            server_tool_use: if self.web_search_count > 0 {
-                Some(ServerToolUseUsage {
-                    web_search_requests: self.web_search_count,
-                })
-            } else {
-                None
-            },
-            iterations: None,
-        }));
+        let usage = self.usage.clone().or_else(|| {
+            Some(AnthropicUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens_5m: 0,
+                cache_creation_input_tokens_1h: 0,
+                thinking_tokens: 0,
+                server_tool_use: if self.web_search_count > 0 {
+                    Some(ServerToolUseUsage {
+                        web_search_requests: self.web_search_count,
+                        ..ServerToolUseUsage::default()
+                    })
+                } else {
+                    None
+                },
+                iterations: None,
+            })
+        });
         events.push(StreamEvent::MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: self.stop_reason.take(),
@@ -831,6 +834,7 @@ impl StreamTranslator {
             if self.web_search_count > 0 {
                 u.server_tool_use = Some(ServerToolUseUsage {
                     web_search_requests: self.web_search_count,
+                    ..ServerToolUseUsage::default()
                 });
             }
             self.usage = Some(u);

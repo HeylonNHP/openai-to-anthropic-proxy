@@ -15,12 +15,13 @@ flowchart LR
 ```
 
 **Not for you if** you need model-generated images, full multimodal assistant
-turns, Claude's other server-side tools (`web_search`, `code_execution`),
+turns, Claude's other server-side tools (`code_execution`, …),
 or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
 `GET /v1/models` is implemented (for gateway model discovery).
 Images *sent to* the model — including images inside tool results — are supported.
-The server-side `web_fetch` tool *is* implemented (the proxy fetches the page
-itself) — see [Enabling the web_fetch tool](#enabling-the-web_fetch-tool).
+The server-side `web_fetch`, `web_search` and `advisor` tools *are* implemented
+by the proxy itself and can be used together in one turn — see
+[Server tools together](#server-tools-together).
 
 ## Features
 
@@ -32,6 +33,8 @@ itself) — see [Enabling the web_fetch tool](#enabling-the-web_fetch-tool).
 - Reasoning-effort mapping (`low`/`medium`/`high`/`xhigh`/`max`) plus extended-thinking replay.
 - Unlocking 1M-context upstreams via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
 - Server-side `web_fetch`: the proxy fetches the URL, extracts the readable text, and hands it back to the model (opt-in).
+- Optional proxy-native `web_search`: DuckDuckGo scraping + page fetching + compaction, as a swap-in for the upstream's built-in search (opt-in).
+- Server tools work together: `web_search`, `web_fetch` and the advisor share one loop, honour the options the client sets on them (`max_uses`, domain lists, …), and stream each round to the client as it finishes.
 - `GET /healthz` for liveness checks.
 - `GET /v1/models` for Claude Code's gateway model discovery (opt-in via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`).
 - Optional shared-secret `proxy_key` auth for a bind-all listener.
@@ -157,6 +160,53 @@ consultation runs.
 Deep protocol notes, reverse-engineering, and implementation history:
 [`ADVISOR_TOOL_RESEARCH.md`](./ADVISOR_TOOL_RESEARCH.md).
 
+### Enabling the proxy's own web search
+
+By default the client's `web_search` tool is handled by the upstream's built-in
+search. To use the proxy's own search instead (DuckDuckGo scraping, every result
+page fetched and, if long, compacted), enable it in `proxy.json`:
+
+```json
+{
+  "web_search": {
+    "enabled": true,
+    "compaction_model": "a-cheap-upstream-model",
+    "compaction_threshold_chars": 5000,
+    "max_queries": 3,
+    "max_results_per_query": 5
+  }
+}
+```
+
+Everything except `enabled` is optional and bounded — there is no unlimited
+setting. Without a `compaction_model`, long pages are truncated rather than
+summarised. Disable it again and the upstream's search is used as before. See
+[`src/tools/web_search/README.md`](./src/tools/web_search/README.md) for how it
+works, its limits, and how to remove it.
+
+### Server tools together
+
+`web_search` (if enabled), `web_fetch` (if enabled) and the advisor (if enabled)
+all run on one shared loop, so a request can declare any mix of them and the
+model can use all of them in one turn. Three things worth knowing:
+
+- **A round limit.** A request runs at most `server_tools.max_rounds` rounds
+  (default 10, like Anthropic's own loop). At the limit the model is told and
+  gets one last run to answer. `0` removes the limit — set it if you also set an
+  unlimited `advisor.max_uses`, or the 10-round default will end the turn first.
+- **`pause_turn`.** `server_tools.pause_turn: true` returns the work so far with
+  `stop_reason: "pause_turn"` at the limit instead, as Anthropic's API does, for
+  clients that resume. **Claude Code does not resume it**, so it is off by default.
+- **The client's own options apply.** `max_uses`, `allowed_domains` /
+  `blocked_domains`, `user_location` and `max_content_tokens`, as the client sets
+  them on its tool, are honoured by the proxy's search and fetch.
+
+```json
+{ "server_tools": { "max_rounds": 10, "pause_turn": false } }
+```
+
+Full details: [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md).
+
 ### Enabling the web_fetch tool
 
 Anthropic's `web_fetch` is a *server* tool: the client declares it and the
@@ -174,9 +224,11 @@ readable text back to the model so it can answer with the page in context.
 - `timeout_secs` (default 20) bounds the whole fetch — connect, read, extract.
 - `max_bytes` and `max_content_bytes` are **unlimited** by default; set either
   to cap the download or the extracted text.
-- There is no domain allow-list and no URL-length limit — the proxy fetches any
-  `http`/`https` URL the model asks for. It does refuse private and reserved
-  addresses (loopback, LAN, cloud metadata …) and re-checks every redirect.
+- The operator sets no domain allow-list and no URL-length limit — the proxy
+  fetches any `http`/`https` URL the model asks for, unless the *client* put
+  `allowed_domains` / `blocked_domains` on its tool (then those apply). It
+  always refuses private and reserved addresses (loopback, LAN, cloud
+  metadata …) and re-checks every redirect.
 - A failed fetch never fails the request: the model is told the fetch failed and
   the turn continues.
 

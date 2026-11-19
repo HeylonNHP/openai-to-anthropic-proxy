@@ -34,6 +34,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use crate::config::WebFetchConfig;
+use crate::tools::domains::DomainRules;
 use crate::tools::web_fetch::extract;
 
 /// The user agent the proxy sends when fetching a page.
@@ -48,6 +49,17 @@ const USER_AGENT: &str = concat!(
 
 /// How many redirects are followed before giving up.
 const MAX_REDIRECTS: usize = 5;
+
+/// Refuse a URL the client's domain rules do not allow.
+fn check_domain(rules: &DomainRules, target: &ValidatedUrl) -> Result<(), FetchError> {
+    if rules.allows(&target.to_url()) {
+        return Ok(());
+    }
+    Err(FetchError::new(
+        "url_not_allowed",
+        "the domain is not permitted by the tool's allowed/blocked domains",
+    ))
+}
 
 /// The outcome of one fetch.
 ///
@@ -105,14 +117,40 @@ pub(crate) enum AddressPolicy {
 /// the network; `None` means unlimited. `cfg.max_content_bytes` caps the
 /// extracted text; `None` means unlimited.
 pub async fn fetch(url: &str, cfg: &WebFetchConfig) -> Result<FetchedPage, FetchError> {
-    fetch_with_policy(url, cfg, AddressPolicy::Strict).await
+    fetch_within(url, cfg, &DomainRules::default()).await
 }
 
-/// Fetch `url` under an explicit [`AddressPolicy`].
+/// [`fetch`], additionally refusing any URL the client's domain rules do not
+/// allow.
+///
+/// The rules are checked on the first URL BEFORE any network access (not even
+/// a DNS lookup), and again on every redirect hop, so a page on an allowed
+/// domain cannot send the proxy to a disallowed one.
+pub async fn fetch_within(
+    url: &str,
+    cfg: &WebFetchConfig,
+    rules: &DomainRules,
+) -> Result<FetchedPage, FetchError> {
+    fetch_guarded(url, cfg, AddressPolicy::Strict, rules).await
+}
+
+/// Fetch `url` under an explicit [`AddressPolicy`] (tests use the permissive
+/// one to reach a loopback server).
+#[cfg(test)]
 async fn fetch_with_policy(
     url: &str,
     cfg: &WebFetchConfig,
     policy: AddressPolicy,
+) -> Result<FetchedPage, FetchError> {
+    fetch_guarded(url, cfg, policy, &DomainRules::default()).await
+}
+
+/// Fetch `url` under an explicit [`AddressPolicy`] and set of domain rules.
+async fn fetch_guarded(
+    url: &str,
+    cfg: &WebFetchConfig,
+    policy: AddressPolicy,
+    rules: &DomainRules,
 ) -> Result<FetchedPage, FetchError> {
     let timeout = cfg.timeout_secs.map(Duration::from_secs);
 
@@ -120,7 +158,7 @@ async fn fetch_with_policy(
     // rather than being handed to the client (which would only bound the
     // request, not the extraction).
     match timeout {
-        Some(t) => tokio::time::timeout(t, fetch_inner(url, cfg, policy))
+        Some(t) => tokio::time::timeout(t, fetch_inner(url, cfg, policy, rules))
             .await
             .unwrap_or_else(|_| {
                 Err(FetchError::new(
@@ -128,7 +166,7 @@ async fn fetch_with_policy(
                     format!("fetch timed out after {}s", t.as_secs()),
                 ))
             }),
-        None => fetch_inner(url, cfg, policy).await,
+        None => fetch_inner(url, cfg, policy, rules).await,
     }
 }
 
@@ -136,8 +174,10 @@ async fn fetch_inner(
     url: &str,
     cfg: &WebFetchConfig,
     policy: AddressPolicy,
+    rules: &DomainRules,
 ) -> Result<FetchedPage, FetchError> {
     let mut target = ValidatedUrl::parse(url)?;
+    check_domain(rules, &target)?;
     let mut pinned = target.pin(policy).await?;
 
     let mut hops = 0usize;
@@ -173,6 +213,7 @@ async fn fetch_inner(
             // network, or onto another scheme.
             let next = resolve_redirect(&target.to_url(), location)?;
             target = ValidatedUrl::parse(&next)?;
+            check_domain(rules, &target)?;
             // Re-resolve and re-check: the redirect may point at a
             // different host entirely.
             pinned = target.pin(policy).await?;
@@ -544,7 +585,7 @@ fn truncate(mut text: String, max_bytes: Option<u64>) -> String {
         return text;
     }
     // Cut at the last paragraph break inside the budget.
-    let head = &text[..max];
+    let head = &text[..text.floor_char_boundary(max)];
     let cut = head.rfind("\n\n").unwrap_or(0);
     text.truncate(cut);
     text.push_str("\n\n[content truncated]");

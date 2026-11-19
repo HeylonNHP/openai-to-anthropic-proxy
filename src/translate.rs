@@ -153,6 +153,38 @@ pub fn anthropic_to_responses(
     )
 }
 
+/// Map the client's `web_search` declaration onto OpenAI's built-in search
+/// tool, carrying over the options OpenAI has an equivalent for.
+///
+/// * `allowed_domains` → `filters.allowed_domains`
+/// * `user_location` → `user_location` (the two shapes agree)
+///
+/// OpenAI has no equivalent for `blocked_domains` or `max_uses`; the former
+/// is a real loss (the model may be shown a site the client blocked), so it
+/// is logged. Only options the client actually set are sent, so a plain
+/// declaration produces exactly the tool it always did.
+fn native_web_search_tool(tool: &crate::anthropic::Tool) -> WebSearchTool {
+    let options = &tool.options;
+    if options.blocked_domains.is_some() {
+        tracing::warn!(
+            "web_search `blocked_domains` is not supported by the upstream's built-in search \
+             and was not applied"
+        );
+    }
+    if options.max_uses.is_some() {
+        tracing::debug!("web_search `max_uses` has no upstream equivalent and was not applied");
+    }
+    WebSearchTool {
+        kind: "web_search".to_string(),
+        search_context_size: Some("medium".to_string()),
+        user_location: options.user_location.clone(),
+        filters: options
+            .allowed_domains
+            .clone()
+            .map(|allowed_domains| crate::responses::WebSearchFilters { allowed_domains }),
+    }
+}
+
 /// As [`anthropic_to_responses`], with an explicit `tool_result_images`
 /// mode (the proxy passes the operator's configured value).
 pub fn anthropic_to_responses_with(
@@ -214,14 +246,7 @@ pub fn anthropic_to_responses_with(
                 // Anthropic server-side web_search tool → OpenAI native web_search.
                 // Server tools have no input_schema; we detect them by name.
                 if t.name == "web_search" {
-                    return Some(ToolDefinition::WebSearch(WebSearchTool {
-                        kind: "web_search".to_string(),
-                        max_uses: None,
-                        search_context_size: Some("medium".to_string()),
-                        user_location: None,
-                        allowed_domains: None,
-                        blocked_domains: None,
-                    }));
+                    return Some(ToolDefinition::WebSearch(native_web_search_tool(t)));
                 }
 
                 // Resolve `$ref`s first so the sanitizer below and the
@@ -1578,7 +1603,8 @@ fn append_user_message(
                     }
                     ContentBlockParam::ServerToolUse(_)
                     | ContentBlockParam::AdvisorToolResult(_)
-                    | ContentBlockParam::WebFetchToolResult(_) => {
+                    | ContentBlockParam::WebFetchToolResult(_)
+                    | ContentBlockParam::WebSearchToolResult(_) => {
                         // Server tool echo blocks belong to an assistant
                         // turn. Folding them into the user's voice would
                         // attribute the prior consultation or the fetched
@@ -2043,6 +2069,9 @@ fn append_assistant_message(
             // Responses `function_call` items, because the paired RESULT
             // block carries the page text into context instead.
             let mut web_fetch_use_ids: Vec<String> = Vec::new();
+            // `(id, query)` of echoed `web_search` uses, so each result can
+            // say what was searched for.
+            let mut web_search_queries: Vec<(String, String)> = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(t) => {
@@ -2119,6 +2148,16 @@ fn append_assistant_message(
                                 id = %stu.id,
                                 "echoed web_fetch server_tool_use; no function_call emitted"
                             );
+                        } else if stu.name == "web_search" {
+                            // The paired RESULT block carries what the model
+                            // saw into context (see `web_search::history`);
+                            // no `function_call` is emitted for the use.
+                            let query = stu
+                                .input
+                                .get("query")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            web_search_queries.push((stu.id.clone(), query.to_owned()));
                         } else {
                             tracing::warn!(
                                 name = %stu.name,
@@ -2206,6 +2245,20 @@ fn append_assistant_message(
                             text.push_str(&page_text);
                             text.push_str(WEB_FETCH_CONTENT_SUFFIX);
                         }
+                    }
+                    ContentBlockParam::WebSearchToolResult(res) => {
+                        // What the search returned is what the model needs in
+                        // context on the NEXT turn: fold it into the same
+                        // assistant `output_text`, delimited so the upstream
+                        // can tell it from the assistant's own words.
+                        let query = web_search_queries
+                            .iter()
+                            .find(|(id, _)| id == &res.tool_use_id)
+                            .map(|(_, q)| q.as_str());
+                        text.push_str(&crate::tools::web_search::history::replay_text(
+                            query,
+                            &res.content,
+                        ));
                     }
                     ContentBlockParam::Image(_)
                     | ContentBlockParam::ToolResult(_)
@@ -2514,6 +2567,7 @@ pub fn responses_to_anthropic(
             server_tool_use: if web_search_count > 0 {
                 Some(ServerToolUseUsage {
                     web_search_requests: web_search_count,
+                    ..ServerToolUseUsage::default()
                 })
             } else {
                 None

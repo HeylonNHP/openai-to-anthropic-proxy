@@ -12,6 +12,7 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 - Usage translation from OpenAI `usage` into Anthropic `usage`.
 - Optional prompt-caching translation from Anthropic `cache_control` to OpenAI `prompt_cache_breakpoint`.
 - The server-side `web_fetch` tool, implemented by the proxy: it fetches the URL itself, extracts the readable text, and returns it as an Anthropic `web_fetch_tool_result` (see "Server-side `web_fetch`" below).
+- Optional proxy-native `web_search` (DuckDuckGo scraping + page fetching + compaction) as a swap-in for the upstream's built-in search — see "Proxy-native `web_search`" below.
 - `GET /healthz` for liveness checks.
 
 ## Configuration
@@ -43,6 +44,17 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `WEB_FETCH_TIMEOUT_SECS` | `web_fetch.timeout_secs` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
 | `WEB_FETCH_MAX_BYTES` | `web_fetch.max_bytes` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
 | `WEB_FETCH_MAX_CONTENT_BYTES` | `web_fetch.max_content_bytes` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
+| `WEB_SEARCH_ENABLED` | `web_search.enabled` | `false` | no | Answer the client's `web_search` tool with the proxy's own search instead of the upstream's built-in one. Accepts `1` / `true` / `yes` / `on`. |
+| `WEB_SEARCH_COMPACTION_MODEL` | `web_search.compaction_model` | (unset) | no | Explicit upstream model used to summarise long pages. Unset = truncate (no model call). |
+| `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS` | `web_search.compaction_threshold_chars` | `5000` | no | Pages longer than this are summarised/truncated to fit. Max `100000`. |
+| `WEB_SEARCH_MAX_QUERIES` | `web_search.max_queries` | `3` | no | Queries per tool call. Max `10`. |
+| `WEB_SEARCH_MAX_RESULTS_PER_QUERY` | `web_search.max_results_per_query` | `5` | no | Result pages fetched per query. Max `10`. |
+| `WEB_SEARCH_SEARCH_TIMEOUT_SECS` | `web_search.search_timeout_secs` | `15` | no | Per-search request budget. Max `120`. |
+| `WEB_SEARCH_PAGE_TIMEOUT_SECS` | `web_search.page_timeout_secs` | `15` | no | Per-page fetch budget. Max `120`. |
+| `WEB_SEARCH_MAX_PAGE_BYTES` | `web_search.max_page_bytes` | `2097152` | no | Per-page network read cap. Max 16 MiB. |
+| `WEB_SEARCH_ENDPOINT` | `web_search.search_endpoint` | DuckDuckGo HTML | no | Search endpoint (mostly for tests). |
+| `SERVER_TOOLS_MAX_ROUNDS` | `server_tools.max_rounds` | `10` | no | Most rounds (executor runs whose server-tool calls were served) one request may run. `0` = no limit (needed for an unlimited `advisor.max_uses` or `web_fetch` to be truly unlimited). Negative / fractional values fall back to the default + warning. |
+| `SERVER_TOOLS_PAUSE_TURN` | `server_tools.pause_turn` | `false` | no | At the round limit, return `stop_reason: "pause_turn"` for the client to resume (as Anthropic's API does) instead of making the model answer. Claude Code does **not** resume a `pause_turn`, so leave it off for Claude Code. Accepts `1` / `true` / `yes` / `on`. |
 | `PREFIX_MODELS_FOR_DISCOVERY` | `prefix_models_for_discovery` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. |
 
 
@@ -192,13 +204,13 @@ The implementation lives in `src/tools/web_fetch/`:
 | `fetch.rs` | the outbound HTTP request: URL validation, SSRF guard, DNS pinning, redirect re-validation, streaming read with a byte cap |
 | `extract.rs` | `dom_smoothie` (Readability) primary extraction, `fast_html2md` full-page fallback |
 | `protocol.rs` | the pure wire builders (`server_tool_use`, `web_fetch_tool_result`, the error result) |
-| `session.rs` | the executor loop: detect the call, fetch, inject the result, re-run |
+| `tool.rs` | the `ServerTool` the shared loop calls: fetch the URL, return the page text |
 
 **The loop.** `prepare` forces `stream: false` on the outbound request, because a
 fetch means the executor MUST be re-run with the page text before the turn can
-end. The chain is buffered and, for a streaming client, converted to a single
-synthetic Anthropic SSE sequence (the same `advisor::sse::message_to_events`
-adapter the advisor uses). `src/stream.rs` is untouched.
+end. The re-run is done by the shared server-tool loop (see
+[Server tools together](#server-tools-together-the-shared-loop)); this module
+only supplies the `ServerTool` that fetches a page.
 
 **Activation.** `web_fetch.enabled` (default `false`) AND an inbound tool named
 `web_fetch` with no `input_schema`. A client function tool that happens to be
@@ -207,19 +219,28 @@ untouched.
 
 **Failure.** A failed fetch never fails the client request: it becomes a
 `web_fetch_tool_result` error block with an Anthropic error code
-(`invalid_tool_input`, `url_not_allowed`, `url_not_accessible`, `unavailable`),
+(`invalid_tool_input`, `url_not_allowed`, `url_not_accessible`, `max_uses_exceeded`,
+`unavailable`),
 the executor is told the fetch failed, and the turn continues.
 
 **SSRF.** The URL comes from a model, so the fetch layer treats it as hostile:
 `http`/`https` only, no credentials in the URL, every resolved address checked
 against the private/reserved ranges, the checked address pinned for the
 connection (so DNS rebinding cannot slip a different address past the check),
-and every redirect hop re-validated. There is deliberately **no** domain
-allow-list and **no** URL-length limit.
+and every redirect hop re-validated. The operator sets no domain allow-list
+and no URL-length limit; domain rules come only from the client's own tool
+options (above).
 
-**Not enforced by the proxy:** the `max_uses` the client declares — the proxy
-fetches as many URLs as the executor asks for, and a turn that passes ten
-fetches is logged with a warning rather than stopped.
+**The client's options.** The options the client sets on its declaration are
+applied:
+
+| option | effect |
+|---|---|
+| `max_uses` | A fetch over the limit is refused (`max_uses_exceeded`) and not counted. With **no** `max_uses`, fetches are unlimited, as configured (the shared loop's round limit still applies). |
+| `allowed_domains` / `blocked_domains` | A URL outside the rules is refused (`url_not_allowed`) before any network access, and every redirect hop is checked too. Setting both is a 400. |
+| `max_content_tokens` | Tightens the extracted text to about 4 characters per token. It can only tighten the operator's `max_content_bytes`, never loosen it. |
+
+A turn that passes ten fetches is still logged with a warning.
 
 > **Claude Code CLI does not send this tool.** It ships a *client-side*
 > `WebFetch` tool (capitalised, with an `input_schema`) and does the HTTP GET
@@ -228,6 +249,53 @@ fetches is logged with a warning rather than stopped.
 > direct Messages API calls, and gateways that add the server tool on the
 > client's behalf. Claude Code's own `WebFetch` continues to work through the
 > ordinary client-tool path and is unaffected by this feature.
+
+### Proxy-native `web_search`
+
+By default the client's server-side `web_search` tool is mapped to the
+upstream's built-in search. With `web_search.enabled`, the proxy answers it
+**itself** instead: the executor calls an internal `proxy_web_search` function
+tool with a list of queries; the proxy scrapes DuckDuckGo for each, fetches
+every result page (through the same SSRF-hardened fetcher as `web_fetch`),
+summarises or truncates long pages, and feeds the text back. The client sees the
+usual `server_tool_use` / `web_search_tool_result` pairs.
+
+Every limit (`max_queries`, `max_results_per_query`, the compaction threshold, the
+timeouts, the page size) has a default **and** a ceiling; there is no unlimited
+setting. A blocked search (CAPTCHA) is reported as an error in the tool result,
+not silently routed to the upstream's search.
+
+The client's tool options are applied (`max_uses` counts queries,
+`allowed_domains` / `blocked_domains` narrow the search and are enforced on the
+results, `user_location` picks the search region), and what the model read is
+carried into later turns through each result's `encrypted_content`, so the model
+still knows on the next turn what it found.
+
+Full details — how it works, design decisions, known limitations, and how to
+remove it — are in [`src/tools/web_search/README.md`](./src/tools/web_search/README.md).
+
+### Server tools together: the shared loop
+
+`web_search`, `web_fetch` and the advisor all run on one loop,
+`src/tools/server_loop/`, so a request can declare any mix of them and the model
+can use all of them in one turn, in any order. Details are in
+[`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md); in short:
+
+- **Rounds.** One round is one executor run whose calls were served. A request
+  runs at most `server_tools.max_rounds` rounds (default 10, like Anthropic's
+  loop; `0` = no limit). At the limit the model is told and gets one last run to
+  answer. With `server_tools.pause_turn` the response is returned as it stands
+  with `stop_reason: "pause_turn"` instead, for a client that resumes (the
+  Anthropic SDKs do; Claude Code does not, so it is off by default).
+- **Streaming.** A streaming client is sent each round as it finishes, with
+  `ping` events while a later run is in flight. A plain answer with no tool call
+  is still delivered in one burst (each executor run is fetched whole).
+- **Usage.** `usage.server_tool_use` reports `web_search_requests` and
+  `web_fetch_requests` (a zero count is left out); the advisor's tokens are in
+  `iterations[]`.
+- **Failure.** A tool never fails the request. If the *first* executor run
+  fails, the error is returned with its HTTP status; if a later run fails, the
+  work already done is returned.
 
 ## Launching Claude Code
 

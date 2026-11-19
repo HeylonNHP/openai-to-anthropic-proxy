@@ -97,6 +97,7 @@ fn prepare_appends_to_existing_tools() {
         name: "Bash".into(),
         description: Some("run a command".into()),
         input_schema: Some(json!({"type": "object", "properties": {}})),
+        ..Tool::default()
     });
     let mut outbound = empty_outbound();
     outbound.tools = Some(vec![ToolDefinition::Function(ResponsesTool {
@@ -132,6 +133,7 @@ fn activation_requires_the_schema_less_declaration_shape() {
         name: "advisor".into(),
         description: Some("an ordinary client tool".into()),
         input_schema: Some(json!({"type": "object", "properties": {}})),
+        ..Tool::default()
     }]);
     assert!(!active_cfg(&cfg, &req));
     let mut outbound = empty_outbound();

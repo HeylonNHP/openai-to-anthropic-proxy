@@ -27,6 +27,7 @@ fn fixture_request() -> CreateMessageRequest {
                 "properties": {"location": {"type": "string"}},
                 "required": ["location"],
             })),
+            ..Tool::default()
         }]),
         tool_choice: None,
         temperature: Some(0.5),
@@ -129,6 +130,7 @@ fn advisor_instructions_survive_when_an_advisor_tool_is_present() {
         name: "advisor".into(),
         description: None,
         input_schema: Some(json!({"type": "object", "properties": {}})),
+        ..Tool::default()
     }];
     let out = translate_system(&system, Some(tools)).unwrap();
     assert!(out.contains("# Advisor Tool"));
@@ -2160,6 +2162,7 @@ fn translate_tool_schema(name: &str, schema: Value) -> (Value, Value) {
         name: name.into(),
         description: None,
         input_schema: Some(schema),
+        ..Tool::default()
     }]);
     let (out, registry) = anthropic_to_responses(
         &req,
@@ -2382,11 +2385,9 @@ fn strict_budget_ignores_already_non_strict_and_server_tools() {
         tool_with_props("loose", 50),
         ToolDefinition::WebSearch(WebSearchTool {
             kind: "web_search".into(),
-            max_uses: None,
             search_context_size: None,
             user_location: None,
-            allowed_domains: None,
-            blocked_domains: None,
+            filters: None,
         }),
         tool_with_props("tight", 5),
     ];
@@ -2412,11 +2413,13 @@ fn over_budget_request_keeps_all_tools_and_demotes_the_heaviest() {
             name: "tiny".into(),
             description: None,
             input_schema: Some(json!({"type": "object", "properties": {"a": {"type": "string"}}})),
+            ..Tool::default()
         },
         Tool {
             name: "enormous".into(),
             description: None,
             input_schema: Some(json!({"type": "object", "properties": big})),
+            ..Tool::default()
         },
     ]);
     let (out, registry) = anthropic_to_responses(
@@ -3825,4 +3828,202 @@ fn array_form_error_marker_leads_even_when_an_image_comes_first_and_empty_text_i
     );
     assert!(matches!(&parts[1], InputContentPart::InputImage { .. }));
     assert!(matches!(&parts[2], InputContentPart::InputText { text, .. } if text == "boom"));
+}
+
+fn native_search_for(declaration: serde_json::Value) -> serde_json::Value {
+    let tool: Tool = serde_json::from_value(declaration).unwrap();
+    serde_json::to_value(native_web_search_tool(&tool)).unwrap()
+}
+
+#[test]
+fn a_plain_search_declaration_maps_to_the_tool_it_always_did() {
+    let native =
+        native_search_for(json!({"type":"web_search_20250305","name":"web_search","max_uses":8}));
+    assert_eq!(
+        native,
+        json!({"type":"web_search","search_context_size":"medium"})
+    );
+}
+
+#[test]
+fn allowed_domains_become_an_openai_filter() {
+    let native = native_search_for(json!({
+        "type":"web_search_20250305","name":"web_search","allowed_domains":["rust-lang.org","docs.rs"]
+    }));
+    assert_eq!(
+        native["filters"]["allowed_domains"],
+        json!(["rust-lang.org", "docs.rs"])
+    );
+}
+
+#[test]
+fn user_location_is_passed_through() {
+    let loc = json!({"type":"approximate","country":"GB","city":"London"});
+    let native = native_search_for(json!({"name":"web_search","user_location":loc}));
+    assert_eq!(native["user_location"], loc);
+}
+
+#[test]
+fn options_openai_lacks_are_not_sent() {
+    let native = native_search_for(json!({
+        "name":"web_search","blocked_domains":["x.example"],"max_uses":3
+    }));
+    assert!(native.get("blocked_domains").is_none() && native.get("max_uses").is_none());
+    assert!(native.get("filters").is_none());
+}
+
+// ── Echoed `web_search` results stay in context ──
+
+/// Translate a conversation whose assistant turn carries `assistant_blocks`
+/// and return every assistant `output_text` sent upstream, joined.
+/// Translate with no reasoning, caching or replay settings.
+fn translate_plain(
+    req: &CreateMessageRequest,
+) -> anyhow::Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
+    anthropic_to_responses(
+        req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+    )
+}
+
+fn replayed_assistant_text(assistant_blocks: serde_json::Value) -> String {
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "What is new in Rust?"},
+            {"role": "assistant", "content": assistant_blocks},
+            {"role": "user", "content": "Tell me more"},
+        ],
+    }))
+    .unwrap();
+    let (out, _) = translate_plain(&req).unwrap();
+    let Input::Items(items) = out.input else {
+        panic!("items")
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            InputItem::Message { role, content } if role == "assistant" => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            InputContentPart::OutputText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn search_pair(result_content: serde_json::Value) -> serde_json::Value {
+    json!([
+        {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+         "input": {"query": "rust news"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": result_content},
+        {"type": "text", "text": "Rust 2026 shipped."},
+    ])
+}
+
+#[test]
+fn a_result_the_proxy_wrote_is_replayed_in_full_with_its_query() {
+    let blob = crate::tools::web_search::history::encode("title: A\nsnippet: a unique snippet");
+    let text = replayed_assistant_text(search_pair(json!([
+        {"type": "web_search_result", "url": "https://a.test/", "title": "A",
+         "encrypted_content": blob},
+    ])));
+    assert!(text.contains("a unique snippet"), "{text}");
+    assert!(text.contains("for the query \"rust news\""), "{text}");
+    assert!(
+        text.contains("Rust 2026 shipped."),
+        "the assistant's own words stay"
+    );
+}
+
+#[test]
+fn a_foreign_result_is_replayed_as_title_and_url() {
+    let text = replayed_assistant_text(search_pair(json!([
+        {"type": "web_search_result", "url": "https://blog.rust-lang.org/2026",
+         "title": "Rust 2026 released", "encrypted_content": "EqgfCkYI-opaque"},
+    ])));
+    assert!(
+        text.contains("Rust 2026 released — https://blog.rust-lang.org/2026"),
+        "{text}"
+    );
+    assert!(!text.contains("EqgfCkYI-opaque"));
+}
+
+#[test]
+fn a_failed_search_adds_nothing_to_the_context() {
+    let text = replayed_assistant_text(search_pair(
+        json!({"type": "web_search_tool_result_error", "error_code": "unavailable"}),
+    ));
+    assert_eq!(text.trim(), "Rust 2026 shipped.");
+}
+
+#[test]
+fn an_echoed_search_never_becomes_a_function_call() {
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": search_pair(json!([]))},
+            {"role": "user", "content": "more"},
+        ],
+    }))
+    .unwrap();
+    let (out, _) = translate_plain(&req).unwrap();
+    let Input::Items(items) = out.input else {
+        panic!("items")
+    };
+    assert!(
+        !items.iter().any(|i| matches!(
+            i,
+            InputItem::FunctionCall { .. } | InputItem::FunctionCallOutput { .. }
+        )),
+        "an orphan call would be rejected upstream"
+    );
+}
+
+#[test]
+fn a_search_result_in_a_user_message_is_dropped_not_fatal() {
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [{"role": "user", "content": [
+            {"type": "web_search_tool_result", "tool_use_id": "x", "content": []},
+            {"type": "text", "text": "hello"},
+        ]}],
+    }))
+    .unwrap();
+    assert!(translate_plain(&req).is_ok());
+}
+
+#[test]
+fn a_conversation_may_end_with_the_paused_assistant_message() {
+    // `pause_turn`: the client resends the assistant message as the LAST one
+    // and expects the turn to carry on. The earlier results must reach the
+    // model, and nothing may be rejected.
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "Research rust"},
+            {"role": "assistant", "content": search_pair(json!([
+                {"type": "web_search_result", "url": "https://a.test/", "title": "A", "encrypted_content": ""},
+            ]))},
+        ],
+    }))
+    .unwrap();
+    let (out, _) = translate_plain(&req).expect("a trailing assistant message is accepted");
+    let Input::Items(items) = out.input else {
+        panic!("items")
+    };
+    let last = items.last().expect("items");
+    assert!(
+        matches!(last, InputItem::Message { role, content }
+            if role == "assistant" && matches!(&content[0],
+                InputContentPart::OutputText { text, .. } if text.contains("https://a.test/"))),
+        "the results are the last thing the model sees: {last:?}"
+    );
 }

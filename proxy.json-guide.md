@@ -320,12 +320,58 @@ When enabled, a fetch happens only if the client declared the **server-side** `w
 - `timeout_secs` bounds the **whole** fetch — connect, read and extract — as one wall-clock budget. The default is 20 seconds.
 - `max_bytes` caps how many bytes are read from the network for one fetch. **`null` (the default) means unlimited.**
 - `max_content_bytes` caps the size of the **extracted text** that is handed to the model, truncating at a paragraph boundary. **`null` (the default) means no truncation.**
-- There is deliberately **no domain allow-list and no URL-length limit**: the proxy fetches any `http`/`https` URL the model asks for.
+- The operator sets **no domain allow-list and no URL-length limit**: the proxy fetches any `http`/`https` URL the model asks for, unless the *client* put `allowed_domains` / `blocked_domains` on its tool declaration (then those apply, and every redirect hop is checked against them too).
 - There **is** an SSRF guard, and it is not configurable: only `http`/`https` are allowed, a URL may not carry credentials, every resolved address is checked against the private/reserved ranges (loopback, RFC1918, link-local including the cloud metadata address, CGNAT, unique-local, multicast, …), the checked address is the one the connection uses (so DNS rebinding cannot smuggle a different one past the check), and every redirect hop is re-validated the same way.
 - A failed fetch never fails the request. It becomes a `web_fetch_tool_result` error block (with an Anthropic error code such as `url_not_allowed` or `url_not_accessible`), the executor is told the fetch failed, and the turn continues — the same contract Anthropic's own server-side tools have.
-- The number of fetches per turn is **not** capped by the proxy. The client may declare `max_uses`, but the proxy does not enforce it; a turn that fetches ten URLs is logged with a warning rather than stopped.
+- The number of fetches is **not** capped by `web_fetch` itself. If the client declares `max_uses`, the proxy enforces it (a fetch over the limit gets a `max_uses_exceeded` result); with none, fetches are unlimited, and a turn that fetches ten URLs is logged with a warning. The shared loop's round limit (see [Server tools](#server-tools-server_tools)) still bounds the turn unless it is set to `0`.
+- The client's `max_content_tokens` (about 4 characters per token) can tighten `max_content_bytes` for a request, never loosen it.
 - Every field has an env override with the same **env > file > default** precedence used elsewhere: `WEB_FETCH_ENABLED`, `WEB_FETCH_TIMEOUT_SECS`, `WEB_FETCH_MAX_BYTES`, `WEB_FETCH_MAX_CONTENT_BYTES`. `WEB_FETCH_ENABLED` accepts `1`/`true`/`yes`/`on`.
 - The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
+
+### Web search (`web_search`)
+
+Optional proxy-native replacement for the upstream's built-in web search. **Opt-in**: `enabled` defaults to `false`, and when it is off the client's `web_search` tool goes to the upstream's own search exactly as before. When enabled, the proxy answers the tool itself — it scrapes DuckDuckGo for each query the model submits, fetches each result page, and compacts long pages — and hands the text to the executor.
+
+```json
+"web_search": {
+  "enabled": false,
+  "compaction_model": null,
+  "compaction_threshold_chars": 5000,
+  "max_queries": 3,
+  "max_results_per_query": 5,
+  "search_timeout_secs": 15,
+  "page_timeout_secs": 15,
+  "max_page_bytes": 2097152
+}
+```
+
+- `compaction_model` is an **explicit upstream model name** (no alias resolution, like `advisor.model`). Pages longer than `compaction_threshold_chars` are summarised by it (up to 3 passes). **Unset / `null` means no model call:** long pages are truncated at a paragraph boundary and carry a note saying so.
+- `max_queries` (default 3, max 10) is how many queries the model may run per call; `max_results_per_query` (default 5, max 10) is how many result pages are fetched per query.
+- **Nothing is unlimited.** Unlike `web_fetch`, `0`, negative and fractional values are invalid: the default is used with a startup warning. Values above the maximum are clamped, with a warning.
+- Result pages are fetched through the same SSRF-hardened fetcher as `web_fetch`.
+- A blocked search (CAPTCHA, HTTP error) or an unreachable page is reported in the tool result and never fails the request. The proxy does not fall back to the upstream's search.
+- `search_endpoint` overrides where searches are POSTed (default DuckDuckGo's HTML interface) — mainly useful for tests.
+- Env overrides use the same env > file > default precedence: `WEB_SEARCH_ENABLED`, `WEB_SEARCH_COMPACTION_MODEL`, `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS`, `WEB_SEARCH_MAX_QUERIES`, `WEB_SEARCH_MAX_RESULTS_PER_QUERY`, `WEB_SEARCH_SEARCH_TIMEOUT_SECS`, `WEB_SEARCH_PAGE_TIMEOUT_SECS`, `WEB_SEARCH_MAX_PAGE_BYTES`, `WEB_SEARCH_ENDPOINT`.
+- It works alongside `web_fetch` and the advisor in the same turn. The client's own options on its `web_search` tool are applied: `max_uses` (queries per request), `allowed_domains` / `blocked_domains`, and `user_location` (the search region). What the model read is carried into later turns, so it still knows what it found.
+
+Full documentation: [`src/tools/web_search/README.md`](./src/tools/web_search/README.md).
+
+### Server tools (`server_tools`)
+
+The limits of the loop that `web_search`, `web_fetch` and the advisor share. **Optional**: the defaults match Anthropic's own server-side loop, and the section is safe to omit.
+
+```json
+"server_tools": {
+  "max_rounds": 10,
+  "pause_turn": false
+}
+```
+
+- `max_rounds` is how many **rounds** one request may run. A round is one executor run whose server-tool calls were served, and every round costs an upstream call. The default is `10`, as in Anthropic's own loop. **`0` means no limit**, like every other limit in this file. Negative and fractional values fall back to the default with a warning.
+- **An unlimited tool needs `max_rounds: 0` too.** `advisor.max_uses: 0` and the unlimited `web_fetch` are only truly unlimited if this is `0` as well; with the default, the turn ends after 10 rounds whatever the tool allows.
+- `pause_turn` chooses what happens at the limit. **`false` (the default):** the model's next tool call is refused, it is told the limit was reached, and it gets one last run to answer, so the client sees an ordinary finished turn. **`true`:** the response is returned as it stands with `stop_reason: "pause_turn"` and no further upstream call is made, as Anthropic's API does; the client resends the conversation to carry on. **Claude Code does not resume a `pause_turn`** (the Anthropic SDKs do), so leave it `false` for Claude Code, or a long research turn would simply end with no answer.
+- Env overrides: `SERVER_TOOLS_MAX_ROUNDS`, `SERVER_TOOLS_PAUSE_TURN` (accepts `1`/`true`/`yes`/`on`), with the usual env > file > default precedence.
+- More: [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md).
 
 ### Advisor (`advisor`)
 
@@ -362,7 +408,7 @@ These three keys follow one rule, in `proxy.json` and in the env vars alike:
 
 `0` = unlimited follows the house precedent of `reasoning_replay.max_chars`, where `0` means unlimited. **"No limit" means something different per field**, so read the caveats before setting it:
 
-- **`max_uses: 0` — the consultation loop loses its bound.** The loop is then bounded only by the executor's behaviour: the executor may call `advisor` as often as it likes. This is a real hazard — every iteration costs **two** upstream calls (the executor re-run *and* the advisor), so an executor that keeps asking will spin and burn tokens. The proxy imposes no ceiling of its own (you asked for no limit), but it makes the hazard visible: one WARN at startup when the advisor is enabled with an unlimited `max_uses`, and one WARN per turn that passes 10 consultations.
+- **`max_uses: 0` — the consultation loop loses its bound** (but see `server_tools.max_rounds`: the shared loop still stops a turn after 10 rounds unless that is `0` too). The loop is then bounded only by the executor's behaviour: the executor may call `advisor` as often as it likes. This is a real hazard — every iteration costs **two** upstream calls (the executor re-run *and* the advisor), so an executor that keeps asking will spin and burn tokens. The proxy imposes no ceiling of its own (you asked for no limit), but it makes the hazard visible: one WARN at startup when the advisor is enabled with an unlimited `max_uses`, and one WARN per turn that passes 10 consultations.
 - **`max_tokens: 0` — the proxy stops capping the answer, the upstream does not.** The proxy then **omits** `max_output_tokens` from the advisor's own upstream request, so the **upstream's own default** applies. That default may be **smaller** than 2048, and for reasoning models the cap must also cover the reasoning tokens — so "no limit" here means *the proxy imposes no cap*, not *the answer may be long*. If your upstream's default is too small, set an explicit number instead.
 - **`timeout_secs: 0` — no per-request timeout override.** The advisor's own call is then bounded only by the **global `request_timeout_secs`** (the reqwest client is built with that timeout, so every request is bounded by it anyway). A *bounded* `timeout_secs` is always clamped to the global value, so the advisor can never extend your global bound.
 

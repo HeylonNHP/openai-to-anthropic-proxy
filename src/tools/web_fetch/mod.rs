@@ -29,11 +29,12 @@
 //! * **`prepare`** (inbound): synthesises the function tool and forces
 //!   `stream: false` on the outbound request, because a fetch means the
 //!   executor must be RE-RUN with the page text before the turn can end.
-//!   The whole chain is buffered and, for a streaming client, converted to
-//!   a synthetic Anthropic SSE sequence — the same shape the advisor uses.
-//! * **`session`** (outbound): the loop that runs the executor, intercepts
-//!   its `web_fetch` call, performs the fetch, injects the result, and
-//!   re-runs the executor.
+//!   The whole chain is buffered, and a streaming client is sent each round as
+//!   it finishes by the shared loop (`crate::tools::server_loop::stream`).
+//! * **`tool`** (outbound): the [`ServerTool`](crate::tools::server_loop::handler::ServerTool)
+//!   the shared loop in [`crate::tools::server_loop`] calls: it fetches the
+//!   URL the executor asked for and returns the page text, which the loop
+//!   injects before re-running the executor.
 //!
 //! ## Activation
 //!
@@ -58,7 +59,7 @@ use serde_json::json;
 pub mod extract;
 pub mod fetch;
 pub mod protocol;
-pub mod session;
+pub mod tool;
 
 /// The tool name Anthropic uses for the server-side `web_fetch` tool.
 ///
@@ -98,7 +99,7 @@ pub fn has_server_side_web_fetch(req: &CreateMessageRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
         tools
             .iter()
-            .any(|t| t.name == WEB_FETCH_TOOL_NAME && t.input_schema.is_none())
+            .any(|t| t.is_server_tool(WEB_FETCH_TOOL_NAME, "web_fetch_"))
     })
 }
 
@@ -116,9 +117,8 @@ pub fn active(config: &WebFetchConfig, req: &CreateMessageRequest) -> bool {
 ///
 /// The executor must be re-run with the fetched text before the turn can
 /// end, so the whole chain is buffered (§11.3 of
-/// `ADVISOR_TOOL_RESEARCH.md`): a streaming client gets ONE synthetic
-/// Anthropic SSE sequence at the end, produced by
-/// [`crate::tools::advisor::sse::message_to_events`].
+/// `ADVISOR_TOOL_RESEARCH.md`); a streaming client is sent each round as it
+/// finishes by [`crate::tools::server_loop::stream`].
 ///
 /// Called from `proxy::build_outbound`, which BOTH the first attempt and
 /// the `default_model` fallback re-translation go through — so a fallback

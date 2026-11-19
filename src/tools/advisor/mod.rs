@@ -22,9 +22,9 @@
 //! (unless `max_uses` is `0` = "no limit", which removes the bound
 //! entirely — the proxy only WARNs about that, it does not cap it).
 //! The executor's request is forced to `stream: false` (§11.3): the whole
-//! chain is buffered and, if the client asked for streaming, converted to a
-//! synthetic Anthropic SSE sequence by [`sse::message_to_events`].
-//! `src/stream.rs` is untouched.
+//! chain is buffered and a streaming client is sent each round as it
+//! finishes by the shared loop (`crate::tools::server_loop::stream`, built on
+//! the event builders in [`sse`]). `src/stream.rs` is untouched.
 //!
 //! ## Fail closed
 //!
@@ -44,9 +44,10 @@
 //!
 //! Modules:
 //! - [`prepare`] — synthesize the zero-argument function tool.
-//! - [`session`] — the bounded consultation loop and advice injection.
+//! - [`tool`] — the [`ServerTool`](crate::tools::server_loop::handler::ServerTool)
+//!   the shared loop calls: one consultation per call, bounded by `max_uses`.
 //! - [`protocol`] — pure wire-block / billing builders.
-//! - [`sse`] — buffered `Message` → synthetic SSE events.
+//! - [`sse`] — `Message` / content blocks → Anthropic SSE events.
 
 use crate::anthropic::CreateMessageRequest;
 use crate::config::{AdvisorConfig, Config};
@@ -54,8 +55,8 @@ use crate::responses::{ResponsesRequest, ResponsesTool, ToolDefinition};
 use serde_json::json;
 
 pub mod protocol;
-pub mod session;
 pub mod sse;
+pub mod tool;
 
 /// The inbound name Claude Code uses for the advisor declaration. The
 /// translator keys on exactly this string too (`strip_advisor_tool_instructions`
@@ -105,7 +106,7 @@ fn has_advisor_tool(req: &CreateMessageRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
         tools
             .iter()
-            .any(|t| t.name == ADVISOR_TOOL_NAME && t.input_schema.is_none())
+            .any(|t| t.is_server_tool(ADVISOR_TOOL_NAME, "advisor_"))
     })
 }
 

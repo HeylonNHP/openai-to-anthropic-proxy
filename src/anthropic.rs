@@ -183,6 +183,11 @@ pub enum ContentBlockParam {
     /// flattened into named fields so the replay does not have to dig
     /// through the union.
     WebFetchToolResult(WebFetchToolResultBlockParam),
+    /// The `web_search` paired result block, echoed by the client on the next
+    /// turn. Its `content` is the list of results (each with an opaque
+    /// `encrypted_content`) or an error object; kept opaque here and read by
+    /// `tools::web_search::history`.
+    WebSearchToolResult(WebSearchToolResultBlockParam),
     /// Unknown block types round-trip as raw JSON; the translator drops them
     /// when forwarding to OpenAI (with a tracing warning).
     #[serde(other)]
@@ -302,6 +307,20 @@ pub struct WebFetchToolResultBlockParam {
     pub extra: Map<String, Value>,
 }
 
+/// A `web_search_tool_result` the client echoes back.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebSearchToolResultBlockParam {
+    /// Id of the preceding `server_tool_use` block.
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub tool_use_id: String,
+    /// A list of `web_search_result` or a `web_search_tool_result_error`.
+    #[serde(default)]
+    pub content: Value,
+    /// All unrecognised fields, preserved for verbatim round-tripping.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 /// Deserialize a text field, tolerating a wrong JSON type.
 ///
 /// Without this, a block like `{"type":"thinking","thinking":123}` aborts
@@ -375,13 +394,109 @@ pub enum ToolResultContent {
 
 // ─── Tools & tool choice (request) ─────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Tool {
     pub name: String,
+    /// The versioned tool type (`web_search_20250305`, `web_fetch_20250910`,
+    /// `advisor_20260301`, or `custom` for a client function tool). Absent on
+    /// older clients' function tools.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<Value>,
+    /// Options a client sets on a server tool. Always default for a client
+    /// function tool.
+    #[serde(flatten)]
+    pub options: ServerToolOptions,
+}
+
+/// The options Anthropic's server tools accept in their declaration.
+///
+/// Every field is optional, and a field a given tool does not define is
+/// simply left unset: `web_search` takes `max_uses`, `allowed_domains`,
+/// `blocked_domains` and `user_location`; `web_fetch` takes `max_uses`,
+/// `allowed_domains`, `blocked_domains`, `max_content_tokens` and
+/// `citations`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServerToolOptions {
+    /// Most uses of the tool the client allows in one request.
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    /// Only these domains may be searched or fetched.
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
+    /// These domains must not be searched or fetched.
+    #[serde(default)]
+    pub blocked_domains: Option<Vec<String>>,
+    /// The user's approximate location, used to localise search results.
+    #[serde(default)]
+    pub user_location: Option<Value>,
+    /// Most page content (in tokens) `web_fetch` may return.
+    #[serde(default)]
+    pub max_content_tokens: Option<u32>,
+    /// `web_fetch` citation settings, passed through as sent.
+    #[serde(default)]
+    pub citations: Option<Value>,
+}
+
+impl Tool {
+    /// Whether this is the SERVER-side tool called `name`, whose versioned
+    /// type starts with `type_prefix` (e.g. `"web_search_"`).
+    ///
+    /// Anthropic server tools never carry an `input_schema`, so the
+    /// schema-less declaration is recognised on its name alone (that is the
+    /// shape Claude Code sends). A versioned `type` marks one even when a
+    /// schema is present. A client function tool that merely shares the name
+    /// has a schema and a `custom` (or absent) type, so it is left alone.
+    #[must_use]
+    pub fn is_server_tool(&self, name: &str, type_prefix: &str) -> bool {
+        self.name == name
+            && (self.input_schema.is_none()
+                || self
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with(type_prefix)))
+    }
+}
+
+impl CreateMessageRequest {
+    /// The options the client set on the server tool called `name` (its
+    /// versioned type starts with `type_prefix`); all unset when the client
+    /// did not declare it.
+    #[must_use]
+    pub fn server_tool_options(&self, name: &str, type_prefix: &str) -> ServerToolOptions {
+        self.tools
+            .iter()
+            .flatten()
+            .find(|t| t.is_server_tool(name, type_prefix))
+            .map(|t| t.options.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Reject a request Anthropic itself would reject: a search or fetch tool
+/// that sets both `allowed_domains` and `blocked_domains`.
+///
+/// # Errors
+///
+/// A client-facing message naming the offending tool.
+pub fn validate_server_tool_options(tools: &[Tool]) -> Result<(), String> {
+    for tool in tools {
+        let is_domain_tool = tool.is_server_tool("web_search", "web_search_")
+            || tool.is_server_tool("web_fetch", "web_fetch_");
+        if is_domain_tool
+            && tool.options.allowed_domains.is_some()
+            && tool.options.blocked_domains.is_some()
+        {
+            return Err(format!(
+                "tools: `{}` cannot set both `allowed_domains` and `blocked_domains`",
+                tool.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -503,14 +618,18 @@ pub enum StopReason {
     PauseTurn,
 }
 
-/// Server tool usage tracking. `web_search_requests` counts how many
-/// web searches were performed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Server tool usage tracking: how many searches and fetches were made.
+/// A count of zero is omitted from the wire, so a request that used only one
+/// of the tools reports only that one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerToolUseUsage {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub web_search_requests: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub web_fetch_requests: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,

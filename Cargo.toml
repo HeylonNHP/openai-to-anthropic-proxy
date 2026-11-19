@@ -43,6 +43,7 @@ unicode-width = "0.1"
 
 # Config + errors + logging
 url = "2"
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"

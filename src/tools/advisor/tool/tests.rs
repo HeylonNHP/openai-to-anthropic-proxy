@@ -211,49 +211,6 @@ fn advice_from_response_requires_completed_status() {
 }
 
 #[test]
-fn find_advisor_call_ignores_other_tools() {
-    let items: Vec<OutputItem> = serde_json::from_value(json!([
-        {"type": "function_call", "call_id": "call_bash", "name": "Bash", "arguments": "{}"},
-        {"type": "function_call", "call_id": "call_adv", "name": "advisor", "arguments": "{}"}
-    ]))
-    .unwrap();
-    assert_eq!(
-        find_advisor_call(&items),
-        Some(("call_adv".to_owned(), "{}".to_owned()))
-    );
-    let plain: Vec<OutputItem> = serde_json::from_value(json!([
-        {"type": "message", "role": "assistant", "content": []}
-    ]))
-    .unwrap();
-    assert_eq!(find_advisor_call(&plain), None);
-}
-
-#[test]
-fn strip_advisor_call_removes_only_the_internal_call() {
-    let mut resp = response("completed", Some("Terminal answer."));
-    let mut extra: Vec<OutputItem> = serde_json::from_value(json!([
-        {"type": "function_call", "call_id": "call_adv", "name": "advisor", "arguments": "{}"},
-        {"type": "function_call", "call_id": "call_bash", "name": "Bash", "arguments": "{}"}
-    ]))
-    .unwrap();
-    resp.output.append(&mut extra);
-    strip_advisor_call(&mut resp);
-    assert_eq!(resp.output.len(), 2);
-    assert!(matches!(&resp.output[0], OutputItem::Message { .. }));
-    assert!(matches!(
-        &resp.output[1],
-        OutputItem::FunctionCall { name, .. } if name == "Bash"
-    ));
-    let mut again = resp.clone();
-    strip_advisor_call(&mut again);
-    assert_eq!(
-        format!("{again:?}"),
-        format!("{resp:?}"),
-        "pure helper is idempotent"
-    );
-}
-
-#[test]
 fn extract_advice_requires_non_empty_text() {
     let parse = |v: Value| serde_json::from_value::<ResponsesResponse>(v).unwrap();
     let base = json!({
@@ -276,4 +233,99 @@ fn extract_advice_requires_non_empty_text() {
     }]);
     assert_eq!(extract_advice(&parse(blank)), None);
     assert_eq!(extract_advice(&parse(base)), None);
+}
+
+fn tool() -> AdvisorTool {
+    AdvisorTool::new(&cfg())
+}
+
+fn kinds(prefix: &[ResponseContentBlock]) -> Vec<String> {
+    prefix
+        .iter()
+        .map(|b| match b {
+            ResponseContentBlock::Raw(v) => v["type"].as_str().unwrap_or("").to_owned(),
+            _ => "other".to_owned(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_tool_answers_to_the_advisor_function() {
+    assert_eq!(tool().executor_name(), "advisor");
+}
+
+#[test]
+fn a_fresh_tool_is_not_exhausted_and_has_no_usage() {
+    let t = tool();
+    assert!(!t.exhausted());
+    let mut usage = Usage::default();
+    t.contribute_usage(&mut usage);
+    assert!(usage.iterations.is_none(), "no iterations field at all");
+}
+
+#[test]
+fn every_executor_sampling_is_an_iteration_in_order() {
+    let mut t = tool();
+    t.on_executor_response(&response("completed", None));
+    t.on_executor_response(&response("completed", None));
+    let mut usage = Usage::default();
+    t.contribute_usage(&mut usage);
+    let iterations = usage.iterations.expect("iterations");
+    assert_eq!(iterations.len(), 2);
+    assert!(iterations.iter().all(|i| i["type"] == "message"));
+}
+
+#[test]
+fn a_response_without_usage_adds_no_iteration() {
+    let mut t = tool();
+    let mut resp = response("completed", None);
+    resp.usage = None;
+    t.on_executor_response(&resp);
+    let mut usage = Usage::default();
+    t.contribute_usage(&mut usage);
+    assert!(usage.iterations.is_none());
+}
+
+#[test]
+fn a_failed_rerun_after_a_consultation_leaves_an_unavailable_pair() {
+    let mut t = tool();
+    t.consulted = true;
+    let mut prefix = Vec::new();
+    t.on_rerun_failure(&mut prefix);
+    assert_eq!(kinds(&prefix), ["server_tool_use", "advisor_tool_result"]);
+    assert_eq!(
+        match &prefix[1] {
+            ResponseContentBlock::Raw(v) => v["content"]["error_code"].clone(),
+            _ => Value::Null,
+        },
+        "unavailable"
+    );
+}
+
+#[test]
+fn a_failed_rerun_with_no_consultation_adds_nothing() {
+    // The tool was declared but never called (the work was another tool's).
+    let mut prefix = Vec::new();
+    tool().on_rerun_failure(&mut prefix);
+    assert!(prefix.is_empty());
+}
+
+#[test]
+fn a_failed_rerun_at_the_cap_adds_nothing() {
+    // The refusal pair was already sent; no consultation is pending.
+    let mut t = tool();
+    t.consulted = true;
+    t.cap_reached = true;
+    let mut prefix = Vec::new();
+    t.on_rerun_failure(&mut prefix);
+    assert!(prefix.is_empty());
+    assert!(t.exhausted());
+}
+
+#[test]
+fn upstream_errors_are_scrubbed_of_advisor_tokens() {
+    let err = tool().scrub_error(AppError::BadRequest(
+        "bad: advisor_20260301 not allowed".to_owned(),
+    ));
+    assert!(matches!(&err, AppError::BadRequest(m) if !m.contains("advisor_20260301")));
 }

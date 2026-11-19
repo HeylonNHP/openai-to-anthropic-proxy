@@ -65,5 +65,18 @@
     "timeout_secs": 20,
     "max_bytes": null,
     "max_content_bytes": null
+  },
+
+  "web_search": {
+    "enabled": false,
+    "compaction_model": null,
+    "compaction_threshold_chars": 5000,
+    "max_queries": 3,
+    "max_results_per_query": 5
+  },
+
+  "server_tools": {
+    "max_rounds": 10,
+    "pause_turn": false
   }
 }

@@ -187,3 +187,28 @@ fn truncation_cuts_at_a_paragraph_boundary() {
     assert!(out.starts_with("first para"), "got {out}");
     assert!(out.contains("[content truncated]"), "got {out}");
 }
+
+#[test]
+fn truncation_never_splits_a_multibyte_character() {
+    // 3 bytes falls inside the second 2-byte character: this used to panic.
+    let text = "é".repeat(10);
+    let out = truncate(text, Some(3));
+    assert!(out.ends_with("[content truncated]"), "got {out}");
+}
+
+#[tokio::test]
+async fn a_disallowed_domain_is_refused_before_the_network_is_touched() {
+    let rules = DomainRules::from_options(&crate::anthropic::ServerToolOptions {
+        allowed_domains: Some(vec!["docs.rs".to_owned()]),
+        ..crate::anthropic::ServerToolOptions::default()
+    });
+    // `.invalid` never resolves, so only the rule can produce this code.
+    let err = fetch_within(
+        "https://elsewhere.invalid/",
+        &WebFetchConfig::default(),
+        &rules,
+    )
+    .await
+    .expect_err("must be refused");
+    assert_eq!(err.code, "url_not_allowed");
+}

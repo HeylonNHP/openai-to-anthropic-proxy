@@ -65,6 +65,34 @@ const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 /// per-redirect budget.
 const DEFAULT_WEB_FETCH_TIMEOUT_SECS: u64 = 20;
 
+// ─── `server_tools` defaults and hard ceiling ───────────────────────────────
+
+/// Anthropic's own server-side loop stops after 10 sampling iterations.
+const DEFAULT_SERVER_TOOLS_MAX_ROUNDS: u64 = 10;
+
+// ─── `web_search` defaults and hard ceilings ────────────────────────────────
+//
+// Every `web_search` bound has BOTH a default and a ceiling, and none of them
+// can be set to "unlimited": the tool makes outbound requests on a model's
+// behalf, and an unbounded search loop is an easy way to get the proxy's IP
+// rate-limited or CAPTCHA'd. See `src/tools/web_search/README.md`.
+
+/// Where the proxy scrapes search results from.
+pub const DEFAULT_WEB_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+const DEFAULT_WEB_SEARCH_MAX_QUERIES: u64 = 3;
+const MAX_WEB_SEARCH_MAX_QUERIES: u64 = 10;
+const DEFAULT_WEB_SEARCH_MAX_RESULTS_PER_QUERY: u64 = 5;
+/// DuckDuckGo's first HTML page carries about 10 results; the proxy does not
+/// paginate, so asking for more than that could never be honoured.
+const MAX_WEB_SEARCH_MAX_RESULTS_PER_QUERY: u64 = 10;
+const DEFAULT_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS: u64 = 5_000;
+const MAX_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS: u64 = 100_000;
+const DEFAULT_WEB_SEARCH_SEARCH_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS: u64 = 15;
+const MAX_WEB_SEARCH_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_WEB_SEARCH_MAX_PAGE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Warning text for an advisor whose consultation loop is UNBOUNDED.
 ///
 /// `advisor.max_uses` = 0 = "no limit". Shared by the config resolver and
@@ -209,6 +237,13 @@ pub struct Config {
     /// `crate::tools::web_fetch`. When `enabled` is false the proxy never fetches
     /// a URL on the model's behalf and the request pipeline is unchanged.
     pub web_fetch: WebFetchConfig,
+    /// Proxy-native `web_search` policy. See [`WebSearchConfig`] and
+    /// `crate::tools::web_search`. When `enabled` is false (the default) the
+    /// client's `web_search` tool keeps going to the upstream's own search.
+    pub web_search: WebSearchConfig,
+    /// How long the proxy's server-tool loop may run in one request. See
+    /// [`ServerToolsConfig`].
+    pub server_tools: ServerToolsConfig,
     /// When true, prefix claude- to every model id returned by /v1/models so Claude Code auto-discovers them (it only adds ids beginning with claude/anthropic).
     pub prefix_models_for_discovery: bool,
     /// Warnings raised while resolving this configuration.
@@ -227,7 +262,7 @@ pub struct Config {
 /// makes no advisor calls and emits no advisor wire fields. Enabling it
 /// requires an explicit `"enabled": true` in `proxy.json` (or
 /// `ADVISOR_ENABLED=1`) AND an inbound tool declaration named `advisor`.
-/// The consultation loop lives in `crate::tools::advisor::session`.
+/// The consultation loop lives in `crate::tools::advisor::tool`.
 ///
 /// **`model` is an explicit UPSTREAM model name, not an inbound alias.**
 /// It is written directly into the advisor's own upstream request; it is
@@ -332,6 +367,92 @@ impl Default for WebFetchConfig {
             timeout_secs: Some(DEFAULT_WEB_FETCH_TIMEOUT_SECS),
             max_bytes: None,
             max_content_bytes: None,
+        }
+    }
+}
+
+/// Resolved `server_tools` settings (the `server_tools` section of
+/// `proxy.json`): the limits of the loop shared by `web_search`, `web_fetch`
+/// and the advisor.
+///
+/// The loop runs the model, serves its server-tool calls, and runs the model
+/// again. Each pass is a ROUND, and every round is an upstream call, so a
+/// request runs at most `max_rounds` of them (10 by default, as Anthropic's
+/// own loop does). As everywhere else in this config, `0` means NO LIMIT: the
+/// loop is then bounded only by the model's behaviour. That is what makes an
+/// unlimited `advisor.max_uses` or `web_fetch` actually unlimited.
+///
+/// What happens at the limit is `pause_turn`:
+///
+/// * `false` (the default): the model is told the limit was reached and gets
+///   one last run to answer with what it has. The client sees an ordinary
+///   finished turn. This is the safe choice for Claude Code, which does not
+///   resume a `pause_turn`.
+/// * `true`: the response is returned as it stands with
+///   `stop_reason: "pause_turn"`, exactly as Anthropic's API does, and the
+///   client resends the conversation to carry on (the Anthropic SDKs do this).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerToolsConfig {
+    /// `None` is "no limit".
+    pub max_rounds: Option<usize>,
+    pub pause_turn: bool,
+}
+
+impl Default for ServerToolsConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: Some(DEFAULT_SERVER_TOOLS_MAX_ROUNDS as usize),
+            pause_turn: false,
+        }
+    }
+}
+
+/// Resolved `web_search` settings (the `web_search` section of `proxy.json`).
+///
+/// When `enabled`, the proxy answers the client's server-side `web_search`
+/// tool ITSELF (DuckDuckGo scraping + page fetching + compaction) instead of
+/// forwarding it to the upstream's built-in search. When disabled, nothing
+/// about the request pipeline changes.
+///
+/// Unlike [`WebFetchConfig`], NOTHING here is unlimited: every bound has a
+/// default and a hard ceiling (see the `*_WEB_SEARCH_*` constants).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchConfig {
+    /// Use the proxy's own search instead of the upstream's.
+    pub enabled: bool,
+    /// Explicit UPSTREAM model used to compact over-long pages (alias
+    /// resolution is bypassed, like `advisor.model`). `None` = no model call:
+    /// over-long pages are truncated instead.
+    pub compaction_model: Option<String>,
+    /// A page whose text is longer than this many characters is compacted
+    /// (or truncated) to fit within it.
+    pub compaction_threshold_chars: usize,
+    /// Most search queries the model may run in ONE tool call.
+    pub max_queries: usize,
+    /// Most result pages fetched per query.
+    pub max_results_per_query: usize,
+    /// Wall-clock budget for one search-engine request, in seconds.
+    pub search_timeout_secs: u64,
+    /// Wall-clock budget for fetching one result page, in seconds.
+    pub page_timeout_secs: u64,
+    /// Network read cap for one result page, in bytes.
+    pub max_page_bytes: u64,
+    /// The search endpoint (DuckDuckGo's HTML interface by default).
+    pub search_endpoint: String,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            compaction_model: None,
+            compaction_threshold_chars: DEFAULT_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS as usize,
+            max_queries: DEFAULT_WEB_SEARCH_MAX_QUERIES as usize,
+            max_results_per_query: DEFAULT_WEB_SEARCH_MAX_RESULTS_PER_QUERY as usize,
+            search_timeout_secs: DEFAULT_WEB_SEARCH_SEARCH_TIMEOUT_SECS,
+            page_timeout_secs: DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS,
+            max_page_bytes: DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES,
+            search_endpoint: DEFAULT_WEB_SEARCH_ENDPOINT.to_owned(),
         }
     }
 }
@@ -934,6 +1055,113 @@ impl Config {
             max_content_bytes: web_fetch_max_content_bytes,
         };
 
+        // `server_tools`: env > file > default; `max_rounds` follows the house
+        // rule (`0` = no limit).
+        let server_tools_defaults = ServerToolsConfig::default();
+        let server_tools_json = file.and_then(|f| f.server_tools.as_ref());
+        let server_tools = ServerToolsConfig {
+            max_rounds: resolve_web_fetch_limit(
+                pick_limit(
+                    server_tools_json.and_then(|w| w.max_rounds.as_ref()),
+                    env.server_tools_max_rounds.as_ref(),
+                ),
+                Some(DEFAULT_SERVER_TOOLS_MAX_ROUNDS),
+                "server_tools.max_rounds",
+                &mut warnings,
+            )
+            .map(|rounds| usize::try_from(rounds).unwrap_or(usize::MAX)),
+            pause_turn: env
+                .server_tools_pause_turn
+                .or_else(|| server_tools_json.and_then(|w| w.pause_turn))
+                .unwrap_or(server_tools_defaults.pause_turn),
+        };
+
+        // `web_search`: env > file > default. Every limit is BOUNDED: absent
+        // = the shipped default, `0` / negative / fractional = the default
+        // with a warning (there is deliberately no "unlimited"), and a value
+        // above the ceiling is clamped with a warning.
+        let web_search_defaults = WebSearchConfig::default();
+        let web_search_json = file.and_then(|f| f.web_search.as_ref());
+        let web_search = WebSearchConfig {
+            enabled: env
+                .web_search_enabled
+                .or_else(|| web_search_json.and_then(|w| w.enabled))
+                .unwrap_or(web_search_defaults.enabled),
+            compaction_model: env
+                .web_search_compaction_model
+                .clone()
+                .or_else(|| web_search_json.and_then(|w| w.compaction_model.clone()))
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty()),
+            compaction_threshold_chars: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.compaction_threshold_chars.as_ref()),
+                    env.web_search_compaction_threshold_chars.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS,
+                MAX_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS,
+                "web_search.compaction_threshold_chars",
+                &mut warnings,
+            ) as usize,
+            max_queries: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.max_queries.as_ref()),
+                    env.web_search_max_queries.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_MAX_QUERIES,
+                MAX_WEB_SEARCH_MAX_QUERIES,
+                "web_search.max_queries",
+                &mut warnings,
+            ) as usize,
+            max_results_per_query: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.max_results_per_query.as_ref()),
+                    env.web_search_max_results_per_query.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_MAX_RESULTS_PER_QUERY,
+                MAX_WEB_SEARCH_MAX_RESULTS_PER_QUERY,
+                "web_search.max_results_per_query",
+                &mut warnings,
+            ) as usize,
+            search_timeout_secs: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.search_timeout_secs.as_ref()),
+                    env.web_search_search_timeout_secs.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_SEARCH_TIMEOUT_SECS,
+                MAX_WEB_SEARCH_TIMEOUT_SECS,
+                "web_search.search_timeout_secs",
+                &mut warnings,
+            ),
+            page_timeout_secs: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.page_timeout_secs.as_ref()),
+                    env.web_search_page_timeout_secs.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS,
+                MAX_WEB_SEARCH_TIMEOUT_SECS,
+                "web_search.page_timeout_secs",
+                &mut warnings,
+            ),
+            max_page_bytes: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.max_page_bytes.as_ref()),
+                    env.web_search_max_page_bytes.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES,
+                MAX_WEB_SEARCH_MAX_PAGE_BYTES,
+                "web_search.max_page_bytes",
+                &mut warnings,
+            ),
+            search_endpoint: env
+                .web_search_endpoint
+                .clone()
+                .or_else(|| web_search_json.and_then(|w| w.search_endpoint.clone()))
+                .map(|e| e.trim().to_owned())
+                .filter(|e| !e.is_empty())
+                .unwrap_or(web_search_defaults.search_endpoint),
+        };
+
         let prefix_models_for_discovery = env.prefix_models_for_discovery.unwrap_or_else(|| {
             file.and_then(|f| f.prefix_models_for_discovery)
                 .unwrap_or(false)
@@ -956,6 +1184,8 @@ impl Config {
             log_to_disk,
             advisor,
             web_fetch,
+            web_search,
+            server_tools,
             prefix_models_for_discovery,
             warnings,
         })
@@ -1172,6 +1402,19 @@ pub struct EnvInputs {
     pub web_fetch_timeout_secs: Option<serde_json::Number>,
     pub web_fetch_max_bytes: Option<serde_json::Number>,
     pub web_fetch_max_content_bytes: Option<serde_json::Number>,
+    /// `web_search` overrides, read like the `web_fetch` ones.
+    pub web_search_enabled: Option<bool>,
+    pub web_search_compaction_model: Option<String>,
+    pub web_search_compaction_threshold_chars: Option<serde_json::Number>,
+    pub web_search_max_queries: Option<serde_json::Number>,
+    pub web_search_max_results_per_query: Option<serde_json::Number>,
+    pub web_search_search_timeout_secs: Option<serde_json::Number>,
+    pub web_search_page_timeout_secs: Option<serde_json::Number>,
+    pub web_search_max_page_bytes: Option<serde_json::Number>,
+    pub web_search_endpoint: Option<String>,
+    /// `server_tools` overrides.
+    pub server_tools_max_rounds: Option<serde_json::Number>,
+    pub server_tools_pause_turn: Option<bool>,
     pub prefix_models_for_discovery: Option<bool>,
 }
 
@@ -1222,6 +1465,37 @@ impl EnvInputs {
             web_fetch_max_content_bytes: env::var("WEB_FETCH_MAX_CONTENT_BYTES")
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
+            server_tools_max_rounds: env::var("SERVER_TOOLS_MAX_ROUNDS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            server_tools_pause_turn: env::var("SERVER_TOOLS_PAUSE_TURN")
+                .ok()
+                .map(|s| parse_truthy(&s)),
+            web_search_enabled: env::var("WEB_SEARCH_ENABLED")
+                .ok()
+                .map(|s| parse_truthy(&s)),
+            web_search_compaction_model: env::var("WEB_SEARCH_COMPACTION_MODEL").ok(),
+            web_search_compaction_threshold_chars: env::var(
+                "WEB_SEARCH_COMPACTION_THRESHOLD_CHARS",
+            )
+            .ok()
+            .and_then(|s| parse_env_limit(&s)),
+            web_search_max_queries: env::var("WEB_SEARCH_MAX_QUERIES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_max_results_per_query: env::var("WEB_SEARCH_MAX_RESULTS_PER_QUERY")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_search_timeout_secs: env::var("WEB_SEARCH_SEARCH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_page_timeout_secs: env::var("WEB_SEARCH_PAGE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_max_page_bytes: env::var("WEB_SEARCH_MAX_PAGE_BYTES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_endpoint: env::var("WEB_SEARCH_ENDPOINT").ok(),
             prefix_models_for_discovery: env::var("PREFIX_MODELS_FOR_DISCOVERY")
                 .ok()
                 .map(|s| parse_truthy(&s)),
@@ -1382,6 +1656,47 @@ where
             Some(default)
         }
     }
+}
+
+/// Resolve one BOUNDED `web_search` limit from its raw JSON/env value.
+///
+/// Unlike [`resolve_web_fetch_limit`] there is no "unlimited": the tool makes
+/// outbound requests on a model's behalf, so every limit keeps a ceiling.
+///
+/// * **absent** → `default`;
+/// * **`0`, negative, fractional, out of range** → `default`, WITH a warning;
+/// * **`1..=ceiling`** → that value;
+/// * **above `ceiling`** → `ceiling`, WITH a warning.
+fn resolve_bounded_limit(
+    value: Option<serde_json::Number>,
+    default: u64,
+    ceiling: u64,
+    field: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u64 {
+    let Some(number) = value.as_ref() else {
+        return default;
+    };
+    let invalid = match classify_limit(number) {
+        RawLimit::Whole(0) => "it must be at least 1 (web_search has no unlimited setting)",
+        RawLimit::Whole(v) if v > ceiling => {
+            warnings.push(
+                ConfigWarning::new(format!(
+                    "{field} = {number} is above the maximum; clamped to {ceiling}"
+                ))
+                .with_field("field", field)
+                .with_field("value", number.to_string())
+                .with_field("fallback", ceiling.to_string()),
+            );
+            return ceiling;
+        }
+        RawLimit::Whole(v) => return v,
+        RawLimit::Negative => "it is negative",
+        RawLimit::Fractional => "it is not a whole number",
+        RawLimit::TooLarge => "it is out of range",
+    };
+    push_invalid_limit_warning(warnings, field, number, default, invalid);
+    default
 }
 
 /// Resolve one `web_fetch` limit from its raw JSON/env value.
@@ -1617,6 +1932,13 @@ pub struct JsonConfig {
     /// See [`WebFetchConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_fetch: Option<JsonWebFetchConfig>,
+    /// Proxy-native `web_search` settings. Off by default.
+    /// See [`WebSearchConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<JsonWebSearchConfig>,
+    /// Limits of the shared server-tool loop. See [`ServerToolsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tools: Option<JsonServerToolsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_models_for_discovery: Option<bool>,
 }
@@ -1644,6 +1966,36 @@ pub struct JsonWebFetchConfig {
     pub max_bytes: Option<serde_json::Number>,
     /// Raw limit, exactly as written. The RESOLVER judges it.
     pub max_content_bytes: Option<serde_json::Number>,
+}
+
+/// JSON shape of the `web_search` section of `proxy.json`.
+///
+/// Every field is optional and `deny_unknown_fields` catches typos. The
+/// limits are RAW numbers (same rationale as [`JsonWebFetchConfig`]); the
+/// resolver judges them and every one stays bounded.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct JsonWebSearchConfig {
+    pub enabled: Option<bool>,
+    /// Explicit upstream model used to compact long pages. Unset = truncate.
+    pub compaction_model: Option<String>,
+    pub compaction_threshold_chars: Option<serde_json::Number>,
+    pub max_queries: Option<serde_json::Number>,
+    pub max_results_per_query: Option<serde_json::Number>,
+    pub search_timeout_secs: Option<serde_json::Number>,
+    pub page_timeout_secs: Option<serde_json::Number>,
+    pub max_page_bytes: Option<serde_json::Number>,
+    /// Search endpoint override (default: DuckDuckGo's HTML interface).
+    pub search_endpoint: Option<String>,
+}
+
+/// JSON shape of the `server_tools` section of `proxy.json`. `max_rounds` is a
+/// RAW number so the resolver can judge it, like the other limits.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct JsonServerToolsConfig {
+    pub max_rounds: Option<serde_json::Number>,
+    pub pause_turn: Option<bool>,
 }
 
 /// JSON shape of the `advisor` section of `proxy.json`.

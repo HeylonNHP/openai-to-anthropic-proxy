@@ -109,6 +109,8 @@ fn test_config_minimal() -> Config {
         proxy_key: None,
         advisor: crate::config::AdvisorConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
+        web_search: crate::config::WebSearchConfig::default(),
+        server_tools: crate::config::ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: crate::config::ToolResultImages::default(),
         warnings: Vec::new(),

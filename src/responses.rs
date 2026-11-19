@@ -341,21 +341,23 @@ pub struct WebSearchTool {
     /// Always `"web_search"`.
     #[serde(rename = "type")]
     pub kind: String,
-    /// Maximum number of web search calls per request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_uses: Option<u32>,
     /// How much search context to include: `"low"`, `"medium"`, or `"high"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_context_size: Option<String>,
     /// Approximate geographic location for localized results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_location: Option<Value>,
+    /// Domain restrictions. OpenAI has an allow-list only: there is no
+    /// block-list and no per-request use cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<WebSearchFilters>,
+}
+
+/// `filters` of OpenAI's built-in web search tool.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSearchFilters {
     /// Restrict search to these domains.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_domains: Option<Vec<String>>,
-    /// Exclude these domains from search results.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocked_domains: Option<Vec<String>>,
+    pub allowed_domains: Vec<String>,
 }
 
 /// `tool_choice`: a string (`"auto" | "required" | "none"`) or a

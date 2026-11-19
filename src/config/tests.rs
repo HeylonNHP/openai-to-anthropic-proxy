@@ -1643,3 +1643,173 @@ fn normalize_effort_lowercases_and_trims() {
     assert_eq!(Config::normalize_effort(Some("")), None);
     assert_eq!(Config::normalize_effort(None), None);
 }
+
+// ─── `web_search` ───────────────────────────────────────────────────────────
+
+fn web_search_file(json: &str) -> JsonConfig {
+    serde_json::from_str(&format!(r#"{{ "web_search": {json} }}"#)).unwrap()
+}
+
+#[test]
+fn web_search_defaults_are_off_and_bounded() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    let ws = &cfg.web_search;
+    assert!(!ws.enabled);
+    assert_eq!(ws.compaction_model, None);
+    assert_eq!(ws.compaction_threshold_chars, 5_000);
+    assert_eq!(ws.max_queries, 3);
+    assert_eq!(ws.max_results_per_query, 5);
+    assert_eq!(ws.search_endpoint, DEFAULT_WEB_SEARCH_ENDPOINT);
+    assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn web_search_file_values_resolve() {
+    let file = web_search_file(
+        r#"{ "enabled": true, "compaction_model": " gpt-mini ", "compaction_threshold_chars": 8000,
+             "max_queries": 2, "max_results_per_query": 4, "search_timeout_secs": 9,
+             "page_timeout_secs": 11, "max_page_bytes": 1000, "search_endpoint": "http://x/html/" }"#,
+    );
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    let ws = &cfg.web_search;
+    assert!(ws.enabled);
+    assert_eq!(ws.compaction_model.as_deref(), Some("gpt-mini"));
+    assert_eq!(ws.compaction_threshold_chars, 8_000);
+    assert_eq!((ws.max_queries, ws.max_results_per_query), (2, 4));
+    assert_eq!((ws.search_timeout_secs, ws.page_timeout_secs), (9, 11));
+    assert_eq!(ws.max_page_bytes, 1000);
+    assert_eq!(ws.search_endpoint, "http://x/html/");
+    assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn web_search_env_beats_file() {
+    let file =
+        web_search_file(r#"{ "enabled": false, "max_queries": 2, "compaction_model": "a" }"#);
+    let env = EnvInputs {
+        web_search_enabled: Some(true),
+        web_search_max_queries: limit(4),
+        web_search_compaction_model: Some("b".into()),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert!(cfg.web_search.enabled);
+    assert_eq!(cfg.web_search.max_queries, 4);
+    assert_eq!(cfg.web_search.compaction_model.as_deref(), Some("b"));
+}
+
+#[test]
+fn web_search_blank_compaction_model_means_none() {
+    let file = web_search_file(r#"{ "compaction_model": "   " }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.compaction_model, None);
+}
+
+#[test]
+fn web_search_has_no_unlimited_setting() {
+    // `0` is "no limit" for the other tools; here it is just invalid.
+    let file = web_search_file(r#"{ "max_queries": 0, "max_results_per_query": 0 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.max_queries, 3);
+    assert_eq!(cfg.web_search.max_results_per_query, 5);
+    assert_eq!(cfg.warnings.len(), 2);
+}
+
+#[test]
+fn web_search_invalid_numbers_fall_back_with_a_warning() {
+    let file = web_search_file(r#"{ "max_queries": -1, "compaction_threshold_chars": 2.5 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.max_queries, 3);
+    assert_eq!(cfg.web_search.compaction_threshold_chars, 5_000);
+    assert_eq!(cfg.warnings.len(), 2);
+}
+
+#[test]
+fn web_search_values_above_the_ceiling_are_clamped() {
+    let file = web_search_file(
+        r#"{ "max_queries": 500, "max_results_per_query": 500, "search_timeout_secs": 9999 }"#,
+    );
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.max_queries, 10);
+    assert_eq!(cfg.web_search.max_results_per_query, 10);
+    assert_eq!(cfg.web_search.search_timeout_secs, 120);
+    assert_eq!(cfg.warnings.len(), 3);
+}
+
+#[test]
+fn web_search_unknown_field_is_rejected() {
+    let parsed: Result<JsonConfig, _> = serde_json::from_str(r#"{ "web_search": { "typo": 1 } }"#);
+    assert!(parsed.is_err());
+}
+
+// ─── `server_tools` ─────────────────────────────────────────────────────────
+
+fn server_tools_file(json: &str) -> JsonConfig {
+    serde_json::from_str(&format!(r#"{{ "server_tools": {json} }}"#)).unwrap()
+}
+
+#[test]
+fn server_tools_defaults_match_anthropics_loop_and_do_not_pause() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.server_tools.max_rounds, Some(10));
+    assert!(!cfg.server_tools.pause_turn, "Claude Code does not resume");
+    assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn server_tools_file_values_resolve() {
+    let file = server_tools_file(r#"{ "max_rounds": 4, "pause_turn": true }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.server_tools.max_rounds, Some(4));
+    assert!(cfg.server_tools.pause_turn);
+}
+
+#[test]
+fn server_tools_env_beats_file() {
+    let file = server_tools_file(r#"{ "max_rounds": 4, "pause_turn": true }"#);
+    let env = EnvInputs {
+        server_tools_max_rounds: limit(6),
+        server_tools_pause_turn: Some(false),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.server_tools.max_rounds, Some(6));
+    assert!(!cfg.server_tools.pause_turn);
+}
+
+#[test]
+fn server_tools_zero_rounds_means_no_limit() {
+    let file = server_tools_file(r#"{ "max_rounds": 0 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.server_tools.max_rounds, None);
+    assert!(cfg.warnings.is_empty(), "0 is the documented spelling");
+}
+
+#[test]
+fn server_tools_invalid_rounds_fall_back_to_the_default_with_a_warning() {
+    for raw in ["-3", "2.5"] {
+        let file = server_tools_file(&format!(r#"{{ "max_rounds": {raw} }}"#));
+        let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+        assert_eq!(cfg.server_tools.max_rounds, Some(10), "{raw}");
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.message.contains("server_tools.max_rounds")),
+            "{raw} must warn"
+        );
+    }
+}
+
+#[test]
+fn server_tools_a_large_explicit_limit_is_honoured() {
+    let file = server_tools_file(r#"{ "max_rounds": 500 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.server_tools.max_rounds, Some(500));
+}
+
+#[test]
+fn server_tools_rejects_unknown_fields() {
+    assert!(
+        serde_json::from_str::<JsonConfig>(r#"{ "server_tools": { "max_round": 3 } }"#).is_err()
+    );
+}

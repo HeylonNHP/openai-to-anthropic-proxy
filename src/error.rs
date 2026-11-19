@@ -63,8 +63,9 @@ impl AppError {
         }
     }
 
-    fn anthropic_error_body(&self) -> serde_json::Value {
-        let (kind, message) = match self {
+    /// The Anthropic error `type` and message for this error.
+    fn kind_and_message(&self) -> (&'static str, String) {
+        match self {
             Self::BadRequest(msg) => ("invalid_request_error", msg.clone()),
             Self::Unauthorized => (
                 "authentication_error",
@@ -82,7 +83,21 @@ impl AppError {
                 (kind, format!("upstream returned {status}: {body}"))
             }
             Self::Internal(msg) => ("api_error", msg.clone()),
-        };
+        }
+    }
+
+    /// The body of an SSE `error` event, for a failure after a stream has
+    /// already started (when an HTTP status can no longer be sent).
+    pub(crate) fn to_api_error_body(&self) -> crate::anthropic::ApiErrorBody {
+        let (kind, message) = self.kind_and_message();
+        crate::anthropic::ApiErrorBody {
+            r#type: kind.to_owned(),
+            message,
+        }
+    }
+
+    fn anthropic_error_body(&self) -> serde_json::Value {
+        let (kind, message) = self.kind_and_message();
 
         json!({
             "type": "error",

@@ -21,10 +21,7 @@ use eventsource_stream::{EventStream, Eventsource};
 use futures_util::{Stream, StreamExt};
 use std::time::Duration;
 
-use crate::anthropic::{
-    AnthropicModelsList, CreateMessageRequest, Message, ResponseContentBlock, StopReason,
-    StreamEvent,
-};
+use crate::anthropic::{AnthropicModelsList, CreateMessageRequest, StreamEvent};
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
@@ -666,7 +663,7 @@ pub(crate) async fn parse_upstream_body(
 pub(crate) struct Attempt {
     pub(crate) state: AppState,
     pub(crate) headers: HeaderMap,
-    req: CreateMessageRequest,
+    pub(crate) req: CreateMessageRequest,
     pub(crate) outbound: responses::ResponsesRequest,
     // Original (client-supplied) tool schemas captured at request
     // translation; threaded to both response paths so tool-call
@@ -726,6 +723,11 @@ fn build_outbound(
         config.reasoning_for_request(model, requested_effort, thinking_disabled);
     let prompt_caching = config.prompt_caching_for_model(model);
     let reasoning_replay = config.reasoning_replay_for_model(model);
+    // A request Anthropic itself would reject (a search/fetch tool with both
+    // domain lists) is refused here, before any upstream call.
+    if let Some(tools) = req.tools.as_deref() {
+        crate::anthropic::validate_server_tool_options(tools).map_err(AppError::BadRequest)?;
+    }
     let (mut outbound, registry) = translate::anthropic_to_responses_with(
         req,
         Some(reasoning_decision),
@@ -769,12 +771,19 @@ fn build_outbound(
     // Both the first attempt AND a default_model fallback re-translation go
     // through this function, so neither can lose the tool or accidentally
     // re-enable upstream streaming.
+    // Every server tool the client declared (and the operator enabled) is
+    // offered to the executor at once, so the model can use any mix of them
+    // in one turn. Each `prepare` is a no-op unless its tool is declared and
+    // enabled, and each adds its own internal function tool (named so they
+    // cannot collide), then forces the outbound request to be buffered: the
+    // executor must be re-run with the tool outputs before the turn can end.
+    //
+    // * `web_search` also removes the upstream's built-in search tool (the
+    //   translator added it), so the model never has two search tools.
+    // * `web_fetch` and the advisor are declared without an `input_schema`,
+    //   so the translator drops them; these synthesize the function tools.
+    crate::tools::web_search::prepare(req, &mut outbound, &config.web_search);
     crate::tools::advisor::prepare(req, &mut outbound, &config.advisor);
-    // Same for the server-side `web_fetch` tool: the client declares it
-    // without an input_schema, so the translator drops it. Synthesize the
-    // function tool the executor calls to request a fetch, and force the
-    // outbound request to be buffered (the executor must be re-run with
-    // the fetched text before the turn can end).
     crate::tools::web_fetch::prepare(req, &mut outbound, &config.web_fetch);
     Ok((outbound, registry, reasoning_replay))
 }
@@ -966,7 +975,7 @@ impl Attempt {
     /// only: streaming bytes are already flowing at that point.
     /// `pub(crate)` so the advisor session can re-run the WHOLE pipe
     /// (including capabilities / fallback / corrective retry) without
-    /// duplicating any of it. See `src/tools/advisor/session.rs` for why this is
+    /// duplicating any of it. See `src/tools/server_loop/run.rs` for why this is
     /// architecture choice (a) rather than a second loop in `proxy.rs`.
     pub(crate) async fn execute(&mut self, url: &str) -> Result<Outcome, AppError> {
         let upstream_resp = self.send_success(url).await?;
@@ -1018,43 +1027,28 @@ impl Attempt {
 
     async fn run(mut self) -> Result<Response, AppError> {
         let url = self.url();
-        // Off by default AND detection-triggered: with `web_fetch.enabled =
-        // false` (the shipped default) this branch is never taken, so every
-        // ordinary request follows the exact same path as before.
-        //
-        // The `web_fetch` path is checked BEFORE the advisor path: a
-        // request that declares BOTH server tools needs one loop that can
-        // serve both, and the `web_fetch` loop is the one that owns the
-        // fetch. (In practice Claude Code declares at most one.)
-        if crate::tools::web_fetch::active(&self.state.config.web_fetch, &self.req) {
-            let cfg = self.state.config.web_fetch.clone();
-            return match crate::tools::web_fetch::session::run(&mut self, &cfg).await {
-                Ok(crate::tools::web_fetch::session::SessionOutcome::UnexpectedStreaming(resp)) => {
-                    render_streaming(self, resp)
+        // Server tools the proxy serves itself (`web_search`, `web_fetch` and
+        // the advisor). Each is off by default and detection-triggered, so
+        // with none active `handlers` is empty and the request is untouched.
+        let tools = crate::tools::server_loop::handlers(&self)?;
+        if !tools.is_empty() && self.req.stream == Some(true) {
+            // A streaming client is sent each round as it finishes.
+            return match crate::tools::server_loop::stream::respond(self, tools).await? {
+                crate::tools::server_loop::stream::Streamed::Response(response) => Ok(response),
+                crate::tools::server_loop::stream::Streamed::Fallback(attempt, raw) => {
+                    render_streaming(*attempt, raw)
                 }
-                Ok(crate::tools::web_fetch::session::SessionOutcome::Complete(result)) => {
-                    render_web_fetch(&self, *result)
-                }
-                Err(err) => Err(err),
             };
         }
-        // Off by default AND detection-triggered: with `advisor.enabled =
-        // false` (the shipped default) this branch is never taken, so every
-        // ordinary request follows the exact same path as before.
-        if crate::tools::advisor::active(self.state.config.as_ref(), &self.req) {
-            let cfg = self.state.config.advisor.clone();
-            // B1: even the FIRST executor error can carry an upstream 400
-            // naming the advisor beta/tool. Scrub those tokens from ANY
-            // error body that could reach the client on this path so Claude
-            // Code cannot latch the feature off for the whole process.
-            return match crate::tools::advisor::session::run(&mut self, &cfg).await {
-                Ok(crate::tools::advisor::session::SessionOutcome::UnexpectedStreaming(resp)) => {
+        if !tools.is_empty() {
+            return match crate::tools::server_loop::run::run(&mut self, tools).await {
+                Ok(crate::tools::server_loop::run::SessionOutcome::UnexpectedStreaming(resp)) => {
                     render_streaming(self, resp)
                 }
-                Ok(crate::tools::advisor::session::SessionOutcome::Complete(result)) => {
-                    render_advisor(&self, *result)
+                Ok(crate::tools::server_loop::run::SessionOutcome::Complete(result)) => {
+                    crate::tools::server_loop::render::render(&self, *result)
                 }
-                Err(err) => Err(AppError::scrub_advisor_error(err)),
+                Err(err) => Err(err),
             };
         }
         // Retries are issued here -- before any response bytes are written,
@@ -1124,160 +1118,14 @@ fn render_json(
     Ok(Json(anth).into_response())
 }
 
-/// Render the assembled advisor turn. The advisor path buffers the whole
-/// chain (`prepare` forced upstream `stream:false`), so a client that asked
-/// for SSE gets ONE synthetic Anthropic event sequence — one
-/// `message_start`, one `message_stop`, no `[DONE]` (§§11.3, 11.5).
-///
-/// The Content-Type is HARD-CODED: the upstream answered `application/json`,
-/// so forwarding its header (as `render_streaming` does) would be wrong.
-fn render_advisor(
-    attempt: &Attempt,
-    result: crate::tools::advisor::session::SessionResult,
-) -> Result<Response, AppError> {
-    let crate::tools::advisor::session::SessionResult {
-        final_resp,
-        prefix_blocks,
-        iterations,
-    } = result;
-
-    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
-
-    // Claude Code must see `server_tool_use` (a Raw block), not a client
-    // `tool_use` named "advisor". Drop only that name. This also strips the
-    // orphan tool_use from the terminal cap re-run if it asked again (B3).
-    anth.content.retain(
-        |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "advisor"),
-    );
-
-    // B6: splice the accumulated intermediate executor content plus
-    // contiguous consultation pairs at the FRONT, in real turn order.
-    // The executor's final text follows.
-    anth.content.splice(0..0, prefix_blocks);
-
-    // B7: preserve any TERMINAL stop reason that came from
-    // `responses_to_anthropic` (notably max_tokens / refusal /
-    // stop_sequence). Only override when a client tool_use remains, or
-    // when the reason is absent / EndTurn. NEVER emit PauseTurn. Never
-    // let a terminal reason be clobbered to EndTurn.
-    let has_client_tool_use = anth
-        .content
-        .iter()
-        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
-    if has_client_tool_use {
-        anth.stop_reason = Some(StopReason::ToolUse);
-    } else if !matches!(
-        anth.stop_reason,
-        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::StopSequence)
-    ) {
-        // None, EndTurn, ToolUse (with no tool left) and the streaming-only
-        // PauseTurn all collapse to EndTurn for a buffered advisor turn.
-        anth.stop_reason = Some(StopReason::EndTurn);
-    }
-
-    // B10: billing lives in iterations[], not the top-level totals. A turn
-    // with no usage should have NO `iterations` field at all so the wire is
-    // byte-identical to the non-advisor path.
-    anth.usage.iterations = if iterations.is_empty() {
-        None
-    } else {
-        Some(iterations)
-    };
-
-    // Same stats/log block as the ordinary buffered path: reads the LAST
-    // executor response's authoritative usage exactly once.
-    record_json_stats(attempt, &final_resp);
-
-    if attempt.req.stream == Some(true) {
-        let events = crate::tools::advisor::sse::message_to_events(anth);
-        let chunks = events
-            .into_iter()
-            .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));
-        let body = Body::from_stream(futures_util::stream::iter(chunks));
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .map_err(|e| AppError::Internal(format!("build advisor streaming response: {e}")));
-    }
-    Ok(Json(anth).into_response())
-}
-
-/// Render the assembled `web_fetch` turn.
-///
-/// The `web_fetch` path buffers the whole chain (`prepare` forced upstream
-/// `stream:false`), so a client that asked for SSE gets ONE synthetic
-/// Anthropic event sequence — one `message_start`, one `message_stop`, no
-/// `[DONE]`.
-///
-/// The Content-Type is HARD-CODED: the upstream answered `application/json`,
-/// so forwarding its header (as `render_streaming` does) would be wrong.
-fn render_web_fetch(
-    attempt: &Attempt,
-    result: crate::tools::web_fetch::session::SessionResult,
-) -> Result<Response, AppError> {
-    let crate::tools::web_fetch::session::SessionResult {
-        final_resp,
-        prefix_blocks,
-    } = result;
-
-    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
-
-    // Claude Code must see `server_tool_use` + `web_fetch_tool_result`
-    // (Raw blocks), not a client `tool_use` named "web_fetch". Drop only
-    // that name.
-    anth.content.retain(
-        |block| !matches!(block, ResponseContentBlock::ToolUse { name, .. } if name == "web_fetch"),
-    );
-
-    // Splice the accumulated intermediate executor content plus the
-    // contiguous server-tool pairs at the FRONT, in real turn order. The
-    // executor's final text follows.
-    anth.content.splice(0..0, prefix_blocks);
-
-    // Preserve any TERMINAL stop reason that came from
-    // `responses_to_anthropic`. Only override when a client tool_use
-    // remains, or when the reason is absent / EndTurn. NEVER emit
-    // PauseTurn.
-    let has_client_tool_use = anth
-        .content
-        .iter()
-        .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
-    if has_client_tool_use {
-        anth.stop_reason = Some(StopReason::ToolUse);
-    } else if !matches!(
-        anth.stop_reason,
-        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::StopSequence)
-    ) {
-        anth.stop_reason = Some(StopReason::EndTurn);
-    }
-
-    // Same stats/log block as the ordinary buffered path: reads the LAST
-    // executor response's authoritative usage exactly once.
-    record_json_stats(attempt, &final_resp);
-
-    if attempt.req.stream == Some(true) {
-        let events = crate::tools::advisor::sse::message_to_events(anth);
-        let chunks = events
-            .into_iter()
-            .map(|event| Ok::<Bytes, std::io::Error>(encode_sse_events(&[event])));
-        let body = Body::from_stream(futures_util::stream::iter(chunks));
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .map_err(|e| AppError::Internal(format!("build web_fetch streaming response: {e}")));
-    }
-    Ok(Json(anth).into_response())
-}
-
 /// Stats + operator log line for a buffered response. Extracted verbatim
 /// from `render_json` so the advisor path cannot drift from the ordinary
 /// path. Reads the RESPONSES body's usage (not `anth.usage`), so mutating
 /// `usage.iterations` above is invisible here by design.
-fn record_json_stats(attempt: &Attempt, upstream_resp_body: &responses::ResponsesResponse) {
+pub(crate) fn record_json_stats(
+    attempt: &Attempt,
+    upstream_resp_body: &responses::ResponsesResponse,
+) {
     if is_countable_response_status(&upstream_resp_body.status)
         && let Some(usage) = upstream_resp_body.usage.as_ref()
     {

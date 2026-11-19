@@ -70,6 +70,7 @@ pub const ERROR_CODE_INVALID_TOOL_INPUT: &str = "invalid_tool_input";
 pub const ERROR_CODE_URL_NOT_ALLOWED: &str = "url_not_allowed";
 pub const ERROR_CODE_URL_NOT_ACCESSIBLE: &str = "url_not_accessible";
 pub const ERROR_CODE_UNAVAILABLE: &str = "unavailable";
+pub const ERROR_CODE_MAX_USES_EXCEEDED: &str = "max_uses_exceeded";
 
 /// The `server_tool_use` block that opens one fetch.
 ///
