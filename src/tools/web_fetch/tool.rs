@@ -77,6 +77,9 @@ pub struct WebFetchTool {
     fetches: usize,
     /// One operator-visible warning per turn, however many fetches fail.
     warned: bool,
+    /// A call was refused at `max_uses` and the executor was told so: the
+    /// tool is [`exhausted`](ServerTool::exhausted) from then on.
+    limit_refused: bool,
 }
 
 /// The answer to one call, plus what is worth telling the operator.
@@ -108,6 +111,7 @@ impl WebFetchTool {
             rules: DomainRules::from_options(options),
             fetches: 0,
             warned: false,
+            limit_refused: false,
         }
     }
 
@@ -138,6 +142,7 @@ impl WebFetchTool {
         // The client's `max_uses`: a refused call is not a fetch, so it is not
         // counted and nothing is requested.
         if self.max_uses.is_some_and(|max| self.fetches >= max) {
+            self.limit_refused = true;
             return Answer {
                 served: Served {
                     blocks: vec![
@@ -245,6 +250,14 @@ impl ServerTool for WebFetchTool {
             self.warn(attempt, &answer);
             answer.served
         })
+    }
+
+    /// Once a call has been refused at the client's `max_uses`, further
+    /// calls are dropped by the loop rather than refused again: an executor
+    /// that ignores the refusal cannot keep the turn alive (which, with
+    /// `server_tools.max_rounds` unlimited, it otherwise could forever).
+    fn exhausted(&self) -> bool {
+        self.limit_refused
     }
 
     fn contribute_usage(&self, usage: &mut Usage) {

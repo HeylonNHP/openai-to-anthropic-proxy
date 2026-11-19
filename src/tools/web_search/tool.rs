@@ -59,6 +59,9 @@ pub struct WebSearchTool<B> {
     search_requests: u32,
     /// One operator-visible warning per turn, however many searches fail.
     warned: bool,
+    /// Queries were refused at `max_uses` and the executor was told so: the
+    /// tool is [`exhausted`](ServerTool::exhausted) from then on.
+    limit_refused: bool,
 }
 
 impl WebSearchTool<LiveBackend> {
@@ -106,6 +109,7 @@ impl<B: Backend> WebSearchTool<B> {
             max_uses: None,
             search_requests: 0,
             warned: false,
+            limit_refused: false,
         }
     }
 
@@ -145,6 +149,9 @@ impl<B: Backend> WebSearchTool<B> {
         let (kept, capped) = run::normalize_queries(&queries, self.settings.max_queries);
         let allowed = kept.len().min(self.remaining_uses());
         let (to_run, refused) = kept.split_at(allowed);
+        if !refused.is_empty() {
+            self.limit_refused = true;
+        }
         let mut report = if to_run.is_empty() {
             run::Report::default()
         } else {
@@ -258,6 +265,14 @@ impl<B: Backend + Send + 'static> ServerTool for WebSearchTool<B> {
             self.warn_once(attempt, &answer.failures);
             answer.served
         })
+    }
+
+    /// Once queries have been refused at the client's `max_uses`, further
+    /// calls are dropped by the loop rather than refused again: an executor
+    /// that ignores the refusal cannot keep the turn alive (which, with
+    /// `server_tools.max_rounds` unlimited, it otherwise could forever).
+    fn exhausted(&self) -> bool {
+        self.limit_refused
     }
 
     fn contribute_usage(&self, usage: &mut Usage) {

@@ -213,3 +213,33 @@ fn no_max_content_tokens_leaves_the_budget_alone() {
         WebFetchConfig::default().max_content_bytes
     );
 }
+
+#[tokio::test]
+async fn the_tool_is_exhausted_once_a_call_is_refused_at_max_uses() {
+    let mut tool = WebFetchTool::new(
+        &WebFetchConfig::default(),
+        &options(serde_json::json!({"max_uses": 1})),
+    );
+    assert!(!tool.exhausted());
+
+    tool.answer(&call(REFUSED)).await;
+    assert!(
+        !tool.exhausted(),
+        "reaching the limit is not a refusal: the executor has not been told yet"
+    );
+
+    tool.answer(&call(REFUSED)).await;
+    assert!(
+        tool.exhausted(),
+        "after the refusal, further calls are dropped so the turn can end"
+    );
+}
+
+#[tokio::test]
+async fn without_max_uses_the_tool_is_never_exhausted() {
+    let mut tool = WebFetchTool::new(&WebFetchConfig::default(), &ServerToolOptions::default());
+    for _ in 0..3 {
+        tool.answer(&call(REFUSED)).await;
+    }
+    assert!(!tool.exhausted());
+}

@@ -243,3 +243,33 @@ async fn queries_over_the_per_call_cap_are_still_reported() {
             .contains("2 further queries were NOT run")
     );
 }
+
+#[tokio::test]
+async fn the_tool_is_exhausted_once_queries_are_refused_at_max_uses() {
+    let mut tool = tool(Fake::default()).with_max_uses(Some(2));
+    tool.answer(&call(r#"{"queries":["a","b"]}"#)).await;
+    assert!(
+        !tool.exhausted(),
+        "using the last query is not a refusal: nothing was refused yet"
+    );
+
+    tool.answer(&call(r#"{"queries":["c"]}"#)).await;
+    assert!(
+        tool.exhausted(),
+        "after the refusal, further calls are dropped so the turn can end"
+    );
+}
+
+#[tokio::test]
+async fn a_partly_refused_call_exhausts_the_tool() {
+    let mut tool = tool(Fake::default()).with_max_uses(Some(1));
+    tool.answer(&call(r#"{"queries":["one","two"]}"#)).await;
+    assert!(tool.exhausted());
+}
+
+#[tokio::test]
+async fn without_max_uses_the_search_tool_is_never_exhausted() {
+    let mut tool = tool(Fake::default());
+    tool.answer(&call(r#"{"queries":["a","b","c"]}"#)).await;
+    assert!(!tool.exhausted());
+}
