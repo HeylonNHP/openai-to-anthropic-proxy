@@ -159,17 +159,36 @@ fn advisor_request(cfg: &AdvisorConfig, transcript: &str) -> ResponsesRequest {
 }
 
 /// The conversation the advisor sees: the executor's system instructions
-/// plus its whole (Responses-shaped) transcript, including the advisor call
-/// that triggered this consultation.
+/// plus its whole (Responses-shaped) transcript. The shared loop appends the
+/// executor's current round (its text, its reasoning per the replay mode,
+/// and every call it made, the triggering advisor call included) before any
+/// call is served, so the advisor sees what led to the consultation, and the
+/// results of any call the round served before it.
+///
+/// Encrypted reasoning is removed: it is opaque, often large, and only the
+/// model that produced it can read it, so it is pure cost to the advisor.
 fn transcript(attempt: &Attempt) -> String {
     let instructions = attempt.outbound.instructions.as_deref().unwrap_or("");
-    let input =
-        serde_json::to_string_pretty(&attempt.outbound.input).unwrap_or_else(|_| "[]".to_owned());
+    let mut input = serde_json::to_value(&attempt.outbound.input).unwrap_or(Value::Null);
+    strip_encrypted_content(&mut input);
+    let input = serde_json::to_string_pretty(&input).unwrap_or_else(|_| "[]".to_owned());
     format!(
         "<system>\n{instructions}\n</system>\n\n\
          <transcript>\n{input}\n</transcript>\n\n\
          Advise the assistant on how to proceed."
     )
+}
+
+/// Remove every `encrypted_content` field from a transcript.
+fn strip_encrypted_content(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("encrypted_content");
+            map.values_mut().for_each(strip_encrypted_content);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_encrypted_content),
+        _ => {}
+    }
 }
 
 /// First non-empty `output_text` in the first `message` output item.

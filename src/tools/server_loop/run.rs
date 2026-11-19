@@ -109,6 +109,13 @@ pub(crate) enum SessionOutcome {
 const ROUND_LIMIT_REACHED: &str = "The server tool limit for this request was reached, so this \
      call was not run. Answer with the information you already have, and say if it is incomplete.";
 
+/// Output for a call the loop did not run because an earlier call in the same
+/// response exhausted its tool. The call is already in the executor's input,
+/// so it must be answered; the refusal that exhausted the tool already said
+/// why.
+const NOT_RUN: &str = "This call was not run: the tool's limit for this request was already \
+     reached. Answer with the information you already have.";
+
 /// How many rounds the loop may run, and what happens at the limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoundPolicy {
@@ -325,12 +332,22 @@ pub(crate) async fn drive(
             continue;
         }
 
-        // `(call_id, output)` of every call answered this round. A call
-        // skipped below gets no output, so it is not replayed either.
-        let mut answered: Vec<(String, String)> = Vec::new();
+        // What the executor said this round, including every call it made,
+        // goes into its input BEFORE the calls are served: a tool that reads
+        // the transcript (the advisor) then sees the round it was called
+        // from, its own call included. Each output follows as soon as its
+        // call is served, so a later call in the round also sees the results
+        // of the earlier ones.
+        let call_ids: Vec<&str> = calls
+            .iter()
+            .map(|(_, call)| call.call_id.as_str())
+            .collect();
+        push_round(&mut attempt.outbound.input, &resp, &call_ids, &replay_mode);
         for (tool_index, call) in &calls {
             // An earlier call in this same response may have exhausted it.
+            // The call is already in the input, so it still gets an output.
             if tools[*tool_index].exhausted() {
+                push_output(&mut attempt.outbound.input, &call.call_id, NOT_RUN);
                 continue;
             }
             let started = Instant::now();
@@ -343,9 +360,8 @@ pub(crate) async fn drive(
             });
             prefix_blocks.extend(served.blocks);
             out.flush(&prefix_blocks);
-            answered.push((call.call_id.clone(), served.output));
+            push_output(&mut attempt.outbound.input, &call.call_id, &served.output);
         }
-        continue_with(&mut attempt.outbound.input, &resp, &answered, &replay_mode);
         rounds += 1;
 
         match policy.after_round(rounds) {
@@ -533,15 +549,32 @@ pub(crate) fn continue_with(
     replay: &ReasoningReplay,
 ) {
     let answered_ids: Vec<&str> = answered.iter().map(|(id, _)| id.as_str()).collect();
-    let mut items = replay_round(resp, &answered_ids, replay);
+    push_round(input, resp, &answered_ids, replay);
     for (call_id, output) in answered {
-        items.push(InputItem::FunctionCallOutput {
-            call_id: call_id.clone(),
-            output: output.clone().into(),
-        });
+        push_output(input, call_id, output);
     }
+}
+
+/// Append what the executor said this round ([`replay_round`]) to its
+/// input. Every call in `call_ids` must then get a [`push_output`].
+pub(crate) fn push_round(
+    input: &mut Input,
+    resp: &ResponsesResponse,
+    call_ids: &[&str],
+    replay: &ReasoningReplay,
+) {
     if let Input::Items(existing) = input {
-        existing.extend(items);
+        existing.extend(replay_round(resp, call_ids, replay));
+    }
+}
+
+/// Append one call's output to the executor's input.
+pub(crate) fn push_output(input: &mut Input, call_id: &str, output: &str) {
+    if let Input::Items(existing) = input {
+        existing.push(InputItem::FunctionCallOutput {
+            call_id: call_id.to_owned(),
+            output: output.to_owned().into(),
+        });
     }
 }
 

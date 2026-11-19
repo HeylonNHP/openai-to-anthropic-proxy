@@ -3662,6 +3662,154 @@ async fn the_rerun_input_replays_what_the_executor_said_in_the_round() {
     );
 }
 
+/// The advisor sees the round it was called from: the executor's words
+/// that led to the consultation and the triggering call itself.
+#[tokio::test]
+async fn the_advisor_transcript_includes_the_round_that_called_it() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let first = FakeResponse {
+        status: StatusCode::OK,
+        body: Some(
+            r#"{
+                "id": "resp_call",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-4o-mini",
+                "output": [
+                    {"type": "message", "id": "msg_1", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "My plan: use a mutex per shard.", "annotations": []}]},
+                    {"type": "function_call", "call_id": "call_adv_1", "name": "advisor", "arguments": "{}"}
+                ],
+                "usage": {"input_tokens":9,"output_tokens":2,"total_tokens":11}
+            }"#
+            .to_owned(),
+        ),
+    };
+    script(
+        &upstream,
+        vec![
+            first,
+            advisor_answer("Use a channel-based coordination pattern."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 3, "executor, advisor, executor");
+    let advisor_body: serde_json::Value = serde_json::from_slice(&sent[1]).unwrap();
+    assert_eq!(advisor_body["model"], "beam");
+    let transcript = advisor_body["input"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        transcript.contains("My plan: use a mutex per shard."),
+        "the executor's words from the round: {transcript}"
+    );
+    assert!(
+        transcript.contains("call_adv_1"),
+        "the triggering call: {transcript}"
+    );
+    assert!(
+        !transcript.contains("Use a channel-based"),
+        "no advice before it is given"
+    );
+}
+
+/// A call dropped because an earlier call in the same response exhausted its
+/// tool is already in the executor's input, so it is answered with a "not
+/// run" output instead of being left dangling.
+#[tokio::test]
+async fn a_call_dropped_after_exhaustion_mid_response_is_still_answered() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let calls: Vec<String> = (1..=4)
+        .map(|n| {
+            format!(
+                r#"{{"type": "function_call", "call_id": "call_adv_{n}", "name": "advisor", "arguments": "{{}}"}}"#
+            )
+        })
+        .collect();
+    let first = FakeResponse {
+        status: StatusCode::OK,
+        body: Some(format!(
+            r#"{{
+                "id": "resp_call",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-4o-mini",
+                "output": [{}],
+                "usage": {{"input_tokens":9,"output_tokens":2,"total_tokens":11}}
+            }}"#,
+            calls.join(",")
+        )),
+    };
+    // `max_uses: 2`: calls 1 and 2 consult, call 3 is refused (exhausting
+    // the tool), call 4 is dropped.
+    script(
+        &upstream,
+        vec![
+            first,
+            advisor_answer("Advice one."),
+            advisor_answer("Advice two."),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body["content"].as_array().unwrap().last().unwrap()["text"],
+        "Done."
+    );
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 4, "executor, advisor x2, executor");
+    let rerun: serde_json::Value = serde_json::from_slice(&sent[3]).unwrap();
+    let items = rerun["input"].as_array().unwrap();
+    for n in 1..=4 {
+        let id = format!("call_adv_{n}");
+        let calls = items
+            .iter()
+            .filter(|i| i["type"] == "function_call" && i["call_id"] == id)
+            .count();
+        let outputs: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|i| i["type"] == "function_call_output" && i["call_id"] == id)
+            .collect();
+        assert_eq!(calls, 1, "{id} replayed once");
+        assert_eq!(outputs.len(), 1, "{id} answered exactly once");
+        if n == 4 {
+            assert!(
+                outputs[0]["output"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("This call was not run"),
+                "{:?}",
+                outputs[0]
+            );
+        }
+    }
+}
+
 /// 3. Fail closed. A 404 from the advisor (a model rejection shape!) must
 /// NOT trigger `default_model`, must NOT fail the client, and must yield
 /// `error_code: "unavailable"` with the executor's final answer intact.

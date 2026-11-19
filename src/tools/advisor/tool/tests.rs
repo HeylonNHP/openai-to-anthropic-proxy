@@ -329,3 +329,18 @@ fn upstream_errors_are_scrubbed_of_advisor_tokens() {
     ));
     assert!(matches!(&err, AppError::BadRequest(m) if !m.contains("advisor_20260301")));
 }
+
+#[test]
+fn encrypted_reasoning_is_stripped_from_the_advisor_transcript() {
+    let mut input = json!([
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "BIG-OPAQUE-BLOB"},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "plan"}]},
+        {"nested": [{"encrypted_content": "x", "keep": 1}]},
+    ]);
+    strip_encrypted_content(&mut input);
+    let text = input.to_string();
+    assert!(!text.contains("encrypted_content"), "{text}");
+    assert!(!text.contains("BIG-OPAQUE-BLOB"), "{text}");
+    assert!(text.contains("rs_1") && text.contains("plan") && text.contains("\"keep\":1"));
+}
