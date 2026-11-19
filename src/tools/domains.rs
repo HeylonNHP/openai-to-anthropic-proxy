@@ -107,7 +107,11 @@ impl DomainRules {
         let Some(host) = parsed.host_str() else {
             return false;
         };
-        let host = host.to_ascii_lowercase();
+        // A fully-qualified name may end in a dot (`example.com.`). DNS
+        // resolves it to the same host, so it must match the same rules:
+        // without this, `https://example.com./` slips past a block on
+        // `example.com`. Rules are stored without the dot (`Rule::parse`).
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         let path = parsed.path().to_ascii_lowercase();
         let listed = |rules: &[Rule]| rules.iter().any(|r| r.matches(&host, &path));
         (self.allowed.is_empty() || listed(&self.allowed)) && !listed(&self.blocked)

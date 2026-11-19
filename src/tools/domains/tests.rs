@@ -112,3 +112,18 @@ fn a_very_long_list_is_capped_in_the_query_only() {
         "filtering still sees every rule"
     );
 }
+
+#[test]
+fn a_trailing_dot_host_is_the_same_host() {
+    // `example.com.` is the fully-qualified spelling of `example.com`: DNS
+    // resolves both to the same place, so a block must cover both.
+    let blocked = rules(&[], &["example.com"]);
+    assert!(!blocked.allows("https://example.com./"));
+    assert!(!blocked.allows("https://www.example.com./a"));
+    assert!(!blocked.allows("https://EXAMPLE.COM../"));
+
+    let allowed = rules(&["example.com"], &[]);
+    assert!(allowed.allows("https://example.com./"));
+    assert!(allowed.allows("https://docs.example.com./x"));
+    assert!(!allowed.allows("https://other.org./"));
+}
