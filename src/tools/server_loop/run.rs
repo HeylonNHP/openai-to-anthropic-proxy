@@ -21,11 +21,13 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::anthropic::{Message, ResponseContentBlock};
+use crate::config::{ReasoningReplay, ReasoningReplayMode};
 use crate::error::AppError;
 use crate::proxy::{Attempt, Outcome};
 use crate::repair::ToolSchemaRegistry;
 use crate::responses::{
-    Input, InputItem, InputTokensDetails, OutputItem, OutputTokensDetails, ResponsesResponse,
+    Input, InputContentPart, InputItem, InputTokensDetails, OutputContentPart, OutputItem,
+    OutputTokensDetails, ReasoningSummaryPart, ReasoningTextPart, ResponsesResponse,
     ResponsesUsage,
 };
 use crate::tools::server_loop::handler::{Call, ServerTool};
@@ -305,17 +307,27 @@ pub(crate) async fn drive(
         prefix_blocks.extend(intermediate_blocks(&resp, &attempt.registry, &names));
         out.flush(&prefix_blocks);
 
+        let replay_mode = attempt
+            .state
+            .config
+            .reasoning_replay_for_model(&attempt.outbound.model);
+
         if limit_hit {
             // The round limit was reached and the model still asks for more:
             // refuse, and give it one last run to answer.
-            for (_, call) in &calls {
-                inject(&mut attempt.outbound.input, call, ROUND_LIMIT_REACHED);
-            }
+            let answered: Vec<(String, String)> = calls
+                .iter()
+                .map(|(_, call)| (call.call_id.clone(), ROUND_LIMIT_REACHED.to_owned()))
+                .collect();
+            continue_with(&mut attempt.outbound.input, &resp, &answered, &replay_mode);
             terminal = true;
             last_good = Some(without_output(&resp));
             continue;
         }
 
+        // `(call_id, output)` of every call answered this round. A call
+        // skipped below gets no output, so it is not replayed either.
+        let mut answered: Vec<(String, String)> = Vec::new();
         for (tool_index, call) in &calls {
             // An earlier call in this same response may have exhausted it.
             if tools[*tool_index].exhausted() {
@@ -331,8 +343,9 @@ pub(crate) async fn drive(
             });
             prefix_blocks.extend(served.blocks);
             out.flush(&prefix_blocks);
-            inject(&mut attempt.outbound.input, call, &served.output);
+            answered.push((call.call_id.clone(), served.output));
         }
+        continue_with(&mut attempt.outbound.input, &resp, &answered, &replay_mode);
         rounds += 1;
 
         match policy.after_round(rounds) {
@@ -510,22 +523,200 @@ pub(crate) fn without_output(resp: &ResponsesResponse) -> ResponsesResponse {
     clone
 }
 
-/// Feed a tool's output back to the executor. The `function_call` is
-/// replayed alongside its `function_call_output`: the Responses API needs
-/// the call in the input for the output to pair with it, so no call is ever
-/// left dangling.
-pub(crate) fn inject(input: &mut Input, call: &Call, output: &str) {
-    if let Input::Items(items) = input {
-        items.push(InputItem::FunctionCall {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            arguments: call.arguments.clone(),
-        });
+/// Extend the executor's input so its re-run continues where this round left
+/// off: what it said this round ([`replay_round`]), then the output of every
+/// call that was answered.
+pub(crate) fn continue_with(
+    input: &mut Input,
+    resp: &ResponsesResponse,
+    answered: &[(String, String)],
+    replay: &ReasoningReplay,
+) {
+    let answered_ids: Vec<&str> = answered.iter().map(|(id, _)| id.as_str()).collect();
+    let mut items = replay_round(resp, &answered_ids, replay);
+    for (call_id, output) in answered {
         items.push(InputItem::FunctionCallOutput {
-            call_id: call.call_id.clone(),
-            output: output.to_owned().into(),
+            call_id: call_id.clone(),
+            output: output.clone().into(),
         });
     }
+    if let Input::Items(existing) = input {
+        existing.extend(items);
+    }
+}
+
+/// What the executor said in one round, as input items for its re-run, in
+/// the order it said them.
+///
+/// Without this the re-run would see only its tool calls and their outputs:
+/// its own text from the round (often the plan the calls were part of) and
+/// its reasoning would be gone, and an upstream that requires a function
+/// call's reasoning item to be passed back with it would reject the request.
+///
+/// * An assistant message is replayed as an assistant message.
+/// * A function call is replayed only if it is answered (`answered` holds
+///   its `call_id`): a call with no output is rejected by the upstream. That
+///   leaves out a sibling CLIENT tool call (the client runs it after the
+///   turn) and a call to an exhausted tool.
+/// * Reasoning follows the operator's `reasoning_replay` mode for the
+///   model, as on a later turn: `native` replays the reasoning item itself
+///   (with its real id and encrypted content), `text` folds its summary
+///   into the next assistant message between `<thinking>` markers, `off`
+///   drops it. A reasoning item belongs to the item that follows it, and the
+///   upstream rejects one whose following item is missing, so a reasoning
+///   item whose next item is not replayed is not replayed either.
+/// * Anything else (a built-in `web_search_call`, an unknown item) is
+///   upstream-internal and is not replayed.
+pub(crate) fn replay_round(
+    resp: &ResponsesResponse,
+    answered: &[&str],
+    replay: &ReasoningReplay,
+) -> Vec<InputItem> {
+    let mut items = Vec::new();
+    // The reasoning waiting for the item it belongs to.
+    let mut pending: Option<PendingReasoning> = None;
+    for item in &resp.output {
+        match item {
+            OutputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+            } => {
+                let text = summary
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                pending = Some(PendingReasoning {
+                    id: id.clone(),
+                    text: cap_chars(text, replay.max_chars),
+                    encrypted_content: encrypted_content.clone(),
+                });
+            }
+            OutputItem::Message { role, content, .. } if role == "assistant" => {
+                let text: String = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        OutputContentPart::OutputText { text, .. } => Some(text.as_str()),
+                        OutputContentPart::OutputRefusal { refusal } => Some(refusal.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let thinking = take_reasoning(&mut pending, replay, &mut items);
+                push_assistant_text(&mut items, thinking, &text);
+            }
+            OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } if answered.contains(&call_id.as_str()) => {
+                if let Some(thinking) = take_reasoning(&mut pending, replay, &mut items) {
+                    push_assistant_text(&mut items, Some(thinking), "");
+                }
+                items.push(InputItem::FunctionCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+            // Not replayed, so the reasoning it followed is not either.
+            _ => pending = None,
+        }
+    }
+    items
+}
+
+/// A reasoning item seen in the output, not yet replayed.
+struct PendingReasoning {
+    id: Option<String>,
+    text: String,
+    encrypted_content: String,
+}
+
+/// The item that `pending` reasoning belongs to is being replayed: in
+/// `native` mode push the reasoning item now (it must come first); in `text`
+/// mode return its text to fold into the assistant message.
+fn take_reasoning(
+    pending: &mut Option<PendingReasoning>,
+    replay: &ReasoningReplay,
+    items: &mut Vec<InputItem>,
+) -> Option<String> {
+    let reasoning = pending.take()?;
+    match replay.mode {
+        ReasoningReplayMode::Off => None,
+        ReasoningReplayMode::Text => (!reasoning.text.is_empty()).then(|| {
+            replay
+                .replayed_chars
+                .set(replay.replayed_chars.get() + reasoning.text.chars().count() as u64);
+            reasoning.text
+        }),
+        ReasoningReplayMode::Native => {
+            if !reasoning.text.is_empty() {
+                replay
+                    .replayed_chars
+                    .set(replay.replayed_chars.get() + reasoning.text.chars().count() as u64);
+            }
+            let has_text = !reasoning.text.is_empty();
+            items.push(InputItem::Reasoning {
+                id: reasoning.id,
+                // OpenAI reads `summary`, DeepSeek reads `content`: both carry
+                // the text, as the translator does for a later turn.
+                content: if has_text {
+                    vec![ReasoningTextPart {
+                        kind: "reasoning_text".into(),
+                        text: reasoning.text.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                summary: if has_text {
+                    vec![ReasoningSummaryPart {
+                        kind: "summary_text".into(),
+                        text: reasoning.text,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                encrypted_content: (!reasoning.encrypted_content.is_empty())
+                    .then_some(reasoning.encrypted_content),
+            });
+            None
+        }
+    }
+}
+
+/// Push an assistant message: the folded reasoning (if any) between
+/// `<thinking>` markers, then the visible text. Nothing at all is pushed
+/// for a message with neither.
+fn push_assistant_text(items: &mut Vec<InputItem>, thinking: Option<String>, text: &str) {
+    let body = thinking.map_or_else(
+        || text.to_owned(),
+        |thinking| {
+            format!(
+                "{}{thinking}{}{text}",
+                crate::translate::THINKING_PREFIX,
+                crate::translate::THINKING_SUFFIX
+            )
+        },
+    );
+    if body.is_empty() {
+        return;
+    }
+    items.push(InputItem::Message {
+        role: "assistant".to_owned(),
+        content: vec![InputContentPart::OutputText { text: body }],
+    });
+}
+
+/// Cut reasoning text to the operator's `reasoning_replay.max_chars`
+/// (`0` is no limit).
+fn cap_chars(text: String, max_chars: usize) -> String {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return text;
+    }
+    text.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]

@@ -1895,8 +1895,8 @@ fn tool_result_output(
 /// assistant message (`ReasoningReplayMode::Text`). The markers make the
 /// boundary between the model's prior reasoning and its visible answer
 /// explicit to the upstream.
-const THINKING_PREFIX: &str = "<thinking>\n";
-const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
+pub const THINKING_PREFIX: &str = "<thinking>\n";
+pub const THINKING_SUFFIX: &str = "\n</thinking>\n\n";
 
 /// Delimiters for replayed advisor advice folded into an assistant
 /// `output_text` part. Follow-up turns must see prior advice as prior context,

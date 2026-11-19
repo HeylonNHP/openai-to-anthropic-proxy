@@ -35,7 +35,7 @@ build_outbound   every tool that is enabled AND declared adds its internal
  │        └─ calls, in the order the model made them
  │               ├─ each tool serves its own call   ServerTool::serve
  │               ├─ the client gets the result blocks
- │               ├─ the output is injected as function_call_output
+ │               ├─ its words, calls and outputs → its input
  │               └─ round complete
  └──────────────────────────────────────────────────┘
 ```

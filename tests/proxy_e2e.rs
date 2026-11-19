@@ -3586,6 +3586,82 @@ async fn advisor_happy_path() {
     assert_eq!(body["usage"]["input_tokens"], 16);
 }
 
+/// The executor's own words and reasoning from a round reach its re-run: the
+/// re-run's input continues with what it said (reasoning folded in, under
+/// the default `text` replay mode), then the call, then the call's output.
+#[tokio::test]
+async fn the_rerun_input_replays_what_the_executor_said_in_the_round() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let first = FakeResponse {
+        status: StatusCode::OK,
+        body: Some(
+            r#"{
+                "id": "resp_call",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-4o-mini",
+                "output": [
+                    {"type": "reasoning", "id": "rs_1",
+                     "summary": [{"type": "summary_text", "text": "A second opinion would help."}],
+                     "encrypted_content": "ENC"},
+                    {"type": "message", "id": "msg_1", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Let me check my plan.", "annotations": []}]},
+                    {"type": "function_call", "call_id": "call_adv_1", "name": "advisor", "arguments": "{}"}
+                ],
+                "usage": {"input_tokens":9,"output_tokens":2,"total_tokens":11}
+            }"#
+            .to_owned(),
+        ),
+    };
+    script(
+        &upstream,
+        vec![
+            first,
+            advisor_answer("Use a channel-based coordination pattern."),
+            advisor_executor_message("resp_final", "Here is the implementation."),
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 3, "executor, advisor, executor");
+    let first_body: serde_json::Value = serde_json::from_slice(&sent[0]).unwrap();
+    let rerun: serde_json::Value = serde_json::from_slice(&sent[2]).unwrap();
+    let before = first_body["input"].as_array().unwrap().len();
+    let items = rerun["input"].as_array().unwrap();
+    let added = &items[before..];
+
+    assert_eq!(added.len(), 3, "message, call, output: {added:#?}");
+    assert_eq!(added[0]["type"], "message");
+    assert_eq!(added[0]["role"], "assistant");
+    assert_eq!(
+        added[0]["content"][0]["text"],
+        "<thinking>\nA second opinion would help.\n</thinking>\n\nLet me check my plan."
+    );
+    assert_eq!(added[1]["type"], "function_call");
+    assert_eq!(added[1]["call_id"], "call_adv_1");
+    assert_eq!(added[2]["type"], "function_call_output");
+    assert_eq!(added[2]["call_id"], "call_adv_1");
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .count(),
+        1,
+        "the call is replayed exactly once"
+    );
+}
+
 /// 3. Fail closed. A 404 from the advisor (a model rejection shape!) must
 /// NOT trigger `default_model`, must NOT fail the client, and must yield
 /// `error_code: "unavailable"` with the executor's final answer intact.

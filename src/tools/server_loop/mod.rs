@@ -14,7 +14,7 @@
 //!                └─ calls (any mix of tools, in the order made)
 //!                       ├─ each tool serves its own call
 //!                       ├─ the client gets server_tool_use + result blocks
-//!                       ├─ the output is injected as function_call_output
+//!                       ├─ its words, calls and outputs → its input
 //!                       └─ re-run the executor
 //! ```
 //!

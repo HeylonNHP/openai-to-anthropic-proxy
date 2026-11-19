@@ -88,37 +88,233 @@ fn the_kept_response_loses_its_output_but_keeps_its_metadata() {
     assert_eq!(kept.usage.as_ref().map(|u| u.output_tokens), Some(4));
 }
 
-#[test]
-fn an_output_is_injected_with_its_call_so_nothing_dangles() {
-    let mut input = Input::Items(Vec::new());
-    let call = Call {
-        call_id: "c1".to_owned(),
-        name: "tool_a".to_owned(),
-        arguments: r#"{"x":1}"#.to_owned(),
-    };
-    inject(&mut input, &call, "the output");
+fn replay(mode: ReasoningReplayMode) -> ReasoningReplay {
+    ReasoningReplay {
+        mode,
+        max_chars: 0,
+        replayed_chars: std::cell::Cell::new(0),
+    }
+}
 
-    let Input::Items(items) = input else {
-        panic!("items")
-    };
-    assert_eq!(items.len(), 2);
-    assert!(
-        matches!(&items[0], InputItem::FunctionCall { call_id, name, arguments }
-        if call_id == "c1" && name == "tool_a" && arguments == r#"{"x":1}"#)
-    );
-    assert!(matches!(&items[1], InputItem::FunctionCallOutput { call_id, .. } if call_id == "c1"));
+fn message_item(text: &str) -> OutputItem {
+    OutputItem::Message {
+        id: Some("msg_1".to_owned()),
+        status: None,
+        role: "assistant".to_owned(),
+        content: vec![OutputContentPart::OutputText {
+            text: text.to_owned(),
+            annotations: Vec::new(),
+        }],
+    }
+}
+
+fn reasoning_item(id: &str, summary: &str, encrypted: &str) -> OutputItem {
+    serde_json::from_value(json!({
+        "type": "reasoning",
+        "id": id,
+        "summary": [{"type": "summary_text", "text": summary}],
+        "encrypted_content": encrypted,
+    }))
+    .unwrap()
+}
+
+/// `type` of each item, plus the text / call id that identifies it.
+fn kinds(items: &[InputItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| match item {
+            InputItem::Message { role, content } => {
+                let text: String = content
+                    .iter()
+                    .map(|p| match p {
+                        InputContentPart::OutputText { text } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                format!("{role}:{text}")
+            }
+            InputItem::FunctionCall { call_id, .. } => format!("call:{call_id}"),
+            InputItem::FunctionCallOutput { call_id, .. } => format!("output:{call_id}"),
+            InputItem::Reasoning { id, .. } => {
+                format!("reasoning:{}", id.clone().unwrap_or_default())
+            }
+            InputItem::ItemReference { id } => format!("ref:{id}"),
+        })
+        .collect()
+}
+
+fn items_of(input: Input) -> Vec<InputItem> {
+    match input {
+        Input::Items(items) => items,
+        Input::Text(_) => panic!("items"),
+    }
 }
 
 #[test]
-fn injecting_into_a_plain_text_input_changes_nothing() {
+fn a_round_is_replayed_with_its_text_then_its_calls_then_their_outputs() {
+    let resp = response(vec![
+        message_item("Let me look that up."),
+        call_item("tool_a", "c1", r#"{"x":1}"#),
+        call_item("tool_a", "c2", "{}"),
+    ]);
+    let mut input = Input::Items(Vec::new());
+    let answered = vec![
+        ("c1".to_owned(), "one".to_owned()),
+        ("c2".to_owned(), "two".to_owned()),
+    ];
+    continue_with(
+        &mut input,
+        &resp,
+        &answered,
+        &replay(ReasoningReplayMode::Text),
+    );
+
+    let items = items_of(input);
+    assert_eq!(
+        kinds(&items),
+        [
+            "assistant:Let me look that up.",
+            "call:c1",
+            "call:c2",
+            "output:c1",
+            "output:c2"
+        ]
+    );
+    assert!(
+        matches!(&items[1], InputItem::FunctionCall { name, arguments, .. }
+        if name == "tool_a" && arguments == r#"{"x":1}"#)
+    );
+    assert!(
+        matches!(&items[3], InputItem::FunctionCallOutput { output, .. }
+        if serde_json::to_value(output).unwrap() == json!("one"))
+    );
+}
+
+#[test]
+fn continuing_a_plain_text_input_changes_nothing() {
+    let resp = response(vec![call_item("t", "c", "{}")]);
     let mut input = Input::Text("hello".to_owned());
-    let call = Call {
-        call_id: "c".to_owned(),
-        name: "t".to_owned(),
-        arguments: "{}".to_owned(),
-    };
-    inject(&mut input, &call, "out");
+    continue_with(
+        &mut input,
+        &resp,
+        &[("c".to_owned(), "out".to_owned())],
+        &replay(ReasoningReplayMode::Text),
+    );
     assert!(matches!(input, Input::Text(t) if t == "hello"));
+}
+
+#[test]
+fn an_unanswered_call_is_not_replayed() {
+    // `client_tool` is a sibling CLIENT tool call (the client runs it after
+    // the turn); `c_dropped` belongs to an exhausted tool. Neither gets an
+    // output, so neither may appear in the input.
+    let resp = response(vec![
+        call_item("client_tool", "c_client", "{}"),
+        call_item("tool_a", "c1", "{}"),
+        call_item("tool_b", "c_dropped", "{}"),
+    ]);
+    let items = replay_round(&resp, &["c1"], &replay(ReasoningReplayMode::Text));
+    assert_eq!(kinds(&items), ["call:c1"]);
+}
+
+#[test]
+fn native_reasoning_is_replayed_as_the_item_itself_before_what_it_preceded() {
+    let resp = response(vec![
+        reasoning_item("rs_1", "I should search.", "ENC"),
+        call_item("tool_a", "c1", "{}"),
+    ]);
+    let mode = replay(ReasoningReplayMode::Native);
+    let items = replay_round(&resp, &["c1"], &mode);
+    assert_eq!(kinds(&items), ["reasoning:rs_1", "call:c1"]);
+    let InputItem::Reasoning {
+        content,
+        summary,
+        encrypted_content,
+        ..
+    } = &items[0]
+    else {
+        panic!("reasoning first")
+    };
+    assert_eq!(summary[0].text, "I should search.");
+    assert_eq!(content[0].text, "I should search.");
+    assert_eq!(encrypted_content.as_deref(), Some("ENC"));
+    assert_eq!(mode.replayed_chars.get(), 16);
+}
+
+#[test]
+fn native_reasoning_without_encrypted_content_omits_it() {
+    let resp = response(vec![reasoning_item("rs_1", "", ""), message_item("hi")]);
+    let items = replay_round(&resp, &[], &replay(ReasoningReplayMode::Native));
+    assert_eq!(kinds(&items), ["reasoning:rs_1", "assistant:hi"]);
+    assert!(matches!(
+        &items[0],
+        InputItem::Reasoning {
+            encrypted_content: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn text_reasoning_is_folded_into_the_assistant_message() {
+    let resp = response(vec![
+        reasoning_item("rs_1", "Plan it.", "ENC"),
+        message_item("Searching now."),
+        reasoning_item("rs_2", "Then fetch.", "ENC"),
+        call_item("tool_a", "c1", "{}"),
+    ]);
+    let items = replay_round(&resp, &["c1"], &replay(ReasoningReplayMode::Text));
+    assert_eq!(
+        kinds(&items),
+        [
+            "assistant:<thinking>\nPlan it.\n</thinking>\n\nSearching now.",
+            "assistant:<thinking>\nThen fetch.\n</thinking>\n\n",
+            "call:c1",
+        ]
+    );
+}
+
+#[test]
+fn reasoning_is_dropped_when_replay_is_off() {
+    let resp = response(vec![
+        reasoning_item("rs_1", "Plan it.", "ENC"),
+        message_item("Searching now."),
+        call_item("tool_a", "c1", "{}"),
+    ]);
+    let items = replay_round(&resp, &["c1"], &replay(ReasoningReplayMode::Off));
+    assert_eq!(kinds(&items), ["assistant:Searching now.", "call:c1"]);
+}
+
+#[test]
+fn reasoning_whose_following_item_is_dropped_is_dropped_too() {
+    // The upstream rejects a reasoning item without its following item, so
+    // reasoning before an unanswered call goes with it, in every mode.
+    let resp = response(vec![
+        reasoning_item("rs_1", "Call the client tool.", "ENC"),
+        call_item("client_tool", "c_client", "{}"),
+        message_item("Done."),
+    ]);
+    for mode in [ReasoningReplayMode::Native, ReasoningReplayMode::Text] {
+        let items = replay_round(&resp, &[], &replay(mode));
+        assert_eq!(kinds(&items), ["assistant:Done."], "{mode:?}");
+    }
+}
+
+#[test]
+fn replayed_reasoning_respects_max_chars() {
+    let resp = response(vec![
+        reasoning_item("rs_1", "abcdefghij", ""),
+        message_item("x"),
+    ]);
+    let mode = ReasoningReplay {
+        max_chars: 4,
+        ..replay(ReasoningReplayMode::Text)
+    };
+    let items = replay_round(&resp, &[], &mode);
+    assert_eq!(
+        kinds(&items),
+        ["assistant:<thinking>\nabcd\n</thinking>\n\nx"]
+    );
 }
 
 /// A tool that only names itself and can be exhausted.
