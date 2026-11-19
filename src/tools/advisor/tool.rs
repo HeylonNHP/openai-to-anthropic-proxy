@@ -19,7 +19,9 @@
 //! ## Fail closed
 //!
 //! A consultation NEVER fails the client request. Every failure degrades to
-//! `protocol::unavailable`, at most one TUI warning is emitted for the whole
+//! `protocol::unavailable` (after ONE retry, for failures that could be
+//! transient: a transport error, timeout, 429, 5xx or an unusable response; a
+//! 4xx is not retried), at most one TUI warning is emitted for the whole
 //! turn, and the executor's transcript is still given a
 //! `function_call_output` so the upstream never sees an orphan
 //! `function_call`. The loop is bounded by `AdvisorConfig::max_uses`, unless
@@ -70,6 +72,12 @@ use crate::tui::{LogKind, LogLine};
 const NO_ADVICE: &str =
     "Advisor is temporarily unavailable. Continue the task without a second opinion.";
 
+/// Text injected when the advisor failed so often that the proxy stopped
+/// consulting it for this turn. Unlike [`NO_ADVICE`] it says the advisor will
+/// not come back, because the executor's next call to it would be dropped.
+const NO_MORE_ADVICE_BROKEN: &str = "The advisor is unavailable and will not be consulted again \
+for this request. Do not call it again; answer with the information you already have.";
+
 /// Text injected when the executor tried to consult more times than the
 /// operator allowed. Also deliberately does NOT look like advice.
 const NO_MORE_ADVICE: &str =
@@ -81,6 +89,12 @@ const NO_MORE_ADVICE: &str =
 /// NOT cap an unlimited `max_uses` (the operator asked for no limit) — it
 /// only makes the loop visible in the log.
 const RUNAWAY_CONSULTATION_THRESHOLD: usize = 10;
+
+/// Failed consultations (each already retried once) after which the advisor
+/// is treated as down for the rest of the turn. Failed consultations do not
+/// count toward `max_uses`, so without this an executor could keep calling a
+/// broken advisor, each call costing the operator two upstream attempts.
+const MAX_FAILED_CONSULTATIONS: usize = 2;
 
 /// Clamp the advisor's own per-request timeout to the operator's global
 /// `request_timeout`. reqwest's per-request `.timeout()` OVERRIDES the
@@ -441,13 +455,70 @@ fn advice_from_response(
     Ok((text, resp.usage.clone()))
 }
 
-/// One standalone advisor POST. Every failure is a `String`, never an
+/// Why one advisor POST failed, and whether trying again is worth it.
+#[derive(Debug)]
+struct ConsultError {
+    message: String,
+    /// A second attempt could plausibly succeed: a transport error or
+    /// timeout, a 429 or 5xx, or a response that held no usable advice (a
+    /// reasoning model is not deterministic). A 4xx such as "prompt is too
+    /// long" would fail again identically, so it is not retried.
+    retryable: bool,
+}
+
+impl ConsultError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+/// Pause before the single retry, so a briefly overloaded upstream is not
+/// hit again at once.
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// One advisor consultation: one POST, plus ONE retry if the first failed in
+/// a way that could be transient. Every failure is a `String`, never an
 /// `AppError`: the caller degrades instead of failing the client.
+///
+/// A failed attempt costs the operator nothing in `max_uses` (see
+/// [`AdvisorTool::answer`]); the retry exists so one flaky response does not
+/// cost the executor its advice.
 async fn consult(
     attempt: &Attempt,
     cfg: &AdvisorConfig,
     prompt: &str,
 ) -> Result<(String, Option<ResponsesUsage>), String> {
+    let first = match consult_once(attempt, cfg, prompt).await {
+        Ok(advice) => return Ok(advice),
+        Err(first) if !first.retryable => return Err(first.message),
+        Err(first) => first,
+    };
+    tracing::debug!(error = %first.message, "advisor consultation failed; retrying once");
+    tokio::time::sleep(RETRY_DELAY).await;
+    consult_once(attempt, cfg, prompt).await.map_err(|second| {
+        format!(
+            "{} (after a retry; first attempt: {})",
+            second.message, first.message
+        )
+    })
+}
+
+/// One standalone advisor POST.
+async fn consult_once(
+    attempt: &Attempt,
+    cfg: &AdvisorConfig,
+    prompt: &str,
+) -> Result<(String, Option<ResponsesUsage>), ConsultError> {
     let outbound = advisor_request(cfg, prompt);
     let url = attempt.url();
     // `None` = no per-request timeout override ("no limit"): the global
@@ -456,20 +527,24 @@ async fn consult(
     let timeout = advisor_timeout(cfg, attempt.state.config.request_timeout);
     let resp = send_upstream_once(&attempt.state, &url, &attempt.headers, &outbound, timeout)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ConsultError::retryable(e.to_string()))?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let body: String = body.chars().take(300).collect();
-        return Err(format!(
-            "upstream returned {status}: {}",
-            scrub_error_body(&body)
-        ));
+        let message = format!("upstream returned {status}: {}", scrub_error_body(&body));
+        return Err(if status.as_u16() == 429 || status.is_server_error() {
+            ConsultError::retryable(message)
+        } else {
+            ConsultError::permanent(message)
+        });
     }
 
-    let parsed = parse_upstream_body(resp).await.map_err(|e| e.to_string())?;
-    let (text, usage) = advice_from_response(&parsed)?;
+    let parsed = parse_upstream_body(resp)
+        .await
+        .map_err(|e| ConsultError::retryable(e.to_string()))?;
+    let (text, usage) = advice_from_response(&parsed).map_err(ConsultError::retryable)?;
     Ok((cap_answer(text, cfg), usage))
 }
 
@@ -544,13 +619,21 @@ pub struct AdvisorTool {
     cfg: AdvisorConfig,
     /// The consultation cap for one turn ([`advisor_cap`]).
     cap: usize,
-    /// Consultations made so far this turn.
+    /// SUCCESSFUL consultations so far this turn: the number `max_uses`
+    /// limits. A failed one is not counted, so one flaky advisor response
+    /// does not use up the operator's allowance.
     uses: usize,
     /// At least one consultation was served (so a failed re-run leaves the
     /// client a degraded pair).
     consulted: bool,
     /// The cap was reached and the refusal was already sent.
     cap_reached: bool,
+    /// Consultations that failed this turn (after their retry). They do not
+    /// count toward `max_uses`; this counter is what bounds them instead.
+    failures: usize,
+    /// [`MAX_FAILED_CONSULTATIONS`] was reached: the advisor is treated as
+    /// down for the rest of the turn.
+    given_up: bool,
     /// One operator-visible warning per turn.
     warned: bool,
     /// One runaway warning per turn.
@@ -569,6 +652,8 @@ impl AdvisorTool {
             uses: 0,
             consulted: false,
             cap_reached: false,
+            failures: 0,
+            given_up: false,
             warned: false,
             runaway_warned: false,
             iterations: Vec::new(),
@@ -602,21 +687,7 @@ impl AdvisorTool {
                 .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
             };
         }
-        self.uses += 1;
         self.consulted = true;
-
-        // A turn that keeps consulting is a runaway loop. Warn ONCE per turn,
-        // at the moment it crosses the threshold, so the spin is visible in
-        // the log without flooding it.
-        if should_warn_runaway(self.uses, &mut self.runaway_warned) {
-            tracing::warn!(
-                consultations = self.uses,
-                advisor_model = %self.cfg.model,
-                max_uses = ?self.cfg.max_uses,
-                "advisor consultations in one turn exceeded the runaway threshold — \
-                 each iteration costs two upstream calls (executor re-run + advisor)"
-            );
-        }
 
         // What the operator sees: the outcome and the advisor's own tokens.
         let mut outcome = OUTCOME_OK;
@@ -624,6 +695,19 @@ impl AdvisorTool {
 
         let advice = match consult(attempt, &self.cfg, &transcript(attempt)).await {
             Ok((text, usage)) => {
+                self.uses += 1;
+                // A turn that keeps consulting is a runaway loop. Warn ONCE
+                // per turn, at the moment it crosses the threshold, so the
+                // spin is visible in the log without flooding it.
+                if should_warn_runaway(self.uses, &mut self.runaway_warned) {
+                    tracing::warn!(
+                        consultations = self.uses,
+                        advisor_model = %self.cfg.model,
+                        max_uses = ?self.cfg.max_uses,
+                        "advisor consultations in one turn exceeded the runaway threshold — \
+                         each iteration costs two upstream calls (executor re-run + advisor)"
+                    );
+                }
                 if let Some(u) = usage.as_ref() {
                     // Advisor tokens live in iterations[], NOT the top-level
                     // totals. The TUI gets one extra "actual" bucket so the
@@ -648,9 +732,23 @@ impl AdvisorTool {
             Err(error) => {
                 outcome = OUTCOME_ERROR;
                 detail = Some(protocol::ERROR_CODE_UNAVAILABLE.to_owned());
+                // Not counted in `uses`, but not free either: after
+                // MAX_FAILED_CONSULTATIONS the advisor is treated as down,
+                // so an executor cannot keep paying for a broken advisor.
+                self.failures += 1;
+                let giving_up = self.failures >= MAX_FAILED_CONSULTATIONS;
+                self.given_up |= giving_up;
                 warn_once(&attempt.state, &mut self.warned, &self.cfg, &error);
                 blocks.push(ResponseContentBlock::Raw(protocol::unavailable(&id)));
-                NO_ADVICE.to_owned()
+                // Once given up on, say so: the executor gets one last run
+                // and any further advisor call in it is dropped, so "try
+                // again later" would leave it with nothing to answer.
+                if giving_up {
+                    NO_MORE_ADVICE_BROKEN
+                } else {
+                    NO_ADVICE
+                }
+                .to_owned()
             }
         };
 
@@ -685,14 +783,15 @@ impl ServerTool for AdvisorTool {
     }
 
     fn exhausted(&self) -> bool {
-        self.cap_reached
+        self.cap_reached || self.given_up
     }
 
     /// A consultation was pending when the re-run failed: add the
-    /// `unavailable` pair. At the cap no consultation is pending, so the last
-    /// good response is rendered as it is.
+    /// `unavailable` pair. At the cap, or once the advisor was given up on, no
+    /// consultation is pending (the refusal or failure was already served),
+    /// so the last good response is rendered as it is.
     fn on_rerun_failure(&mut self, prefix: &mut Vec<ResponseContentBlock>) {
-        if self.consulted && !self.cap_reached {
+        if self.consulted && !self.exhausted() {
             append_degraded_pair(prefix);
         }
     }

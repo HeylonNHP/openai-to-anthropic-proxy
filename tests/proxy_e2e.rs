@@ -3929,13 +3929,18 @@ async fn advisor_timeout_degrades_gracefully() {
         vec![
             advisor_call_response("resp_call", "call_timeout"),
             advisor_answer("never arrives"),
+            advisor_answer("never arrives"),
             advisor_executor_message("resp_final", "never arrives"),
         ],
     );
-    // Attempt 1 = executor (fast); attempt 2 = advisor (stalled);
-    // attempt 3 = final executor (fast).
-    *upstream.delay_per_attempt.lock().await =
-        VecDeque::from([Duration::ZERO, Duration::from_secs(3), Duration::ZERO]);
+    // Attempt 1 = executor (fast); attempts 2 and 3 = the advisor and its
+    // one retry (both stalled); attempt 4 = final executor (fast).
+    *upstream.delay_per_attempt.lock().await = VecDeque::from([
+        Duration::ZERO,
+        Duration::from_secs(3),
+        Duration::from_secs(3),
+        Duration::ZERO,
+    ]);
     let mut config = (*advisor_config(upstream_addr)).clone();
     config.advisor.timeout_secs = Some(1);
     let proxy_addr = start_proxy(Arc::new(config)).await;
@@ -3964,18 +3969,20 @@ async fn advisor_timeout_degrades_gracefully() {
             .any(|b| b["text"] == "never arrives"),
         "the executor's NEXT canned answer arrived; the timeout did not fail the turn"
     );
-    // The fake upstream records the stalled advisor POST before the client
-    // times out; the final executor call is the 3rd. No 4th request: the
-    // advisor timeout never triggered a default_model fallback or retry.
+    // The fake upstream records each stalled advisor POST before the client
+    // times out: the advisor and its ONE retry (2nd and 3rd), then the final
+    // executor call (4th). No 5th request: a timeout never triggers a
+    // default_model fallback, and the advisor is retried only once.
     let sent = upstream.received_all.lock().await.clone();
-    assert_eq!(sent.len(), 3, "no fallback POST after the timeout");
+    assert_eq!(sent.len(), 4, "one retry, no fallback POST after it");
     let bodies: Vec<serde_json::Value> = sent
         .iter()
         .map(|b| serde_json::from_slice(b).unwrap())
         .collect();
     assert_eq!(bodies[0]["model"], "gpt-4o-mini");
     assert_eq!(bodies[1]["model"], "beam", "the timed-out advisor POST");
-    assert_eq!(bodies[2]["model"], "gpt-4o-mini");
+    assert_eq!(bodies[2]["model"], "beam", "its retry");
+    assert_eq!(bodies[3]["model"], "gpt-4o-mini");
 }
 
 /// 3b. Repeated advisor failures stay fail-closed, and at most ONE
@@ -3991,11 +3998,17 @@ async fn advisor_repeated_failure_emits_one_warning() {
         &upstream,
         vec![
             advisor_call_response("resp_c1", "call_t1"),
+            // A 503 is retried once, and the retry fails too.
+            FakeResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: Some(r#"{"error":{"message":"overloaded"}}"#.into()),
+            },
             FakeResponse {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 body: Some(r#"{"error":{"message":"overloaded"}}"#.into()),
             },
             advisor_call_response("resp_c2", "call_t2"),
+            // A 404 is permanent, so it is not retried.
             FakeResponse {
                 status: StatusCode::NOT_FOUND,
                 body: Some(REAL_GATEWAY_MODEL_404.into()),
@@ -5160,6 +5173,8 @@ async fn b2_failed_advisor_status_is_not_accepted_as_advice() {
             &upstream,
             vec![
                 advisor_call_response("resp_call", "call_b2"),
+                // The unusable response is retried once; the retry is bad too.
+                advisor_answer_with_status(status, "FAKE ADVICE FROM A FAILED RESPONSE"),
                 advisor_answer_with_status(status, "FAKE ADVICE FROM A FAILED RESPONSE"),
                 advisor_executor_message("resp_final", "Answer without advice."),
             ],
@@ -5195,8 +5210,12 @@ async fn b2_failed_advisor_status_is_not_accepted_as_advice() {
 
         // The failed text was NOT injected into the executor's transcript.
         let sent = upstream.received_all.lock().await.clone();
-        assert_eq!(sent.len(), 3, "{status}: no extra POSTs");
-        let final_body: serde_json::Value = serde_json::from_slice(&sent[2]).unwrap();
+        assert_eq!(
+            sent.len(),
+            4,
+            "{status}: the advisor and ONE retry, no more"
+        );
+        let final_body: serde_json::Value = serde_json::from_slice(&sent[3]).unwrap();
         let injected = final_body["input"]
             .as_array()
             .unwrap()
@@ -5582,11 +5601,17 @@ async fn b4_advisor_timeout_is_clamped_to_request_timeout() {
         vec![
             advisor_call_response("resp_call", "call_b4"),
             advisor_answer("never arrives"),
+            advisor_answer("never arrives"),
             advisor_executor_message("resp_final", "Continued without advice."),
         ],
     );
-    *upstream.delay_per_attempt.lock().await =
-        VecDeque::from([Duration::ZERO, Duration::from_secs(3), Duration::ZERO]);
+    // The advisor stalls on both its attempt and its one retry.
+    *upstream.delay_per_attempt.lock().await = VecDeque::from([
+        Duration::ZERO,
+        Duration::from_secs(3),
+        Duration::from_secs(3),
+        Duration::ZERO,
+    ]);
     let mut config = (*advisor_config(upstream_addr)).clone();
     config.request_timeout = Duration::from_millis(300);
     config.advisor.timeout_secs = Some(5);
@@ -8452,4 +8477,167 @@ async fn a_client_that_disconnects_stops_the_turn() {
         2,
         "no third run for a client that left"
     );
+}
+
+/// Run one advisor turn against a scripted upstream with `max_uses` set;
+/// returns the client's response body and every POST the upstream received.
+async fn advisor_turn_with_max_uses(
+    max_uses: u32,
+    responses: Vec<FakeResponse>,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(&upstream, responses);
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = Some(max_uses);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let sent = upstream.received_all.lock().await.clone();
+    let bodies = sent
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    (body, bodies)
+}
+
+fn advisor_results(body: &serde_json::Value) -> Vec<&serde_json::Value> {
+    body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["type"] == "advisor_tool_result")
+        .collect()
+}
+
+fn upstream_failure(status: StatusCode) -> FakeResponse {
+    FakeResponse {
+        status,
+        body: Some(r#"{"error":{"message":"advisor trouble"}}"#.into()),
+    }
+}
+
+/// A transient failure (503) is retried once, and the retry's advice is used.
+#[tokio::test]
+async fn an_advisor_failure_that_a_retry_fixes_still_gives_advice() {
+    let (body, sent) = advisor_turn_with_max_uses(
+        2,
+        vec![
+            advisor_call_response("resp_call", "call_retry"),
+            upstream_failure(StatusCode::SERVICE_UNAVAILABLE),
+            advisor_answer("Use a channel."),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    )
+    .await;
+    let results = advisor_results(&body);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["content"]["text"], "Use a channel.");
+    assert_eq!(sent.len(), 4, "executor, advisor, its retry, executor");
+    assert_eq!(sent[1]["model"], "beam");
+    assert_eq!(sent[2]["model"], "beam");
+}
+
+/// A permanent failure (a 4xx) is NOT retried: it would fail the same way.
+#[tokio::test]
+async fn a_permanent_advisor_failure_is_not_retried() {
+    let (body, sent) = advisor_turn_with_max_uses(
+        2,
+        vec![
+            advisor_call_response("resp_call", "call_perm"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    )
+    .await;
+    assert_eq!(
+        advisor_results(&body)[0]["content"]["error_code"],
+        "unavailable"
+    );
+    assert_eq!(sent.len(), 3, "executor, ONE advisor POST, executor");
+}
+
+/// A consultation that failed does not use up `max_uses`: with a limit of 1,
+/// a failed first consultation still leaves the second one available.
+#[tokio::test]
+async fn a_failed_consultation_does_not_use_up_max_uses() {
+    let (body, _) = advisor_turn_with_max_uses(
+        1,
+        vec![
+            advisor_call_response("resp_c1", "call_f1"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_call_response("resp_c2", "call_f2"),
+            advisor_answer("Second time lucky."),
+            advisor_executor_message("resp_final", "Done."),
+        ],
+    )
+    .await;
+    let results = advisor_results(&body);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["content"]["error_code"], "unavailable");
+    assert_eq!(results[1]["content"]["text"], "Second time lucky.");
+    assert!(
+        results
+            .iter()
+            .all(|r| r["content"]["error_code"] != "max_uses_exceeded"),
+        "the failure was not counted against max_uses"
+    );
+}
+
+/// Failures are not free: after two failed consultations the advisor is
+/// treated as down for the rest of the turn. The executor is told so, and a
+/// further call to it is dropped without another advisor POST.
+#[tokio::test]
+async fn a_broken_advisor_is_given_up_on_after_two_failures() {
+    let (body, sent) = advisor_turn_with_max_uses(
+        5,
+        vec![
+            advisor_call_response("resp_c1", "call_g1"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_call_response("resp_c2", "call_g2"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_executor_message("resp_final", "Answer without advice."),
+        ],
+    )
+    .await;
+    assert_eq!(advisor_results(&body).len(), 2, "two failed consultations");
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"] == "Answer without advice."),
+        "the turn ends with the executor's answer"
+    );
+    // The executor's last run was told the advisor is gone for good.
+    let last = sent.last().unwrap().to_string();
+    assert!(last.contains("will not be consulted again"), "{last}");
+    // A first failure was told only that it is temporary.
+    assert!(sent[2].to_string().contains("temporarily unavailable"));
+}
+
+/// An executor that ignores that and calls the advisor a third time gets no
+/// third advisor POST.
+#[tokio::test]
+async fn a_third_call_to_a_given_up_advisor_is_dropped() {
+    let (_, sent) = advisor_turn_with_max_uses(
+        5,
+        vec![
+            advisor_call_response("resp_c1", "call_h1"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_call_response("resp_c2", "call_h2"),
+            upstream_failure(StatusCode::UNPROCESSABLE_ENTITY),
+            advisor_call_response("resp_c3", "call_h3"),
+            advisor_executor_message("resp_final", "Never needed."),
+        ],
+    )
+    .await;
+    let advisor_posts = sent.iter().filter(|b| b["model"] == "beam").count();
+    assert_eq!(advisor_posts, 2, "no advisor POST for the third call");
 }

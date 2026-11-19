@@ -434,6 +434,12 @@ The advisor is sent the executor's whole conversation, which grows without bound
 
 The executor's own instructions are capped at a quarter of the budget (300,000 characters) so they cannot crowd out the conversation. Each cut states how many bytes it removed, and a trimmed prompt is logged at `info` with its size before and after. If you point `advisor.model` at a model whose context window is much smaller than about 400,000 tokens, this budget is too large for it and its calls will still be rejected as "prompt is too long"; the constant is `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`.
 
+#### Failed consultations: one retry, and they do not use up `max_uses`
+
+A consultation that fails for a reason that could be transient (a network error or timeout, an HTTP 429 or 5xx, or a response with no usable advice) is **retried once**, after a quarter of a second, before it is reported as `unavailable`. A client-side error such as "prompt is too long" would fail again the same way, so it is not retried. The log line carries both failures when the retry fails too.
+
+**Only successful consultations count toward `max_uses`.** With the default of 2, one flaky response no longer uses up half the allowance. Failures are bounded separately: after **two** failed consultations in one turn (each already retried) the advisor is treated as down for the rest of that turn. The executor is told it will not be consulted again and given one last run to answer, and any further advisor call is dropped without another upstream request. This limit is built in, not a `proxy.json` key.
+
 #### How the advisor is prompted
 
 The advisor reads another assistant's instructions and conversation, and a model shown those can mistake them for its own and carry on as that assistant. A reasoning advisor did exactly that in practice: it answered with a call to `advisor` and no text, so the consultation failed. The request is therefore framed as a review. The advisor's system prompt says it is **not** the assistant, has **no tools** (and must not call `advisor`), and must reply with plain-text advice only. The assistant's instructions are labelled as not written for the reviewer, the executor's own `# Advisor Tool` section ("call advisor before substantive work") is removed from them, and the request ends by repeating that the reviewer should write advice and call no tool. If an advisor model still replies with a tool call, the log now says "advisor called a tool instead of writing advice".
