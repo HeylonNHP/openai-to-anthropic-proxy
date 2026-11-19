@@ -189,6 +189,36 @@ fn truncation_cuts_at_a_paragraph_boundary() {
 }
 
 #[test]
+fn truncation_keeps_text_that_has_no_paragraph_break() {
+    // One long paragraph used to be cut to nothing: the last "\n\n" was
+    // not found, so the cut fell back to byte 0.
+    let text = "word ".repeat(100);
+    let out = truncate(text, Some(103));
+    let kept = out.trim_end_matches("\n\n[content truncated]");
+    assert!(kept.len() > 50, "most of the budget is kept, got {out:?}");
+    assert!(kept.len() <= 103, "still within the budget, got {out:?}");
+    assert!(
+        kept.ends_with("word"),
+        "cut at a word boundary, got {out:?}"
+    );
+}
+
+#[test]
+fn truncation_hard_cuts_text_with_no_break_at_all() {
+    let text = "x".repeat(500);
+    let out = truncate(text, Some(100));
+    assert!(out.starts_with(&"x".repeat(100)), "got {out:?}");
+    assert!(out.ends_with("[content truncated]"), "got {out:?}");
+}
+
+#[test]
+fn truncation_ignores_a_paragraph_break_that_would_lose_most_of_the_budget() {
+    let text = format!("a\n\n{}", "b ".repeat(200));
+    let out = truncate(text, Some(100));
+    assert!(out.len() > 60, "the early break is not used, got {out:?}");
+}
+
+#[test]
 fn truncation_never_splits_a_multibyte_character() {
     // 3 bytes falls inside the second 2-byte character: this used to panic.
     let text = "é".repeat(10);

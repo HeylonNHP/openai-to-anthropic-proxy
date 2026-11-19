@@ -679,11 +679,14 @@ fn resolve_redirect(base: &str, location: &str) -> Result<String, FetchError> {
     Ok(next)
 }
 
-/// Truncate the extracted text at a paragraph boundary.
+/// Truncate the extracted text at a natural boundary.
 ///
-/// `max_bytes` is `None` for "no limit" (the default). The cut is made at
-/// the last paragraph break that fits, so the model never receives half
-/// a sentence where it could have received a whole paragraph.
+/// `max_bytes` is `None` for "no limit" (the default). The cut prefers the
+/// last paragraph break that fits, then the last line break, then the last
+/// space, so the model gets whole paragraphs where it can. A boundary is
+/// only used if it keeps at least half the budget: text with no break in
+/// it (one long paragraph, minified JSON) is cut at the budget itself
+/// rather than emptied.
 fn truncate(mut text: String, max_bytes: Option<u64>) -> String {
     let Some(max) = max_bytes else {
         return text;
@@ -692,10 +695,18 @@ fn truncate(mut text: String, max_bytes: Option<u64>) -> String {
     if text.len() <= max {
         return text;
     }
-    // Cut at the last paragraph break inside the budget.
-    let head = &text[..text.floor_char_boundary(max)];
-    let cut = head.rfind("\n\n").unwrap_or(0);
+    let end = text.floor_char_boundary(max);
+    let head = &text[..end];
+    let keeps_enough = |cut: &usize| *cut >= end / 2;
+    let cut = head
+        .rfind("\n\n")
+        .filter(keeps_enough)
+        .or_else(|| head.rfind('\n').filter(keeps_enough))
+        .or_else(|| head.rfind(' ').filter(keeps_enough))
+        .unwrap_or(end);
     text.truncate(cut);
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
     text.push_str("\n\n[content truncated]");
     text
 }
