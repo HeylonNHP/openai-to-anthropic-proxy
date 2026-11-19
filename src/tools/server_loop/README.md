@@ -116,6 +116,7 @@ at the end:
 
 ```text
 first run done ─▶ message_start
+  (or, if the first run takes over 10 s: placeholder message_start at 10 s)
 each round     ─▶ content blocks (the model's text, server_tool_use, result)
 (quiet)        ─▶ ping every 10 s
 last run done  ─▶ final blocks, message_delta, message_stop
@@ -126,8 +127,13 @@ last run done  ─▶ final blocks, message_delta, message_stop
   no tool call, is still delivered in one burst. Streaming a plain answer token
   by token would need the call detection to work on a live upstream stream;
   that is not built.
-* The stream only starts once the **first** run has succeeded. A failure there
-  is an ordinary HTTP error with its real status, which clients retry on.
+* The stream normally starts once the **first** run has succeeded, so a quick
+  failure there is an ordinary HTTP error with its real status, which clients
+  retry on. If the first run is still going after 10 s, the stream starts
+  anyway with a placeholder `message_start` (the requested model, an empty
+  message, zero usage) and pings, so the client is never silent for longer
+  than the ping interval. A failure after that is an SSE `error` event; the
+  closing `message_delta` carries the turn's real usage.
 * The loop runs in its own task, talking to the response over a channel. A
   client that disconnects stops the loop before its next upstream call.
 

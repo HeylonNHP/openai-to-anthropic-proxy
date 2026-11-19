@@ -198,3 +198,107 @@ async fn events_that_do_not_belong_after_the_start_are_ignored() {
         .unwrap();
     assert!(chunk_text(&chunk).contains("event: content_block_start"));
 }
+
+fn started(id: &str) -> LoopEvent {
+    let mut message = placeholder_message("m");
+    message.id = id.to_owned();
+    LoopEvent::Started(message)
+}
+
+/// The next data chunk of a started response's body.
+async fn body_chunk(body: &mut axum::body::BodyDataStream) -> String {
+    let chunk = body.next().await.expect("a chunk").expect("no body error");
+    chunk_text(&chunk)
+}
+
+fn streamed_body(streamed: Streamed) -> axum::body::BodyDataStream {
+    match streamed {
+        Streamed::Response(response) => response.into_body().into_data_stream(),
+        Streamed::Fallback(..) => panic!("expected a streaming response"),
+    }
+}
+
+#[test]
+fn the_placeholder_is_an_empty_assistant_message_for_the_requested_model() {
+    let message = placeholder_message("claude-sonnet-5-5");
+    assert!(message.id.starts_with("msg_"), "{}", message.id);
+    assert_eq!(message.model, "claude-sonnet-5-5");
+    assert_eq!(message.role, "assistant");
+    assert!(message.content.is_empty());
+    assert!(message.stop_reason.is_none());
+}
+
+#[tokio::test]
+async fn a_fast_first_run_starts_the_stream_with_its_own_message() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tx.send(started("msg_from_the_run")).unwrap();
+    let streamed = start(rx, placeholder_message("m"), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let mut body = streamed_body(streamed);
+    let first = body_chunk(&mut body).await;
+    assert!(first.contains("msg_from_the_run"), "{first}");
+}
+
+#[tokio::test]
+async fn a_fast_first_failure_is_still_a_plain_error() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tx.send(LoopEvent::Failed(AppError::Internal("quick".into())))
+        .unwrap();
+    let result = start(rx, placeholder_message("m"), Duration::from_secs(30)).await;
+    assert!(matches!(result, Err(AppError::Internal(m)) if m == "quick"));
+}
+
+#[tokio::test]
+async fn a_slow_first_run_starts_the_stream_early_with_the_placeholder() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let placeholder = placeholder_message("m");
+    let placeholder_id = placeholder.id.clone();
+
+    // Nothing has arrived when the deadline passes: the response starts.
+    let streamed = start(rx, placeholder, Duration::from_millis(10))
+        .await
+        .unwrap();
+    let mut body = streamed_body(streamed);
+    let first = body_chunk(&mut body).await;
+    assert!(first.contains("event: message_start"), "{first}");
+    assert!(first.contains(&placeholder_id), "{first}");
+
+    // The run then finishes: its own message_start is NOT sent again, its
+    // blocks and the end follow.
+    tx.send(started("msg_from_the_run")).unwrap();
+    tx.send(LoopEvent::Finished(tail(
+        vec![text("answer")],
+        Some(StopReason::EndTurn),
+    )))
+    .unwrap();
+    let rest = body_chunk(&mut body).await;
+    assert!(!rest.contains("message_start"), "{rest}");
+    assert!(!rest.contains("msg_from_the_run"), "{rest}");
+    assert!(
+        rest.contains("answer") && rest.contains("event: message_stop"),
+        "{rest}"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_first_run_that_then_fails_ends_the_early_stream_with_an_error() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let streamed = start(rx, placeholder_message("m"), Duration::from_millis(10))
+        .await
+        .unwrap();
+    let mut body = streamed_body(streamed);
+    body_chunk(&mut body).await;
+
+    tx.send(LoopEvent::Failed(AppError::Internal("slow failure".into())))
+        .unwrap();
+    let rest = body_chunk(&mut body).await;
+    assert!(
+        rest.contains("event: error") && rest.contains("slow failure"),
+        "{rest}"
+    );
+    assert!(
+        body.next().await.is_none(),
+        "the stream ends after the error"
+    );
+}

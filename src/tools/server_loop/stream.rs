@@ -14,12 +14,24 @@
 //! last run done  ─▶ final blocks, message_delta, message_stop
 //! ```
 //!
-//! The response only starts once the FIRST executor run has succeeded, so a
-//! failure there is still an ordinary HTTP error with its proper status (which
-//! clients retry on), exactly as before. After that a failure cannot change
-//! the status any more and is sent as an SSE `error` event. In practice a
-//! failed re-run does not even get that far: it degrades to the work done so
-//! far (see [`crate::tools::server_loop::run`]).
+//! The response normally starts once the FIRST executor run has succeeded, so
+//! a quick failure there is still an ordinary HTTP error with its proper
+//! status (which clients retry on), exactly as before. But a first run can be
+//! slow (a reasoning model, a long context), and a client or intermediary that
+//! sees no byte at all for that long may give up. So if the first run has not
+//! finished within [`EARLY_START_AFTER`], the stream starts anyway with a
+//! placeholder `message_start` (the request's model, an empty message) and
+//! `ping`s from then on:
+//!
+//! ```text
+//! first run done within EARLY_START_AFTER ─▶ message_start (from the run)
+//! first run still going at EARLY_START_AFTER ─▶ message_start (placeholder), ping …
+//! ```
+//!
+//! Once the stream has started a failure cannot change the status any more
+//! and is sent as an SSE `error` event. In practice a failed re-run does not
+//! even get that far: it degrades to the work done so far (see
+//! [`crate::tools::server_loop::run`]).
 //!
 //! The loop runs in its own task and talks to the response body over a
 //! channel, so a slow client never stalls it and a vanished client stops it
@@ -50,6 +62,12 @@ use crate::tools::server_loop::run::{LoopEvent, SessionOutcome, drive};
 /// How long the stream may be silent before a `ping` is sent.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long the first executor run may take before the stream is started
+/// without it, so the client is never left without a byte for longer than
+/// the ping interval. A first run that fails sooner is still a plain HTTP
+/// error.
+const EARLY_START_AFTER: Duration = PING_INTERVAL;
+
 /// What [`respond`] made of the request.
 pub(crate) enum Streamed {
     /// The streaming response.
@@ -69,16 +87,48 @@ pub(crate) async fn respond(
     attempt: Attempt,
     tools: Vec<Box<dyn ServerTool>>,
 ) -> Result<Streamed, AppError> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let placeholder = placeholder_message(&attempt.req.model);
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(run_turn(attempt, tools, tx));
+    start(rx, placeholder, EARLY_START_AFTER).await
+}
 
-    match rx.recv().await {
+/// Wait for the first executor run, but no longer than `start_after`: past
+/// that the stream starts with `placeholder` as its `message_start`.
+pub(crate) async fn start(
+    mut rx: UnboundedReceiver<LoopEvent>,
+    placeholder: Message,
+    start_after: Duration,
+) -> Result<Streamed, AppError> {
+    let Ok(first) = tokio::time::timeout(start_after, rx.recv()).await else {
+        tracing::debug!("first executor run is slow; starting the stream early");
+        return Ok(Streamed::Response(response(placeholder, rx)));
+    };
+    match first {
         Some(LoopEvent::Started(message)) => Ok(Streamed::Response(response(message, rx))),
         Some(LoopEvent::Failed(err)) => Err(err),
         Some(LoopEvent::Fallback(attempt, raw)) => Ok(Streamed::Fallback(attempt, raw)),
         Some(LoopEvent::Blocks(_) | LoopEvent::Finished(_)) | None => Err(AppError::Internal(
             "the server-tool turn ended without starting".to_owned(),
         )),
+    }
+}
+
+/// The `message_start` sent when the stream starts before the first
+/// executor run has answered: an empty assistant message for the model the
+/// client asked for. Its usage is zero; the closing `message_delta` carries
+/// the turn's real usage.
+pub(crate) fn placeholder_message(model: &str) -> Message {
+    let id = crate::tools::web_fetch::protocol::new_id();
+    Message {
+        id: format!("msg_{}", id.trim_start_matches("srvtoolu_")),
+        r#type: "message",
+        role: "assistant",
+        content: Vec::new(),
+        model: model.to_owned(),
+        stop_reason: None,
+        stop_sequence: None,
+        usage: crate::anthropic::Usage::default(),
     }
 }
 
@@ -148,8 +198,18 @@ async fn next_chunk(mut state: BodyState) -> Option<(Bytes, BodyState)> {
                     state.done = true;
                     break vec![error_event(&err)];
                 }
-                // Neither is sent after the start; ignore rather than guess.
-                Some(LoopEvent::Started(_) | LoopEvent::Fallback(..)) => {}
+                // The stream was started early with a placeholder: the real
+                // `message_start` is not sent a second time.
+                Some(LoopEvent::Started(_)) => {}
+                // The stream was started early, and the upstream then
+                // answered with a stream although a whole response was
+                // asked for. It cannot be spliced into this stream.
+                Some(LoopEvent::Fallback(..)) => {
+                    state.done = true;
+                    break vec![error_event(&AppError::Internal(
+                        "the upstream streamed a response that was requested whole".to_owned(),
+                    ))];
+                }
                 None => {
                     state.done = true;
                     break vec![error_event(&AppError::Internal(
