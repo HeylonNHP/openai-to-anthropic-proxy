@@ -30,6 +30,10 @@ pub enum LogKind {
     Warning,
     Error,
     Info,
+    /// A server tool call the proxy served: the tool, what it acted on, how
+    /// it ended and how long it took. The client never sees this call, so it
+    /// is the only place it shows up.
+    Tool,
 }
 
 /// Where request log lines go.

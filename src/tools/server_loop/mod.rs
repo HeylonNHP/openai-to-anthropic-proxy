@@ -41,6 +41,7 @@ pub(crate) mod handler;
 pub(crate) mod render;
 pub(crate) mod run;
 pub(crate) mod stream;
+pub(crate) mod summary;
 
 use handler::ServerTool;
 

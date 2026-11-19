@@ -30,12 +30,16 @@ use crate::error::AppError;
 use crate::proxy::Attempt;
 use crate::tools::domains::DomainRules;
 use crate::tools::server_loop::handler::{Call, Served, ServerTool};
+use crate::tools::server_loop::summary::CallSummary;
 use crate::tools::web_fetch::protocol::new_id;
 use crate::tools::web_search::backend::{Backend, LiveBackend};
 use crate::tools::web_search::compact::UpstreamCompactor;
 use crate::tools::web_search::ddg;
 use crate::tools::web_search::run::{self, RunSettings};
-use crate::tools::web_search::{EXECUTOR_TOOL_NAME, format, protocol};
+use crate::tools::web_search::{EXECUTOR_TOOL_NAME, WEB_SEARCH_TOOL_NAME, format, protocol};
+use crate::tui::format::{
+    OUTCOME_ERROR, OUTCOME_OK, OUTCOME_PARTIAL, OUTCOME_REFUSED, format_token_count,
+};
 use crate::tui::{LogKind, LogLine};
 
 const INVALID_INPUT: &str = "The web search request had no usable queries. Call the tool again \
@@ -125,6 +129,14 @@ impl<B: Backend> WebSearchTool<B> {
                 served: Served {
                     blocks: pair_error("", protocol::ERROR_INVALID_INPUT),
                     output: INVALID_INPUT.to_owned(),
+                    summary: Some(
+                        CallSummary::new(
+                            WEB_SEARCH_TOOL_NAME,
+                            call.arguments.clone(),
+                            OUTCOME_ERROR,
+                        )
+                        .with_detail(protocol::ERROR_INVALID_INPUT),
+                    ),
                 },
                 failures: Vec::new(),
             };
@@ -174,8 +186,51 @@ impl<B: Backend> WebSearchTool<B> {
                 self.max_uses.unwrap_or_default()
             ));
         }
+
+        // What the operator wants to know: what was searched, how much came
+        // back, and what did not work.
+        let subject = kept
+            .iter()
+            .map(|query| format!("\"{query}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ran = report.queries.len();
+        let results: usize = report
+            .queries
+            .iter()
+            .map(|query| query.outcome.as_ref().map_or(0, Vec::len))
+            .sum();
+        let failed = failures.len();
+        let not_run = refused.len() + report.dropped_queries;
+        let outcome = if ran == 0 {
+            OUTCOME_REFUSED
+        } else if failed == ran {
+            OUTCOME_ERROR
+        } else if failed > 0 || not_run > 0 {
+            OUTCOME_PARTIAL
+        } else {
+            OUTCOME_OK
+        };
+        let mut detail = format!(
+            "{} · {}",
+            count_with_unit(ran, "query"),
+            count_with_unit(results, "result")
+        );
+        if failed > 0 {
+            detail.push_str(&format!(" · {failed} failed"));
+        }
+        if not_run > 0 {
+            detail.push_str(&format!(" · {not_run} not run"));
+        }
+
         Answer {
-            served: Served { blocks, output },
+            served: Served {
+                blocks,
+                output,
+                summary: Some(
+                    CallSummary::new(WEB_SEARCH_TOOL_NAME, subject, outcome).with_detail(detail),
+                ),
+            },
             failures,
         }
     }
@@ -226,6 +281,16 @@ fn pair_error(query: &str, code: &str) -> Vec<ResponseContentBlock> {
         ResponseContentBlock::Raw(protocol::server_tool_use(&id, query)),
         ResponseContentBlock::Raw(protocol::error_result(&id, code)),
     ]
+}
+
+/// A count and what it counts: "1 query", "12 queries", "1.20k results".
+fn count_with_unit(count: usize, unit: &str) -> String {
+    let number = format_token_count(count as u64);
+    if count == 1 {
+        format!("{number} {unit}")
+    } else {
+        format!("{number} {unit}s")
+    }
 }
 
 /// The `queries` strings of a call's arguments; anything malformed is an

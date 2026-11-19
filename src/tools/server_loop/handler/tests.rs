@@ -13,6 +13,7 @@ impl ServerTool for Bare {
             Served {
                 blocks: Vec::new(),
                 output: String::new(),
+                summary: None,
             }
         })
     }

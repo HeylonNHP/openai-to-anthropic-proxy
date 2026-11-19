@@ -59,6 +59,8 @@ use crate::responses::{
 };
 use crate::tools::advisor::{ADVISOR_TOOL_NAME, protocol, scrub_error_body};
 use crate::tools::server_loop::handler::{Call, Served, ServerTool};
+use crate::tools::server_loop::summary::CallSummary;
+use crate::tui::format::{OUTCOME_ERROR, OUTCOME_OK, OUTCOME_REFUSED, format_token_count};
 use crate::tui::{LogKind, LogLine};
 
 /// Text injected into the executor's transcript when the advisor could not
@@ -348,6 +350,10 @@ impl AdvisorTool {
             return Served {
                 blocks,
                 output: NO_MORE_ADVICE.to_owned(),
+                summary: Some(
+                    CallSummary::new(ADVISOR_TOOL_NAME, self.cfg.model.as_str(), OUTCOME_REFUSED)
+                        .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
+                ),
             };
         }
         self.uses += 1;
@@ -366,6 +372,10 @@ impl AdvisorTool {
             );
         }
 
+        // What the operator sees: the outcome and the advisor's own tokens.
+        let mut outcome = OUTCOME_OK;
+        let mut detail: Option<String> = None;
+
         let advice = match consult(attempt, &self.cfg, &transcript(attempt)).await {
             Ok((text, usage)) => {
                 if let Some(u) = usage.as_ref() {
@@ -378,6 +388,11 @@ impl AdvisorTool {
                         .state
                         .stats
                         .record_actual(self.cfg.model.clone(), token_usage(u));
+                    detail = Some(format!(
+                        "{} in · {} out",
+                        format_token_count(u64::from(u.input_tokens)),
+                        format_token_count(u64::from(u.output_tokens))
+                    ));
                 }
                 blocks.push(ResponseContentBlock::Raw(protocol::advisor_result(
                     &id, &text,
@@ -385,6 +400,8 @@ impl AdvisorTool {
                 text
             }
             Err(error) => {
+                outcome = OUTCOME_ERROR;
+                detail = Some(protocol::ERROR_CODE_UNAVAILABLE.to_owned());
                 warn_once(&attempt.state, &mut self.warned, &self.cfg, &error);
                 blocks.push(ResponseContentBlock::Raw(protocol::unavailable(&id)));
                 NO_ADVICE.to_owned()
@@ -394,9 +411,14 @@ impl AdvisorTool {
         // Server-side advice injection: emitting the Anthropic block alone is
         // NOT enough. The loop injects `advice` into the executor's own
         // prompt (§3.4).
+        let mut summary = CallSummary::new(ADVISOR_TOOL_NAME, self.cfg.model.as_str(), outcome);
+        if let Some(detail) = detail {
+            summary = summary.with_detail(detail);
+        }
         Served {
             blocks,
             output: advice,
+            summary: Some(summary),
         }
     }
 }

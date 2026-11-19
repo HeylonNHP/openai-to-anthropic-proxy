@@ -16,6 +16,8 @@
 //! and propagates; a failure on a LATER run does not discard the work already
 //! done, so the response built so far is returned instead.
 
+use std::time::Instant;
+
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::anthropic::{Message, ResponseContentBlock};
@@ -294,7 +296,16 @@ pub(crate) async fn drive(
             if tools[*tool_index].exhausted() {
                 continue;
             }
+            let started = Instant::now();
             let served = tools[*tool_index].serve(attempt, call).await;
+            // The call the client never sees: show it in the request log, so
+            // a turn that fetched pages is not a turn that did nothing.
+            if let Some(summary) = &served.summary {
+                attempt.state.output.emit(LogLine {
+                    kind: LogKind::Tool,
+                    text: summary.row(started.elapsed()),
+                });
+            }
             prefix_blocks.extend(served.blocks);
             out.flush(&prefix_blocks);
             inject(&mut attempt.outbound.input, call, &served.output);

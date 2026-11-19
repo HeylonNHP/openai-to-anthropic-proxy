@@ -6,6 +6,7 @@ use crate::anthropic::{ResponseContentBlock, Usage};
 use crate::error::AppError;
 use crate::proxy::Attempt;
 use crate::responses::ResponsesResponse;
+use crate::tools::server_loop::summary::CallSummary;
 
 /// One call the executor model made to a server tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,9 @@ pub(crate) struct Served {
     /// What the executor model reads as the call's output. It must never
     /// look like content when the call failed.
     pub output: String,
+    /// What the operator sees: the call in one line, for the request log.
+    /// `None` when the tool has nothing to say about this call.
+    pub summary: Option<CallSummary>,
 }
 
 /// A server tool the proxy serves itself.

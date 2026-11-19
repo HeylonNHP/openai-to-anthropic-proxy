@@ -25,19 +25,6 @@ fn make_log_line(text: &str) -> LogLine {
 }
 
 #[test]
-fn token_counts_use_compact_human_readable_units() {
-    assert_eq!(format_token_count(0), "0");
-    assert_eq!(format_token_count(999), "999");
-    assert_eq!(format_token_count(1_000), "1.00k");
-    assert_eq!(format_token_count(1_234), "1.23k");
-    assert_eq!(format_token_count(999_995), "1.00m");
-    assert_eq!(format_token_count(1_000_000), "1.00m");
-    assert_eq!(format_token_count(1_000_000_000), "1.00b");
-    assert_eq!(format_token_count(1_000_000_000_000), "1.00t");
-    assert_eq!(format_token_count(1_000_000_000_000_000), "1.00q");
-}
-
-#[test]
 fn token_usage_values_are_color_coded() {
     let line = style_token_usage_line(
         "  model                           7 req  in      1.00k  out      1.00m  cache      1.23k/999  reason      1.00b",
@@ -84,6 +71,84 @@ fn recent_request_token_values_are_color_coded() {
     assert_eq!(styled[3].style.fg, Some(TOKEN_CACHE_COLOR));
     assert_eq!(styled[4].content, "999w");
     assert_eq!(styled[4].style.fg, Some(TOKEN_CACHE_COLOR));
+}
+
+/// A tool row carries URLs, queries and error codes. A number in one of
+/// those is not a token count, so the token formatting must leave it alone.
+#[test]
+fn tool_rows_keep_their_numbers_as_they_are() {
+    let lines = vec![LogLine {
+        text: "  web_search  |  \"1200 in stock\"  |  ok  |  1.00s  |  2 results".into(),
+        kind: LogKind::Tool,
+    }];
+    let widths = recent_request_column_widths(lines.iter());
+    let normalized = normalize_recent_request_text(
+        LogKind::Tool,
+        &lines[0].text,
+        &widths[log_kind_index(LogKind::Tool)],
+    );
+    assert!(normalized.contains("1200 in stock"), "{normalized}");
+}
+
+#[test]
+fn a_tool_rows_outcome_is_coloured_by_what_happened() {
+    let worked =
+        style_tool_line("  web_fetch  |  https://example.com/  |  ok  |  1.00s  |  2 chars");
+    let coloured: Vec<_> = worked
+        .spans
+        .iter()
+        .filter(|span| span.style.fg.is_some())
+        .collect();
+    assert_eq!(coloured.len(), 2, "the outcome and the elapsed time");
+    assert_eq!(coloured[0].content, "ok");
+    assert_eq!(coloured[0].style.fg, Some(TOOL_OK_COLOR));
+    assert_eq!(coloured[1].content, "1.00s");
+    assert_eq!(coloured[1].style.fg, Some(TOOL_DIM_COLOR));
+
+    let failed =
+        style_tool_line("  web_fetch  |  https://intranet.corp/  |  error  |  0.02s  |  —");
+    let coloured: Vec<_> = failed
+        .spans
+        .iter()
+        .filter(|span| span.style.fg.is_some())
+        .collect();
+    assert_eq!(coloured[0].content, "error");
+    assert_eq!(coloured[0].style.fg, Some(TOOL_ERROR_COLOR));
+}
+
+#[test]
+fn tool_rows_are_rendered_in_the_log_pane() {
+    let mut app = TuiApp::new(
+        make_store(),
+        None,
+        "0.0.0.0:8085".into(),
+        "http://localhost/v1".into(),
+    );
+    app.push_log(LogLine {
+        text: "  web_fetch  |  https://example.com/docs  |  ok  |  1.24s  |  18.43k chars".into(),
+        kind: LogKind::Tool,
+    });
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            app.render(frame, area);
+        })
+        .expect("draw failed");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(120)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("web_fetch"), "{rendered}");
+    assert!(rendered.contains("https://example.com/docs"), "{rendered}");
+    assert!(rendered.contains("18.43k chars"), "{rendered}");
 }
 
 #[test]
@@ -208,8 +273,8 @@ fn recent_request_normalization_aligns_formatted_token_counts() {
         },
     ];
     let widths = recent_request_column_widths(lines.iter());
-    let first = normalize_recent_request_text(&lines[0].text, &widths[1]);
-    let second = normalize_recent_request_text(&lines[1].text, &widths[1]);
+    let first = normalize_recent_request_text(LogKind::Response, &lines[0].text, &widths[1]);
+    let second = normalize_recent_request_text(LogKind::Response, &lines[1].text, &widths[1]);
 
     assert!(first.contains("1.23k in"));
     assert!(first.contains("1.00mr"));
@@ -272,6 +337,7 @@ fn recent_request_columns_are_width_normalized() {
         ];
     let widths = recent_request_column_widths(lines.iter());
     let normalized = normalize_recent_request_text(
+        LogKind::Inbound,
         "  → claude-sonnet-5 → gpt-5.4-mini  |  2 tools  |  12 messages  |  stream  |  reasoning: high",
         &widths[log_kind_index(LogKind::Inbound)],
     );
@@ -287,6 +353,7 @@ fn recent_request_columns_handle_wide_text() {
     }];
     let widths = recent_request_column_widths(lines.iter());
     let normalized = normalize_recent_request_text(
+        LogKind::Inbound,
         "  → haiku → 繁體中文  |  12 tools  |  9 messages",
         &widths[log_kind_index(LogKind::Inbound)],
     );

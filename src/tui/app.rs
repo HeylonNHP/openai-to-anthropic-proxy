@@ -19,6 +19,9 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::format::{
+    DASH, OUTCOME_ERROR, OUTCOME_OK, OUTCOME_PARTIAL, OUTCOME_REFUSED, format_token_count,
+};
 use super::output::{LogKind, LogLine};
 use super::panels::{Panel, truncate_to_width};
 use super::runtime::{MappingsStore, RuntimeMappings};
@@ -39,6 +42,13 @@ const TOKEN_INPUT_COLOR: Color = Color::Green;
 const TOKEN_OUTPUT_COLOR: Color = Color::Red;
 const TOKEN_CACHE_COLOR: Color = Color::Cyan;
 const TOKEN_REASONING_COLOR: Color = Color::Yellow;
+
+// A tool row's outcome is the only part that changes meaning from row to
+// row, so it carries the colour; the rest of the row is structure.
+const TOOL_OK_COLOR: Color = Color::Green;
+const TOOL_ERROR_COLOR: Color = Color::Red;
+const TOOL_WARN_COLOR: Color = Color::Yellow;
+const TOOL_DIM_COLOR: Color = Color::DarkGray;
 
 /// Stable, ordered list of inbound models for display. We sort the live
 /// map's keys for stability; the `default_model` is rendered as its
@@ -840,11 +850,12 @@ impl TuiApp {
             .into_iter()
             .map(|line| {
                 let text = normalize_recent_request_text(
+                    line.kind,
                     &line.text,
                     &recent_widths[log_kind_index(line.kind)],
                 );
                 let display = format!("{}  {}", kind_glyph(line.kind), text);
-                ListItem::new(style_token_usage_line(&display))
+                ListItem::new(style_log_line(line.kind, &display))
             })
             .collect();
         let title = if self.log.is_empty() {
@@ -1063,16 +1074,21 @@ fn kind_glyph(kind: LogKind) -> &'static str {
         LogKind::Warning => "!",
         LogKind::Error => "X",
         LogKind::Info => ".",
+        LogKind::Tool => "\u{21b3}",
     }
 }
 
+/// The width of each column of the log lines of one kind.
+///
+/// Every kind gets its own bucket: the request lines, the response lines and
+/// the tool rows are three different tables, so each aligns on its own.
 fn recent_request_column_widths<'a>(
     lines: impl IntoIterator<Item = &'a LogLine>,
-) -> [Vec<usize>; 5] {
+) -> [Vec<usize>; 6] {
     let mut widths = std::array::from_fn(|_| Vec::new());
     for line in lines {
         let slot = &mut widths[log_kind_index(line.kind)];
-        let text = format_recent_request_token_counts(&line.text);
+        let text = format_for_log(line.kind, &line.text);
         for (idx, col) in recent_request_columns(&text).into_iter().enumerate() {
             let width = col.width();
             if idx >= slot.len() {
@@ -1085,8 +1101,20 @@ fn recent_request_column_widths<'a>(
     widths
 }
 
-fn normalize_recent_request_text(text: &str, widths: &[usize]) -> String {
-    let text = format_recent_request_token_counts(text);
+/// The text a log line is measured and rendered with.
+///
+/// Token counts are compacted only where they ARE token counts. A tool row
+/// carries URLs, queries and error codes, and a number in one of those
+/// ("1200 in stock") is not a token count.
+fn format_for_log(kind: LogKind, text: &str) -> String {
+    match kind {
+        LogKind::Tool => text.to_owned(),
+        _ => format_recent_request_token_counts(text),
+    }
+}
+
+fn normalize_recent_request_text(kind: LogKind, text: &str, widths: &[usize]) -> String {
+    let text = format_for_log(kind, text);
     let cols = recent_request_columns(&text);
     if cols.len() <= 1 {
         return text;
@@ -1188,6 +1216,49 @@ fn log_kind_index(kind: LogKind) -> usize {
         LogKind::Warning => 2,
         LogKind::Error => 3,
         LogKind::Info => 4,
+        LogKind::Tool => 5,
+    }
+}
+
+/// Style one log line for the log pane.
+///
+/// The request and response lines colour their numbers by what the number
+/// counts (in, out, cache). A tool row has its own shape — the tool name
+/// leads, the outcome says whether the call worked, the elapsed time is the
+/// quiet part — so it gets its own styler.
+fn style_log_line(kind: LogKind, text: &str) -> Line<'static> {
+    match kind {
+        LogKind::Tool => style_tool_line(text),
+        _ => style_token_usage_line(text),
+    }
+}
+
+/// Style a tool row: `tool | subject | outcome | elapsed | detail`.
+fn style_tool_line(text: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (idx, col) in text.split("  |  ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  |  "));
+        }
+        let style = match idx {
+            0 => Style::default().add_modifier(Modifier::BOLD),
+            2 => tool_outcome_style(col.trim()),
+            3 => Style::default().fg(TOOL_DIM_COLOR),
+            _ => Style::default(),
+        };
+        spans.push(Span::styled(col.to_owned(), style));
+    }
+    Line::from(spans)
+}
+
+/// The colour of a tool row's outcome: green for a call that worked, red for
+/// one that failed, yellow for one that was refused or only partly worked.
+fn tool_outcome_style(outcome: &str) -> Style {
+    match outcome {
+        OUTCOME_OK => Style::default().fg(TOOL_OK_COLOR),
+        OUTCOME_ERROR => Style::default().fg(TOOL_ERROR_COLOR),
+        OUTCOME_REFUSED | OUTCOME_PARTIAL => Style::default().fg(TOOL_WARN_COLOR),
+        _ => Style::default(),
     }
 }
 
@@ -1244,11 +1315,6 @@ fn style_token_usage_line(text: &str) -> Line<'static> {
     spans.push(Span::raw(text[cursor..].to_owned()));
     Line::from(spans)
 }
-
-/// Placeholder for a cell with nothing to show yet. An em dash reads as
-/// "no data" where a zero would read as "zero tokens", which is a
-/// different (and misleading) claim for a model that has not been used.
-const DASH: &str = "\u{2014}";
 
 /// Render one row of the merged routing + token table.
 ///
@@ -1359,36 +1425,8 @@ fn combined_totals(sections: &SessionStatsSnapshot) -> TokenTotals {
     combined
 }
 
-/// Format a token count compactly for the dashboard.
-///
-/// Counts below one thousand remain integer counts so small values do not
-/// gain needless decimal places. Larger counts use decimal (base-1000) units
-/// and are rounded to two decimal places. If rounding would produce
-/// `1000.00` of one unit, the count is promoted to the next unit instead.
-fn format_token_count(count: u64) -> String {
-    const UNITS: [&str; 6] = ["", "k", "m", "b", "t", "q"];
-
-    if count < 1_000 {
-        return count.to_string();
-    }
-
-    let mut unit_index = 0;
-    let mut scaled = count as f64;
-    while scaled >= 1_000.0 && unit_index + 1 < UNITS.len() {
-        scaled /= 1_000.0;
-        unit_index += 1;
-    }
-
-    // Avoid output such as `1000.00k` when rounding carries into the next
-    // unit. This also keeps values near a unit boundary intuitive.
-    while scaled >= 999.995 && unit_index + 1 < UNITS.len() {
-        scaled /= 1_000.0;
-        unit_index += 1;
-    }
-
-    format!("{scaled:.2}{}", UNITS[unit_index])
-}
-
+/// Cut a string to `max_chars` characters, with an ellipsis for what was
+/// cut off.
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_owned()

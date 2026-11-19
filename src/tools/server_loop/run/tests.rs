@@ -138,6 +138,7 @@ impl ServerTool for Named {
             crate::tools::server_loop::handler::Served {
                 blocks: Vec::new(),
                 output: String::new(),
+                summary: None,
             }
         })
     }

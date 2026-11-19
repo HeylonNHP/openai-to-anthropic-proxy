@@ -13,6 +13,7 @@ in one turn.
 
 - [How a turn runs](#how-a-turn-runs)
 - [What the client receives](#what-the-client-receives)
+- [What the operator sees](#what-the-operator-sees)
 - [The round limit](#the-round-limit)
 - [Streaming](#streaming)
 - [Failure handling](#failure-handling)
@@ -60,6 +61,27 @@ intermediate text, each tool's `server_tool_use` / result pair, any client
 * `usage` is the LAST executor response's, plus what each tool adds:
   `server_tool_use.web_search_requests` / `web_fetch_requests` (a zero count is
   left out) and, for the advisor, `iterations[]`.
+
+## What the operator sees
+
+Every served call becomes one row in the TUI's RECENT REQUESTS pane. The
+client never sees the call itself — it sees a `server_tool_use` block — so
+this is the only place it shows up:
+
+```text
+↳  web_fetch  |  https://example.com/docs  |  ok  |  1.24s  |  18.43k chars
+```
+
+| column | what it holds |
+|---|---|
+| tool | the client-facing tool name (`web_fetch`, `web_search`, `advisor`) |
+| subject | what the call acted on: a URL, a query, a model |
+| outcome | `ok`, `error`, `refused` or `partial` |
+| elapsed | how long the call took |
+| detail | the error code, or the size of what came back |
+
+A tool that has nothing to say about a call returns no summary, and no row
+is written.
 
 ## The round limit
 
@@ -137,6 +159,10 @@ A tool is a struct implementing [`handler::ServerTool`](handler.rs):
 | `contribute_usage` | *(optional)* add to the response's `usage` |
 | `scrub_error` | *(optional)* clean a first-run error before the client sees it |
 
+What `serve` returns also carries a one-line `summary` of the call (see
+[What the operator sees](#what-the-operator-sees)). A new tool says what it
+did in it; the loop writes the row and times the call.
+
 To **add** one: write the module (a `prepare` that adds its function tool, an
 `active` predicate, and the `ServerTool`), call its `prepare` in
 `proxy::build_outbound`, and add an `if its::active(..)` line in
@@ -162,4 +188,5 @@ To **remove** one: delete its module and those two lines.
 | `run.rs` | the loop, the round limit, the streaming sink |
 | `render.rs` | assembling the final message (`assemble`) and the streaming tail |
 | `stream.rs` | the streaming response: task, channel, pings, SSE events |
+| `summary.rs` | what the operator sees of one served call |
 | `*/tests.rs` | unit tests, one file per module (enforced by `tests/project_layout.rs`) |

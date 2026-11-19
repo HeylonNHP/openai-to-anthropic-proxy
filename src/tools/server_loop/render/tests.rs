@@ -17,6 +17,7 @@ impl ServerTool for Tool {
             Served {
                 blocks: Vec::new(),
                 output: String::new(),
+                summary: None,
             }
         })
     }

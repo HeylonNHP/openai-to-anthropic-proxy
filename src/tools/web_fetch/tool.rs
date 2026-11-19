@@ -31,7 +31,9 @@ use crate::config::WebFetchConfig;
 use crate::proxy::Attempt;
 use crate::tools::domains::DomainRules;
 use crate::tools::server_loop::handler::{Call, Served, ServerTool};
+use crate::tools::server_loop::summary::CallSummary;
 use crate::tools::web_fetch::{WEB_FETCH_TOOL_NAME, fetch, protocol};
+use crate::tui::format::{OUTCOME_ERROR, OUTCOME_OK, OUTCOME_REFUSED, format_token_count};
 use crate::tui::{LogKind, LogLine};
 
 /// A turn that fetches this many URLs is a runaway loop.
@@ -122,6 +124,14 @@ impl WebFetchTool {
                         )),
                     ],
                     output: INVALID_INPUT.to_owned(),
+                    summary: Some(
+                        CallSummary::new(
+                            WEB_FETCH_TOOL_NAME,
+                            asked_url(&call.arguments),
+                            OUTCOME_ERROR,
+                        )
+                        .with_detail(protocol::ERROR_CODE_INVALID_TOOL_INPUT),
+                    ),
                 },
                 failure: None,
                 runaway: false,
@@ -141,6 +151,10 @@ impl WebFetchTool {
                         )),
                     ],
                     output: LIMIT_REACHED.to_owned(),
+                    summary: Some(
+                        CallSummary::new(WEB_FETCH_TOOL_NAME, url.as_str(), OUTCOME_REFUSED)
+                            .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
+                    ),
                 },
                 failure: None,
                 runaway: false,
@@ -151,7 +165,7 @@ impl WebFetchTool {
         let runaway = self.fetches == RUNAWAY_FETCH_THRESHOLD;
         let use_block = ResponseContentBlock::Raw(protocol::server_tool_use(&id, &url));
 
-        let (result_block, output, failure) =
+        let (result_block, output, failure, summary) =
             match fetch::fetch_within(&url, &self.cfg, &self.rules).await {
                 Ok(page) => {
                     let block = protocol::web_fetch_result(
@@ -160,19 +174,31 @@ impl WebFetchTool {
                         page.title.as_deref(),
                         &page.text,
                     );
-                    (block, page.text, None)
+                    let summary = CallSummary::new(WEB_FETCH_TOOL_NAME, url.as_str(), OUTCOME_OK)
+                        .with_detail(format!(
+                            "{} chars",
+                            format_token_count(page.text.chars().count() as u64)
+                        ));
+                    (block, page.text, None, summary)
                 }
-                Err(err) => (
-                    protocol::error_result(&id, err.code),
-                    FETCH_FAILED.to_owned(),
-                    Some((err.code, err.detail)),
-                ),
+                Err(err) => {
+                    let summary =
+                        CallSummary::new(WEB_FETCH_TOOL_NAME, url.as_str(), OUTCOME_ERROR)
+                            .with_detail(err.code);
+                    (
+                        protocol::error_result(&id, err.code),
+                        FETCH_FAILED.to_owned(),
+                        Some((err.code, err.detail)),
+                        summary,
+                    )
+                }
             };
 
         Answer {
             served: Served {
                 blocks: vec![use_block, ResponseContentBlock::Raw(result_block)],
                 output,
+                summary: Some(summary),
             },
             failure,
             runaway,
@@ -245,6 +271,12 @@ pub(crate) fn parse_url_argument(arguments: &str) -> Option<String> {
         return None;
     }
     Some(url)
+}
+
+/// The URL the model asked for, even when it is not usable: the log row
+/// needs something to name the call by.
+fn asked_url(arguments: &str) -> String {
+    parse_url_argument(arguments).unwrap_or_else(|| arguments.to_owned())
 }
 
 #[cfg(test)]
