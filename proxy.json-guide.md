@@ -434,6 +434,10 @@ The advisor is sent the executor's whole conversation, which grows without bound
 
 The executor's own instructions are capped at a quarter of the budget (300,000 characters) so they cannot crowd out the conversation. Each cut states how many bytes it removed, and a trimmed prompt is logged at `info` with its size before and after. If you point `advisor.model` at a model whose context window is much smaller than about 400,000 tokens, this budget is too large for it and its calls will still be rejected as "prompt is too long"; the constant is `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`.
 
+#### How the advisor is prompted
+
+The advisor reads another assistant's instructions and conversation, and a model shown those can mistake them for its own and carry on as that assistant. A reasoning advisor did exactly that in practice: it answered with a call to `advisor` and no text, so the consultation failed. The request is therefore framed as a review. The advisor's system prompt says it is **not** the assistant, has **no tools** (and must not call `advisor`), and must reply with plain-text advice only. The assistant's instructions are labelled as not written for the reviewer, the executor's own `# Advisor Tool` section ("call advisor before substantive work") is removed from them, and the request ends by repeating that the reviewer should write advice and call no tool. If an advisor model still replies with a tool call, the log now says "advisor called a tool instead of writing advice".
+
 #### An invalid value is a warning, not a startup failure
 
 A limit must be a **whole number that is not negative**. Anything else is invalid, and an invalid value never stops the proxy: it **starts anyway**, falls back to that limit's shipped default, and prints a warning. (The judgement is on the VALUE: `2` and `2.0` are the same valid limit; `-1` and `2.5` are not.)

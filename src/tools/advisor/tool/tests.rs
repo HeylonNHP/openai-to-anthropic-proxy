@@ -548,3 +548,66 @@ fn a_long_answer_is_held_to_the_answer_budget() {
     };
     assert_eq!(cap_answer("word ".repeat(100), &unlimited).len(), 500);
 }
+
+#[test]
+fn the_reviewer_is_told_it_is_not_the_assistant_and_has_no_tools() {
+    let v = serde_json::to_value(advisor_request(&cfg(), "t")).unwrap();
+    let sys = v["instructions"].as_str().unwrap();
+    assert!(sys.contains("NOT that assistant"), "{sys}");
+    assert!(sys.contains("never call a function or tool"), "{sys}");
+    assert!(
+        sys.contains("`advisor`"),
+        "it names the tool it must not call: {sys}"
+    );
+    assert!(sys.contains("plain text only"), "{sys}");
+    assert!(v.get("tools").is_none(), "and it really is sent none");
+}
+
+#[test]
+fn the_executors_instructions_are_labelled_as_not_the_reviewers() {
+    let out = build_transcript("BE A CODER", json!([user_message("task")]), 100_000);
+    let label = out.find("not for you").expect("the label");
+    let body = out.find("BE A CODER").expect("the instructions");
+    assert!(label < body, "the label comes first: {out}");
+    assert!(out.contains("<assistant_instructions>"), "{out}");
+    assert!(
+        !out.contains("<system>"),
+        "no look-alike system block: {out}"
+    );
+}
+
+#[test]
+fn the_request_ends_by_telling_the_reviewer_to_write_advice_not_call_a_tool() {
+    let out = build_transcript("sys", json!([user_message("task")]), 100_000);
+    let transcript_end = out.find("</transcript>").unwrap();
+    let tail = &out[transcript_end..];
+    assert!(tail.contains("do not call any tool"), "{tail}");
+    assert!(tail.contains("advice"), "{tail}");
+}
+
+#[test]
+fn the_advisor_tool_section_is_hidden_from_the_reviewer() {
+    let executor = "You are a coder.\n\n# Advisor Tool\n\nCall advisor BEFORE substantive work.\n\n\
+                    <system-reminder>keep me</system-reminder>";
+    let seen = reviewer_view_of(Some(executor));
+    assert!(!seen.contains("Call advisor BEFORE"), "{seen}");
+    assert!(!seen.contains("# Advisor Tool"), "{seen}");
+    assert!(
+        seen.contains("You are a coder.") && seen.contains("keep me"),
+        "{seen}"
+    );
+    assert_eq!(reviewer_view_of(None), "");
+}
+
+#[test]
+fn a_tool_call_instead_of_advice_is_named_in_the_error() {
+    let resp: ResponsesResponse = serde_json::from_value(json!({
+        "id": "resp_a", "object": "response", "created_at": 1,
+        "status": "completed", "model": "beam",
+        "output": [{"type": "function_call", "call_id": "c1", "name": "advisor",
+                    "arguments": "{}", "status": "completed"}]
+    }))
+    .unwrap();
+    let err = advice_from_response(&resp).unwrap_err();
+    assert!(err.contains("called a tool"), "{err}");
+}
