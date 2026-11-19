@@ -8,6 +8,7 @@ fn cfg() -> AdvisorConfig {
         effort: Some("medium".into()),
         max_uses: Some(2),
         max_tokens: Some(64),
+        reasoning_max_tokens: Some(100),
         timeout_secs: Some(2),
     }
 }
@@ -36,7 +37,7 @@ fn advisor_request_is_tool_free_buffered_and_explicitly_modeled() {
     assert!(v.get("tool_choice").is_none());
     assert!(v.get("temperature").is_none());
     assert!(v.get("top_p").is_none());
-    assert_eq!(v["max_output_tokens"], 64);
+    assert_eq!(v["max_output_tokens"], 164, "answer 64 + reasoning 100");
     assert_eq!(v["reasoning"]["effort"], "medium");
     assert_eq!(v["input"][0]["role"], "user");
     assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
@@ -152,7 +153,7 @@ fn a_zero_limit_means_no_limit_everywhere() {
     );
     c.max_tokens = Some(64);
     let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
-    assert_eq!(v["max_output_tokens"], 64);
+    assert_eq!(v["max_output_tokens"], 164, "answer 64 + reasoning 100");
 }
 
 #[test]
@@ -167,7 +168,7 @@ fn advisor_request_omits_max_output_tokens_when_unlimited() {
     // The bounded case still sends the cap.
     c.max_tokens = Some(64);
     let v = serde_json::to_value(advisor_request(&c, "transcript")).unwrap();
-    assert_eq!(v["max_output_tokens"], 64);
+    assert_eq!(v["max_output_tokens"], 164, "answer 64 + reasoning 100");
 }
 
 #[test]
@@ -458,4 +459,92 @@ fn truncation_never_splits_a_multibyte_character() {
         out.starts_with('é') && out.contains("bytes omitted"),
         "{out}"
     );
+}
+
+fn incomplete_response(reason: &str, text: Option<&str>) -> ResponsesResponse {
+    let mut v = json!({
+        "id": "resp_a", "object": "response", "created_at": 1,
+        "status": "incomplete", "incomplete_details": {"reason": reason},
+        "model": "beam", "output": [],
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    });
+    if let Some(text) = text {
+        v["output"] = json!([{
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]
+        }]);
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn the_request_limit_is_the_answer_budget_plus_the_reasoning_budget() {
+    let c = AdvisorConfig {
+        max_tokens: Some(4096),
+        reasoning_max_tokens: Some(16384),
+        ..cfg()
+    };
+    assert_eq!(output_token_limit(&c), Some(20480));
+    let v = serde_json::to_value(advisor_request(&c, "t")).unwrap();
+    assert_eq!(v["max_output_tokens"], 20480);
+}
+
+#[test]
+fn either_budget_at_no_limit_omits_the_request_limit() {
+    for (answer, reasoning) in [
+        (None, Some(100)),
+        (Some(100), None),
+        (Some(0), Some(100)),
+        (Some(100), Some(0)),
+    ] {
+        let c = AdvisorConfig {
+            max_tokens: answer,
+            reasoning_max_tokens: reasoning,
+            ..cfg()
+        };
+        assert_eq!(output_token_limit(&c), None, "{answer:?} + {reasoning:?}");
+    }
+}
+
+#[test]
+fn an_answer_cut_at_the_output_limit_is_kept_and_marked() {
+    let (text, usage) = advice_from_response(&incomplete_response(
+        "max_output_tokens",
+        Some("Use a channel, and"),
+    ))
+    .unwrap();
+    assert!(text.starts_with("Use a channel, and"), "{text}");
+    assert!(text.contains("cut off at the output limit"), "{text}");
+    assert!(usage.is_some(), "the spend is still billed");
+}
+
+#[test]
+fn reasoning_that_used_the_whole_budget_is_reported_as_such() {
+    let err = advice_from_response(&incomplete_response("max_output_tokens", None)).unwrap_err();
+    assert!(err.contains("reasoning used the whole budget"), "{err}");
+}
+
+#[test]
+fn an_incomplete_response_stopped_for_another_reason_is_still_a_failure() {
+    let err =
+        advice_from_response(&incomplete_response("content_filter", Some("partial"))).unwrap_err();
+    assert!(err.contains("status is incomplete"), "{err}");
+}
+
+#[test]
+fn a_long_answer_is_held_to_the_answer_budget() {
+    let c = AdvisorConfig {
+        max_tokens: Some(10),
+        ..cfg()
+    };
+    let out = cap_answer("word ".repeat(100), &c);
+    assert!(out.chars().count() <= 10 * CHARS_PER_TOKEN + 4, "{out}");
+    assert!(out.ends_with("[…]"), "{out}");
+    // Within budget: untouched. No limit: untouched.
+    assert_eq!(cap_answer("short".into(), &c), "short");
+    let unlimited = AdvisorConfig {
+        max_tokens: None,
+        ..cfg()
+    };
+    assert_eq!(cap_answer("word ".repeat(100), &unlimited).len(), 500);
 }

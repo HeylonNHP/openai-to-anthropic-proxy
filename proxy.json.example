@@ -56,7 +56,8 @@
     "model": "beam",
     "effort": "medium",
     "max_uses": 2,
-    "max_tokens": 2048,
+    "max_tokens": 4096,
+    "reasoning_max_tokens": 16384,
     "timeout_secs": 45
   },
 

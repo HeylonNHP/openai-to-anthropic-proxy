@@ -3225,6 +3225,7 @@ fn advisor_config(addr: SocketAddr) -> Arc<Config> {
         effort: None,
         max_uses: Some(2),
         max_tokens: Some(64),
+        reasoning_max_tokens: Some(100),
         timeout_secs: Some(2),
     };
     Arc::new(config)
@@ -3497,7 +3498,8 @@ async fn advisor_happy_path() {
     assert_eq!(bodies[1]["model"], "beam");
     assert_eq!(bodies[1]["stream"], false);
     assert!(bodies[1]["tools"].is_null());
-    assert_eq!(bodies[1]["max_output_tokens"], 64);
+    // answer budget 64 + reasoning budget 100
+    assert_eq!(bodies[1]["max_output_tokens"], 164);
     assert!(
         bodies[1]["input"][0]["content"][0]["text"]
             .as_str()
@@ -4421,7 +4423,10 @@ async fn advisor_unlimited_max_tokens_omits_the_cap() {
         .iter()
         .map(|b| serde_json::from_slice(b).unwrap())
         .collect();
-    assert_eq!(bodies[1]["max_output_tokens"], 64, "the bounded case");
+    assert_eq!(
+        bodies[1]["max_output_tokens"], 164,
+        "the bounded case: answer 64 + reasoning 100"
+    );
 }
 
 /// `timeout_secs = 0` means "no limit": no per-request timeout override is
@@ -7343,6 +7348,7 @@ fn all_server_tools_config(upstream: SocketAddr, engine: SocketAddr) -> Arc<Conf
         effort: None,
         max_uses: Some(2),
         max_tokens: Some(64),
+        reasoning_max_tokens: Some(100),
         timeout_secs: Some(2),
     };
     Arc::new(config)

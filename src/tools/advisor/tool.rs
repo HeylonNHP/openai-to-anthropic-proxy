@@ -115,6 +115,44 @@ fn advisor_cap(cfg: &AdvisorConfig) -> usize {
     effective_limit(cfg.max_uses).map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX))
 }
 
+/// The `max_output_tokens` to send: the answer budget plus the reasoning
+/// budget.
+///
+/// Upstream counts reasoning and answer against ONE limit and offers no way
+/// to exclude reasoning, so a reasoning advisor given only an answer-sized
+/// limit can spend all of it thinking and return nothing. The proxy therefore
+/// sends `max_tokens + reasoning_max_tokens`; the answer itself is held to
+/// `max_tokens` afterwards ([`cap_answer`]).
+///
+/// Either budget at "no limit" (`None` or `Some(0)`) means the SUM has no
+/// limit: the field is OMITTED so the upstream's own default applies.
+fn output_token_limit(cfg: &AdvisorConfig) -> Option<u32> {
+    let answer = effective_limit(cfg.max_tokens)?;
+    let reasoning = effective_limit(cfg.reasoning_max_tokens)?;
+    Some(answer.saturating_add(reasoning))
+}
+
+/// Characters per token assumed when holding the answer to `max_tokens`.
+/// Deliberately generous (English averages about 4), so a cut only ever
+/// removes an answer that was well over budget.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Hold the advisor's answer to `max_tokens`, which the upstream cannot do
+/// for us because it counts reasoning in the same limit. The cut is an
+/// estimate ([`CHARS_PER_TOKEN`]) made on a character boundary.
+fn cap_answer(text: String, cfg: &AdvisorConfig) -> String {
+    let Some(limit) = effective_limit(cfg.max_tokens) else {
+        return text;
+    };
+    let max_chars = usize::try_from(limit)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(CHARS_PER_TOKEN);
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{} […]", text[..end].trim_end()),
+        None => text,
+    }
+}
+
 /// Build the separate, tool-free advisor request. `model` is the explicit
 /// UPSTREAM name from `proxy.json` — alias resolution is intentionally
 /// bypassed (§11.4).
@@ -143,10 +181,7 @@ fn advisor_request(cfg: &AdvisorConfig, transcript: &str) -> ResponsesRequest {
         text: None,
         temperature: None,
         top_p: None,
-        // `max_tokens: None` (and `Some(0)`, which means the same thing) =
-        // "no limit": OMIT the field so the UPSTREAM's own default applies
-        // (it may well be smaller than 2048).
-        max_output_tokens: effective_limit(cfg.max_tokens),
+        max_output_tokens: output_token_limit(cfg),
         parallel_tool_calls: None,
         store: None,
         previous_response_id: None,
@@ -340,13 +375,36 @@ fn extract_advice(resp: &ResponsesResponse) -> Option<String> {
 /// Pure status + text guard for one advisor response. A 200 whose body says
 /// `status:"failed"` / `"incomplete"` is NOT a successful review: it must
 /// not be injected into the executor's prompt or billed as advice.
+///
+/// The one exception is a response that stopped at the output limit
+/// (`incomplete` / `max_output_tokens`) but already holds advice text. That
+/// text is real advice that was cut short, so it is kept, marked as cut, and
+/// the executor is better served by it than by nothing. An `incomplete`
+/// response with no text, or one stopped for any other reason (a content
+/// filter), is still a failure.
 fn advice_from_response(
     resp: &ResponsesResponse,
 ) -> Result<(String, Option<ResponsesUsage>), String> {
-    if resp.status != "completed" {
+    let hit_output_limit = resp.status == "incomplete"
+        && resp
+            .incomplete_details
+            .as_ref()
+            .is_some_and(|d| d.reason == "max_output_tokens");
+    if resp.status != "completed" && !hit_output_limit {
         return Err(format!("advisor response status is {}", resp.status));
     }
-    let text = extract_advice(resp).ok_or_else(|| "advisor returned no text".to_owned())?;
+    let text = match extract_advice(resp) {
+        Some(text) if hit_output_limit => format!("{text} [advice cut off at the output limit]"),
+        Some(text) => text,
+        None if hit_output_limit => {
+            return Err(
+                "advisor hit its output limit before writing any advice (its \
+                        reasoning used the whole budget)"
+                    .to_owned(),
+            );
+        }
+        None => return Err("advisor returned no text".to_owned()),
+    };
     Ok((text, resp.usage.clone()))
 }
 
@@ -378,7 +436,8 @@ async fn consult(
     }
 
     let parsed = parse_upstream_body(resp).await.map_err(|e| e.to_string())?;
-    advice_from_response(&parsed)
+    let (text, usage) = advice_from_response(&parsed)?;
+    Ok((cap_answer(text, cfg), usage))
 }
 
 /// The gate behind `warn_once`: exactly ONE warning per turn, covering

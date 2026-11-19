@@ -54,7 +54,13 @@ const DEFAULT_REASONING_EFFORT: &str = "none";
 /// to a kimi model.
 const DEFAULT_ADVISOR_MODEL: &str = "beam";
 const DEFAULT_ADVISOR_MAX_USES: u32 = 2;
-const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 2048;
+/// Cap on the advisor's ANSWER (not its reasoning; see
+/// [`DEFAULT_ADVISOR_REASONING_MAX_TOKENS`]).
+const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 4096;
+/// Extra output tokens the advisor may spend REASONING before it answers.
+/// Upstream `max_output_tokens` counts reasoning and answer together, so the
+/// proxy sends `max_tokens + reasoning_max_tokens`.
+const DEFAULT_ADVISOR_REASONING_MAX_TOKENS: u32 = 16384;
 const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
 
 /// Default total timeout for one `web_fetch` request, in seconds.
@@ -275,12 +281,13 @@ pub struct Config {
 ///
 /// ## The three limits, and what `0` means
 ///
-/// `max_uses`, `max_tokens` and `timeout_secs` are all [`Option`]: `None`
+/// `max_uses`, `max_tokens`, `reasoning_max_tokens` and `timeout_secs` are
+/// all [`Option`]: `None`
 /// means **no limit**, `Some(n)` means a bound of `n`. The rule is the same
 /// in `proxy.json` and in the env vars:
 ///
-/// * **key ABSENT** → the shipped default (`max_uses` 2, `max_tokens` 2048,
-///   `timeout_secs` 45) — an absent key is *not* "no limit";
+/// * **key ABSENT** → the shipped default (`max_uses` 2, `max_tokens` 4096,
+///   `reasoning_max_tokens` 16384, `timeout_secs` 45) — an absent key is *not* "no limit";
 /// * **`0`** → **no limit** — the house precedent of
 ///   `reasoning_replay.max_chars`, where `0` means unlimited;
 /// * **`n > 0`** → that bound;
@@ -298,11 +305,12 @@ pub struct Config {
 ///   will spin. The proxy does NOT impose a ceiling of its own: it warns
 ///   once at startup (config-resolve time) and again at runtime when one
 ///   turn passes 10 consultations.
-/// * `max_tokens: None` — the proxy OMITS `max_output_tokens` from the
-///   advisor's own upstream request, so the **upstream's own default**
-///   applies. That default may be SMALLER than 2048 — and for reasoning
-///   models the cap must also cover the reasoning tokens — so "no limit"
-///   here means "the proxy imposes no cap", NOT "the answer may be long".
+/// * `max_tokens: None` or `reasoning_max_tokens: None` — the proxy OMITS
+///   `max_output_tokens` from the advisor's own upstream request (the
+///   request limit is their SUM, so one unbounded part leaves it unbounded),
+///   and the **upstream's own default** applies. That default may be SMALLER
+///   than the shipped one, so "no limit" here means "the proxy imposes no
+///   cap", NOT "the answer may be long".
 /// * `timeout_secs: None` — no per-request timeout override. The global
 ///   `request_timeout` still applies (the reqwest client is built with
 ///   `.timeout(config.request_timeout)`), and a *bounded* value is always
@@ -323,9 +331,15 @@ pub struct AdvisorConfig {
     pub effort: Option<String>,
     /// Consultations per turn. `None` = no limit (see the module docs).
     pub max_uses: Option<u32>,
-    /// Cap on the advisor's own answer. `None` = no limit: the proxy sends
-    /// no `max_output_tokens` and the upstream's default applies.
+    /// Cap on the advisor's own ANSWER, reasoning excluded. `None` = no
+    /// limit: the proxy sends no `max_output_tokens` and the upstream's
+    /// default applies.
     pub max_tokens: Option<u32>,
+    /// Extra output tokens the advisor may spend on REASONING, on top of
+    /// `max_tokens`. Upstream `max_output_tokens` counts reasoning and answer
+    /// together and cannot be split, so the proxy sends their sum. `None` =
+    /// no limit: the proxy sends no `max_output_tokens` at all.
+    pub reasoning_max_tokens: Option<u32>,
     /// Per-request timeout for the advisor's upstream call. `None` = no
     /// per-request override; the global `request_timeout` applies.
     pub timeout_secs: Option<u64>,
@@ -465,6 +479,7 @@ impl Default for AdvisorConfig {
             effort: None,
             max_uses: Some(DEFAULT_ADVISOR_MAX_USES),
             max_tokens: Some(DEFAULT_ADVISOR_MAX_TOKENS),
+            reasoning_max_tokens: Some(DEFAULT_ADVISOR_REASONING_MAX_TOKENS),
             timeout_secs: Some(DEFAULT_ADVISOR_TIMEOUT_SECS),
         }
     }
@@ -973,6 +988,15 @@ impl Config {
             "advisor.max_tokens",
             &mut warnings,
         );
+        let advisor_reasoning_max_tokens = resolve_advisor_limit(
+            pick_limit(
+                advisor_json.and_then(|a| a.reasoning_max_tokens.as_ref()),
+                env.advisor_reasoning_max_tokens.as_ref(),
+            ),
+            DEFAULT_ADVISOR_REASONING_MAX_TOKENS,
+            "advisor.reasoning_max_tokens",
+            &mut warnings,
+        );
         let advisor_timeout_secs = resolve_advisor_limit(
             pick_limit(
                 advisor_json.and_then(|a| a.timeout_secs.as_ref()),
@@ -989,6 +1013,7 @@ impl Config {
             effort: advisor_effort,
             max_uses: advisor_max_uses,
             max_tokens: advisor_max_tokens,
+            reasoning_max_tokens: advisor_reasoning_max_tokens,
             timeout_secs: advisor_timeout_secs,
         };
 
@@ -1394,6 +1419,7 @@ pub struct EnvInputs {
     pub advisor_effort: Option<String>,
     pub advisor_max_uses: Option<serde_json::Number>,
     pub advisor_max_tokens: Option<serde_json::Number>,
+    pub advisor_reasoning_max_tokens: Option<serde_json::Number>,
     pub advisor_timeout_secs: Option<serde_json::Number>,
     /// `web_fetch` overrides. `WEB_FETCH_ENABLED` uses the same truthy
     /// values as `LOG_TO_DISK`; the three limits are read as RAW numbers
@@ -1450,6 +1476,9 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             advisor_max_tokens: env::var("ADVISOR_MAX_TOKENS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            advisor_reasoning_max_tokens: env::var("ADVISOR_REASONING_MAX_TOKENS")
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             advisor_timeout_secs: env::var("ADVISOR_TIMEOUT_SECS")
@@ -2049,6 +2078,9 @@ pub struct JsonAdvisorConfig {
     /// Raw limit, exactly as written. The RESOLVER judges it — see the
     /// struct docs.
     pub max_tokens: Option<serde_json::Number>,
+    /// Raw limit, exactly as written. The RESOLVER judges it — see the
+    /// struct docs.
+    pub reasoning_max_tokens: Option<serde_json::Number>,
     /// Raw limit, exactly as written. The RESOLVER judges it — see the
     /// struct docs.
     pub timeout_secs: Option<serde_json::Number>,

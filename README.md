@@ -247,14 +247,15 @@ The advisor's three limits in `proxy.json` are removed by **zeroing** them:
   "model": "beam",
   "max_uses": 0,
   "max_tokens": 0,
+  "reasoning_max_tokens": 0,
   "timeout_secs": 0
 }
 ```
 
-A **`0` means "no limit"** for `max_uses`, `max_tokens` and `timeout_secs`
+A **`0` means "no limit"** for `max_uses`, `max_tokens`, `reasoning_max_tokens` and `timeout_secs`
 (in `proxy.json` and in the `ADVISOR_*` env vars alike). **Omitting a key is
 not the same thing** — an absent key keeps the shipped default (`max_uses` 2,
-`max_tokens` 2048, `timeout_secs` 45), so a config that only sets
+`max_tokens` 4096, `reasoning_max_tokens` 16384, `timeout_secs` 45), so a config that only sets
 `"enabled": true` gets the safe, bounded behaviour.
 
 "No limit" means something different per field, so read the caveats in
@@ -266,10 +267,12 @@ it:
   **two** upstream calls (the executor re-run *and* the advisor). The proxy
   imposes no ceiling of its own, but warns once at startup and once per turn
   that passes 10 consultations.
-- **`max_tokens: 0`** means the *proxy* stops capping the advisor's answer:
-  it omits `max_output_tokens` so the **upstream's** own default applies —
-  which may be *smaller* than 2048. If your upstream's default is too small,
-  set an explicit number instead.
+- **`max_tokens`** caps the advisor's *answer* and **`reasoning_max_tokens`**
+  is the extra allowance for its *thinking* (the upstream counts both in one
+  limit, so the proxy sends their sum, 20480 by default). **Either set to
+  `0`** means the *proxy* stops capping: it omits `max_output_tokens` so the
+  **upstream's** own default applies, which may be *smaller* than the shipped
+  one. If your upstream's default is too small, set explicit numbers instead.
 - **`timeout_secs: 0`** applies no per-request timeout override, so the
   global `request_timeout_secs` still bounds the call. A *finite*
   `timeout_secs` is always clamped to that global bound.

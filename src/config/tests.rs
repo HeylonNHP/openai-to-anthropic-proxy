@@ -526,7 +526,8 @@ fn advisor_is_off_by_default_with_cheap_model() {
     assert_eq!(cfg.advisor.model, "beam", "default advisor must be cheap");
     assert_eq!(cfg.advisor.effort, None);
     assert_eq!(cfg.advisor.max_uses, Some(2));
-    assert_eq!(cfg.advisor.max_tokens, Some(2048));
+    assert_eq!(cfg.advisor.max_tokens, Some(4096));
+    assert_eq!(cfg.advisor.reasoning_max_tokens, Some(16384));
     assert_eq!(cfg.advisor.timeout_secs, Some(45));
 }
 
@@ -544,6 +545,7 @@ fn advisor_json_section_parses_and_resolves() {
                 "effort": "medium",
                 "max_uses": 3,
                 "max_tokens": 1024,
+                "reasoning_max_tokens": 8192,
                 "timeout_secs": 20
             }
         }"#;
@@ -558,6 +560,7 @@ fn advisor_json_section_parses_and_resolves() {
             effort: Some("medium".into()),
             max_uses: Some(3),
             max_tokens: Some(1024),
+            reasoning_max_tokens: Some(8192),
             timeout_secs: Some(20),
         }
     );
@@ -572,6 +575,7 @@ fn advisor_env_overrides_file_then_default() {
             effort: Some("low".into()),
             max_uses: limit(5),
             max_tokens: limit(999),
+            reasoning_max_tokens: limit(888),
             timeout_secs: limit(30),
         }),
         ..JsonConfig::default()
@@ -582,6 +586,7 @@ fn advisor_env_overrides_file_then_default() {
         advisor_effort: Some("high".into()),
         advisor_max_uses: limit(1),
         advisor_max_tokens: limit(77),
+        advisor_reasoning_max_tokens: limit(66),
         advisor_timeout_secs: limit(9),
         ..env_with_required()
     };
@@ -594,6 +599,7 @@ fn advisor_env_overrides_file_then_default() {
             effort: Some("high".into()),
             max_uses: Some(1),
             max_tokens: Some(77),
+            reasoning_max_tokens: Some(66),
             timeout_secs: Some(9),
         }
     );
@@ -1082,6 +1088,7 @@ fn a_real_proxy_json_with_and_without_the_advisor_section_loads() {
             effort: Some("medium".into()),
             max_uses: Some(2),
             max_tokens: Some(2048),
+            reasoning_max_tokens: Some(DEFAULT_ADVISOR_REASONING_MAX_TOKENS),
             timeout_secs: Some(45),
         }
     );
@@ -1812,4 +1819,34 @@ fn server_tools_rejects_unknown_fields() {
     assert!(
         serde_json::from_str::<JsonConfig>(r#"{ "server_tools": { "max_round": 3 } }"#).is_err()
     );
+}
+
+#[test]
+fn advisor_reasoning_budget_follows_the_limit_rules() {
+    // Absent = the default; 0 = no limit; n > 0 = that bound; env > file.
+    let absent = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(
+        absent.advisor.reasoning_max_tokens,
+        Some(DEFAULT_ADVISOR_REASONING_MAX_TOKENS)
+    );
+
+    let file = |n: u64| JsonConfig {
+        advisor: Some(JsonAdvisorConfig {
+            enabled: Some(true),
+            reasoning_max_tokens: limit(n),
+            ..JsonAdvisorConfig::default()
+        }),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file(0)), &env_with_required()).unwrap();
+    assert_eq!(cfg.advisor.reasoning_max_tokens, None, "0 = no limit");
+    let cfg = Config::resolve(Some(&file(5000)), &env_with_required()).unwrap();
+    assert_eq!(cfg.advisor.reasoning_max_tokens, Some(5000));
+
+    let env = EnvInputs {
+        advisor_reasoning_max_tokens: limit(7000),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file(5000)), &env).unwrap();
+    assert_eq!(cfg.advisor.reasoning_max_tokens, Some(7000), "env > file");
 }

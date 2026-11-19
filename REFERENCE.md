@@ -38,7 +38,8 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `ADVISOR_MODEL` | `advisor.model` | `beam` | no | Upstream model name the advisor is routed to (not alias-resolved; written as-is into the advisor request). |
 | `ADVISOR_EFFORT` | `advisor.effort` | (none) | no | Reasoning-effort string applied to the advisor request only. Omit to send none. |
 | `ADVISOR_MAX_USES` | `advisor.max_uses` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative / fractional / out-of-range values fall back to the default + warning. |
-| `ADVISOR_MAX_TOKENS` | `advisor.max_tokens` | `2048` | no | Cap on the advisor answer (output tokens). `0` removes the cap (upstream default then applies). |
+| `ADVISOR_MAX_TOKENS` | `advisor.max_tokens` | `4096` | no | Cap on the advisor *answer* (output tokens, reasoning excluded). `0` removes the cap (upstream default then applies). |
+| `ADVISOR_REASONING_MAX_TOKENS` | `advisor.reasoning_max_tokens` | `16384` | no | Extra output tokens the advisor may spend *reasoning*. The request limit is `max_tokens` + this. `0` removes the cap (upstream default then applies). |
 | `ADVISOR_TIMEOUT_SECS` | `advisor.timeout_secs` | `45` | no | Per-advisor-call timeout. `0` uses the global budget only. |
 | `WEB_FETCH_ENABLED` | `web_fetch.enabled` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1` / `true` / `yes` / `on`. |
 | `WEB_FETCH_TIMEOUT_SECS` | `web_fetch.timeout_secs` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
@@ -120,11 +121,13 @@ For multiple custom headers, separate them with newlines (a single line is enoug
   model is consulted mid-turn and its advice is fed back to the executor. The
   feature is **off by default** (`enabled` defaults to `false`), and when it
   is off the request path is byte-for-byte unchanged.
-- **`advisor.max_uses`, `advisor.max_tokens` and `advisor.timeout_secs` are
+- **`advisor.max_uses`, `advisor.max_tokens`, `advisor.reasoning_max_tokens`
+  and `advisor.timeout_secs` are
   removed by setting them to `0`.** A **`0` means "no limit"**; an
-  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 2048,
+  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384,
   `timeout_secs` 45). The same rule applies to the `ADVISOR_MAX_USES`,
-  `ADVISOR_MAX_TOKENS` and `ADVISOR_TIMEOUT_SECS` env vars.
+  `ADVISOR_MAX_TOKENS`, `ADVISOR_REASONING_MAX_TOKENS` and
+  `ADVISOR_TIMEOUT_SECS` env vars.
 - **The advisor prompt is trimmed to a fixed 1,200,000 characters** (roughly
   400,000 tokens; `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`). It
   is a built-in constant with no config key or env var. Over budget, tool
@@ -138,14 +141,15 @@ For multiple custom headers, separate them with newlines (a single line is enoug
     "model": "beam",
     "max_uses": 0,
     "max_tokens": 0,
+    "reasoning_max_tokens": 0,
     "timeout_secs": 0
   }
   ```
 
   "No limit" differs per field: `max_uses: 0` removes the consultation
   loop's only backstop (each iteration costs two upstream calls);
-  `max_tokens: 0` means the *upstream's* default answer cap applies rather
-  than the proxy's; `timeout_secs: 0` means no per-request override, so the
+  `max_tokens: 0` or `reasoning_max_tokens: 0` means the *upstream's* default
+  output cap applies rather than the proxy's; `timeout_secs: 0` means no per-request override, so the
   global `request_timeout_secs` still bounds the call. An invalid limit
   (negative, fractional, too large) is a warning, not a startup failure —
   the proxy starts and falls back to the default. Full detail in
