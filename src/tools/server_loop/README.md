@@ -80,8 +80,8 @@ this is the only place it shows up:
 | elapsed | how long the call took |
 | detail | the error code, or the size of what came back |
 
-A tool that has nothing to say about a call returns no summary, and no row
-is written.
+Every served call has one: a tool that has nothing much to say still says
+what it did, so no call can go unseen.
 
 ## The round limit
 

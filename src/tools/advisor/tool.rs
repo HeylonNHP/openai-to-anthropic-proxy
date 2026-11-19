@@ -350,10 +350,12 @@ impl AdvisorTool {
             return Served {
                 blocks,
                 output: NO_MORE_ADVICE.to_owned(),
-                summary: Some(
-                    CallSummary::new(ADVISOR_TOOL_NAME, self.cfg.model.as_str(), OUTCOME_REFUSED)
-                        .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
-                ),
+                summary: CallSummary::new(
+                    ADVISOR_TOOL_NAME,
+                    self.cfg.model.as_str(),
+                    OUTCOME_REFUSED,
+                )
+                .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
             };
         }
         self.uses += 1;
@@ -418,7 +420,7 @@ impl AdvisorTool {
         Served {
             blocks,
             output: advice,
-            summary: Some(summary),
+            summary,
         }
     }
 }

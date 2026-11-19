@@ -29,8 +29,8 @@ pub(crate) struct Served {
     /// look like content when the call failed.
     pub output: String,
     /// What the operator sees: the call in one line, for the request log.
-    /// `None` when the tool has nothing to say about this call.
-    pub summary: Option<CallSummary>,
+    /// Every served call has one, so no call can go unseen.
+    pub summary: CallSummary,
 }
 
 /// A server tool the proxy serves itself.

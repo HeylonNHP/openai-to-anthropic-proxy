@@ -45,6 +45,9 @@ use crate::tui::{LogKind, LogLine};
 const INVALID_INPUT: &str = "The web search request had no usable queries. Call the tool again \
      with `queries` set to a list of non-empty search strings.";
 
+/// What the log row says when the call carried no query to name it by.
+const NO_QUERIES: &str = "no usable queries";
+
 /// Serves `proxy_web_search` calls through a [`Backend`].
 pub struct WebSearchTool<B> {
     backend: B,
@@ -129,14 +132,8 @@ impl<B: Backend> WebSearchTool<B> {
                 served: Served {
                     blocks: pair_error("", protocol::ERROR_INVALID_INPUT),
                     output: INVALID_INPUT.to_owned(),
-                    summary: Some(
-                        CallSummary::new(
-                            WEB_SEARCH_TOOL_NAME,
-                            call.arguments.clone(),
-                            OUTCOME_ERROR,
-                        )
+                    summary: CallSummary::new(WEB_SEARCH_TOOL_NAME, NO_QUERIES, OUTCOME_ERROR)
                         .with_detail(protocol::ERROR_INVALID_INPUT),
-                    ),
                 },
                 failures: Vec::new(),
             };
@@ -227,9 +224,8 @@ impl<B: Backend> WebSearchTool<B> {
             served: Served {
                 blocks,
                 output,
-                summary: Some(
-                    CallSummary::new(WEB_SEARCH_TOOL_NAME, subject, outcome).with_detail(detail),
-                ),
+                summary: CallSummary::new(WEB_SEARCH_TOOL_NAME, subject, outcome)
+                    .with_detail(detail),
             },
             failures,
         }

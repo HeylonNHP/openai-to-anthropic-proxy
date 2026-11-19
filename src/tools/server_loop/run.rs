@@ -300,12 +300,10 @@ pub(crate) async fn drive(
             let served = tools[*tool_index].serve(attempt, call).await;
             // The call the client never sees: show it in the request log, so
             // a turn that fetched pages is not a turn that did nothing.
-            if let Some(summary) = &served.summary {
-                attempt.state.output.emit(LogLine {
-                    kind: LogKind::Tool,
-                    text: summary.row(started.elapsed()),
-                });
-            }
+            attempt.state.output.emit(LogLine {
+                kind: LogKind::Tool,
+                text: served.summary.row(started.elapsed()),
+            });
             prefix_blocks.extend(served.blocks);
             out.flush(&prefix_blocks);
             inject(&mut attempt.outbound.input, call, &served.output);

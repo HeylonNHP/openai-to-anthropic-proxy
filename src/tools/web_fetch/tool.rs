@@ -54,6 +54,9 @@ const FETCH_FAILED: &str =
 const INVALID_INPUT: &str = "The web_fetch request had no usable `url`. Call the tool again with `url` set to an \
      absolute http:// or https:// address.";
 
+/// What the log row says when the call carried no URL to name it by.
+const NO_URL: &str = "no usable url";
+
 /// Text injected when the client's `max_uses` is used up.
 const LIMIT_REACHED: &str = "The web_fetch limit for this request was reached. Answer with the information you already \
      have, and say if it is incomplete.";
@@ -124,14 +127,8 @@ impl WebFetchTool {
                         )),
                     ],
                     output: INVALID_INPUT.to_owned(),
-                    summary: Some(
-                        CallSummary::new(
-                            WEB_FETCH_TOOL_NAME,
-                            asked_url(&call.arguments),
-                            OUTCOME_ERROR,
-                        )
+                    summary: CallSummary::new(WEB_FETCH_TOOL_NAME, NO_URL, OUTCOME_ERROR)
                         .with_detail(protocol::ERROR_CODE_INVALID_TOOL_INPUT),
-                    ),
                 },
                 failure: None,
                 runaway: false,
@@ -151,10 +148,8 @@ impl WebFetchTool {
                         )),
                     ],
                     output: LIMIT_REACHED.to_owned(),
-                    summary: Some(
-                        CallSummary::new(WEB_FETCH_TOOL_NAME, url.as_str(), OUTCOME_REFUSED)
-                            .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
-                    ),
+                    summary: CallSummary::new(WEB_FETCH_TOOL_NAME, url.as_str(), OUTCOME_REFUSED)
+                        .with_detail(protocol::ERROR_CODE_MAX_USES_EXCEEDED),
                 },
                 failure: None,
                 runaway: false,
@@ -198,7 +193,7 @@ impl WebFetchTool {
             served: Served {
                 blocks: vec![use_block, ResponseContentBlock::Raw(result_block)],
                 output,
-                summary: Some(summary),
+                summary,
             },
             failure,
             runaway,
@@ -271,12 +266,6 @@ pub(crate) fn parse_url_argument(arguments: &str) -> Option<String> {
         return None;
     }
     Some(url)
-}
-
-/// The URL the model asked for, even when it is not usable: the log row
-/// needs something to name the call by.
-fn asked_url(arguments: &str) -> String {
-    parse_url_argument(arguments).unwrap_or_else(|| arguments.to_owned())
 }
 
 #[cfg(test)]

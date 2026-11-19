@@ -6989,6 +6989,47 @@ async fn web_search_streaming_client_gets_a_synthetic_sse_sequence() {
     assert!(!text.contains("proxy_web_search"));
 }
 
+/// A served server-tool call shows up in the request log: the client only
+/// ever sees a `server_tool_use` block, so the log is the one place the
+/// call itself can be seen.
+#[tokio::test]
+async fn a_served_tool_call_is_logged() {
+    use openai_to_anthropic_proxy::SessionStatsStore;
+    use openai_to_anthropic_proxy::tui::LogKind;
+
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["rust"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "the answer")),
+        },
+    ]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let (output, log_rx) = openai_to_anthropic_proxy::OutputSink::tui();
+    let proxy_addr = start_proxy_with_captured_stores(
+        web_search_config(upstream_addr, engine),
+        Arc::new(SessionStatsStore::new()),
+        output,
+    )
+    .await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let lines: Vec<_> = std::iter::from_fn(|| log_rx.try_recv().ok()).collect();
+    let tool_rows: Vec<_> = lines.iter().filter(|l| l.kind == LogKind::Tool).collect();
+    assert_eq!(tool_rows.len(), 1, "one row per served tool call");
+    let row = &tool_rows[0].text;
+    assert!(row.contains("web_search"), "{row}");
+    assert!(row.contains("\"rust\""), "{row}");
+    assert!(row.contains("|  ok  |"), "{row}");
+    assert!(row.contains("results"), "{row}");
+}
+
 // ─── Shared server-tool loop: Anthropic-faithful behaviour ─────────────────
 //
 // These tests describe how the proxy must behave when several server-side

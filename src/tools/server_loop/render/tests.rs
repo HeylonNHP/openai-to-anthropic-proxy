@@ -1,6 +1,8 @@
 use super::*;
 use crate::anthropic::{ServerToolUseUsage, Usage};
 use crate::tools::server_loop::handler::{Call, Served};
+use crate::tools::server_loop::summary::CallSummary;
+use crate::tui::format::OUTCOME_OK;
 use futures_util::future::BoxFuture;
 use serde_json::json;
 
@@ -17,7 +19,7 @@ impl ServerTool for Tool {
             Served {
                 blocks: Vec::new(),
                 output: String::new(),
-                summary: None,
+                summary: CallSummary::new(self.0, "subject", OUTCOME_OK),
             }
         })
     }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::format::OUTCOME_OK;
 
 /// A tool that relies on every default.
 struct Bare;
@@ -13,7 +14,7 @@ impl ServerTool for Bare {
             Served {
                 blocks: Vec::new(),
                 output: String::new(),
-                summary: None,
+                summary: CallSummary::new("bare", "subject", OUTCOME_OK),
             }
         })
     }
