@@ -171,12 +171,145 @@ fn transcript(attempt: &Attempt) -> String {
     let instructions = attempt.outbound.instructions.as_deref().unwrap_or("");
     let mut input = serde_json::to_value(&attempt.outbound.input).unwrap_or(Value::Null);
     strip_encrypted_content(&mut input);
-    let input = serde_json::to_string_pretty(&input).unwrap_or_else(|_| "[]".to_owned());
-    format!(
-        "<system>\n{instructions}\n</system>\n\n\
-         <transcript>\n{input}\n</transcript>\n\n\
-         Advise the assistant on how to proceed."
-    )
+    build_transcript(instructions, input, MAX_TRANSCRIPT_CHARS)
+}
+
+/// The most characters the advisor prompt may hold. The advisor is a
+/// separate model with its own, often smaller, context window, and the
+/// executor's transcript grows without bound over a long session: an
+/// untrimmed 1.4M-token prompt was rejected by a 1,048,576-token model with a
+/// 400, and every later consultation in that session failed the same way.
+/// JSON-heavy text runs at roughly 3 characters per token, so this budget is
+/// roughly 400k tokens — well inside a 1M window, with room for the advisor's
+/// reasoning and answer.
+const MAX_TRANSCRIPT_CHARS: usize = 1_200_000;
+
+/// Successive per-string caps applied to tool RESULTS (the bulk of any long
+/// transcript) while the prompt is over budget, gentlest first.
+const RESULT_CAPS: [usize; 3] = [16_000, 4_000, 1_000];
+
+/// Cap applied to every string anywhere in the transcript if tool results
+/// alone were not enough (e.g. a huge pasted user message).
+const ANY_STRING_CAP: usize = 20_000;
+
+/// Assemble the advisor prompt, trimmed to `budget` characters.
+///
+/// What is kept, in order of how much it is worth:
+/// 1. the first item (the user's original task) and the most recent items;
+/// 2. the executor's instructions (capped at a quarter of the budget);
+/// 3. the middle of the conversation, oldest items going first.
+///
+/// Trimming proceeds in stages and stops at the first that fits: inline
+/// `data:` blobs (images) are always replaced by a placeholder; then tool
+/// results are shortened (gentlest cap first); then every long string; then
+/// the oldest items are dropped and replaced by one marker item.
+fn build_transcript(instructions: &str, mut input: Value, budget: usize) -> String {
+    omit_inline_data(&mut input);
+    let instructions = truncate_str(instructions, budget / 4);
+    let assemble = |input: &Value| {
+        format!(
+            "<system>\n{instructions}\n</system>\n\n\
+             <transcript>\n{}\n</transcript>\n\n\
+             Advise the assistant on how to proceed.",
+            serde_json::to_string(input).unwrap_or_else(|_| "[]".to_owned())
+        )
+    };
+
+    let mut prompt = assemble(&input);
+    let original = prompt.len();
+    if original <= budget {
+        return prompt;
+    }
+
+    for cap in RESULT_CAPS {
+        if let Value::Array(items) = &mut input {
+            for item in items
+                .iter_mut()
+                .filter(|item| item["type"] == "function_call_output")
+            {
+                cap_strings(item, cap);
+            }
+        }
+        prompt = assemble(&input);
+        if prompt.len() <= budget {
+            return trimmed(prompt, original);
+        }
+    }
+
+    cap_strings(&mut input, ANY_STRING_CAP);
+    prompt = assemble(&input);
+    if prompt.len() <= budget {
+        return trimmed(prompt, original);
+    }
+
+    // Still too big: drop the oldest items after the first until it fits.
+    if let Value::Array(items) = &mut input {
+        let mut size = prompt.len();
+        let mut dropped = 0;
+        while items.len() > 2 && size > budget {
+            size = size.saturating_sub(items.remove(1).to_string().len() + 1);
+            dropped += 1;
+        }
+        if dropped > 0 {
+            items.insert(
+                1,
+                serde_json::json!({
+                    "type": "omitted",
+                    "note": format!(
+                        "{dropped} earlier items were omitted to fit the reviewer's context window"
+                    ),
+                }),
+            );
+            prompt = assemble(&input);
+        }
+    }
+    trimmed(prompt, original)
+}
+
+/// Log that a transcript was shortened.
+fn trimmed(prompt: String, original: usize) -> String {
+    tracing::info!(
+        original_chars = original,
+        trimmed_chars = prompt.len(),
+        "advisor transcript trimmed to fit the advisor's context window"
+    );
+    prompt
+}
+
+/// Replace every inline `data:` URI (an embedded image) with a placeholder:
+/// a text-only reviewer cannot use it, and it can be megabytes.
+fn omit_inline_data(value: &mut Value) {
+    match value {
+        Value::String(s) if s.starts_with("data:") && s.contains(";base64,") => {
+            *s = format!("[inline data omitted: {} bytes]", s.len());
+        }
+        Value::Object(map) => map.values_mut().for_each(omit_inline_data),
+        Value::Array(items) => items.iter_mut().for_each(omit_inline_data),
+        _ => {}
+    }
+}
+
+/// Shorten every string under `value` that is longer than `cap` bytes.
+fn cap_strings(value: &mut Value, cap: usize) {
+    match value {
+        Value::String(s) if s.len() > cap => *s = truncate_str(s, cap),
+        Value::Object(map) => map.values_mut().for_each(|v| cap_strings(v, cap)),
+        Value::Array(items) => items.iter_mut().for_each(|v| cap_strings(v, cap)),
+        _ => {}
+    }
+}
+
+/// `s` cut to at most `cap` bytes on a character boundary, with a note of how
+/// much was removed. Unchanged when it already fits.
+fn truncate_str(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_owned();
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes omitted]", &s[..end], s.len() - end)
 }
 
 /// Remove every `encrypted_content` field from a transcript.

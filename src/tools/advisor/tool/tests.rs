@@ -344,3 +344,118 @@ fn encrypted_reasoning_is_stripped_from_the_advisor_transcript() {
     assert!(!text.contains("BIG-OPAQUE-BLOB"), "{text}");
     assert!(text.contains("rs_1") && text.contains("plan") && text.contains("\"keep\":1"));
 }
+
+fn tool_result(call_id: &str, output: &str) -> Value {
+    json!({"type": "function_call_output", "call_id": call_id, "output": output})
+}
+
+fn user_message(text: &str) -> Value {
+    json!({"type": "message", "role": "user",
+           "content": [{"type": "input_text", "text": text}]})
+}
+
+#[test]
+fn a_transcript_within_budget_is_left_alone() {
+    let input = json!([user_message("task"), tool_result("c1", "short result")]);
+    let out = build_transcript("sys", input, 100_000);
+    assert!(
+        out.contains("task") && out.contains("short result"),
+        "{out}"
+    );
+    assert!(!out.contains("omitted"), "{out}");
+}
+
+#[test]
+fn the_transcript_is_compact_json() {
+    let out = build_transcript("sys", json!([user_message("task")]), 100_000);
+    assert!(!out.contains("\n  "), "no pretty-print indentation: {out}");
+}
+
+#[test]
+fn inline_image_data_is_replaced_by_a_placeholder() {
+    let blob = format!("data:image/png;base64,{}", "A".repeat(50_000));
+    let input = json!([{"type": "message", "role": "user",
+        "content": [{"type": "input_image", "image_url": blob}]}]);
+    let out = build_transcript("sys", input, 100_000);
+    assert!(out.contains("[inline data omitted"), "{out}");
+    assert!(
+        out.len() < 1_000,
+        "the blob is gone, got {} chars",
+        out.len()
+    );
+}
+
+#[test]
+fn an_over_budget_transcript_shortens_tool_results_first() {
+    let huge = "x".repeat(200_000);
+    let input = json!([
+        user_message("the original task"),
+        tool_result("c1", &huge),
+        user_message("the latest question"),
+    ]);
+    let out = build_transcript("sys", input, 60_000);
+    assert!(out.len() <= 60_000, "fits the budget, got {}", out.len());
+    // Every message survives; only the tool result is shortened.
+    assert!(out.contains("the original task"), "{out}");
+    assert!(out.contains("the latest question"), "{out}");
+    assert!(out.contains("bytes omitted"), "{out}");
+    assert!(
+        !out.contains("earlier items were omitted"),
+        "no item was dropped"
+    );
+}
+
+#[test]
+fn the_oldest_items_go_first_and_the_task_and_latest_stay() {
+    let mut items = vec![user_message("the original task")];
+    for i in 0..200 {
+        items.push(tool_result(
+            &format!("c{i}"),
+            &format!("result number {i} {}", "y".repeat(900)),
+        ));
+    }
+    items.push(user_message("the latest question"));
+    let out = build_transcript("sys", Value::Array(items), 40_000);
+    assert!(
+        out.len() <= 40_000 + 200,
+        "fits the budget, got {}",
+        out.len()
+    );
+    assert!(out.contains("the original task"), "the task is kept");
+    assert!(
+        out.contains("the latest question"),
+        "the latest item is kept"
+    );
+    assert!(out.contains("result number 199"), "recent results are kept");
+    assert!(
+        !out.contains("result number 0 "),
+        "the oldest results are dropped"
+    );
+    assert!(
+        out.contains("earlier items were omitted"),
+        "a marker says so"
+    );
+}
+
+#[test]
+fn a_huge_user_message_is_capped_too() {
+    let input = json!([user_message(&"z".repeat(500_000))]);
+    let out = build_transcript("sys", input, 100_000);
+    assert!(out.len() <= 100_000, "got {}", out.len());
+}
+
+#[test]
+fn oversized_instructions_cannot_crowd_out_the_transcript() {
+    let out = build_transcript(&"i".repeat(300_000), json!([user_message("task")]), 40_000);
+    assert!(out.len() <= 40_000, "got {}", out.len());
+    assert!(out.contains("task"));
+}
+
+#[test]
+fn truncation_never_splits_a_multibyte_character() {
+    let out = truncate_str(&"é".repeat(10), 3);
+    assert!(
+        out.starts_with('é') && out.contains("bytes omitted"),
+        "{out}"
+    );
+}
