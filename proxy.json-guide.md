@@ -440,6 +440,21 @@ A consultation that fails for a reason that could be transient (a network error 
 
 **Only successful consultations count toward `max_uses`.** With the default of 2, one flaky response no longer uses up half the allowance. Failures are bounded separately: after **two** failed consultations in one turn (each already retried) the advisor is treated as down for the rest of that turn. The executor is told it will not be consulted again and given one last run to answer, and any further advisor call is dropped without another upstream request. This limit is built in, not a `proxy.json` key.
 
+#### Why a consultation failed: the error code and the executor's message
+
+Claude Code shows a failed consultation as "Advisor unavailable (`code`)", so the code is the only reason you see there. The proxy now picks the most specific code Claude Code knows, and tells the executor the same reason in words (so it can adapt). The full detail, including the upstream's own message, is in the proxy log.
+
+| the advisor failed because… | code shown in Claude Code | retried once? |
+| --- | --- | --- |
+| the conversation is too long for it (a 4xx naming "too long" or the context length) | `prompt_too_long` | no |
+| it is rate limited (HTTP 429) | `too_many_requests` | yes |
+| it is overloaded or unreachable (HTTP 5xx, connection failure) | `overloaded` | yes |
+| it did not answer in time (timeout, HTTP 504) | `execution_time_exceeded` | yes |
+| it answered with no usable advice (no text, a tool call, or the output limit hit before any text) | `unavailable` | yes |
+| the request to it was refused (any other 4xx, such as a bad model name) | `unavailable` | no |
+
+Claude Code only knows six codes, and an unknown one renders as "unknown", so no other code is ever sent. After two failures in a turn the executor is told the advisor will not be consulted again, whatever the reason.
+
 #### How the advisor is prompted
 
 The advisor reads another assistant's instructions and conversation, and a model shown those can mistake them for its own and carry on as that assistant. A reasoning advisor did exactly that in practice: it answered with a call to `advisor` and no text, so the consultation failed. The request is therefore framed as a review. The advisor's system prompt says it is **not** the assistant, has **no tools** (and must not call `advisor`), and must reply with plain-text advice only. The assistant's instructions are labelled as not written for the reviewer, the executor's own `# Advisor Tool` section ("call advisor before substantive work") is removed from them, and the request ends by repeating that the reviewer should write advice and call no tool. If an advisor model still replies with a tool call, the log now says "advisor called a tool instead of writing advice".

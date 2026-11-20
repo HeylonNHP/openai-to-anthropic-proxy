@@ -611,3 +611,110 @@ fn a_tool_call_instead_of_advice_is_named_in_the_error() {
     let err = advice_from_response(&resp).unwrap_err();
     assert!(err.contains("called a tool"), "{err}");
 }
+
+#[test]
+fn http_failures_are_sorted_into_kinds() {
+    let kind = FailureKind::from_http;
+    assert_eq!(kind(429, "slow down"), FailureKind::TooManyRequests);
+    assert_eq!(kind(504, ""), FailureKind::Timeout);
+    assert_eq!(kind(502, "bad gateway"), FailureKind::Overloaded);
+    assert_eq!(kind(503, "overloaded"), FailureKind::Overloaded);
+    assert_eq!(kind(529, ""), FailureKind::Overloaded);
+    assert_eq!(kind(404, "model not found"), FailureKind::Rejected);
+    assert_eq!(kind(422, "bad parameter"), FailureKind::Rejected);
+    // The real upstream message from the proxy log.
+    assert_eq!(
+        kind(
+            400,
+            "The prompt is too long: 1424454, model maximum context length: 1048576"
+        ),
+        FailureKind::PromptTooLong
+    );
+    assert_eq!(
+        kind(400, "Input exceeds the CONTEXT WINDOW"),
+        FailureKind::PromptTooLong
+    );
+    assert_eq!(kind(413, "request too long"), FailureKind::PromptTooLong);
+}
+
+#[test]
+fn a_timeout_or_connection_error_from_the_shared_client_is_sorted() {
+    let upstream = |status: u16| AppError::Upstream {
+        status: axum::http::StatusCode::from_u16(status).unwrap(),
+        body: "x".into(),
+    };
+    // `From<reqwest::Error>`: a timeout is 504, a connection failure 502.
+    assert_eq!(
+        FailureKind::from_app_error(&upstream(504)),
+        FailureKind::Timeout
+    );
+    assert_eq!(
+        FailureKind::from_app_error(&upstream(502)),
+        FailureKind::Overloaded
+    );
+    assert_eq!(
+        FailureKind::from_app_error(&AppError::Internal("x".into())),
+        FailureKind::Overloaded
+    );
+}
+
+const ALL_KINDS: [FailureKind; 6] = [
+    FailureKind::PromptTooLong,
+    FailureKind::TooManyRequests,
+    FailureKind::Overloaded,
+    FailureKind::Timeout,
+    FailureKind::NoAdvice,
+    FailureKind::Rejected,
+];
+
+#[test]
+fn every_kind_maps_to_an_error_code_claude_code_knows() {
+    for kind in ALL_KINDS {
+        let code = kind.client_code();
+        assert!(
+            protocol::ADVISOR_ERROR_CODES.contains(&code),
+            "{kind:?} -> {code}"
+        );
+        assert_ne!(code, protocol::ERROR_CODE_MAX_USES_EXCEEDED, "{kind:?}");
+    }
+    assert_eq!(FailureKind::PromptTooLong.client_code(), "prompt_too_long");
+    assert_eq!(
+        FailureKind::TooManyRequests.client_code(),
+        "too_many_requests"
+    );
+    assert_eq!(FailureKind::Overloaded.client_code(), "overloaded");
+    assert_eq!(
+        FailureKind::Timeout.client_code(),
+        "execution_time_exceeded"
+    );
+    assert_eq!(FailureKind::NoAdvice.client_code(), "unavailable");
+    assert_eq!(FailureKind::Rejected.client_code(), "unavailable");
+}
+
+#[test]
+fn what_the_executor_is_told_never_reads_like_advice() {
+    let mut seen = std::collections::HashSet::new();
+    for kind in ALL_KINDS {
+        let text = kind.executor_text();
+        assert!(
+            text.starts_with("The advisor could not be consulted"),
+            "{text}"
+        );
+        assert!(text.ends_with("without a second opinion."), "{text}");
+        assert!(seen.insert(text), "each kind has its own reason: {text}");
+    }
+}
+
+#[test]
+fn only_failures_that_could_change_are_retried() {
+    assert!(!FailureKind::PromptTooLong.retryable());
+    assert!(!FailureKind::Rejected.retryable());
+    for kind in [
+        FailureKind::TooManyRequests,
+        FailureKind::Overloaded,
+        FailureKind::Timeout,
+        FailureKind::NoAdvice,
+    ] {
+        assert!(kind.retryable(), "{kind:?}");
+    }
+}

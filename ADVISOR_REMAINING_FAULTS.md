@@ -2,8 +2,8 @@
 
 Findings from reading the Raspberry Pi proxy log for 2026-11-19 against the code.
 The advisor (`beam`, a reasoning model) kept returning "Advisor unavailable" in
-Claude Code. Faults #1 to #4 are fixed; this file records the four that remain
-(#5 to #8), with enough detail to pick them up cold on another machine.
+Claude Code. Faults #1 to #5 are fixed; this file records the three that remain
+(#6 to #8; the #5 entry is kept as the original analysis), with enough detail to pick them up cold on another machine.
 
 Line numbers drift, so code is referred to by function and constant name.
 The log lines quoted here are the evidence; the log itself is not in the repo.
@@ -16,7 +16,7 @@ The log lines quoted here are the evidence; the log itself is not in the repo.
 | 2 | Output cap shared with hidden reasoning; cut-off answers discarded | Fixed, `a61fac6` |
 | 3 | Advisor acts as the executor and calls a tool instead of answering | Fixed, `b45d3f5` |
 | 4 | Failed consults burn `max_uses`; no retry | Fixed, `1831a89` |
-| 5 | Executor and UI only ever see a generic "unavailable" | **Open** |
+| 5 | Executor and UI only ever see a generic "unavailable" | Fixed (commit "report why an advisor consultation failed") |
 | 6 | Retired `default_model` makes unmapped model names fail completely | **Open** (config and small code change) |
 | 7 | Only the first failure per turn is logged | **Open** |
 | 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | **Open** (largely helped by #1) |
@@ -30,7 +30,9 @@ shows 6 real advisor failures, one per turn (see #7 for why only one per turn).
 
 ---
 
-## #5. The executor and the UI only ever see a generic "unavailable"
+## #5. The executor and the UI only ever see a generic "unavailable" (FIXED)
+
+> Fixed: failures are sorted into a `FailureKind` in `src/tools/advisor/tool.rs`, mapped to the client-known error codes, and the executor is told the reason. Documented in `proxy.json-guide.md` ("Why a consultation failed"). The notes below are the original analysis.
 
 **Plain English.** Every advisor failure, whatever the cause, produces the same
 `unavailable` error block for Claude Code and the same "temporarily unavailable"

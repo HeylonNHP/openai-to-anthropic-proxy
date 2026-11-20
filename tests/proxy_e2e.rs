@@ -3891,8 +3891,9 @@ async fn advisor_failure_degrades_to_unavailable() {
         .as_str()
         .unwrap();
     assert!(
-        failure_output.contains("temporarily unavailable"),
-        "the executor must not be told a review happened"
+        failure_output.contains("could not be consulted")
+            && failure_output.contains("request to it was refused"),
+        "the executor is told why, and not that a review happened: {failure_output}"
     );
 
     let content = body["content"].as_array().unwrap();
@@ -3960,7 +3961,7 @@ async fn advisor_timeout_degrades_gracefully() {
         .iter()
         .find(|b| b["type"] == "advisor_tool_result")
         .unwrap();
-    assert_eq!(result["content"]["error_code"], "unavailable");
+    assert_eq!(result["content"]["error_code"], "execution_time_exceeded");
     assert!(
         body["content"]
             .as_array()
@@ -4038,9 +4039,11 @@ async fn advisor_repeated_failure_emits_one_warning() {
         .filter(|b| b["type"] == "advisor_tool_result")
         .collect();
     assert_eq!(errors.len(), 2);
-    for e in errors {
-        assert_eq!(e["content"]["error_code"], "unavailable");
-    }
+    // The 503 (retried, still failing) is "overloaded"; the 404 is a refused
+    // request, which has no more specific client code than "unavailable".
+    let codes: Vec<&serde_json::Value> =
+        errors.iter().map(|e| &e["content"]["error_code"]).collect();
+    assert_eq!(codes, ["overloaded", "unavailable"]);
     assert!(
         body["content"]
             .as_array()
@@ -5229,7 +5232,10 @@ async fn b2_failed_advisor_status_is_not_accepted_as_advice() {
             !injected.contains("FAKE ADVICE"),
             "{status}: failed advice leaked into the executor prompt"
         );
-        assert!(injected.contains("temporarily unavailable"), "{status}");
+        assert!(
+            injected.contains("returned no advice"),
+            "{status}: {injected}"
+        );
     }
 }
 
@@ -5638,7 +5644,7 @@ async fn b4_advisor_timeout_is_clamped_to_request_timeout() {
         .iter()
         .find(|b| b["type"] == "advisor_tool_result")
         .unwrap();
-    assert_eq!(result["content"]["error_code"], "unavailable");
+    assert_eq!(result["content"]["error_code"], "execution_time_exceeded");
     assert!(
         body["content"]
             .as_array()
@@ -8619,7 +8625,7 @@ async fn a_broken_advisor_is_given_up_on_after_two_failures() {
     let last = sent.last().unwrap().to_string();
     assert!(last.contains("will not be consulted again"), "{last}");
     // A first failure was told only that it is temporary.
-    assert!(sent[2].to_string().contains("temporarily unavailable"));
+    assert!(sent[2].to_string().contains("request to it was refused"));
 }
 
 /// An executor that ignores that and calls the advisor a third time gets no
@@ -8640,4 +8646,51 @@ async fn a_third_call_to_a_given_up_advisor_is_dropped() {
     .await;
     let advisor_posts = sent.iter().filter(|b| b["model"] == "beam").count();
     assert_eq!(advisor_posts, 2, "no advisor POST for the third call");
+}
+
+/// Each kind of advisor failure reaches the client as its own known error
+/// code and tells the executor its own reason.
+#[tokio::test]
+async fn advisor_failures_report_their_own_code_and_reason() {
+    let cases = [
+        (
+            FakeResponse {
+                status: StatusCode::BAD_REQUEST,
+                body: Some(
+                    r#"{"error":{"message":"The prompt is too long: 1424454, model maximum context length: 1048576"}}"#
+                        .into(),
+                ),
+            },
+            1,
+            "prompt_too_long",
+            "too long for it",
+        ),
+        (
+            upstream_failure(StatusCode::TOO_MANY_REQUESTS),
+            2,
+            "too_many_requests",
+            "rate limited",
+        ),
+        (
+            upstream_failure(StatusCode::BAD_GATEWAY),
+            2,
+            "overloaded",
+            "overloaded or unreachable",
+        ),
+    ];
+    for (failure, advisor_attempts, code, reason) in cases {
+        // A too-long prompt is permanent (one attempt); 429 and 5xx are
+        // retried once, so the retry fails the same way.
+        let mut script = vec![advisor_call_response("resp_call", "call_kind")];
+        script.extend((0..advisor_attempts).map(|_| FakeResponse {
+            status: failure.status,
+            body: failure.body.clone(),
+        }));
+        script.push(advisor_executor_message("resp_final", "Done."));
+        let (body, sent) = advisor_turn_with_max_uses(2, script).await;
+        assert_eq!(advisor_results(&body)[0]["content"]["error_code"], code);
+        let told = sent.last().unwrap().to_string();
+        assert!(told.contains(reason), "{code}: {told}");
+        assert!(told.contains("without a second opinion"), "{code}: {told}");
+    }
 }

@@ -65,15 +65,8 @@ use crate::tools::server_loop::summary::CallSummary;
 use crate::tui::format::{OUTCOME_ERROR, OUTCOME_OK, OUTCOME_REFUSED, format_token_count};
 use crate::tui::{LogKind, LogLine};
 
-/// Text injected into the executor's transcript when the advisor could not
-/// be reached. It must NOT look like advice — the client sees an
-/// `advisor_tool_result_error` block, and the executor must not be told a
-/// review happened.
-const NO_ADVICE: &str =
-    "Advisor is temporarily unavailable. Continue the task without a second opinion.";
-
 /// Text injected when the advisor failed so often that the proxy stopped
-/// consulting it for this turn. Unlike [`NO_ADVICE`] it says the advisor will
+/// consulting it for this turn. Unlike [`FailureKind::executor_text`] it says the advisor will
 /// not come back, because the executor's next call to it would be dropped.
 const NO_MORE_ADVICE_BROKEN: &str = "The advisor is unavailable and will not be consulted again \
 for this request. Do not call it again; answer with the information you already have.";
@@ -455,30 +448,129 @@ fn advice_from_response(
     Ok((text, resp.usage.clone()))
 }
 
-/// Why one advisor POST failed, and whether trying again is worth it.
-#[derive(Debug)]
-struct ConsultError {
-    message: String,
-    /// A second attempt could plausibly succeed: a transport error or
-    /// timeout, a 429 or 5xx, or a response that held no usable advice (a
-    /// reasoning model is not deterministic). A 4xx such as "prompt is too
-    /// long" would fail again identically, so it is not retried.
-    retryable: bool,
+/// Why an advisor consultation failed. It decides three things: the error
+/// code Claude Code shows ("Advisor unavailable (overloaded)"), what the
+/// executor is told, and whether a retry is worth making.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// The conversation does not fit the advisor model's context window.
+    /// Retrying would fail identically.
+    PromptTooLong,
+    /// HTTP 429.
+    TooManyRequests,
+    /// HTTP 5xx other than 504, or the connection failed.
+    Overloaded,
+    /// The advisor did not answer in time (HTTP 504 / a request timeout).
+    Timeout,
+    /// The advisor answered but gave no usable advice: no text, a tool call
+    /// instead of text, or stopped at its output limit before writing any.
+    NoAdvice,
+    /// Any other 4xx: the upstream refused the request itself (a bad model
+    /// name, a rejected parameter). Retrying would fail identically.
+    Rejected,
 }
 
-impl ConsultError {
-    fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: true,
+impl FailureKind {
+    /// The `error_code` for the client's `advisor_tool_result_error` block.
+    /// Only codes Claude Code knows are used, so it never renders "unknown".
+    /// There is no client code for the kinds that fall back to the generic
+    /// `unavailable`.
+    const fn client_code(self) -> &'static str {
+        match self {
+            Self::PromptTooLong => protocol::ERROR_CODE_PROMPT_TOO_LONG,
+            Self::TooManyRequests => protocol::ERROR_CODE_TOO_MANY_REQUESTS,
+            Self::Overloaded => protocol::ERROR_CODE_OVERLOADED,
+            Self::Timeout => protocol::ERROR_CODE_EXECUTION_TIME_EXCEEDED,
+            Self::NoAdvice | Self::Rejected => protocol::ERROR_CODE_UNAVAILABLE,
         }
     }
 
-    fn permanent(message: impl Into<String>) -> Self {
+    /// What the executor is told in place of advice. It must not read like
+    /// advice, and each one ends by telling the executor to carry on.
+    const fn executor_text(self) -> &'static str {
+        match self {
+            Self::PromptTooLong => {
+                "The advisor could not be consulted: the conversation is too long for it. \
+                 Continue the task without a second opinion."
+            }
+            Self::TooManyRequests => {
+                "The advisor could not be consulted: it is rate limited right now. \
+                 Continue the task without a second opinion."
+            }
+            Self::Overloaded => {
+                "The advisor could not be consulted: it is overloaded or unreachable. \
+                 Continue the task without a second opinion."
+            }
+            Self::Timeout => {
+                "The advisor could not be consulted: it did not answer in time. \
+                 Continue the task without a second opinion."
+            }
+            Self::NoAdvice => {
+                "The advisor could not be consulted: it returned no advice. \
+                 Continue the task without a second opinion."
+            }
+            Self::Rejected => {
+                "The advisor could not be consulted: the request to it was refused. \
+                 Continue the task without a second opinion."
+            }
+        }
+    }
+
+    /// A second attempt could plausibly succeed. A reasoning model is not
+    /// deterministic, so "no advice" is worth one more try; a too-long prompt
+    /// or a refused request would fail again identically.
+    const fn retryable(self) -> bool {
+        !matches!(self, Self::PromptTooLong | Self::Rejected)
+    }
+
+    /// Sort an upstream HTTP failure.
+    fn from_http(status: u16, body: &str) -> Self {
+        let body = body.to_ascii_lowercase();
+        let too_long = [
+            "too long",
+            "context length",
+            "context window",
+            "context_length",
+        ]
+        .iter()
+        .any(|needle| body.contains(needle));
+        match status {
+            429 => Self::TooManyRequests,
+            504 => Self::Timeout,
+            _ if too_long => Self::PromptTooLong,
+            500.. => Self::Overloaded,
+            _ => Self::Rejected,
+        }
+    }
+
+    /// Sort an error from the shared upstream client. A timeout arrives as
+    /// HTTP 504 and a connection failure as 502 (see `From<reqwest::Error>`).
+    fn from_app_error(err: &AppError) -> Self {
+        match err {
+            AppError::Upstream { status, body } => Self::from_http(status.as_u16(), body),
+            _ => Self::Overloaded,
+        }
+    }
+}
+
+/// Why one advisor POST failed.
+#[derive(Debug)]
+struct ConsultError {
+    /// For the operator's log: specific, and may quote the upstream.
+    message: String,
+    kind: FailureKind,
+}
+
+impl ConsultError {
+    fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            retryable: false,
+            kind,
         }
+    }
+
+    fn from_app_error(err: &AppError) -> Self {
+        Self::new(FailureKind::from_app_error(err), err.to_string())
     }
 }
 
@@ -487,8 +579,10 @@ impl ConsultError {
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// One advisor consultation: one POST, plus ONE retry if the first failed in
-/// a way that could be transient. Every failure is a `String`, never an
-/// `AppError`: the caller degrades instead of failing the client.
+/// a way that could be transient ([`FailureKind::retryable`]). A failure is a
+/// [`ConsultError`], never an `AppError`: the caller degrades instead of
+/// failing the client. When the retry fails too, the error keeps the RETRY's
+/// kind and its message names both attempts.
 ///
 /// A failed attempt costs the operator nothing in `max_uses` (see
 /// [`AdvisorTool::answer`]); the retry exists so one flaky response does not
@@ -497,18 +591,21 @@ async fn consult(
     attempt: &Attempt,
     cfg: &AdvisorConfig,
     prompt: &str,
-) -> Result<(String, Option<ResponsesUsage>), String> {
+) -> Result<(String, Option<ResponsesUsage>), ConsultError> {
     let first = match consult_once(attempt, cfg, prompt).await {
         Ok(advice) => return Ok(advice),
-        Err(first) if !first.retryable => return Err(first.message),
+        Err(first) if !first.kind.retryable() => return Err(first),
         Err(first) => first,
     };
     tracing::debug!(error = %first.message, "advisor consultation failed; retrying once");
     tokio::time::sleep(RETRY_DELAY).await;
     consult_once(attempt, cfg, prompt).await.map_err(|second| {
-        format!(
-            "{} (after a retry; first attempt: {})",
-            second.message, first.message
+        ConsultError::new(
+            second.kind,
+            format!(
+                "{} (after a retry; first attempt: {})",
+                second.message, first.message
+            ),
         )
     })
 }
@@ -527,24 +624,24 @@ async fn consult_once(
     let timeout = advisor_timeout(cfg, attempt.state.config.request_timeout);
     let resp = send_upstream_once(&attempt.state, &url, &attempt.headers, &outbound, timeout)
         .await
-        .map_err(|e| ConsultError::retryable(e.to_string()))?;
+        .map_err(|e| ConsultError::from_app_error(&e))?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let body: String = body.chars().take(300).collect();
-        let message = format!("upstream returned {status}: {}", scrub_error_body(&body));
-        return Err(if status.as_u16() == 429 || status.is_server_error() {
-            ConsultError::retryable(message)
-        } else {
-            ConsultError::permanent(message)
-        });
+        let kind = FailureKind::from_http(status.as_u16(), &body);
+        return Err(ConsultError::new(
+            kind,
+            format!("upstream returned {status}: {}", scrub_error_body(&body)),
+        ));
     }
 
     let parsed = parse_upstream_body(resp)
         .await
-        .map_err(|e| ConsultError::retryable(e.to_string()))?;
-    let (text, usage) = advice_from_response(&parsed).map_err(ConsultError::retryable)?;
+        .map_err(|e| ConsultError::from_app_error(&e))?;
+    let (text, usage) = advice_from_response(&parsed)
+        .map_err(|message| ConsultError::new(FailureKind::NoAdvice, message))?;
     Ok((cap_answer(text, cfg), usage))
 }
 
@@ -731,22 +828,24 @@ impl AdvisorTool {
             }
             Err(error) => {
                 outcome = OUTCOME_ERROR;
-                detail = Some(protocol::ERROR_CODE_UNAVAILABLE.to_owned());
+                let code = error.kind.client_code();
+                detail = Some(code.to_owned());
                 // Not counted in `uses`, but not free either: after
                 // MAX_FAILED_CONSULTATIONS the advisor is treated as down,
                 // so an executor cannot keep paying for a broken advisor.
                 self.failures += 1;
                 let giving_up = self.failures >= MAX_FAILED_CONSULTATIONS;
                 self.given_up |= giving_up;
-                warn_once(&attempt.state, &mut self.warned, &self.cfg, &error);
-                blocks.push(ResponseContentBlock::Raw(protocol::unavailable(&id)));
-                // Once given up on, say so: the executor gets one last run
-                // and any further advisor call in it is dropped, so "try
-                // again later" would leave it with nothing to answer.
+                warn_once(&attempt.state, &mut self.warned, &self.cfg, &error.message);
+                blocks.push(ResponseContentBlock::Raw(protocol::error_result(&id, code)));
+                // Tell the executor WHY, so it can adapt. Once given up on,
+                // say that instead: the executor gets one last run and any
+                // further advisor call in it is dropped, so "carry on
+                // without it" alone would leave it nothing to answer.
                 if giving_up {
                     NO_MORE_ADVICE_BROKEN
                 } else {
-                    NO_ADVICE
+                    error.kind.executor_text()
                 }
                 .to_owned()
             }
