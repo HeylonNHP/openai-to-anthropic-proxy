@@ -23,6 +23,28 @@ CI (`.github/workflows/ci.yml`) runs exactly these three on every push and pull
 request, plus a build check on macOS and Windows. Nothing merges without them
 passing.
 
+### Checking another platform without building it
+
+The CI matrix builds on macOS and Windows; `cargo check` type-checks a target
+without linking:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+  cargo check --target x86_64-pc-windows-gnu --all-targets
+```
+
+Two things worth knowing before you chase a cross-compilation failure:
+
+- **The Windows build does not need NASM.** `reqwest`'s `rustls` feature pulls
+  in `rustls` with its default features, which enable `aws-lc-rs/prebuilt-nasm`,
+  so `aws-lc-sys` uses its shipped prebuilt assembly objects when NASM is
+  absent. Do not add a NASM install step to CI.
+- **macOS shares the `unix` code path.** There is no `target_os = "macos"`
+  branch anywhere in `src/`, so macOS compiles the same `#[cfg(unix)]` code as
+  Linux. Cross-checking it from Linux fails inside `aws-lc-sys`'s C build
+  (it needs the Apple SDK), not in the Rust code.
+
 ## Conventions
 
 ### One unit-test module per file — enforced

@@ -49,5 +49,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # No NASM install step is needed on Windows: rustls enables
+      # `aws-lc-rs/prebuilt-nasm` by default, so aws-lc-sys assembles from the
+      # prebuilt objects it ships rather than requiring the NASM assembler.
       - name: Build
         run: cargo build --all-targets
