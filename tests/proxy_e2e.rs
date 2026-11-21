@@ -3508,6 +3508,69 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
     );
 }
 
+/// The advisor request carries a `prompt_cache_key` only when the operator
+/// turned prompt caching on for the advisor's model, and the key is the same
+/// for every consultation of one conversation.
+async fn advisor_cache_keys(models: &[&str], cache_key: Option<&str>) -> Vec<serde_json::Value> {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_c1", "call_t1"),
+            advisor_answer("first advice"),
+            advisor_call_response("resp_c2", "call_t2"),
+            advisor_answer("second advice"),
+            advisor_executor_message("resp_final", "done"),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.prompt_caching.models = models.iter().map(|m| (*m).to_owned()).collect();
+    config.prompt_caching.cache_key = cache_key.map(str::to_owned);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    upstream
+        .received_all
+        .lock()
+        .await
+        .iter()
+        .map(|b| serde_json::from_slice::<serde_json::Value>(b).unwrap())
+        .filter(|b| b["model"] == "beam")
+        .map(|b| b["prompt_cache_key"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn advisor_sends_no_cache_key_unless_caching_is_on_for_its_model() {
+    let keys = advisor_cache_keys(&[], None).await;
+    assert_eq!(keys.len(), 2, "two consultations");
+    assert!(keys.iter().all(serde_json::Value::is_null), "{keys:?}");
+    // Caching on for another model only: still none.
+    let keys = advisor_cache_keys(&["gpt-4o-mini"], None).await;
+    assert!(keys.iter().all(serde_json::Value::is_null), "{keys:?}");
+}
+
+#[tokio::test]
+async fn advisor_uses_one_stable_cache_key_per_conversation() {
+    let keys = advisor_cache_keys(&["beam"], None).await;
+    assert_eq!(keys.len(), 2);
+    let first = keys[0].as_str().expect("a derived key");
+    assert!(first.starts_with("advisor-"), "{first}");
+    assert_eq!(keys[0], keys[1], "both consultations share one key");
+}
+
+#[tokio::test]
+async fn advisor_uses_the_configured_cache_key_as_given() {
+    let keys = advisor_cache_keys(&["beam"], Some("my-key")).await;
+    assert!(keys.iter().all(|k| k == "my-key"), "{keys:?}");
+}
+
 /// 2. Happy path: 3 POSTs (executor call → advisor text → final executor
 /// text). The third body must carry the canonical `function_call_output`
 /// advice, and the client sees one contiguous, id-matched block pair plus

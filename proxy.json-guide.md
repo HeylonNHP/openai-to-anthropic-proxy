@@ -434,9 +434,20 @@ The advisor is sent the executor's whole conversation, which grows without bound
 | always | inline `data:` blobs (images) are replaced by a short placeholder, and the JSON is compact (not pretty-printed) |
 | 1 | **tool results** are shortened, gentlest cap first: 16,000, then 4,000, then 1,000 bytes each |
 | 2 | **every remaining long string** is capped at 20,000 bytes |
-| 3 | the **oldest items** are dropped and replaced by one marker line. The first item (the user's task) and the most recent items are always kept |
+| 3 | the **oldest items** are dropped, in blocks of 16, and replaced by one marker line. The first item (the user's task) and the most recent items are always kept |
 
 The executor's own instructions are capped at a quarter of the budget (300,000 characters) so they cannot crowd out the conversation. Each cut states how many bytes it removed, and a trimmed prompt is logged at `info` with its size before and after. If you point `advisor.model` at a model whose context window is much smaller than about 400,000 tokens, this budget is too large for it and its calls will still be rejected as "prompt is too long"; the constant is `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`.
+
+#### Prompt caching for the advisor
+
+Every consultation sends the whole conversation again, but each one is the previous one plus a few new items, so the start of the prompt is nearly identical from one consultation to the next. An upstream with prompt caching charges much less for a repeated start. To get that for the advisor, **list the advisor's model in `prompt_caching.models`** (for example `"models": ["beam"]`); with the default empty list the advisor request carries no caching fields, as before.
+
+- The prompt is laid out with the unchanging parts first: the reviewer's instructions, then the assistant's own instructions, then the conversation, oldest item first, with the new text at the end.
+- The advisor request carries a `prompt_cache_key`. If you set `prompt_caching.cache_key` it is used as given; otherwise the proxy derives one from the conversation's first item (the user's task), so every consultation of one conversation shares a key and a different conversation gets a different one.
+- When the conversation is long enough to be trimmed (step 3 above), the oldest items are dropped **in blocks of 16**, rounded up. Dropping exactly as many as needed would move the cut on every consultation and change the start of the prompt each time, so no cache could hit. In blocks, the cut stays put for several consultations in a row. The price is that up to 15 more old items than strictly necessary are left out.
+- The Claude Code advisor line now shows how many input tokens were served from the cache (`576k in (480k cached) · 1.2k out`). Check that number on the second consultation of a turn to see whether the upstream is honouring the cache.
+
+Whether the upstream gives a discount at all depends on the upstream and the model, and it has not been checked against the real service. A cache also expires after a few minutes without use, so a consultation after a long pause starts cold.
 
 #### Failed consultations: one retry, and they do not use up `max_uses`
 

@@ -252,6 +252,11 @@ const MAX_TRANSCRIPT_CHARS: usize = 1_200_000;
 /// transcript) while the prompt is over budget, gentlest first.
 const RESULT_CAPS: [usize; 3] = [16_000, 4_000, 1_000];
 
+/// Items dropped from the middle of an over-long transcript go in blocks of
+/// this many, so the start of the prompt stays identical across consecutive
+/// consultations and the upstream's prompt cache can keep hitting it.
+const DROP_STEP: usize = 16;
+
 /// Cap applied to every string anywhere in the transcript if tool results
 /// alone were not enough (e.g. a huge pasted user message).
 const ANY_STRING_CAP: usize = 20_000;
@@ -311,20 +316,31 @@ fn build_transcript(instructions: &str, mut input: Value, budget: usize) -> Stri
     }
 
     // Still too big: drop the oldest items after the first until it fits.
+    //
+    // The number dropped is rounded UP to a multiple of DROP_STEP. A
+    // consultation happens every few items, so dropping exactly as many as
+    // needed would move the cut (and the "N earlier items were omitted"
+    // marker) on every consultation, changing the start of the prompt each
+    // time and defeating the upstream's prompt cache. Rounded up, the cut
+    // stays put for several consultations in a row.
     if let Value::Array(items) = &mut input {
         let mut size = prompt.len();
-        let mut dropped = 0;
-        while items.len() > 2 && size > budget {
-            size = size.saturating_sub(items.remove(1).to_string().len() + 1);
-            dropped += 1;
+        let mut needed = 0;
+        let mut removable = items.len().saturating_sub(2);
+        while removable > needed && size > budget {
+            size = size.saturating_sub(items[1 + needed].to_string().len() + 1);
+            needed += 1;
         }
-        if dropped > 0 {
+        let dropped = needed.div_ceil(DROP_STEP).saturating_mul(DROP_STEP);
+        removable = removable.min(dropped);
+        if needed > 0 {
+            items.drain(1..=removable);
             items.insert(
                 1,
                 serde_json::json!({
                     "type": "omitted",
                     "note": format!(
-                        "{dropped} earlier items were omitted to fit the reviewer's context window"
+                        "{removable} earlier items were omitted to fit the reviewer's context window"
                     ),
                 }),
             );
@@ -616,13 +632,62 @@ async fn consult(
     })
 }
 
+/// The `prompt_cache_key` for an advisor request.
+///
+/// Sent only when the operator has turned prompt caching on for the advisor's
+/// model (`prompt_caching.models`), exactly as for the executor: an upstream
+/// that does not know the field must not receive it unasked. A configured
+/// `prompt_caching.cache_key` is used as given. Otherwise the key is derived
+/// from `session` (see [`session_fingerprint`]), which stays the same for
+/// every consultation of one conversation, so they are routed alike and share
+/// a cache, while a different conversation gets a different key.
+fn advisor_cache_key(
+    config: &crate::config::Config,
+    cfg: &AdvisorConfig,
+    session: &str,
+) -> Option<String> {
+    let caching = config.prompt_caching_for_model(&cfg.model);
+    if caching.models.is_empty() {
+        return None;
+    }
+    if caching.cache_key.is_some() {
+        return caching.cache_key;
+    }
+    // FNV-1a, 64-bit: stable across runs and Rust versions, unlike `DefaultHasher`.
+    let hash = session
+        .bytes()
+        .chain(cfg.model.bytes())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    Some(format!("advisor-{hash:016x}"))
+}
+
+/// What identifies one conversation across its consultations: its FIRST
+/// input item (the user's original task), which never changes as the
+/// conversation grows, cut to a bounded length.
+fn session_fingerprint(input: &Input) -> String {
+    let Input::Items(items) = input else {
+        return String::new();
+    };
+    let first = items
+        .first()
+        .and_then(|item| serde_json::to_string(item).ok())
+        .unwrap_or_default();
+    truncate_str(&first, SESSION_FINGERPRINT_BYTES)
+}
+
+/// How much of the first input item identifies a conversation.
+const SESSION_FINGERPRINT_BYTES: usize = 2_000;
+
 /// One standalone advisor POST.
 async fn consult_once(
     attempt: &Attempt,
     cfg: &AdvisorConfig,
     prompt: &str,
 ) -> Result<(String, Option<ResponsesUsage>), ConsultError> {
-    let outbound = advisor_request(cfg, prompt);
+    let mut outbound = advisor_request(cfg, prompt);
+    outbound.prompt_cache_key = advisor_cache_key(&attempt.state.config, cfg, &session_fingerprint(&attempt.outbound.input));
     let url = attempt.url();
     // `None` = no per-request timeout override ("no limit"): the global
     // `request_timeout` — the timeout the reqwest client was built with —
@@ -819,9 +884,11 @@ impl AdvisorTool {
                         .state
                         .stats
                         .record_actual(self.cfg.model.clone(), token_usage(u));
+                    let cached = u.input_tokens_details.as_ref().map_or(0, |d| d.cached_tokens);
                     detail = Some(format!(
-                        "{} in · {} out",
+                        "{} in ({} cached) · {} out",
                         format_token_count(u64::from(u.input_tokens)),
+                        format_token_count(u64::from(cached)),
                         format_token_count(u64::from(u.output_tokens))
                     ));
                 }

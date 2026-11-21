@@ -718,3 +718,139 @@ fn only_failures_that_could_change_are_retried() {
         assert!(kind.retryable(), "{kind:?}");
     }
 }
+
+// ── Prompt caching ───────────────────────────────────────────────────────
+
+/// A `Config` with the given prompt-caching setting, built from the
+/// resolver (the struct has too many fields to spell out here).
+fn config_with_caching(models: &[&str], key: Option<&str>) -> crate::config::Config {
+    let mut config = crate::config::Config::resolve(
+        None,
+        &crate::config::EnvInputs {
+            upstream_base_url: Some("https://example.com".into()),
+            upstream_api_key: Some("k".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    config.prompt_caching.models = models.iter().map(|m| (*m).to_owned()).collect();
+    config.prompt_caching.cache_key = key.map(str::to_owned);
+    config
+}
+
+#[test]
+fn no_cache_key_is_sent_unless_caching_is_enabled_for_the_advisor_model() {
+    let c = cfg();
+    let prompt = "x<transcript>[]</transcript>";
+    assert_eq!(advisor_cache_key(&config_with_caching(&[], None), &c, prompt), None);
+    // Caching on for a DIFFERENT model only.
+    assert_eq!(
+        advisor_cache_key(&config_with_caching(&["other-model"], None), &c, prompt),
+        None
+    );
+}
+
+#[test]
+fn a_configured_cache_key_is_used_as_given() {
+    let c = cfg();
+    let config = config_with_caching(&[c.model.as_str()], Some("my-key"));
+    assert_eq!(
+        advisor_cache_key(&config, &c, "anything").as_deref(),
+        Some("my-key")
+    );
+}
+
+#[test]
+fn the_derived_cache_key_is_stable_across_one_session_and_differs_between_sessions() {
+    let c = cfg();
+    let config = config_with_caching(&[c.model.as_str()], None);
+    let a = advisor_cache_key(&config, &c, "{\"text\":\"fix the bug\"}").unwrap();
+    assert_eq!(
+        a,
+        advisor_cache_key(&config, &c, "{\"text\":\"fix the bug\"}").unwrap()
+    );
+    assert!(a.starts_with("advisor-"), "{a}");
+    assert_ne!(
+        a,
+        advisor_cache_key(&config, &c, "{\"text\":\"write a poem\"}").unwrap()
+    );
+}
+
+#[test]
+fn the_session_fingerprint_is_the_first_item_only() {
+    let task = |text: &str| InputItem::Message {
+        role: "user".to_owned(),
+        content: vec![InputContentPart::InputText {
+            text: text.to_owned(),
+            prompt_cache_breakpoint: None,
+        }],
+    };
+    let follow_up = || InputItem::Message {
+        role: "user".to_owned(),
+        content: vec![InputContentPart::InputText {
+            text: "and then".to_owned(),
+            prompt_cache_breakpoint: None,
+        }],
+    };
+    let short = Input::Items(vec![task("fix the bug")]);
+    let longer = Input::Items(vec![task("fix the bug"), follow_up(), follow_up()]);
+    let other = Input::Items(vec![task("write a poem")]);
+    assert_eq!(session_fingerprint(&short), session_fingerprint(&longer));
+    assert_ne!(session_fingerprint(&short), session_fingerprint(&other));
+    assert_eq!(session_fingerprint(&Input::Items(Vec::new())), "");
+}
+
+#[test]
+fn the_cut_point_stays_put_across_consecutive_consultations() {
+    // The transcript grows by one item per step. Without the block-wise
+    // drop, the "N earlier items were omitted" marker (and so the start of
+    // the prompt) would change every step and no cache could ever hit.
+    let build = |n: usize| {
+        let mut items = vec![user_message("the original task")];
+        for i in 0..n {
+            items.push(tool_result(&format!("c{i}"), &format!("{i} {}", "y".repeat(900))));
+        }
+        build_transcript("sys", Value::Array(items), 40_000)
+    };
+    let marker = |out: &str| {
+        let end = out.find(" earlier items were omitted").expect("trimmed");
+        let start = out[..end].rfind('"').unwrap() + 1;
+        out[start..end].to_owned()
+    };
+    let outputs: Vec<String> = (200..216).map(build).collect();
+    let mut markers: Vec<String> = outputs.iter().map(|o| marker(o)).collect();
+    markers.dedup();
+    assert!(
+        markers.len() <= 2,
+        "the cut moved on {} of 16 steps: {markers:?}",
+        markers.len() - 1
+    );
+    // Within one marker value, the prompts share everything but the new
+    // item and the closing text.
+    for pair in outputs.windows(2) {
+        if marker(&pair[0]) == marker(&pair[1]) {
+            let common = pair[0]
+                .bytes()
+                .zip(pair[1].bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            assert!(
+                common + 600 >= pair[0].len(),
+                "only {common} of {} bytes are shared",
+                pair[0].len()
+            );
+        }
+    }
+}
+
+#[test]
+fn dropping_in_blocks_still_fits_the_budget_and_keeps_task_and_latest() {
+    let mut items = vec![user_message("the original task")];
+    for i in 0..60 {
+        items.push(tool_result(&format!("c{i}"), &format!("{i} {}", "y".repeat(900))));
+    }
+    items.push(user_message("the latest question"));
+    let out = build_transcript("sys", Value::Array(items), 20_000);
+    assert!(out.len() <= 20_000 + 200, "got {}", out.len());
+    assert!(out.contains("the original task") && out.contains("the latest question"));
+}
