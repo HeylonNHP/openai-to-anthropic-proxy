@@ -302,3 +302,44 @@ async fn a_slow_first_run_that_then_fails_ends_the_early_stream_with_an_error() 
         "the stream ends after the error"
     );
 }
+
+#[tokio::test]
+async fn live_events_are_sent_as_they_are_and_numbering_follows_them() {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut st = state(rx, Duration::from_secs(60));
+    // A run streamed live used blocks 0 and 1; the next block the response
+    // numbers itself must be 2.
+    tx.send(LoopEvent::Live(
+        vec![
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStop { index: 1 },
+        ],
+        2,
+    ))
+    .unwrap();
+    tx.send(LoopEvent::Blocks(vec![text("after")])).unwrap();
+
+    let (live, st1) = next_chunk(std::mem::replace(&mut st, state_empty()))
+        .await
+        .unwrap();
+    assert_eq!(st1.next_index, 2);
+    assert_eq!(
+        chunk_text(&live)
+            .matches("event: content_block_stop")
+            .count(),
+        2
+    );
+
+    let (blocks, st2) = next_chunk(st1).await.unwrap();
+    assert!(
+        chunk_text(&blocks).contains(r#""index":2"#),
+        "{}",
+        chunk_text(&blocks)
+    );
+    assert_eq!(st2.next_index, 3);
+}
+
+fn state_empty() -> BodyState {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    state(rx, Duration::from_secs(60))
+}

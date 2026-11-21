@@ -26,6 +26,7 @@
 //! |---|---|
 //! | [`handler`] | the [`handler::ServerTool`] interface |
 //! | [`run`] | the loop |
+//! | [`live`] | read one streamed executor run, forwarding it to the client |
 //! | [`render`] | assemble the final Anthropic response |
 //! | [`stream`] | stream a turn to the client as it happens |
 
@@ -38,6 +39,7 @@ use crate::proxy::Attempt;
 use crate::tools::{advisor, web_fetch, web_search};
 
 pub(crate) mod handler;
+pub(crate) mod live;
 pub(crate) mod render;
 pub(crate) mod run;
 pub(crate) mod stream;

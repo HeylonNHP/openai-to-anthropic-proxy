@@ -26,6 +26,7 @@ in one turn.
 ```text
 build_outbound   every tool that is enabled AND declared adds its internal
                  function tool; the request is forced to stream: false
+                 (the loop turns streaming back on for a streaming client)
       │
       ▼
  ┌─▶ run the executor (the upstream model)         Attempt::execute
@@ -111,31 +112,39 @@ message) is accepted; the earlier results are put back in front of the model.
 
 ## Streaming
 
-A streaming client is sent each round as it finishes instead of the whole turn
-at the end:
+A streaming client is sent each executor run **as it is generated**, so text
+and reasoning appear token by token instead of after the whole turn:
 
 ```text
-first run done ─▶ message_start
-  (or, if the first run takes over 10 s: placeholder message_start at 10 s)
-each round     ─▶ content blocks (the model's text, server_tool_use, result)
-(quiet)        ─▶ ping every 10 s
-last run done  ─▶ final blocks, message_delta, message_stop
+upstream answers ─▶ message_start (placeholder: model, empty, zero usage)
+each run         ─▶ the run's events, translated live (text, thinking, client tool_use)
+each served call ─▶ server_tool_use + result blocks
+(quiet)          ─▶ ping every 10 s
+last run done    ─▶ message_delta (the turn's usage), message_stop
 ```
 
-* Each executor run is still fetched **whole**: a function call cannot be
-  served until it is complete. So a turn where the model simply answers, with
-  no tool call, is still delivered in one burst. Streaming a plain answer token
-  by token would need the call detection to work on a live upstream stream;
-  that is not built.
-* The stream normally starts once the **first** run has succeeded, so a quick
-  failure there is an ordinary HTTP error with its real status, which clients
-  retry on. If the first run is still going after 10 s, the stream starts
-  anyway with a placeholder `message_start` (the requested model, an empty
-  message, zero usage) and pings, so the client is never silent for longer
-  than the ping interval. A failure after that is an SSE `error` event; the
-  closing `message_delta` carries the turn's real usage.
-* The loop runs in its own task, talking to the response over a channel. A
-  client that disconnects stops the loop before its next upstream call.
+* Every executor run is requested with `stream: true` and read through a
+  *continuation* `StreamTranslator` ([`live`](live.rs)): no `message_start`, content
+  indices that continue from the previous run, and calls to the loop's own tools
+  dropped, so the client never sees `proxy_web_search` and friends as `tool_use`.
+  The same events are collected into the run's response, which the loop
+  inspects for calls to serve and replays into the next run. The terminal
+  event's `output` is used when it has one; otherwise the items are rebuilt
+  from `output_item.added` / deltas / `output_item.done`.
+* The loop is the single owner of the content numbering. The response mirrors
+  it: every [`LoopEvent::Live`](run.rs) carries the index that follows its
+  events.
+* The stream starts as soon as the upstream has answered the first run with a
+  success status, so an HTTP error there is still an ordinary error with its
+  real status, which clients retry on. A failure after that is an SSE `error`
+  event (or, on a later run, the work so far is returned, as before).
+* However a run ends (a `response.failed`, a dropped connection, no terminal
+  event, a client that went away), every block it opened is closed first.
+  What was already streamed stays.
+* An upstream that ignores `stream: true` and answers with JSON is still
+  served: the whole response is sent when it arrives, as a buffered client's
+  would be.
+* A buffered client (`stream: false`) is unchanged: every run is fetched whole.
 
 ## Failure handling
 
@@ -179,7 +188,10 @@ To **remove** one: delete its module and those two lines.
 
 ## Known limitations
 
-* **Plain answers are not streamed token by token** (see [Streaming](#streaming)).
+* **No hidden validation retry for a streamed run.** A buffered run whose client
+  tool call still violates the client's schema after repair gets one corrective
+  re-send. A streamed run's bytes are already with the client, so it cannot.
+  (Arguments are still repaired.)
 * **Usage is the last executor run's**, not the sum of the rounds (the advisor's
   tokens are in `iterations[]`; compaction tokens are not recorded).
 * **Internal calls use the model's own function-calling**, not Anthropic's
@@ -193,6 +205,7 @@ To **remove** one: delete its module and those two lines.
 | `mod.rs` | `handlers`: which tools serve this request |
 | `handler.rs` | the `ServerTool` interface |
 | `run.rs` | the loop, the round limit, the streaming sink |
+| `live.rs` | one streamed executor run: forward its events, collect its response |
 | `render.rs` | assembling the final message (`assemble`) and the streaming tail |
 | `stream.rs` | the streaming response: task, channel, pings, SSE events |
 | `summary.rs` | what the operator sees of one served call |

@@ -38,7 +38,7 @@
 //! The state is private; tests assert on the emitted events, not the
 //! internal state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -91,6 +91,13 @@ pub struct StreamTranslator {
     /// True only when a terminal completed/incomplete response event arrived.
     /// A stream that merely closes or errors is not countable.
     completed: bool,
+    /// Names of function calls that must never reach the client (the proxy's
+    /// own server-tool calls, see [`Self::continuation`]). Empty for an
+    /// ordinary translator.
+    hidden_tools: Vec<String>,
+    /// `output_index`es of the hidden calls seen so far, so their argument
+    /// events are dropped without the "dangling delta" warning.
+    hidden_outputs: BTreeSet<u32>,
 }
 
 /// Summary stats extracted from a `StreamTranslator` after the stream ends.
@@ -172,7 +179,56 @@ impl StreamTranslator {
             input_usage_seen: false,
             finished: false,
             completed: false,
+            hidden_tools: Vec::new(),
+            hidden_outputs: BTreeSet::new(),
         }
+    }
+
+    /// Build a translator for ONE executor run inside a larger message.
+    ///
+    /// The proxy's server-tool loop streams every run of the executor to the
+    /// client as it is generated, but the client sees a single assistant
+    /// message made of several runs. So a continuation translator:
+    ///
+    /// * never sends `message_start` (the loop sent it, once);
+    /// * numbers its content blocks from `first_index`, where the previous
+    ///   run's blocks left off (read the end with [`Self::next_index`]);
+    /// * drops every call to a function named in `hidden_tools`: the loop
+    ///   serves those itself, so the client must not see them as `tool_use`;
+    /// * must be closed with [`Self::close_blocks`], never [`Self::finish`],
+    ///   which would end the whole message.
+    #[must_use]
+    pub fn continuation(
+        msg_id: String,
+        model: String,
+        registry: crate::repair::ToolSchemaRegistry,
+        first_index: u32,
+        hidden_tools: Vec<String>,
+    ) -> Self {
+        let mut translator = Self::new(msg_id, model, registry);
+        translator.started = true;
+        translator.next_index = first_index;
+        translator.hidden_tools = hidden_tools;
+        translator
+    }
+
+    /// The content index the next block would get: where a following run (or
+    /// a block the loop sends itself) must continue.
+    #[must_use]
+    pub const fn next_index(&self) -> u32 {
+        self.next_index
+    }
+
+    /// Close every open content block and stop, without the closing
+    /// `message_delta` / `message_stop`. Idempotent. The loop calls this when
+    /// a run ends, however it ended, so the client never sees a
+    /// `content_block_start` without its `content_block_stop`.
+    pub fn close_blocks(&mut self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if !self.finished {
+            self.finalize(&mut events);
+        }
+        events
     }
 
     /// Feed one upstream event. Returns the Anthropic events it produces.
@@ -557,6 +613,13 @@ impl StreamTranslator {
                 // this item in the stream.
                 self.emit_server_tool_use(events);
             }
+            OutputItem::FunctionCall { name, .. }
+                if self.hidden_tools.iter().any(|hidden| hidden == name) =>
+            {
+                // One of the loop's own tools: the client never sees it. No
+                // block, no index; its argument events are dropped.
+                self.hidden_outputs.insert(output_index);
+            }
             OutputItem::FunctionCall { call_id, name, .. } => {
                 // The model may invoke web search as a function tool
                 // (name == "WebSearch" or "web_search") instead of via
@@ -730,7 +793,7 @@ impl StreamTranslator {
         output_index: u32,
         args: &str,
     ) {
-        if args.is_empty() {
+        if args.is_empty() || self.hidden_outputs.contains(&output_index) {
             return;
         }
         let Some(state) = self.tool_blocks.get_mut(&output_index) else {

@@ -21,10 +21,11 @@
 //! `function_call{name:"advisor"}`, bounded by `AdvisorConfig::max_uses`
 //! (unless `max_uses` is `0` = "no limit", which removes the bound
 //! entirely — the proxy only WARNs about that, it does not cap it).
-//! The executor's request is forced to `stream: false` (§11.3): the whole
-//! chain is buffered and a streaming client is sent each round as it
-//! finishes by the shared loop (`crate::tools::server_loop::stream`, built on
-//! the event builders in [`sse`]). `src/stream.rs` is untouched.
+//! The executor's request is built with `stream: false` (§11.3), which is how a
+//! buffered client's whole chain runs. For a streaming client the shared loop
+//! turns streaming back on per run and forwards each run as it is generated
+//! (`crate::tools::server_loop::{live, stream}`, with the event builders in
+//! [`sse`]); the advisor's own consultation is never streamed.
 //!
 //! ## Fail closed
 //!
@@ -169,9 +170,10 @@ pub fn prepare(
         }));
     }
 
-    // §11.3: run the whole consultation chain through the existing buffered
-    // pipeline, then synthesize SSE for a streaming client. Splicing a second
-    // upstream stream into TranslatorStream is deliberately NOT attempted.
+    // §11.3: the default for the chain is buffered (a buffered client gets the
+    // whole turn at once). A streaming client's loop sets `stream` per run
+    // (`server_loop::run::drive`), because `prepare` runs again on a
+    // `default_model` fallback and would otherwise reset it.
     outbound.stream = false;
     true
 }

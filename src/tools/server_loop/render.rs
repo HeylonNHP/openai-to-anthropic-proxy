@@ -1,7 +1,7 @@
 //! Assemble the final Anthropic response for a server-tool turn.
 //!
-//! The chain was buffered (`prepare` forced `stream: false`). A client that
-//! asked for the response whole gets it from [`render`]; one that asked for
+//! A client that asked for the response whole gets it from [`render`] (every
+//! run was buffered: `prepare` forces `stream: false`); one that asked for
 //! SSE is streamed to as the turn goes (see
 //! [`crate::tools::server_loop::stream`]) and finished by [`finish_streaming`].
 
@@ -23,6 +23,7 @@ pub(crate) fn render(attempt: &Attempt, result: SessionResult) -> Result<Respons
         tools,
         paused,
         emitted: _,
+        live_final: _,
     } = result;
 
     let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
@@ -53,14 +54,22 @@ pub(crate) fn finish_streaming(attempt: &Attempt, result: SessionResult) -> Tail
         tools,
         paused,
         emitted,
+        live_final,
     } = result;
 
+    let prefix_len = prefix_blocks.len();
     let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
     assemble(&mut anth, prefix_blocks, &tools, paused);
     record_json_stats(attempt, &final_resp);
 
     // The blocks already sent are the first `emitted` of the assembled
     // message: `assemble` puts the prefix, which they came from, in front.
+    // When the last run was streamed live, its content (everything after the
+    // prefix) is with the client too; `assemble` still read it, for the stop
+    // reason, but none of it is sent again.
+    if live_final {
+        anth.content.truncate(prefix_len);
+    }
     let unsent = anth.content.split_off(emitted.min(anth.content.len()));
     Tail {
         blocks: unsent,

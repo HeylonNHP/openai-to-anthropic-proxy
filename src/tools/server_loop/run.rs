@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::anthropic::{Message, ResponseContentBlock};
+use crate::anthropic::{Message, ResponseContentBlock, StreamEvent};
 use crate::config::{ReasoningReplay, ReasoningReplayMode};
 use crate::error::AppError;
 use crate::proxy::{Attempt, Outcome};
@@ -39,8 +39,13 @@ pub(crate) enum LoopEvent {
     /// The first executor response arrived: the stream can start. Carries
     /// the message skeleton for `message_start`.
     Started(Message),
-    /// More content blocks are final, in order.
+    /// More content blocks are final, in order. The response numbers them.
     Blocks(Vec<ResponseContentBlock>),
+    /// Events already numbered by the loop: a run of the executor being
+    /// streamed live. `next_index` is the content index that follows them, so
+    /// the response's own numbering (for [`LoopEvent::Blocks`] and the tail)
+    /// carries on from there.
+    Live(Vec<StreamEvent>, u32),
     /// The turn is complete: what is left to send.
     Finished(crate::tools::server_loop::render::Tail),
     /// The turn failed. Before `Started` this is an ordinary HTTP error;
@@ -53,19 +58,25 @@ pub(crate) enum LoopEvent {
 
 /// Sends a streaming client's view of the loop to its response, and counts
 /// what was sent. Does nothing when there is no sink (a buffered client).
-struct Emitter<'a> {
+pub(crate) struct Emitter<'a> {
     sink: Option<&'a UnboundedSender<LoopEvent>>,
     /// Prefix blocks already sent.
     emitted: usize,
     started: bool,
+    /// The content index the next block sent to the client gets. The loop is
+    /// the one owner of the numbering: a live run starts its translator here
+    /// and hands the end back, and the response follows (see
+    /// [`LoopEvent::Live`]).
+    next_index: u32,
 }
 
 impl<'a> Emitter<'a> {
-    const fn new(sink: Option<&'a UnboundedSender<LoopEvent>>) -> Self {
+    pub(crate) const fn new(sink: Option<&'a UnboundedSender<LoopEvent>>) -> Self {
         Self {
             sink,
             emitted: 0,
             started: false,
+            next_index: 0,
         }
     }
 
@@ -85,8 +96,47 @@ impl<'a> Emitter<'a> {
             && self.emitted < prefix.len()
         {
             let _ = sink.send(LoopEvent::Blocks(prefix[self.emitted..].to_vec()));
+            // The response numbers these blocks one each, from its own
+            // counter, which is in step with this one.
+            let sent = u32::try_from(prefix.len() - self.emitted).unwrap_or(u32::MAX);
+            self.next_index = self.next_index.saturating_add(sent);
             self.emitted = prefix.len();
         }
+    }
+
+    /// The first `prefix_len` prefix blocks are already with the client: they
+    /// were streamed live, so they must not be sent again.
+    pub(crate) fn mark_sent(&mut self, prefix_len: usize) {
+        self.emitted = self.emitted.max(prefix_len);
+    }
+
+    /// Send events the loop numbered itself. `next_index` is the content index
+    /// after them.
+    pub(crate) fn send_live(&mut self, events: Vec<StreamEvent>, next_index: u32) {
+        self.next_index = next_index;
+        if let Some(sink) = self.sink
+            && !events.is_empty()
+        {
+            let _ = sink.send(LoopEvent::Live(events, next_index));
+        }
+    }
+
+    /// The content index the next block gets.
+    pub(crate) const fn next_index(&self) -> u32 {
+        self.next_index
+    }
+
+    /// Resolves when the client has gone away; never, without a sink.
+    pub(crate) async fn closed(&self) {
+        match self.sink {
+            Some(sink) => sink.closed().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Whether a streaming client is being sent the turn as it happens.
+    pub(crate) const fn is_live(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// The client is still there (always true without a sink).
@@ -177,6 +227,9 @@ pub(crate) struct SessionResult {
     /// How many `prefix_blocks` a streaming client already has (0 when the
     /// client is buffered).
     pub emitted: usize,
+    /// The LAST executor response was streamed to the client as it was
+    /// generated, so its content must not be sent again at the end.
+    pub live_final: bool,
 }
 
 /// Run the whole turn for `tools`, for a client that gets the response whole.
@@ -232,11 +285,38 @@ pub(crate) async fn drive(
                 "the client disconnected during a server-tool turn".to_owned(),
             ));
         }
+        // A streaming client gets the run as it is generated, so ask the
+        // upstream to stream it. `prepare` set `stream: false` for the
+        // buffered client, and a `default_model` fallback rebuilds the request
+        // (and `prepare` with it), so the flag is set before EVERY run and
+        // cleared again right after, so nothing a tool clones from the
+        // request inherits it.
+        if out.is_live() {
+            attempt.outbound.stream = true;
+        }
+        // The `→ upstream` line is written before the loop decides this, so
+        // say here how each executor run is actually fetched.
+        tracing::info!(
+            round = rounds + 1,
+            stream = attempt.outbound.stream,
+            "→ executor run (server-tool turn)"
+        );
+        let run_started = Instant::now();
         let outcome = attempt.execute(&url).await;
-        // An upstream that streams although the request was buffered can only
-        // be handed on as a stream when nothing has been done yet; later, it
-        // is treated like any other failed re-run.
+        attempt.outbound.stream = false;
+        // `live_run`: the run's content is already with the client. Without
+        // a sink an upstream that streams although the request was buffered
+        // can only be handed on as a stream when nothing has been done yet;
+        // later, it is treated like any other failed re-run.
         let outcome = match outcome {
+            Ok(Outcome::Streaming(raw)) if out.is_live() => {
+                // The upstream answered: the stream can start now, and a
+                // failure before this point stayed an ordinary HTTP error.
+                out.start(|| {
+                    crate::tools::server_loop::stream::placeholder_message(&attempt.req.model)
+                });
+                run_streamed(attempt, raw, &mut out, &names).await
+            }
             Ok(Outcome::Streaming(raw)) if last_good.is_none() => {
                 tracing::warn!(
                     "server-tool path expected a buffered response; rendering the upstream \
@@ -247,14 +327,23 @@ pub(crate) async fn drive(
             Ok(Outcome::Streaming(_)) => Err(AppError::Internal(
                 "the upstream streamed a response that was requested whole".to_owned(),
             )),
-            other => other,
+            Ok(Outcome::Buffered(body)) => Ok((body, false)),
+            Err(err) => Err(err),
         };
-        let resp = match outcome {
-            Ok(Outcome::Buffered(body)) => {
+        let (resp, live_run) = match outcome {
+            Ok((body, live_run)) => {
+                tracing::info!(
+                    round = rounds + 1,
+                    streamed = live_run,
+                    elapsed_ms = u64::try_from(run_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    status = %body.status,
+                    input_tokens = body.usage.as_ref().map_or(0, |u| u.input_tokens),
+                    output_tokens = body.usage.as_ref().map_or(0, |u| u.output_tokens),
+                    "← executor run (server-tool turn)"
+                );
                 add_usage(&mut total_usage, body.usage.as_ref());
-                body
+                (body, live_run)
             }
-            Ok(Outcome::Streaming(_)) => unreachable!("handled above"),
             Err(err) => {
                 let Some(last) = last_good.take() else {
                     return Err(scrub(&tools, err));
@@ -271,10 +360,13 @@ pub(crate) async fn drive(
                     prefix_blocks,
                     tools,
                     false,
-                    out.emitted,
+                    &out,
+                    false,
                 ));
             }
         };
+        // A buffered run (an upstream that ignored `stream`, or a client that
+        // is not streaming) starts the response from its own skeleton.
         out.start(|| {
             let mut skeleton = crate::translate::responses_to_anthropic(&resp, &attempt.registry);
             skeleton.content.clear();
@@ -305,13 +397,18 @@ pub(crate) async fn drive(
                 prefix_blocks,
                 tools,
                 false,
-                out.emitted,
+                &out,
+                live_run,
             ));
         }
 
         // Everything the executor said in this sampling is an INTERMEDIATE
         // block: keep all of it except the internal tool calls.
         prefix_blocks.extend(intermediate_blocks(&resp, &attempt.registry, &names));
+        if live_run {
+            // Already sent as it was generated.
+            out.mark_sent(prefix_blocks.len());
+        }
         out.flush(&prefix_blocks);
 
         let replay_mode = attempt
@@ -377,7 +474,8 @@ pub(crate) async fn drive(
                     prefix_blocks,
                     tools,
                     true,
-                    out.emitted,
+                    &out,
+                    false,
                 ));
             }
             AfterRound::AnswerNext => {
@@ -404,7 +502,8 @@ fn complete(
     prefix_blocks: Vec<ResponseContentBlock>,
     tools: Vec<Box<dyn ServerTool>>,
     paused: bool,
-    emitted: usize,
+    out: &Emitter<'_>,
+    live_final: bool,
 ) -> SessionOutcome {
     // The response the client gets (and the stats) carry the whole turn's
     // usage, not only the last run's.
@@ -416,8 +515,46 @@ fn complete(
         prefix_blocks,
         tools,
         paused,
-        emitted,
+        emitted: out.emitted,
+        live_final,
     }))
+}
+
+/// One executor run for a streaming client: read the upstream's SSE stream,
+/// sending the client its events as they arrive, and return the whole run as
+/// a [`ResponsesResponse`] for the loop to inspect. The flag says whether the
+/// run's content has been streamed to the client (it has not when the
+/// upstream ignored `stream: true` and answered with JSON).
+async fn run_streamed(
+    attempt: &Attempt,
+    raw: reqwest::Response,
+    out: &mut Emitter<'_>,
+    names: &[&'static str],
+) -> Result<(ResponsesResponse, bool), AppError> {
+    let is_json = raw
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+    if is_json {
+        return crate::proxy::parse_upstream_body(raw)
+            .await
+            .map(|body| (body, false));
+    }
+    let msg_id = crate::tools::server_loop::stream::placeholder_message(&attempt.req.model).id;
+    let events = eventsource_stream::Eventsource::eventsource(raw.bytes_stream());
+    crate::tools::server_loop::live::consume(
+        events,
+        out,
+        crate::tools::server_loop::live::RunContext {
+            msg_id,
+            model: attempt.outbound.model.clone(),
+            registry: attempt.registry.clone(),
+            hidden: names,
+        },
+    )
+    .await
+    .map(|resp| (resp, true))
 }
 
 /// Add one executor run's usage to the turn's running total.

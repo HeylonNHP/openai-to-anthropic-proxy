@@ -29,8 +29,9 @@
 //! * **`prepare`** (inbound): synthesises the function tool and forces
 //!   `stream: false` on the outbound request, because a fetch means the
 //!   executor must be RE-RUN with the page text before the turn can end.
-//!   The whole chain is buffered, and a streaming client is sent each round as
-//!   it finishes by the shared loop (`crate::tools::server_loop::stream`).
+//!   A buffered client's whole chain is buffered; a streaming client's loop
+//!   turns streaming back on per run and forwards each run as it is generated
+//!   (`crate::tools::server_loop::{live, stream}`).
 //! * **`tool`** (outbound): the [`ServerTool`](crate::tools::server_loop::handler::ServerTool)
 //!   the shared loop in [`crate::tools::server_loop`] calls: it fetches the
 //!   URL the executor asked for and returns the page text, which the loop
@@ -167,9 +168,9 @@ pub fn prepare(
         }));
     }
 
-    // The executor must be re-run with the fetched text, so the whole
-    // chain is buffered. Splicing a second upstream stream into
-    // TranslatorStream is deliberately NOT attempted.
+    // The executor must be re-run with the fetched text. The default is a
+    // buffered chain; a streaming client's loop streams each run itself
+    // (`server_loop::run::drive`) and reads it with a continuation translator.
     outbound.stream = false;
     true
 }

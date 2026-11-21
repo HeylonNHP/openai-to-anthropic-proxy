@@ -1,31 +1,28 @@
 //! Streaming a server-tool turn to the client as it happens.
 //!
-//! Each executor run is still fetched whole (a model's function call cannot be
-//! served until it is complete), but the CLIENT does not have to wait for the
-//! turn to end. As each round finishes, the blocks it produced (the model's
-//! text, `server_tool_use`, the result) are sent at once, `ping` events keep
-//! the connection alive while a later run is in flight, and the closing
-//! `message_delta` follows the last block:
+//! Each executor run is streamed upstream and forwarded as it is generated
+//! (see [`crate::tools::server_loop::live`]); between runs the blocks of the
+//! served tool calls are sent, `ping` events keep the connection alive while a
+//! run is quiet, and the closing `message_delta` follows the last block:
 //!
 //! ```text
-//! first run done ─▶ message_start
-//! each round     ─▶ content_block_start / delta / stop …
-//! (idle)         ─▶ ping, ping …
-//! last run done  ─▶ final blocks, message_delta, message_stop
+//! upstream answered ─▶ message_start (placeholder)
+//! each run          ─▶ content_block_start / delta / stop … (live)
+//! each served call  ─▶ server_tool_use, result
+//! (idle)            ─▶ ping, ping …
+//! last run done     ─▶ message_delta, message_stop
 //! ```
 //!
-//! The response normally starts once the FIRST executor run has succeeded, so
-//! a quick failure there is still an ordinary HTTP error with its proper
-//! status (which clients retry on), exactly as before. But a first run can be
-//! slow (a reasoning model, a long context), and a client or intermediary that
-//! sees no byte at all for that long may give up. So if the first run has not
-//! finished within [`EARLY_START_AFTER`], the stream starts anyway with a
-//! placeholder `message_start` (the request's model, an empty message) and
-//! `ping`s from then on:
+//! The response starts once the first executor run has been ANSWERED with a
+//! success status (not finished), so a quick failure there is still an ordinary
+//! HTTP error with its proper status, which clients retry on. If the upstream
+//! has not answered within [`EARLY_START_AFTER`] the stream starts anyway with
+//! the same placeholder `message_start` and `ping`s, so the client is never
+//! silent for longer than the ping interval:
 //!
 //! ```text
-//! first run done within EARLY_START_AFTER ─▶ message_start (from the run)
-//! first run still going at EARLY_START_AFTER ─▶ message_start (placeholder), ping …
+//! first run answered within EARLY_START_AFTER ─▶ message_start (placeholder)
+//! still waiting at EARLY_START_AFTER          ─▶ message_start (placeholder), ping …
 //! ```
 //!
 //! Once the stream has started a failure cannot change the status any more
@@ -35,7 +32,8 @@
 //!
 //! The loop runs in its own task and talks to the response body over a
 //! channel, so a slow client never stalls it and a vanished client stops it
-//! (the loop notices the closed channel before its next upstream call).
+//! (the loop notices the closed channel before its next upstream call, and a
+//! run being read stops at once).
 
 // `tools` is a private module, so these crate-visible items look redundant to
 // clippy; they must be `pub(crate)` because they name `proxy::Attempt`.
@@ -108,9 +106,9 @@ pub(crate) async fn start(
         Some(LoopEvent::Started(message)) => Ok(Streamed::Response(response(message, rx))),
         Some(LoopEvent::Failed(err)) => Err(err),
         Some(LoopEvent::Fallback(attempt, raw)) => Ok(Streamed::Fallback(attempt, raw)),
-        Some(LoopEvent::Blocks(_) | LoopEvent::Finished(_)) | None => Err(AppError::Internal(
-            "the server-tool turn ended without starting".to_owned(),
-        )),
+        Some(LoopEvent::Blocks(_) | LoopEvent::Live(..) | LoopEvent::Finished(_)) | None => Err(
+            AppError::Internal("the server-tool turn ended without starting".to_owned()),
+        ),
     }
 }
 
@@ -189,6 +187,12 @@ async fn next_chunk(mut state: BodyState) -> Option<(Bytes, BodyState)> {
             event = state.rx.recv() => match event {
                 Some(LoopEvent::Blocks(blocks)) => {
                     break block_stream_events(&mut state.next_index, blocks);
+                }
+                Some(LoopEvent::Live(events, next_index)) => {
+                    // The loop numbered these itself (a run streamed live);
+                    // carry on from where it left off.
+                    state.next_index = next_index;
+                    break events;
                 }
                 Some(LoopEvent::Finished(tail)) => {
                     state.done = true;

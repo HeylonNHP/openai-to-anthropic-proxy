@@ -1175,3 +1175,80 @@ fn non_web_search_function_call_does_not_emit_search_blocks() {
         other => panic!("expected message_delta, got {other:?}"),
     }
 }
+
+// ─── continuation mode (one executor run inside a larger message) ──────────
+
+fn continuation(first_index: u32) -> StreamTranslator {
+    StreamTranslator::continuation(
+        "msg_x".into(),
+        "m".into(),
+        crate::repair::ToolSchemaRegistry::default(),
+        first_index,
+        vec!["internal".to_owned()],
+    )
+}
+
+fn event(value: serde_json::Value) -> ResponsesStreamEvent {
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn a_continuation_sends_no_message_start_and_starts_at_its_index() {
+    let mut t = continuation(5);
+    let mut events = t.feed_event(&event(serde_json::json!({
+        "type": "response.output_item.added", "output_index": 0,
+        "item": {"type": "message", "role": "assistant", "content": []}
+    })));
+    events.extend(t.feed_event(&event(serde_json::json!({
+        "type": "response.output_text.delta", "item_id": "m", "output_index": 0,
+        "content_index": 0, "delta": "hi"
+    }))));
+    let json = serde_json::to_string(&events).unwrap();
+    assert!(!json.contains("message_start"), "{json}");
+    assert!(
+        json.contains(r#""type":"content_block_start","index":5"#),
+        "{json}"
+    );
+    assert_eq!(t.next_index(), 6);
+}
+
+#[test]
+fn a_hidden_call_gets_no_block_no_index_and_no_warning_events() {
+    let mut t = continuation(0);
+    let mut events = Vec::new();
+    for e in [
+        serde_json::json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "c", "name": "internal", "arguments": ""}}),
+        serde_json::json!({"type": "response.function_call_arguments.delta",
+            "item_id": "f", "output_index": 0, "delta": "{}"}),
+        serde_json::json!({"type": "response.function_call_arguments.done",
+            "item_id": "f", "output_index": 0, "arguments": "{}"}),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "c", "name": "internal", "arguments": "{}"}}),
+    ] {
+        events.extend(t.feed_event(&event(e)));
+    }
+    events.extend(t.close_blocks());
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(t.next_index(), 0);
+}
+
+#[test]
+fn closing_a_continuation_closes_open_blocks_once_and_never_ends_the_message() {
+    let mut t = continuation(2);
+    t.feed_event(&event(serde_json::json!({
+        "type": "response.output_item.added", "output_index": 0,
+        "item": {"type": "message", "role": "assistant", "content": []}
+    })));
+    let closing = t.close_blocks();
+    let json = serde_json::to_string(&closing).unwrap();
+    assert!(
+        json.contains(r#""type":"content_block_stop","index":2"#),
+        "{json}"
+    );
+    assert!(
+        !json.contains("message_delta") && !json.contains("message_stop"),
+        "{json}"
+    );
+    assert!(t.close_blocks().is_empty(), "idempotent");
+}

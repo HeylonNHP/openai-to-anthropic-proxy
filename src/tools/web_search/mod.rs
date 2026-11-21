@@ -68,8 +68,9 @@ pub fn active(config: &WebSearchConfig, req: &CreateMessageRequest) -> bool {
 /// * removes the upstream's built-in `web_search` tool (the translator added
 ///   it) — otherwise the model would have two search tools;
 /// * adds the [`EXECUTOR_TOOL_NAME`] function tool taking `queries[]`;
-/// * forces `stream: false`: the executor must be re-run with the results,
-///   so the chain is buffered (see `web_fetch` for the same reasoning).
+/// * sets `stream: false`: the executor must be re-run with the results, so
+///   the chain is buffered by default (a streaming client's loop streams each
+///   run itself; see `web_fetch` for the same reasoning).
 ///
 /// Returns whether it activated. Called from `proxy::build_outbound`, which
 /// both the first attempt and the `default_model` fallback go through.
