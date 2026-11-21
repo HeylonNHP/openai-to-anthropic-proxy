@@ -157,8 +157,10 @@ remove `advisorModel`) to turn it off. A failed consultation degrades to
 `advisor.enabled` is true in `proxy.json`, Claude Code declares the tool but no
 consultation runs.
 
-Deep protocol notes, reverse-engineering, and implementation history:
-[`ADVISOR_TOOL_RESEARCH.md`](./ADVISOR_TOOL_RESEARCH.md).
+Deep protocol notes and the advisor's configuration live in
+[`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor) and
+[`REFERENCE.md`](./REFERENCE.md#configuration); the faults still open are
+tracked in [`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md).
 
 ### Enabling the proxy's own web search
 
@@ -303,8 +305,9 @@ and prints a warning.
 
 ## License, contributing, and more
 
-- **License:** none granted by default — see [`REFERENCE.md`](./REFERENCE.md#license)
-  before redistributing.
+- **License:** GPL-3.0 — see [`LICENSE`](./LICENSE). You may use, modify and
+  redistribute the code; any derivative must also be GPL-3.0 with its source
+  available.
 - **Development:** `cargo test`; `cargo clippy --all-targets`; `cargo fmt --all -- --check`
   (details in [`REFERENCE.md`](./REFERENCE.md#development)).
 - **Architecture, translation overview, out-of-scope notes:** [`REFERENCE.md`](./REFERENCE.md).

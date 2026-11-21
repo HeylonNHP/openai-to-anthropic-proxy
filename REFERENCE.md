@@ -332,9 +332,9 @@ Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4
 ## Development
 
 - `cargo test` runs unit and e2e tests.
-- `cargo clippy --all-targets` is the lint gate. There are **5 known
-  pre-existing warnings** (in the test modules); no new ones are allowed.
+- `cargo clippy --all-targets` is the lint gate and must stay **warning-free**.
 - `cargo fmt --all -- --check` checks formatting.
+- CI (`.github/workflows/ci.yml`) runs all three on every push and pull request.
 
 ### Test layout (project standard)
 
@@ -423,7 +423,7 @@ OpenAI-compatible upstream.
 See also [`README.md`](./README.md#features) for the shorter visitor-facing list.
 
 ### Endpoints and transport
-- `/v1/models` listing (and other Anthropic endpoints such as batches/files)
+- Anthropic endpoints other than Messages, `GET /v1/models` and `/healthz` (such as batches/files)
 - TLS termination (bind a plain HTTP listener; put a reverse proxy in front)
 - One upstream target per instance: no multi-tenant or per-user routing
 
@@ -437,7 +437,7 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 - `thinking.budget_tokens` is parsed but not enforced or forwarded
 
 ### Server-side / built-in tools
-- Server-side tools beyond OpenAI's `web_search` and the proxy's own `web_fetch` (no `code_execution`, `tool_search`, etc.)
+- Server-side tools beyond OpenAI's `web_search` and the proxy's own `web_search`, `web_fetch` and `advisor` (no `code_execution`, `tool_search`, etc.)
 - Server-tool continuation loops (`pause_turn` re-sends, mixed server/client turns)
 - Claude Code's standby advisor path (only an explicitly configured `advisorModel` works behind a proxy)
 
@@ -462,24 +462,27 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 This is a planning note for future changes. It is separate from the current
 "out of scope" list above, which describes hard limits of the design.
 
-> **Done:** the server-side `web_fetch` tool (image input support landed
-> earlier) — see "Server-side `web_fetch`" above.
+> **Shipped since this section was written:** the server-side `web_fetch` tool,
+> the proxy's own `web_search`, the experimental `advisor` tool and the
+> `GET /v1/models` route — see "Server-side `web_fetch`" above and
+> [Gateway model discovery](./README.md#enabling-gateway-model-discovery-v1models).
 
-### Best next improvement: `/v1/models`
+### Open
 
-Small, self-contained route that improves compatibility with tools and model
-selectors. (Image input support has since landed: user-message images were
-already forwarded, and `tool_result` images now reach the upstream too — see
-[`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).)
-It does not unlock a new user workflow on its own.
+Nothing self-contained is queued here. The remaining work is either a
+user-facing feature (see the "out of scope" list above) or bug fixes in the
+`advisor`, whose open faults are tracked in
+[`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md).
 
 ### De-prioritise for now
 - TLS termination: better handled by a reverse proxy (Caddy/nginx/Traefik).
-- Server-side tools (`web_fetch`, `code_execution`, etc.): high value, but
-  require upstream loops and are not cheap.
+- Anthropic's remaining server-side tools (`code_execution`, `tool_search`, …):
+  they need upstream loops the proxy does not have.
 - `redacted_thinking`, `stop_sequences`: need upstream semantics OpenAI-compatible
   APIs mostly do not expose.
 
 ## License
 
-This is a personal/professional project; no license is granted by default. Add one if you intend to distribute.
+GPL-3.0 — see [`LICENSE`](./LICENSE). You may use, modify and redistribute the
+code; any derivative must also be distributed under GPL-3.0 with its source
+available. Contributions are welcome as pull requests.
