@@ -227,6 +227,9 @@ pub struct Config {
     /// the encoding the Responses API specifies; `lift` and `drop` are
     /// escape hatches for gateways that only accept string tool outputs.
     pub tool_result_images: ToolResultImages,
+    /// Where a `role: "system"` message in the middle of the conversation
+    /// goes. See [`SystemMessagePlacement`].
+    pub system_message_placement: SystemMessagePlacement,
     /// Shared secret required on the inbound `X-Proxy-Key` header.
     /// `None` means no client authentication (current behavior); a
     /// warning is printed at startup. `Some(_)` means every request
@@ -706,6 +709,44 @@ impl ToolResultImages {
     }
 }
 
+/// Where a `role: "system"` message that sits **inside the conversation** goes
+/// on the way to the upstream.
+///
+/// Claude Code does not only send a system prompt at the top. It also puts
+/// `system` messages into `messages` (the environment block, the skills list,
+/// "the user hasn't heard from you in a while", hook output), each at the
+/// point in the conversation where it applies.
+///
+/// An upstream's prompt cache can only reuse a prompt whose START is
+/// unchanged. Folding those messages into `instructions` (the very start of
+/// the prompt) changes the start every time one arrives, so the whole
+/// conversation after it is re-read at full price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SystemMessagePlacement {
+    /// Append the message to `instructions`. Works with every upstream, but
+    /// breaks the prompt cache each time a system message arrives. Default,
+    /// because it is the behaviour every upstream is known to accept.
+    #[default]
+    Instructions,
+    /// Send it as a `system` message at its own position in `input`. The
+    /// start of the prompt then stays the same and the cache keeps hitting.
+    /// The upstream must accept system messages after the first turn; the
+    /// OpenAI Responses API does, and a chat-template-based upstream may not.
+    Inline,
+}
+
+impl SystemMessagePlacement {
+    /// Lenient parse used by the config resolver (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "instructions" => Some(Self::Instructions),
+            "inline" => Some(Self::Inline),
+            _ => None,
+        }
+    }
+}
+
 /// Reasoning-replay settings.
 ///
 /// `models` holds per-upstream-model overrides keyed by the **alias-resolved
@@ -958,6 +999,31 @@ impl Config {
                     ToolResultImages::default()
                 })
             });
+
+        // `system_message_placement`: `instructions` (default) or `inline`.
+        // Env wins over file; an unrecognised value falls back to the default
+        // with a warning, like `tool_result_images`.
+        let placement_raw = env
+            .system_message_placement
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                file.and_then(|f| f.system_message_placement.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        let system_message_placement = placement_raw.map_or_else(Default::default, |v| {
+            SystemMessagePlacement::parse(v).unwrap_or_else(|| {
+                warnings.push(
+                    ConfigWarning::new(format!(
+                        "system_message_placement = {v:?} is not one of \"instructions\" or \"inline\"; using the default \"instructions\""
+                    ))
+                    .with_field("system_message_placement", v.to_owned()),
+                );
+                SystemMessagePlacement::default()
+            })
+        });
 
         // `log_to_disk`: env wins over file, then default to `false`.
         // For a boolean we can't reuse `pick_str`; do it inline.
@@ -1246,6 +1312,7 @@ impl Config {
             prompt_caching,
             reasoning_replay,
             tool_result_images,
+            system_message_placement,
             proxy_key,
             log_to_disk,
             advisor,
@@ -1446,6 +1513,10 @@ pub struct EnvInputs {
     /// same as a bad value in `proxy.json` (warn + fall back to the
     /// default), never a hard startup failure.
     pub tool_result_images: Option<String>,
+    /// `SYSTEM_MESSAGE_PLACEMENT=instructions|inline`. See
+    /// [`SystemMessagePlacement`]; judged by the resolver like
+    /// `TOOL_RESULT_IMAGES`.
+    pub system_message_placement: Option<String>,
     /// Advisor overrides. `ADVISOR_ENABLED` uses the same truthy values as
     /// `LOG_TO_DISK`; a value that is not a number at all is ignored (the
     /// file/default value wins) rather than silently disabling the section.
@@ -1507,6 +1578,7 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             tool_result_images: env::var("TOOL_RESULT_IMAGES").ok(),
+            system_message_placement: env::var("SYSTEM_MESSAGE_PLACEMENT").ok(),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
@@ -1986,6 +2058,11 @@ pub struct JsonConfig {
     /// it round-trips unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_images: Option<String>,
+    /// Where a `role: "system"` message inside the conversation goes. See
+    /// [`SystemMessagePlacement`]. Unset keeps the file unchanged when the
+    /// TUI rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message_placement: Option<String>,
     /// Shared secret required on inbound `X-Proxy-Key` header.
     /// Omit to leave `/v1/messages` unauthenticated (with a
     /// startup-time warning).

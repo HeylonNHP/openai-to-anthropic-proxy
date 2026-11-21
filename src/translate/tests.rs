@@ -1618,6 +1618,7 @@ fn tool_result_image_lift_mode_sends_images_in_follow_up_user_message() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        Default::default(),
     )
     .unwrap();
     let items = unwrap_items(out);
@@ -1678,6 +1679,7 @@ fn tool_result_image_drop_mode_drops_images_and_keeps_text() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Drop,
+        Default::default(),
     )
     .unwrap();
     let items = unwrap_items(out);
@@ -3720,6 +3722,7 @@ fn lift_mode_keeps_parallel_tool_outputs_adjacent_and_labels_images() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        Default::default(),
     )
     .unwrap();
     let items = unwrap_items(out);
@@ -3774,6 +3777,7 @@ fn lift_mode_image_only_result_gets_a_placeholder_output_not_an_empty_string() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        Default::default(),
     )
     .unwrap();
     let items = unwrap_items(out);
@@ -4026,4 +4030,117 @@ fn a_conversation_may_end_with_the_paused_assistant_message() {
                 InputContentPart::OutputText { text, .. } if text.contains("https://a.test/"))),
         "the results are the last thing the model sees: {last:?}"
     );
+}
+
+// ── System messages inside the conversation ─────────────────────────────
+
+fn with_mid_conversation_system(text: &str) -> CreateMessageRequest {
+    let mut req = fixture_request();
+    req.messages.push(MessageParam {
+        role: MessageRole::System,
+        content: MessageContent::Blocks(vec![
+            ContentBlockParam::Text(TextBlockParam {
+                text: text.into(),
+                cache_control: None,
+            }),
+            // Claude Code announces a tool this way; it has no text.
+            ContentBlockParam::Unknown,
+        ]),
+    });
+    req.messages.push(MessageParam {
+        role: MessageRole::User,
+        content: MessageContent::Text("next".into()),
+    });
+    req
+}
+
+fn translate_with(req: &CreateMessageRequest, placement: SystemMessagePlacement) -> ResponsesRequest {
+    anthropic_to_responses_with(
+        req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+        ToolResultImages::default(),
+        placement,
+    )
+    .unwrap()
+    .0
+}
+
+#[test]
+fn a_mid_conversation_system_message_is_folded_into_the_instructions_by_default() {
+    let req = with_mid_conversation_system("the user hasn't heard from you");
+    let out = translate_with(&req, SystemMessagePlacement::Instructions);
+    assert!(
+        out.instructions
+            .as_deref()
+            .unwrap()
+            .ends_with("the user hasn't heard from you")
+    );
+    let items = unwrap_items(out);
+    assert_eq!(items.len(), 2, "only the two user turns: {items:?}");
+}
+
+#[test]
+fn inline_placement_keeps_the_system_message_where_it_was_sent() {
+    let req = with_mid_conversation_system("the user hasn't heard from you");
+    let out = translate_with(&req, SystemMessagePlacement::Inline);
+    // The start of the prompt is exactly what it was before the note arrived.
+    assert_eq!(out.instructions.as_deref(), Some("You are helpful."));
+    let items = unwrap_items(out);
+    assert_eq!(items.len(), 3, "{items:?}");
+    match &items[1] {
+        InputItem::Message { role, content } => {
+            assert_eq!(role, "system");
+            match &content[0] {
+                InputContentPart::InputText { text, .. } => {
+                    assert_eq!(text, "the user hasn't heard from you");
+                }
+                other => panic!("unexpected part {other:?}"),
+            }
+        }
+        other => panic!("expected the system message in place, got {other:?}"),
+    }
+    assert!(matches!(&items[2], InputItem::Message { role, .. } if role == "user"));
+}
+
+#[test]
+fn inline_placement_leaves_the_prompt_start_stable_as_notes_arrive() {
+    // The cache-relevant property: the bytes before the new note do not change.
+    let one = with_mid_conversation_system("note one");
+    let mut two = with_mid_conversation_system("note one");
+    two.messages.push(MessageParam {
+        role: MessageRole::System,
+        content: MessageContent::Text("note two".into()),
+    });
+    let a = translate_with(&one, SystemMessagePlacement::Inline);
+    let b = translate_with(&two, SystemMessagePlacement::Inline);
+    assert_eq!(a.instructions, b.instructions);
+    let (ia, ib) = (unwrap_items(a), unwrap_items(b));
+    assert_eq!(
+        serde_json::to_string(&ia[..]).unwrap().trim_end_matches(']'),
+        serde_json::to_string(&ib[..ia.len()]).unwrap().trim_end_matches(']')
+    );
+}
+
+#[test]
+fn inline_placement_skips_a_system_message_with_no_text() {
+    let mut req = fixture_request();
+    req.messages.push(MessageParam {
+        role: MessageRole::System,
+        content: MessageContent::Blocks(vec![ContentBlockParam::Unknown]),
+    });
+    let items = unwrap_items(translate_with(&req, SystemMessagePlacement::Inline));
+    assert_eq!(items.len(), 1, "{items:?}");
+}
+
+#[test]
+fn inline_placement_strips_the_advisor_section_when_no_advisor_tool_is_sent() {
+    let text = format!("# Environment\nx\n\n{ADVISOR_SECTION}<system-reminder>keep</system-reminder>");
+    let req = with_mid_conversation_system(&text);
+    let items = unwrap_items(translate_with(&req, SystemMessagePlacement::Inline));
+    let InputItem::Message { content, .. } = &items[1] else { panic!("{items:?}") };
+    let InputContentPart::InputText { text, .. } = &content[0] else { panic!() };
+    assert!(!text.contains("# Advisor Tool"), "{text}");
+    assert!(text.contains("# Environment") && text.contains("keep"), "{text}");
 }

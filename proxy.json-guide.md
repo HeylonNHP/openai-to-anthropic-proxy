@@ -188,6 +188,27 @@ Environment variable: `PROMPT_CACHING_MODELS` — a comma-separated list (e.g. `
 
 Because unknown JSON fields are silently ignored by most OpenAI-compatible endpoints, enabling this is safe even for Ollama, OpenRouter, or vLLM upstreams. Those endpoints will simply ignore the extra fields.
 
+### System messages inside the conversation (`system_message_placement`)
+
+Claude Code does not only send a system prompt at the top. It also puts `role: "system"` messages **inside** `messages`, each where it applies: the environment block and skills list near the start, and later "The user hasn't heard from you in a while", hook output and similar notes. (Captured from the Claude Code CLI itself; each of those is a separate `system` message, and a tool announcement arrives as a text-less `tool_addition` block next to them.)
+
+An upstream's prompt cache can only reuse a prompt whose **start is unchanged**. By default the proxy folds every one of these messages into `instructions`, which is the very start of the prompt, so each time one arrives the whole conversation after it is read again at full price. In a day of real traffic this was **46% of all uncached input** (13 misses, 2.8M tokens, some on 470k-token conversations).
+
+- `"instructions"` (**default**): fold them into `instructions`, as before. Every upstream accepts this.
+- `"inline"`: send each one as a `system` message at its own position in the conversation. The start of the prompt then stays identical and only the new note is uncached.
+
+```json
+{
+  "system_message_placement": "inline"
+}
+```
+
+Environment variable: `SYSTEM_MESSAGE_PLACEMENT` (`instructions` or `inline`, case-insensitive; the env var wins over the file; anything else warns and uses the default).
+
+**Try it before relying on it.** `inline` needs the upstream to accept a `system` message after the first turn. The OpenAI Responses API does; an upstream that applies a chat template might reject it or ignore it. If requests start failing with a 400, set it back to `"instructions"`. To see whether it helps, compare the cached-token figures in the proxy's log before and after.
+
+The `# Advisor Tool` section Claude Code puts in one of these messages is removed from the inline copy too, under the same rule as for the instructions, and the advisor's reviewer never sees it there either.
+
 ### Tool result images (`tool_result_images`)
 
 A tool can return images (a screenshot from a browser tool, an image produced by

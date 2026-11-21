@@ -734,6 +734,7 @@ fn build_outbound(
         &prompt_caching,
         &reasoning_replay,
         config.tool_result_images,
+        config.system_message_placement,
     )
     .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;
     // The translator copies the inbound model name verbatim; rewrite
@@ -753,9 +754,15 @@ fn build_outbound(
     // sections are deliberately preserved.
     if crate::tools::advisor::has_inbound_advisor_tool(req)
         && !crate::tools::advisor::active(config, req)
-        && let Some(instructions) = outbound.instructions.as_mut()
     {
-        translate::strip_advisor_tool_instructions(instructions);
+        if let Some(instructions) = outbound.instructions.as_mut() {
+            translate::strip_advisor_tool_instructions(instructions);
+        }
+        // The same section can sit in a system message kept in the
+        // conversation (`system_message_placement = "inline"`).
+        if let responses::Input::Items(items) = &mut outbound.input {
+            translate::strip_advisor_from_system_items(items);
+        }
     }
 
     // If the operator configured a prompt-cache key, forward it. This

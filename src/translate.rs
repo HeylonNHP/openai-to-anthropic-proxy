@@ -31,7 +31,8 @@ use crate::anthropic::{
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
 use crate::config::{
-    PromptCachingConfig, ReasoningDecision, ReasoningReplay, ReasoningReplayMode, ToolResultImages,
+    PromptCachingConfig, ReasoningDecision, ReasoningReplay, ReasoningReplayMode,
+    SystemMessagePlacement, ToolResultImages,
 };
 use crate::responses::{
     FunctionCallOutputBody, Input, InputContentPart, InputItem, PromptCacheBreakpoint,
@@ -150,6 +151,7 @@ pub fn anthropic_to_responses(
         prompt_caching,
         replay,
         ToolResultImages::default(),
+        SystemMessagePlacement::default(),
     )
 }
 
@@ -193,15 +195,39 @@ pub fn anthropic_to_responses_with(
     prompt_caching: &PromptCachingConfig,
     replay: &ReasoningReplay,
     tool_result_images: ToolResultImages,
+    system_messages: SystemMessagePlacement,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
     let mut items: Vec<InputItem> = Vec::new();
+    let has_advisor_tool = req
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == "advisor"));
 
     // Top-level `system` → `instructions`. Legacy `role: "system"`
     // messages are folded in below.
     let mut instructions = req.system.as_ref().map(system_text).unwrap_or_default();
 
     for msg in &req.messages {
+        // A system message in the middle of the conversation stays where it
+        // is, so the start of the prompt does not change (see
+        // `SystemMessagePlacement`).
+        if msg.role == MessageRole::System && system_messages == SystemMessagePlacement::Inline {
+            let mut text = system_message_text(&msg.content);
+            if !has_advisor_tool {
+                strip_advisor_tool_instructions(&mut text);
+            }
+            if !text.is_empty() {
+                items.push(InputItem::Message {
+                    role: "system".to_owned(),
+                    content: vec![InputContentPart::InputText {
+                        text,
+                        prompt_cache_breakpoint: None,
+                    }],
+                });
+            }
+            continue;
+        }
         append_message_translation(
             &mut items,
             &mut instructions,
@@ -226,10 +252,6 @@ pub fn anthropic_to_responses_with(
     // for byte identity. The proxy re-applies this strip AFTER translation
     // only when the translator skipped it but the pipeline is inactive
     // (`enabled:false` + schema-less declaration, B9).
-    let has_advisor_tool = req
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.name == "advisor"));
     if !has_advisor_tool {
         strip_advisor_tool_instructions(&mut instructions);
     }
@@ -2402,7 +2424,20 @@ fn build_reasoning_item(reasoning: &str, signature: &str) -> Option<InputItem> {
 }
 
 fn append_system_message(instructions: &mut String, content: &MessageContent) -> Result<()> {
-    let text = match content {
+    let text = system_message_text(content);
+    if !text.is_empty() {
+        if !instructions.is_empty() {
+            instructions.push('\n');
+        }
+        instructions.push_str(&text);
+    }
+    Ok(())
+}
+
+/// The text of a `system` message. Non-text blocks (`thinking`, and the
+/// `tool_addition` marker Claude Code uses to announce a tool) carry no text.
+fn system_message_text(content: &MessageContent) -> String {
+    match content {
         MessageContent::Text(s) => s.clone(),
         MessageContent::Blocks(blocks) => blocks
             .iter()
@@ -2426,14 +2461,24 @@ fn append_system_message(instructions: &mut String, content: &MessageContent) ->
             })
             .collect::<Vec<_>>()
             .join("\n"),
-    };
-    if !text.is_empty() {
-        if !instructions.is_empty() {
-            instructions.push('\n');
-        }
-        instructions.push_str(&text);
     }
-    Ok(())
+}
+
+/// Strip the `# Advisor Tool` section from every inline `system` message in
+/// `items`. The same single-section strip the instructions get, for the
+/// system messages kept in the conversation.
+pub fn strip_advisor_from_system_items(items: &mut [InputItem]) {
+    for item in items {
+        if let InputItem::Message { role, content } = item
+            && role == "system"
+        {
+            for part in content {
+                if let InputContentPart::InputText { text, .. } = part {
+                    strip_advisor_tool_instructions(text);
+                }
+            }
+        }
+    }
 }
 
 /// Map Anthropic's `ToolChoice` to a Responses-API `ToolChoice` and

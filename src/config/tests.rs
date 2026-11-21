@@ -1867,3 +1867,41 @@ fn advisor_reasoning_budget_follows_the_limit_rules() {
     let cfg = Config::resolve(Some(&file(5000)), &env).unwrap();
     assert_eq!(cfg.advisor.reasoning_max_tokens, Some(7000), "env > file");
 }
+
+#[test]
+fn system_message_placement_defaults_to_instructions() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn system_message_placement_file_env_and_case() {
+    let parsed = JsonConfig::parse(
+        r#"{"upstream_base_url": "https://api.example.com", "upstream_api_key": "k",
+            "system_message_placement": "Inline"}"#,
+    )
+    .unwrap();
+    let cfg = Config::resolve(Some(&parsed), &env_with_required()).unwrap();
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Inline);
+    // The env var wins over the file.
+    let env = EnvInputs {
+        system_message_placement: Some("instructions".to_owned()),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&parsed), &env).unwrap();
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+}
+
+#[test]
+fn system_message_placement_unknown_value_warns_and_uses_the_default() {
+    let parsed = JsonConfig::parse(
+        r#"{"upstream_base_url": "https://api.example.com", "upstream_api_key": "k",
+            "system_message_placement": "sideways"}"#,
+    )
+    .unwrap();
+    let cfg = Config::resolve(Some(&parsed), &env_with_required()).unwrap();
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert_eq!(cfg.warnings.len(), 1);
+    assert!(cfg.warnings[0].message.contains("system_message_placement"));
+}

@@ -187,6 +187,7 @@ fn make_config_with_default_model(
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     })
 }
@@ -226,6 +227,7 @@ fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     })
 }
@@ -635,6 +637,7 @@ async fn per_model_reasoning_effort_lookup() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -730,6 +733,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -817,6 +821,7 @@ async fn model_alias_rewrites_inbound_model() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -900,6 +905,7 @@ async fn model_not_supported_falls_back_to_default() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -962,6 +968,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1032,6 +1039,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1739,6 +1747,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1840,6 +1849,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -1919,6 +1929,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -2011,6 +2022,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -2105,6 +2117,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
@@ -2206,6 +2219,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let store = Arc::new(MappingsStore::seeded(Arc::new(
@@ -2300,6 +2314,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     // Seed the runtime store with an alias so the first request
@@ -2962,6 +2977,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
         server_tools: ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: ToolResultImages::default(),
+        system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
     let proxy_addr = start_proxy(config).await;
@@ -8947,4 +8963,60 @@ async fn advisor_failures_report_their_own_code_and_reason() {
         assert!(told.contains(reason), "{code}: {told}");
         assert!(told.contains("without a second opinion"), "{code}: {told}");
     }
+}
+
+// ── System messages inside the conversation ─────────────────────────────
+
+/// Claude Code sends `role: "system"` messages inside `messages` (the
+/// environment block, "the user hasn't heard from you", hook output).
+fn request_with_mid_conversation_system() -> &'static str {
+    r#"{"model":"gpt-4o-mini","max_tokens":16,"system":"You are helpful.",
+        "messages":[
+          {"role":"user","content":"hello"},
+          {"role":"system","content":[{"type":"text","text":"the user has not heard from you"},
+                                       {"type":"tool_addition","tool":{"type":"tool_reference","name":"x"}}]},
+          {"role":"user","content":"next"}]}"#
+}
+
+async fn upstream_body_for_mid_conversation_system(
+    placement: openai_to_anthropic_proxy::config::SystemMessagePlacement,
+) -> serde_json::Value {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(completed_response_with_id("resp_ok", "ok"));
+    let mut config = (*make_proxy_config(upstream_addr)).clone();
+    config.system_message_placement = placement;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(request_with_mid_conversation_system()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sent = upstream.received_all.lock().await.clone();
+    serde_json::from_slice(&sent[0]).unwrap()
+}
+
+#[tokio::test]
+async fn a_mid_conversation_system_message_goes_to_the_instructions_by_default() {
+    use openai_to_anthropic_proxy::config::SystemMessagePlacement;
+    let body = upstream_body_for_mid_conversation_system(SystemMessagePlacement::Instructions).await;
+    assert!(
+        body["instructions"].as_str().unwrap().contains("the user has not heard from you"),
+        "{body}"
+    );
+    assert_eq!(body["input"].as_array().unwrap().len(), 2, "{body}");
+}
+
+#[tokio::test]
+async fn inline_placement_sends_the_system_message_in_the_conversation() {
+    use openai_to_anthropic_proxy::config::SystemMessagePlacement;
+    let body = upstream_body_for_mid_conversation_system(SystemMessagePlacement::Inline).await;
+    assert_eq!(body["instructions"], "You are helpful.", "{body}");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3, "{body}");
+    assert_eq!(input[1]["role"], "system");
+    assert_eq!(input[1]["content"][0]["text"], "the user has not heard from you");
+    assert_eq!(input[2]["role"], "user");
 }

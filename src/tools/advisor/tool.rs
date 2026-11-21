@@ -225,7 +225,26 @@ fn transcript(attempt: &Attempt) -> String {
     let instructions = reviewer_view_of(attempt.outbound.instructions.as_deref());
     let mut input = serde_json::to_value(&attempt.outbound.input).unwrap_or(Value::Null);
     strip_encrypted_content(&mut input);
+    strip_advisor_section_from_system_messages(&mut input);
     build_transcript(&instructions, input, MAX_TRANSCRIPT_CHARS)
+}
+
+/// The `# Advisor Tool` section can also sit in a system message kept in the
+/// conversation (`system_message_placement = "inline"`); the reviewer must not
+/// read it there either (see [`reviewer_view_of`]).
+fn strip_advisor_section_from_system_messages(input: &mut Value) {
+    let Value::Array(items) = input else { return };
+    for item in items.iter_mut().filter(|i| i["role"] == "system") {
+        if let Some(parts) = item["content"].as_array_mut() {
+            for part in parts {
+                if let Some(text) = part["text"].as_str() {
+                    let mut text = text.to_owned();
+                    crate::translate::strip_advisor_tool_instructions(&mut text);
+                    part["text"] = Value::String(text);
+                }
+            }
+        }
+    }
 }
 
 /// The executor's instructions as the reviewer should see them: without the
