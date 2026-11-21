@@ -1070,10 +1070,9 @@ impl Attempt {
             };
         }
         // Retries are issued here -- before any response bytes are written,
-        // so the streaming path is safe too (see TODO at the end of this
-        // file): once per sampling parameter the upstream says it does not
-        // support, and once with the configured `default_model` if the
-        // upstream rejects the requested model entirely.
+        // so the streaming path is safe too: once per sampling parameter the
+        // upstream says it does not support, and once with the configured
+        // `default_model` if the upstream rejects the requested model entirely.
         match self.execute(&url).await? {
             Outcome::Streaming(resp) => render_streaming(self, resp),
             Outcome::Buffered(body) => render_json(&self, body),

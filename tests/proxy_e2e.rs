@@ -4189,9 +4189,7 @@ async fn advisor_logs_every_failure_even_though_the_tui_shows_one() {
             advisor_call_response("resp_c2", "call_t2"),
             FakeResponse {
                 status: StatusCode::NOT_FOUND,
-                body: Some(
-                    REAL_GATEWAY_MODEL_404.replace("claude-sonnet-5", MARK),
-                ),
+                body: Some(REAL_GATEWAY_MODEL_404.replace("claude-sonnet-5", MARK)),
             },
             advisor_executor_message("resp_final", "Answer without advice."),
         ],
@@ -4214,12 +4212,32 @@ async fn advisor_logs_every_failure_even_though_the_tui_shows_one() {
         .filter(|l| l.contains(MARK))
         .filter(|l| l.contains("advisor consultation failed; continuing without advice"))
         .collect();
-    assert_eq!(failures.len(), 2, "one log line per failed consultation:\n{log}");
-    assert!(failures[0].contains("failure=\"overloaded\""), "{}", failures[0]);
-    assert!(failures[0].contains("failures_this_turn=1"), "{}", failures[0]);
+    assert_eq!(
+        failures.len(),
+        2,
+        "one log line per failed consultation:\n{log}"
+    );
+    assert!(
+        failures[0].contains("failure=\"overloaded\""),
+        "{}",
+        failures[0]
+    );
+    assert!(
+        failures[0].contains("failures_this_turn=1"),
+        "{}",
+        failures[0]
+    );
     assert!(failures[0].contains("prompt_chars="), "{}", failures[0]);
-    assert!(failures[1].contains("failure=\"unavailable\""), "{}", failures[1]);
-    assert!(failures[1].contains("failures_this_turn=2"), "{}", failures[1]);
+    assert!(
+        failures[1].contains("failure=\"unavailable\""),
+        "{}",
+        failures[1]
+    );
+    assert!(
+        failures[1].contains("failures_this_turn=2"),
+        "{}",
+        failures[1]
+    );
     assert_eq!(
         log.lines()
             .filter(|l| l.contains(MARK))
@@ -8339,7 +8357,11 @@ async fn a_default_model_fallback_does_not_stop_later_runs_streaming() {
     assert_eq!(sent.len(), 3, "{text}");
     let streams: Vec<bool> = sent
         .iter()
-        .map(|b| serde_json::from_slice::<serde_json::Value>(b).unwrap()["stream"].as_bool().unwrap())
+        .map(|b| {
+            serde_json::from_slice::<serde_json::Value>(b).unwrap()["stream"]
+                .as_bool()
+                .unwrap()
+        })
         .collect();
     // The first request streamed and was refused; the fallback's request was
     // rebuilt non-streaming; the run after it streams again.
@@ -9390,9 +9412,13 @@ async fn upstream_body_for_mid_conversation_system(
 #[tokio::test]
 async fn instructions_placement_sends_a_mid_conversation_system_message_to_the_instructions() {
     use openai_to_anthropic_proxy::config::SystemMessagePlacement;
-    let body = upstream_body_for_mid_conversation_system(SystemMessagePlacement::Instructions).await;
+    let body =
+        upstream_body_for_mid_conversation_system(SystemMessagePlacement::Instructions).await;
     assert!(
-        body["instructions"].as_str().unwrap().contains("the user has not heard from you"),
+        body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("the user has not heard from you"),
         "{body}"
     );
     assert_eq!(body["input"].as_array().unwrap().len(), 2, "{body}");
@@ -9406,7 +9432,10 @@ async fn inline_placement_sends_the_system_message_in_the_conversation() {
     let input = body["input"].as_array().unwrap();
     assert_eq!(input.len(), 3, "{body}");
     assert_eq!(input[1]["role"], "system");
-    assert_eq!(input[1]["content"][0]["text"], "the user has not heard from you");
+    assert_eq!(
+        input[1]["content"][0]["text"],
+        "the user has not heard from you"
+    );
     assert_eq!(input[2]["role"], "user");
 }
 

@@ -85,13 +85,23 @@ async fn a_success_resets_the_record() {
 
 #[tokio::test]
 async fn gates_are_shared_per_endpoint() {
-    assert!(Arc::ptr_eq(&gate_for("https://a.test/"), &gate_for("https://a.test/")));
-    assert!(!Arc::ptr_eq(&gate_for("https://a.test/"), &gate_for("https://b.test/")));
+    assert!(Arc::ptr_eq(
+        &gate_for("https://a.test/"),
+        &gate_for("https://a.test/")
+    ));
+    assert!(!Arc::ptr_eq(
+        &gate_for("https://a.test/"),
+        &gate_for("https://b.test/")
+    ));
 }
 
 #[test]
 fn the_first_block_tells_the_model_how_long_to_wait() {
-    let text = blocked_message("the search engine returned a bot challenge (CAPTCHA)", None, 10);
+    let text = blocked_message(
+        "the search engine returned a bot challenge (CAPTCHA)",
+        None,
+        10,
+    );
     assert_eq!(
         text,
         "the search engine returned a bot challenge (CAPTCHA). \
@@ -108,12 +118,18 @@ fn a_repeat_block_reports_seconds_and_minutes() {
     );
     assert!(text.contains("again."), "{text}");
     assert!(text.contains("83 seconds (1.4 minutes) ago"), "{text}");
-    assert!(text.ends_with("Wait about 10 minutes before searching again."), "{text}");
+    assert!(
+        text.ends_with("Wait about 10 minutes before searching again."),
+        "{text}"
+    );
     assert!(!text.to_lowercase().contains("never"), "{text}");
 }
 
 #[test]
 fn singular_units() {
-    assert!(blocked_message("x", Some(Duration::from_secs(1)), 1).contains("1 second (0.0 minutes) ago"));
+    assert!(
+        blocked_message("x", Some(Duration::from_secs(1)), 1)
+            .contains("1 second (0.0 minutes) ago")
+    );
     assert!(blocked_message("x", None, 1).contains("1 minute before"));
 }

@@ -742,7 +742,10 @@ fn config_with_caching(models: &[&str], key: Option<&str>) -> crate::config::Con
 fn no_cache_key_is_sent_unless_caching_is_enabled_for_the_advisor_model() {
     let c = cfg();
     let prompt = "x<transcript>[]</transcript>";
-    assert_eq!(advisor_cache_key(&config_with_caching(&[], None), &c, prompt), None);
+    assert_eq!(
+        advisor_cache_key(&config_with_caching(&[], None), &c, prompt),
+        None
+    );
     // Caching on for a DIFFERENT model only.
     assert_eq!(
         advisor_cache_key(&config_with_caching(&["other-model"], None), &c, prompt),
@@ -808,7 +811,10 @@ fn the_cut_point_stays_put_across_consecutive_consultations() {
     let build = |n: usize| {
         let mut items = vec![user_message("the original task")];
         for i in 0..n {
-            items.push(tool_result(&format!("c{i}"), &format!("{i} {}", "y".repeat(900))));
+            items.push(tool_result(
+                &format!("c{i}"),
+                &format!("{i} {}", "y".repeat(900)),
+            ));
         }
         build_transcript("sys", Value::Array(items), 40_000)
     };
@@ -847,7 +853,10 @@ fn the_cut_point_stays_put_across_consecutive_consultations() {
 fn dropping_in_blocks_still_fits_the_budget_and_keeps_task_and_latest() {
     let mut items = vec![user_message("the original task")];
     for i in 0..60 {
-        items.push(tool_result(&format!("c{i}"), &format!("{i} {}", "y".repeat(900))));
+        items.push(tool_result(
+            &format!("c{i}"),
+            &format!("{i} {}", "y".repeat(900)),
+        ));
     }
     items.push(user_message("the latest question"));
     let out = build_transcript("sys", Value::Array(items), 20_000);

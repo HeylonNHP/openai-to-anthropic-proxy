@@ -528,7 +528,10 @@ fn advisor_is_off_by_default_with_cheap_model() {
     assert_eq!(cfg.advisor.max_uses, Some(2));
     assert_eq!(cfg.advisor.max_tokens, Some(4096));
     assert_eq!(cfg.advisor.reasoning_max_tokens, Some(16384));
-    assert_eq!(cfg.advisor.timeout_secs, None, "the advisor has no timeout of its own by default");
+    assert_eq!(
+        cfg.advisor.timeout_secs, None,
+        "the advisor has no timeout of its own by default"
+    );
 }
 
 #[test]
@@ -1883,7 +1886,10 @@ fn system_message_placement_file_env_and_case() {
     )
     .unwrap();
     let cfg = Config::resolve(Some(&parsed), &env_with_required()).unwrap();
-    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert_eq!(
+        cfg.system_message_placement,
+        SystemMessagePlacement::Instructions
+    );
     // The env var wins over the file.
     let env = EnvInputs {
         system_message_placement: Some("inline".to_owned()),

@@ -706,7 +706,11 @@ async fn consult_once(
     prompt: &str,
 ) -> Result<(String, Option<ResponsesUsage>), ConsultError> {
     let mut outbound = advisor_request(cfg, prompt);
-    outbound.prompt_cache_key = advisor_cache_key(&attempt.state.config, cfg, &session_fingerprint(&attempt.outbound.input));
+    outbound.prompt_cache_key = advisor_cache_key(
+        &attempt.state.config,
+        cfg,
+        &session_fingerprint(&attempt.outbound.input),
+    );
     let url = attempt.url();
     // `None` = no per-request timeout override ("no limit"): the global
     // `request_timeout` — the timeout the reqwest client was built with —
@@ -903,7 +907,10 @@ impl AdvisorTool {
                         .state
                         .stats
                         .record_actual(self.cfg.model.clone(), token_usage(u));
-                    let cached = u.input_tokens_details.as_ref().map_or(0, |d| d.cached_tokens);
+                    let cached = u
+                        .input_tokens_details
+                        .as_ref()
+                        .map_or(0, |d| d.cached_tokens);
                     detail = Some(format!(
                         "{} in ({} cached) · {} out",
                         format_token_count(u64::from(u.input_tokens)),

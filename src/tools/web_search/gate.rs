@@ -101,7 +101,11 @@ fn describe(elapsed: Duration) -> String {
 /// The tool-result text for a blocked search: what happened, how long to wait
 /// and, if the model was blocked before, how recently.
 pub fn blocked_message(what: &str, since_previous: Option<Duration>, wait_minutes: u64) -> String {
-    let unit = if wait_minutes == 1 { "minute" } else { "minutes" };
+    let unit = if wait_minutes == 1 {
+        "minute"
+    } else {
+        "minutes"
+    };
     let wait = format!("Wait about {wait_minutes} {unit} before searching again.");
     since_previous.map_or_else(
         || format!("{what}. {wait}"),

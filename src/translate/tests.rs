@@ -4054,7 +4054,10 @@ fn with_mid_conversation_system(text: &str) -> CreateMessageRequest {
     req
 }
 
-fn translate_with(req: &CreateMessageRequest, placement: SystemMessagePlacement) -> ResponsesRequest {
+fn translate_with(
+    req: &CreateMessageRequest,
+    placement: SystemMessagePlacement,
+) -> ResponsesRequest {
     anthropic_to_responses_with(
         req,
         None,
@@ -4083,7 +4086,10 @@ fn instructions_placement_folds_a_mid_conversation_system_message_into_the_instr
 
 #[test]
 fn inline_is_the_default_placement() {
-    assert_eq!(SystemMessagePlacement::default(), SystemMessagePlacement::Inline);
+    assert_eq!(
+        SystemMessagePlacement::default(),
+        SystemMessagePlacement::Inline
+    );
 }
 
 #[test]
@@ -4123,8 +4129,12 @@ fn inline_placement_leaves_the_prompt_start_stable_as_notes_arrive() {
     assert_eq!(a.instructions, b.instructions);
     let (ia, ib) = (unwrap_items(a), unwrap_items(b));
     assert_eq!(
-        serde_json::to_string(&ia[..]).unwrap().trim_end_matches(']'),
-        serde_json::to_string(&ib[..ia.len()]).unwrap().trim_end_matches(']')
+        serde_json::to_string(&ia[..])
+            .unwrap()
+            .trim_end_matches(']'),
+        serde_json::to_string(&ib[..ia.len()])
+            .unwrap()
+            .trim_end_matches(']')
     );
 }
 
@@ -4141,11 +4151,19 @@ fn inline_placement_skips_a_system_message_with_no_text() {
 
 #[test]
 fn inline_placement_strips_the_advisor_section_when_no_advisor_tool_is_sent() {
-    let text = format!("# Environment\nx\n\n{ADVISOR_SECTION}<system-reminder>keep</system-reminder>");
+    let text =
+        format!("# Environment\nx\n\n{ADVISOR_SECTION}<system-reminder>keep</system-reminder>");
     let req = with_mid_conversation_system(&text);
     let items = unwrap_items(translate_with(&req, SystemMessagePlacement::Inline));
-    let InputItem::Message { content, .. } = &items[1] else { panic!("{items:?}") };
-    let InputContentPart::InputText { text, .. } = &content[0] else { panic!() };
+    let InputItem::Message { content, .. } = &items[1] else {
+        panic!("{items:?}")
+    };
+    let InputContentPart::InputText { text, .. } = &content[0] else {
+        panic!()
+    };
     assert!(!text.contains("# Advisor Tool"), "{text}");
-    assert!(text.contains("# Environment") && text.contains("keep"), "{text}");
+    assert!(
+        text.contains("# Environment") && text.contains("keep"),
+        "{text}"
+    );
 }
