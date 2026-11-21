@@ -2,6 +2,12 @@
 name = "openai-to-anthropic-proxy"
 version = "0.1.0"
 edition = "2024"
+description = "Run Claude Code on any OpenAI-compatible model: a proxy that translates Anthropic Messages requests to the OpenAI Responses API and back."
+license = "GPL-3.0-only"
+repository = "https://github.com/HeylonNHP/openai-to-anthropic-proxy"
+readme = "README.md"
+keywords = ["anthropic", "openai", "proxy", "claude", "llm"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [dependencies]
 # Async runtime + HTTP
