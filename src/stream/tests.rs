@@ -1072,7 +1072,7 @@ fn duplicate_web_search_citations_are_emitted_once_in_arrival_order() {
 
     let _ = t.feed_event(&message_item_done_with_annotations(
         1,
-        json!([second.clone(), {
+        json!([second, {
             "type": "url_citation",
             "url": "https://example.com/first",
             "title": "First (final annotation)",

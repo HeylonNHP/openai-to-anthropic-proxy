@@ -77,7 +77,7 @@ fn recent_request_token_values_are_color_coded() {
 /// those is not a token count, so the token formatting must leave it alone.
 #[test]
 fn tool_rows_keep_their_numbers_as_they_are() {
-    let lines = vec![LogLine {
+    let lines = [LogLine {
         text: "  web_search  |  \"1200 in stock\"  |  ok  |  1.00s  |  2 results".into(),
         kind: LogKind::Tool,
     }];
@@ -262,7 +262,7 @@ fn recent_request_token_counts_use_compact_units_without_changing_metadata() {
 
 #[test]
 fn recent_request_normalization_aligns_formatted_token_counts() {
-    let lines = vec![
+    let lines = [
         LogLine {
             text: "  200  |  1.25s  |  1234 in  |  2 out  |  cache: 1000000r 999w".into(),
             kind: LogKind::Response,
@@ -325,7 +325,7 @@ fn recent_request_rendering_shows_formatted_token_counts() {
 
 #[test]
 fn recent_request_columns_are_width_normalized() {
-    let lines = vec![
+    let lines = [
             LogLine {
                 text: "  → claude-sonnet-5 → gpt-5.4-mini  |  2 tools  |  12 messages  |  stream  |  reasoning: high".into(),
                 kind: LogKind::Inbound,
@@ -347,7 +347,7 @@ fn recent_request_columns_are_width_normalized() {
 
 #[test]
 fn recent_request_columns_handle_wide_text() {
-    let lines = vec![LogLine {
+    let lines = [LogLine {
         text: "  → haiku → 繁體中文  |  12 tools  |  9 messages".into(),
         kind: LogKind::Inbound,
     }];

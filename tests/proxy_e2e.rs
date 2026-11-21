@@ -78,7 +78,8 @@ async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
     // MutexGuard is bound to its own `let` so it doesn't live across the
     // `if let` (clippy::significant_drop_in_scrutinee).
     let next = s.canned_per_attempt.lock().await.pop_front();
-    if let Some(delay) = *s.delay.lock().await {
+    let delay = *s.delay.lock().await;
+    if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
     }
     let attempt_delay = s.delay_per_attempt.lock().await.pop_front();
