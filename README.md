@@ -255,7 +255,7 @@ The advisor's three limits in `proxy.json` are removed by **zeroing** them:
 A **`0` means "no limit"** for `max_uses`, `max_tokens`, `reasoning_max_tokens` and `timeout_secs`
 (in `proxy.json` and in the `ADVISOR_*` env vars alike). **Omitting a key is
 not the same thing** — an absent key keeps the shipped default (`max_uses` 2,
-`max_tokens` 4096, `reasoning_max_tokens` 16384, `timeout_secs` 45), so a config that only sets
+`max_tokens` 4096, `reasoning_max_tokens` 16384; `timeout_secs` has no limit by default), so a config that only sets
 `"enabled": true` gets the safe, bounded behaviour.
 
 "No limit" means something different per field, so read the caveats in

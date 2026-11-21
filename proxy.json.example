@@ -58,7 +58,7 @@
     "max_uses": 2,
     "max_tokens": 4096,
     "reasoning_max_tokens": 16384,
-    "timeout_secs": 45
+    "timeout_secs": 0
   },
 
   "web_fetch": {

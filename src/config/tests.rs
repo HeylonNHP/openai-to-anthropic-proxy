@@ -528,7 +528,7 @@ fn advisor_is_off_by_default_with_cheap_model() {
     assert_eq!(cfg.advisor.max_uses, Some(2));
     assert_eq!(cfg.advisor.max_tokens, Some(4096));
     assert_eq!(cfg.advisor.reasoning_max_tokens, Some(16384));
-    assert_eq!(cfg.advisor.timeout_secs, Some(45));
+    assert_eq!(cfg.advisor.timeout_secs, None, "the advisor has no timeout of its own by default");
 }
 
 #[test]
@@ -644,7 +644,7 @@ fn advisor_zero_limits_mean_no_limit() {
     let cfg = Config::resolve(Some(&absent), &env_with_required()).unwrap();
     assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
     assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
-    assert_eq!(cfg.advisor.timeout_secs, Some(DEFAULT_ADVISOR_TIMEOUT_SECS));
+    assert_eq!(cfg.advisor.timeout_secs, None);
 
     // An explicit `n > 0` is that bound.
     let explicit = JsonConfig {
@@ -816,7 +816,7 @@ fn a_negative_json_limit_still_loads_and_warns() {
     let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
     assert_eq!(cfg.advisor.max_uses, Some(DEFAULT_ADVISOR_MAX_USES));
     assert_eq!(cfg.advisor.max_tokens, Some(DEFAULT_ADVISOR_MAX_TOKENS));
-    assert_eq!(cfg.advisor.timeout_secs, Some(DEFAULT_ADVISOR_TIMEOUT_SECS));
+    assert_eq!(cfg.advisor.timeout_secs, None);
     assert_eq!(cfg.warnings.len(), 3, "one warning per invalid limit");
     for warning in &cfg.warnings {
         assert!(

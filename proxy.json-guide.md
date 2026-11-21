@@ -389,14 +389,14 @@ Optional settings for the server-side advisor (a second-opinion consultation ins
   "max_uses": 2,
   "max_tokens": 4096,
   "reasoning_max_tokens": 16384,
-  "timeout_secs": 45
+  "timeout_secs": 0
 }
 ```
 
 - `model` is an **explicit upstream model name**, not an inbound alias. It is written straight into the advisor's own upstream request; `model_aliases.map` is not applied to it. Keep it separate from the executor's alias so the advisor's effort and cost do not couple to the executor's `reasoning.models` entry.
 - **`beam` is the cheap default** ($0.125/M input, $0.40/M output — roughly 25× cheaper on output than `kimi-k3.1-pro`). An advisor consult re-runs the executor, so a wrong model choice multiplies cost. Never use a kimi model as the advisor.
 - `effort` is an optional reasoning effort string for the advisor only. Omit it to send none.
-- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's **answer** (reasoning is not counted against it) and `reasoning_max_tokens` is the extra allowance for its **reasoning**. `timeout_secs` bounds the extra upstream call. **Set any of them to `0` to remove that limit** — a `0` means "no limit"; leaving a key out keeps its shipped default.
+- `max_uses` caps consultations per turn (Claude Code never sets one). `max_tokens` caps the advisor's **answer** (reasoning is not counted against it) and `reasoning_max_tokens` is the extra allowance for its **reasoning**. `timeout_secs` bounds the extra upstream call, and **by default there is none**: a reasoning advisor reading a long conversation is slow, and cutting it off only turns a good answer into a failure. Set it to a number of seconds if you want one. **Set any of the others to `0` to remove that limit** — a `0` means "no limit"; leaving a key out keeps its shipped default (for `timeout_secs` the default is no limit).
 - Every field has an env override with the same **env > file > default** precedence used elsewhere: `ADVISOR_ENABLED`, `ADVISOR_MODEL`, `ADVISOR_EFFORT`, `ADVISOR_MAX_USES`, `ADVISOR_MAX_TOKENS`, `ADVISOR_REASONING_MAX_TOKENS`, `ADVISOR_TIMEOUT_SECS`. `ADVISOR_ENABLED` accepts `1`/`true`/`yes`/`on` (anything else is `false`).
 - The section is safe to omit entirely. The TUI rewrites `proxy.json` from the same schema, and the new key is only written when it is actually configured — so a config saved by this version still starts on an older binary.
 
@@ -406,7 +406,7 @@ These four keys follow one rule, in `proxy.json` and in the env vars alike:
 
 | value | meaning |
 | --- | --- |
-| key **absent** | the shipped default — `max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384, `timeout_secs` 45. An absent key is **not** "no limit". |
+| key **absent** | the shipped default — `max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384; `timeout_secs` has no limit by default. For the other three an absent key is **not** "no limit". |
 | **`0`** | **no limit** |
 | `n > 0` | that bound |
 | invalid (negative, fractional, too large) | the shipped default, **with a warning** — the proxy still starts (see below) |
@@ -421,7 +421,7 @@ These four keys follow one rule, in `proxy.json` and in the env vars alike:
 The upstream's `max_output_tokens` counts reasoning and answer together and cannot count only the answer. A reasoning advisor such as `beam` given a small limit can spend all of it thinking and return nothing (the proxy log showed exactly this: `incomplete / max_output_tokens` at 2048). So the proxy sends the **sum**, `max_tokens + reasoning_max_tokens` (by default 4096 + 16384 = 20480), and then holds the *answer* to `max_tokens` itself: an answer longer than about `max_tokens × 4` characters is cut and marked `[…]`. This is an estimate, since the proxy cannot count tokens exactly.
 
 If the advisor still stops at the output limit but had already written advice, that advice is kept (marked as cut off) instead of being thrown away. If it stopped before writing any, the consultation fails and the log says its reasoning used the whole budget; raise `reasoning_max_tokens` or lower `effort`.
-- **`timeout_secs: 0` — no per-request timeout override.** The advisor's own call is then bounded only by the **global `request_timeout_secs`** (the reqwest client is built with that timeout, so every request is bounded by it anyway). A *bounded* `timeout_secs` is always clamped to the global value, so the advisor can never extend your global bound.
+- **`timeout_secs: 0` (or absent, the default) — no per-request timeout override.** The advisor's own call is then bounded only by the **global `request_timeout_secs`** (the reqwest client is built with that timeout, so every request is bounded by it anyway). A *bounded* `timeout_secs` is always clamped to the global value, so the advisor can never extend your global bound.
 
 The env vars follow the same `0` = no limit rule (`ADVISOR_MAX_USES=0`, `ADVISOR_MAX_TOKENS=0`, `ADVISOR_REASONING_MAX_TOKENS=0`, `ADVISOR_TIMEOUT_SECS=0`).
 

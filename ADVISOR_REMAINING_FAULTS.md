@@ -19,7 +19,7 @@ The log lines quoted here are the evidence; the log itself is not in the repo.
 | 5 | Executor and UI only ever see a generic "unavailable" | Fixed (commit "report why an advisor consultation failed") |
 | 6 | Retired `default_model` makes unmapped model names fail completely | Code fixed (commit "name default_model when the fallback is itself unavailable"); **config change on the Pi still needed** |
 | 7 | Only the first failure per turn is logged | Fixed (commit "log every failed advisor consultation") |
-| 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | **Open** (largely helped by #1) |
+| 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | Timeout removed (commit "remove the advisor's default timeout"); caching still **open** |
 
 Ranked most severe and likely first. Fix them in order.
 
@@ -165,7 +165,9 @@ keep the new log lines short and avoid logging the transcript.
 
 ---
 
-## #8. Timeout is tight for huge prompts; the transcript is re-sent uncached each time
+## #8. Timeout is tight for huge prompts; the transcript is re-sent uncached each time (TIMEOUT REMOVED, CACHING OPEN)
+
+> The operator chose to remove the advisor's own timeout instead of scaling it: `advisor.timeout_secs` now defaults to no limit, so only the global `request_timeout_secs` (600 s in the deployed config) bounds an advisor call. Suggested fix items 1 and 2 (scaling, shorter retry timeout) are therefore not needed. Item 3 (prompt caching) is still open.
 
 **Plain English.** The advisor's default timeout is 45 seconds. A reasoning model
 reading a 300k to 600k token transcript can be slow, and a timeout is just another

@@ -61,7 +61,11 @@ const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 4096;
 /// Upstream `max_output_tokens` counts reasoning and answer together, so the
 /// proxy sends `max_tokens + reasoning_max_tokens`.
 const DEFAULT_ADVISOR_REASONING_MAX_TOKENS: u32 = 16384;
-const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 45;
+/// The advisor has NO timeout of its own by default (`0` = no limit): a
+/// reasoning advisor reading a long transcript is slow, and cutting it off
+/// only turns a good answer into a failure. The global `request_timeout_secs`
+/// still bounds every upstream call.
+const DEFAULT_ADVISOR_TIMEOUT_SECS: u64 = 0;
 
 /// Default total timeout for one `web_fetch` request, in seconds.
 ///
@@ -291,7 +295,8 @@ pub struct Config {
 /// in `proxy.json` and in the env vars:
 ///
 /// * **key ABSENT** → the shipped default (`max_uses` 2, `max_tokens` 4096,
-///   `reasoning_max_tokens` 16384, `timeout_secs` 45) — an absent key is *not* "no limit";
+///   `reasoning_max_tokens` 16384; `timeout_secs` has NO default limit) — an absent key
+///   is *not* "no limit" for the other three;
 /// * **`0`** → **no limit** — the house precedent of
 ///   `reasoning_replay.max_chars`, where `0` means unlimited;
 /// * **`n > 0`** → that bound;
@@ -493,7 +498,7 @@ impl Default for AdvisorConfig {
             max_uses: Some(DEFAULT_ADVISOR_MAX_USES),
             max_tokens: Some(DEFAULT_ADVISOR_MAX_TOKENS),
             reasoning_max_tokens: Some(DEFAULT_ADVISOR_REASONING_MAX_TOKENS),
-            timeout_secs: Some(DEFAULT_ADVISOR_TIMEOUT_SECS),
+            timeout_secs: None,
         }
     }
 }
@@ -1018,7 +1023,10 @@ impl Config {
             DEFAULT_ADVISOR_TIMEOUT_SECS,
             "advisor.timeout_secs",
             &mut warnings,
-        );
+        )
+        // The default is "no limit", which `resolve_advisor_limit` reports
+        // as `Some(0)` for an absent key.
+        .filter(|secs| *secs != 0);
 
         let advisor = AdvisorConfig {
             enabled: advisor_enabled,

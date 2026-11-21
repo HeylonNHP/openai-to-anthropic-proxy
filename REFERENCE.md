@@ -40,7 +40,7 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `ADVISOR_MAX_USES` | `advisor.max_uses` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative / fractional / out-of-range values fall back to the default + warning. |
 | `ADVISOR_MAX_TOKENS` | `advisor.max_tokens` | `4096` | no | Cap on the advisor *answer* (output tokens, reasoning excluded). `0` removes the cap (upstream default then applies). |
 | `ADVISOR_REASONING_MAX_TOKENS` | `advisor.reasoning_max_tokens` | `16384` | no | Extra output tokens the advisor may spend *reasoning*. The request limit is `max_tokens` + this. `0` removes the cap (upstream default then applies). |
-| `ADVISOR_TIMEOUT_SECS` | `advisor.timeout_secs` | `45` | no | Per-advisor-call timeout. `0` uses the global budget only. |
+| `ADVISOR_TIMEOUT_SECS` | `advisor.timeout_secs` | none | no | Per-advisor-call timeout. Default and `0`: no limit of its own, only the global `request_timeout_secs`. |
 | `WEB_FETCH_ENABLED` | `web_fetch.enabled` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1` / `true` / `yes` / `on`. |
 | `WEB_FETCH_TIMEOUT_SECS` | `web_fetch.timeout_secs` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
 | `WEB_FETCH_MAX_BYTES` | `web_fetch.max_bytes` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
@@ -126,8 +126,8 @@ For multiple custom headers, separate them with newlines (a single line is enoug
 - **`advisor.max_uses`, `advisor.max_tokens`, `advisor.reasoning_max_tokens`
   and `advisor.timeout_secs` are
   removed by setting them to `0`.** A **`0` means "no limit"**; an
-  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384,
-  `timeout_secs` 45). The same rule applies to the `ADVISOR_MAX_USES`,
+  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384;
+  `timeout_secs` has no default limit). The same rule applies to the `ADVISOR_MAX_USES`,
   `ADVISOR_MAX_TOKENS`, `ADVISOR_REASONING_MAX_TOKENS` and
   `ADVISOR_TIMEOUT_SECS` env vars.
 - **The advisor prompt is trimmed to a fixed 1,200,000 characters** (roughly
