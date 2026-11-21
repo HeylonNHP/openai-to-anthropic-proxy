@@ -194,18 +194,18 @@ Claude Code does not only send a system prompt at the top. It also puts `role: "
 
 An upstream's prompt cache can only reuse a prompt whose **start is unchanged**. By default the proxy folds every one of these messages into `instructions`, which is the very start of the prompt, so each time one arrives the whole conversation after it is read again at full price. In a day of real traffic this was **46% of all uncached input** (13 misses, 2.8M tokens, some on 470k-token conversations).
 
-- `"instructions"` (**default**): fold them into `instructions`, as before. Every upstream accepts this.
-- `"inline"`: send each one as a `system` message at its own position in the conversation. The start of the prompt then stays identical and only the new note is uncached.
+- `"inline"` (**default**): send each one as a `system` message at its own position in the conversation. The start of the prompt then stays identical and only the new note is uncached.
+- `"instructions"`: fold them into `instructions`, as the proxy did before. Every upstream accepts this, but it changes the start of the prompt each time one arrives.
 
 ```json
 {
-  "system_message_placement": "inline"
+  "system_message_placement": "instructions"
 }
 ```
 
-Environment variable: `SYSTEM_MESSAGE_PLACEMENT` (`instructions` or `inline`, case-insensitive; the env var wins over the file; anything else warns and uses the default).
+Environment variable: `SYSTEM_MESSAGE_PLACEMENT` (`inline` or `instructions`, case-insensitive; the env var wins over the file; anything else warns and uses the default).
 
-**Try it before relying on it.** `inline` needs the upstream to accept a `system` message after the first turn. The OpenAI Responses API does; an upstream that applies a chat template might reject it or ignore it. If requests start failing with a 400, set it back to `"instructions"`. To see whether it helps, compare the cached-token figures in the proxy's log before and after.
+**`inline` is the default because it needs nothing to be set up, but it does depend on the upstream.** It needs the upstream to accept a `system` message after the first turn. The OpenAI Responses API does. An upstream that applies a chat template might reject one with a 400, or ignore it. It has not been tried against every upstream. **If requests start failing after an upgrade, or the model seems to ignore the notes, set `"system_message_placement": "instructions"`.** To see whether `inline` helps with your upstream, compare the cached-token figures in the proxy's log.
 
 The `# Advisor Tool` section Claude Code puts in one of these messages is removed from the inline copy too, under the same rule as for the instructions, and the advisor's reviewer never sees it there either.
 

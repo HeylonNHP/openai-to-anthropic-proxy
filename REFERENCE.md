@@ -31,7 +31,7 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `PROMPT_CACHING_ENABLED` | `prompt_caching` (object) | `false` | no | Set `true` to forward OpenAI prompt-cache hints; also see `prompt_caching`. |
 | `PROMPT_CACHING_MODELS` | `prompt_caching.models` | (none) | no | Comma-separated inbound model IDs that the cache path is allowed for. |
 | `PROMPT_CACHE_KEY` | `prompt_cache_key` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
-| `SYSTEM_MESSAGE_PLACEMENT` | `system_message_placement` | `instructions` | no | Where a `role: "system"` message inside the conversation goes: folded into `instructions` (default) or kept in place as `inline`, which keeps the prompt start stable for the upstream's cache. |
+| `SYSTEM_MESSAGE_PLACEMENT` | `system_message_placement` | `inline` | no | Where a `role: "system"` message inside the conversation goes: kept in place as `inline` (default), which keeps the prompt start stable for the upstream's cache, or folded into `instructions`, for an upstream that rejects a late system message. |
 | `TOOL_RESULT_IMAGES` | `tool_result_images` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, `drop`). |
 | `LOG_TO_DISK` | `log_to_disk` | `false` | no | Set `1` / `true` / `yes` to also write `target/logs/proxy.log`. |
 | `PROXY_KEY` | `proxy_key` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |

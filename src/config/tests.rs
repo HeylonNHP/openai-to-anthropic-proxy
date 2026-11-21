@@ -1869,9 +1869,9 @@ fn advisor_reasoning_budget_follows_the_limit_rules() {
 }
 
 #[test]
-fn system_message_placement_defaults_to_instructions() {
+fn system_message_placement_defaults_to_inline() {
     let cfg = Config::resolve(None, &env_with_required()).unwrap();
-    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Inline);
     assert!(cfg.warnings.is_empty());
 }
 
@@ -1879,18 +1879,18 @@ fn system_message_placement_defaults_to_instructions() {
 fn system_message_placement_file_env_and_case() {
     let parsed = JsonConfig::parse(
         r#"{"upstream_base_url": "https://api.example.com", "upstream_api_key": "k",
-            "system_message_placement": "Inline"}"#,
+            "system_message_placement": "Instructions"}"#,
     )
     .unwrap();
     let cfg = Config::resolve(Some(&parsed), &env_with_required()).unwrap();
-    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Inline);
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
     // The env var wins over the file.
     let env = EnvInputs {
-        system_message_placement: Some("instructions".to_owned()),
+        system_message_placement: Some("inline".to_owned()),
         ..env_with_required()
     };
     let cfg = Config::resolve(Some(&parsed), &env).unwrap();
-    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Inline);
 }
 
 #[test]
@@ -1901,7 +1901,7 @@ fn system_message_placement_unknown_value_warns_and_uses_the_default() {
     )
     .unwrap();
     let cfg = Config::resolve(Some(&parsed), &env_with_required()).unwrap();
-    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Instructions);
+    assert_eq!(cfg.system_message_placement, SystemMessagePlacement::Inline);
     assert_eq!(cfg.warnings.len(), 1);
     assert!(cfg.warnings[0].message.contains("system_message_placement"));
 }

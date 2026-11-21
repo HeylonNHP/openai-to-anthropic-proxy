@@ -724,14 +724,15 @@ impl ToolResultImages {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SystemMessagePlacement {
     /// Append the message to `instructions`. Works with every upstream, but
-    /// breaks the prompt cache each time a system message arrives. Default,
-    /// because it is the behaviour every upstream is known to accept.
-    #[default]
+    /// breaks the prompt cache each time a system message arrives. The
+    /// fallback for an upstream that rejects a late system message.
     Instructions,
     /// Send it as a `system` message at its own position in `input`. The
     /// start of the prompt then stays the same and the cache keeps hitting.
     /// The upstream must accept system messages after the first turn; the
-    /// OpenAI Responses API does, and a chat-template-based upstream may not.
+    /// OpenAI Responses API does, and a chat-template-based upstream may not
+    /// (set `instructions` for such an upstream). Default.
+    #[default]
     Inline,
 }
 
@@ -1000,7 +1001,7 @@ impl Config {
                 })
             });
 
-        // `system_message_placement`: `instructions` (default) or `inline`.
+        // `system_message_placement`: `inline` (default) or `instructions`.
         // Env wins over file; an unrecognised value falls back to the default
         // with a warning, like `tool_result_images`.
         let placement_raw = env
@@ -1017,7 +1018,7 @@ impl Config {
             SystemMessagePlacement::parse(v).unwrap_or_else(|| {
                 warnings.push(
                     ConfigWarning::new(format!(
-                        "system_message_placement = {v:?} is not one of \"instructions\" or \"inline\"; using the default \"instructions\""
+                        "system_message_placement = {v:?} is not one of \"inline\" or \"instructions\"; using the default \"inline\""
                     ))
                     .with_field("system_message_placement", v.to_owned()),
                 );

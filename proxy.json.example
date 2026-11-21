@@ -4,6 +4,8 @@
   "request_timeout_secs": 600,
   "max_request_body_bytes": 33554432,
 
+  "system_message_placement": "inline",
+
   "reasoning": {
     "default": "none",
     "models": {

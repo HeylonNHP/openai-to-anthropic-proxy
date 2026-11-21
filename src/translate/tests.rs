@@ -4068,7 +4068,7 @@ fn translate_with(req: &CreateMessageRequest, placement: SystemMessagePlacement)
 }
 
 #[test]
-fn a_mid_conversation_system_message_is_folded_into_the_instructions_by_default() {
+fn instructions_placement_folds_a_mid_conversation_system_message_into_the_instructions() {
     let req = with_mid_conversation_system("the user hasn't heard from you");
     let out = translate_with(&req, SystemMessagePlacement::Instructions);
     assert!(
@@ -4079,6 +4079,11 @@ fn a_mid_conversation_system_message_is_folded_into_the_instructions_by_default(
     );
     let items = unwrap_items(out);
     assert_eq!(items.len(), 2, "only the two user turns: {items:?}");
+}
+
+#[test]
+fn inline_is_the_default_placement() {
+    assert_eq!(SystemMessagePlacement::default(), SystemMessagePlacement::Inline);
 }
 
 #[test]
