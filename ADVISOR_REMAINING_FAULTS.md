@@ -17,7 +17,7 @@ The log lines quoted here are the evidence; the log itself is not in the repo.
 | 3 | Advisor acts as the executor and calls a tool instead of answering | Fixed, `b45d3f5` |
 | 4 | Failed consults burn `max_uses`; no retry | Fixed, `1831a89` |
 | 5 | Executor and UI only ever see a generic "unavailable" | Fixed (commit "report why an advisor consultation failed") |
-| 6 | Retired `default_model` makes unmapped model names fail completely | **Open** (config and small code change) |
+| 6 | Retired `default_model` makes unmapped model names fail completely | Code fixed (commit "name default_model when the fallback is itself unavailable"); **config change on the Pi still needed** |
 | 7 | Only the first failure per turn is logged | **Open** |
 | 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | **Open** (largely helped by #1) |
 
@@ -84,7 +84,9 @@ the executor text without `scrub_error_body`.
 
 ---
 
-## #6. A retired `default_model` makes unmapped model names fail completely
+## #6. A retired `default_model` makes unmapped model names fail completely (CODE FIXED, CONFIG STILL OPEN)
+
+> Code: when the `default_model` fallback is itself refused (a 400/404 model rejection or a 410 retirement), the client error now says the proxy's `default_model` is unavailable and to update it, followed by the upstream's reason. The request still fails, so the Pi's `proxy.json` still needs a live `default_model` and the missing `claude-sonnet-5`/`sonnet-5` aliases (step 1 below).
 
 **Plain English.** Your `default_model` points at `deepseek-v4-flash:0731`, which
 the upstream retired on 25 September 2026. When a client asks for a model name

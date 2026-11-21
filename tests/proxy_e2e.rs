@@ -1323,8 +1323,12 @@ async fn fallback_model_also_rejected_returns_the_second_error() {
     // The client must see a readable message, not the raw JSON blob.
     let message = body["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("gpt-4o-mini"),
-        "expected the upstream's own message, got {body}"
+        message.contains("default_model") && message.contains("gpt-4o-mini"),
+        "the error must name default_model as the problem, got {body}"
+    );
+    assert!(
+        message.contains("not found"),
+        "the upstream's own reason must be kept, got {body}"
     );
     assert!(
         !message.contains("{\"error\""),
@@ -1332,6 +1336,50 @@ async fn fallback_model_also_rejected_returns_the_second_error() {
     );
     let sent_bodies = upstream.received_all.lock().await.clone();
     assert_eq!(sent_bodies.len(), 2, "there must be no third attempt");
+}
+
+/// A retired `default_model` answers 410, not 404. The client must be told
+/// the default model is the problem (the 2026-11-19 log: five requests died
+/// on a retired default with the retirement notice as the only clue).
+#[tokio::test]
+async fn retired_default_model_is_named_in_the_error() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from(vec![
+        FakeResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Some(REAL_GATEWAY_MODEL_404.into()),
+        },
+        FakeResponse {
+            status: StatusCode::GONE,
+            body: Some(
+                r#"{"error":{"message":"gpt-4o-mini was retired on September 25, 2026. Try glm-5.3-flash:cloud.","type":"gone_error","param":null,"code":null}}"#
+                    .into(),
+            ),
+        },
+    ]);
+    let proxy_addr = start_proxy(make_config_with_default_model(
+        upstream_addr,
+        BTreeMap::new(),
+        Some("gpt-4o-mini"),
+    ))
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"a"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::GONE);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("default_model") && message.contains("retired"),
+        "expected default_model named plus the retirement notice, got {body}"
+    );
 }
 
 /// Retrying with the model that was just rejected would be pointless, so

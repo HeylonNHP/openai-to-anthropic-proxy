@@ -967,6 +967,17 @@ impl Attempt {
                 continue;
             }
 
+            // The fallback itself was refused: say so, otherwise the client
+            // reads the fallback's error as if it were about the model it
+            // asked for (the 2026-11-19 log: a retired `default_model`
+            // answered 410 to every request whose own model was unknown).
+            if self.fallback_used && default_model_unavailable(status, rejection.is_some()) {
+                return Err(fallback_unavailable_error(
+                    &self.outbound.model,
+                    map_upstream_error(status, &body),
+                ));
+            }
+
             return Err(map_upstream_error(status, &body));
         }
     }
@@ -1528,6 +1539,30 @@ fn event_kind(event: &StreamEvent) -> &'static str {
 }
 
 // ─── Upstream error mapping ───────────────────────────────────────────────
+
+/// Whether an error from the `default_model` fallback means the fallback
+/// model itself is unusable: a model rejection, or 410 Gone (how the
+/// upstream reports a retired model, which `detect_model_rejection` does not
+/// treat as a rejection because it only covers 400/404).
+fn default_model_unavailable(status: StatusCode, rejected: bool) -> bool {
+    rejected || status == StatusCode::GONE
+}
+
+/// Re-word the fallback's error so it names `default_model` as the problem.
+fn fallback_unavailable_error(fallback: &str, error: AppError) -> AppError {
+    match error {
+        AppError::Upstream { status, body } => AppError::Upstream {
+            status,
+            body: format!(
+                "the requested model was not available and the proxy's default_model \
+                 `{}` is not available either; update default_model in the proxy \
+                 config ({body})",
+                log_safe(fallback)
+            ),
+        },
+        other => other,
+    }
+}
 
 fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
     // Upstreams use two envelopes: the flat Responses shape
