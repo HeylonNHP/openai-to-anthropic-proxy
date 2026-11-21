@@ -459,6 +459,10 @@ Claude Code shows a failed consultation as "Advisor unavailable (`code`)", so th
 
 Claude Code only knows six codes, and an unknown one renders as "unknown", so no other code is ever sent. After two failures in a turn the executor is told the advisor will not be consulted again, whatever the reason.
 
+#### What the log records about advisor failures
+
+**Every** failed consultation is a `WARN` line in the proxy log (`advisor consultation failed; continuing without advice`), with the failure code, how many consultations have failed so far this turn (`failures_this_turn`), the prompt size in characters (`prompt_chars`), whether the advisor is now being given up on (`giving_up`) and the error text. A failed attempt that is then retried is logged too (`advisor consultation attempt failed; retrying once`). The transcript itself is never logged. Only the one-line warning shown in the Claude Code/TUI is limited to once per turn, since repeats there are noise; the log is the reliable record of how often the advisor fails.
+
 #### How the advisor is prompted
 
 The advisor reads another assistant's instructions and conversation, and a model shown those can mistake them for its own and carry on as that assistant. A reasoning advisor did exactly that in practice: it answered with a call to `advisor` and no text, so the consultation failed. The request is therefore framed as a review. The advisor's system prompt says it is **not** the assistant, has **no tools** (and must not call `advisor`), and must reply with plain-text advice only. The assistant's instructions are labelled as not written for the reviewer, the executor's own `# Advisor Tool` section ("call advisor before substantive work") is removed from them, and the request ends by repeating that the reviewer should write advice and call no tool. If an advisor model still replies with a tool call, the log now says "advisor called a tool instead of writing advice".

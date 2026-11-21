@@ -18,7 +18,7 @@ The log lines quoted here are the evidence; the log itself is not in the repo.
 | 4 | Failed consults burn `max_uses`; no retry | Fixed, `1831a89` |
 | 5 | Executor and UI only ever see a generic "unavailable" | Fixed (commit "report why an advisor consultation failed") |
 | 6 | Retired `default_model` makes unmapped model names fail completely | Code fixed (commit "name default_model when the fallback is itself unavailable"); **config change on the Pi still needed** |
-| 7 | Only the first failure per turn is logged | **Open** |
+| 7 | Only the first failure per turn is logged | Fixed (commit "log every failed advisor consultation") |
 | 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | **Open** (largely helped by #1) |
 
 Ranked most severe and likely first. Fix them in order.
@@ -134,7 +134,9 @@ the repo or into issues.
 
 ---
 
-## #7. Only the first failure per turn is logged
+## #7. Only the first failure per turn is logged (FIXED)
+
+> Fixed: every failed consultation is now a `warn` line in the tracing log (failure code, `failures_this_turn`, `prompt_chars`, `giving_up`, the error text), and the failed attempt that triggers the retry is logged too. Only the Claude Code/TUI line is still limited to one per turn. Notes below are the original analysis.
 
 **Plain English.** The advisor warning is deliberately limited to one per turn, so
 if a turn has several failed consultations, only the first leaves a log line. The

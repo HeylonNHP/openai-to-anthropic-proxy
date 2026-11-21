@@ -4037,6 +4037,112 @@ async fn advisor_timeout_degrades_gracefully() {
 /// 3b. Repeated advisor failures stay fail-closed, and at most ONE
 /// operator-visible warning is emitted for the whole turn (the loop
 /// consults twice, both times unsuccessfully).
+/// A tracing writer that collects everything into a shared buffer.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Every failed consultation reaches the tracing log (the operator's record
+/// of how often the advisor fails), including the failed attempt that was
+/// retried, while the TUI still gets a single line (see below).
+#[tokio::test]
+async fn advisor_logs_every_failure_even_though_the_tui_shows_one() {
+    // A global subscriber: tests run on separate threads, and a thread-local
+    // one is defeated by tracing's callsite cache once another thread has hit
+    // the same callsite with no subscriber. Other tests' warnings land in the
+    // buffer too, so this test picks out its own lines by a unique marker in
+    // the upstream error text.
+    static CAPTURE: std::sync::OnceLock<LogCapture> = std::sync::OnceLock::new();
+    let capture = CAPTURE
+        .get_or_init(|| {
+            let capture = LogCapture::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(capture.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+            .expect("no other test installs a global subscriber");
+            capture
+        })
+        .clone();
+    const MARK: &str = "overloaded-7f3a91";
+
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_c1", "call_t1"),
+            // A 503 is retried once, and the retry fails too.
+            FakeResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: Some(format!(r#"{{"error":{{"message":"{MARK}"}}}}"#)),
+            },
+            FakeResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: Some(format!(r#"{{"error":{{"message":"{MARK}"}}}}"#)),
+            },
+            advisor_call_response("resp_c2", "call_t2"),
+            FakeResponse {
+                status: StatusCode::NOT_FOUND,
+                body: Some(
+                    REAL_GATEWAY_MODEL_404.replace("claude-sonnet-5", MARK),
+                ),
+            },
+            advisor_executor_message("resp_final", "Answer without advice."),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.max_uses = Some(2);
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let failures: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(MARK))
+        .filter(|l| l.contains("advisor consultation failed; continuing without advice"))
+        .collect();
+    assert_eq!(failures.len(), 2, "one log line per failed consultation:\n{log}");
+    assert!(failures[0].contains("failure=\"overloaded\""), "{}", failures[0]);
+    assert!(failures[0].contains("failures_this_turn=1"), "{}", failures[0]);
+    assert!(failures[0].contains("prompt_chars="), "{}", failures[0]);
+    assert!(failures[1].contains("failure=\"unavailable\""), "{}", failures[1]);
+    assert!(failures[1].contains("failures_this_turn=2"), "{}", failures[1]);
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains(MARK))
+            .filter(|l| l.contains("attempt failed; retrying once"))
+            .count(),
+        1,
+        "the failed attempt that was retried is logged:\n{log}"
+    );
+}
+
 #[tokio::test]
 async fn advisor_repeated_failure_emits_one_warning() {
     use openai_to_anthropic_proxy::SessionStatsStore;

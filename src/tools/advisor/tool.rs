@@ -597,7 +597,13 @@ async fn consult(
         Err(first) if !first.kind.retryable() => return Err(first),
         Err(first) => first,
     };
-    tracing::debug!(error = %first.message, "advisor consultation failed; retrying once");
+    tracing::warn!(
+        error = %first.message,
+        failure = first.kind.client_code(),
+        advisor_model = %cfg.model,
+        prompt_chars = prompt.len(),
+        "advisor consultation attempt failed; retrying once"
+    );
     tokio::time::sleep(RETRY_DELAY).await;
     consult_once(attempt, cfg, prompt).await.map_err(|second| {
         ConsultError::new(
@@ -645,8 +651,8 @@ async fn consult_once(
     Ok((cap_answer(text, cfg), usage))
 }
 
-/// The gate behind `warn_once`: exactly ONE warning per turn, covering
-/// BOTH the `tracing::warn!` and the operator-visible TUI line.
+/// The gate behind `warn_once`: exactly ONE operator-visible TUI line per
+/// turn. (The tracing log is not gated.)
 fn should_warn(warned: &mut bool) -> bool {
     if *warned {
         false
@@ -656,18 +662,14 @@ fn should_warn(warned: &mut bool) -> bool {
     }
 }
 
-/// Structured warning + at most ONE operator-visible line per turn. Both the
-/// `tracing::warn!` and the TUI line are gated — the first failure is the
-/// useful one, repeats are noise.
-fn warn_once(state: &AppState, warned: &mut bool, cfg: &AdvisorConfig, error: &str) {
+/// At most ONE operator-visible line per turn: the first failure is the
+/// useful one in the TUI, repeats are noise there. The tracing log is NOT
+/// gated (see [`AdvisorTool::answer`]): it is the record of how often the
+/// advisor fails.
+fn warn_once(state: &AppState, warned: &mut bool, cfg: &AdvisorConfig) {
     if !should_warn(warned) {
         return;
     }
-    tracing::warn!(
-        error = %error,
-        advisor_model = %cfg.model,
-        "advisor consultation failed; continuing without advice"
-    );
     state.output.emit(LogLine {
         kind: LogKind::Warning,
         text: format!(
@@ -765,12 +767,13 @@ impl AdvisorTool {
         // Terminal cap path: refuse, tell the executor, and become exhausted.
         // The loop gives the executor ONE more run for a real answer.
         if self.uses >= self.cap {
-            warn_once(
-                &attempt.state,
-                &mut self.warned,
-                &self.cfg,
-                "advisor max_uses exceeded",
+            tracing::warn!(
+                advisor_model = %self.cfg.model,
+                max_uses = ?self.cfg.max_uses,
+                consultations = self.uses,
+                "advisor consultation refused: max_uses exceeded"
             );
+            warn_once(&attempt.state, &mut self.warned, &self.cfg);
             blocks.push(ResponseContentBlock::Raw(protocol::max_uses_exceeded(&id)));
             self.cap_reached = true;
             return Served {
@@ -790,7 +793,8 @@ impl AdvisorTool {
         let mut outcome = OUTCOME_OK;
         let mut detail: Option<String> = None;
 
-        let advice = match consult(attempt, &self.cfg, &transcript(attempt)).await {
+        let prompt = transcript(attempt);
+        let advice = match consult(attempt, &self.cfg, &prompt).await {
             Ok((text, usage)) => {
                 self.uses += 1;
                 // A turn that keeps consulting is a runaway loop. Warn ONCE
@@ -836,7 +840,19 @@ impl AdvisorTool {
                 self.failures += 1;
                 let giving_up = self.failures >= MAX_FAILED_CONSULTATIONS;
                 self.given_up |= giving_up;
-                warn_once(&attempt.state, &mut self.warned, &self.cfg, &error.message);
+                // Every failure is logged (short: never the transcript), with
+                // enough to tell a flaky advisor from a broken one. Only the
+                // TUI line is limited to once per turn.
+                tracing::warn!(
+                    error = %error.message,
+                    failure = code,
+                    advisor_model = %self.cfg.model,
+                    failures_this_turn = self.failures,
+                    prompt_chars = prompt.len(),
+                    giving_up,
+                    "advisor consultation failed; continuing without advice"
+                );
+                warn_once(&attempt.state, &mut self.warned, &self.cfg);
                 blocks.push(ResponseContentBlock::Raw(protocol::error_result(&id, code)));
                 // Tell the executor WHY, so it can adapt. Once given up on,
                 // say that instead: the executor gets one last run and any
