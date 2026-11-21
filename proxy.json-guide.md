@@ -402,6 +402,8 @@ The limits of the loop that `web_search`, `web_fetch` and the advisor share. **O
 
 Optional settings for the server-side advisor (a second-opinion consultation inside one assistant message). **The whole feature is opt-in**: `enabled` defaults to `false`, and when it is off the proxy makes no extra upstream calls, synthesizes no tool, and emits no advisor wire fields — every ordinary request is byte-for-byte unchanged. When enabled, a consultation happens only if the client declared a tool named `advisor` **and** the executor emits `function_call{name:"advisor"}`; it is bounded by `max_uses` (set `max_uses` to `0` to remove that bound — see below) and degrades to `error_code: "unavailable"` on any advisor failure without failing the client request.
 
+This section only covers the **proxy** side. The client side is separate and is set in Claude Code's own settings file (`advisorModel` plus `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1` in `~/.claude/settings.json`) — see [the proxy's own server tools](./README.md#optional-the-proxys-own-server-tools).
+
 ```json
 "advisor": {
   "enabled": false,

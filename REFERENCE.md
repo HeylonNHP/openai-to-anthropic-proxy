@@ -465,7 +465,7 @@ This is a planning note for future changes. It is separate from the current
 > **Shipped since this section was written:** the server-side `web_fetch` tool,
 > the proxy's own `web_search`, the experimental `advisor` tool and the
 > `GET /v1/models` route — see "Server-side `web_fetch`" above and
-> [Gateway model discovery](./README.md#enabling-gateway-model-discovery-v1models).
+> [Gateway model discovery](./README.md#gateway-model-discovery-v1models).
 
 ### Open
 

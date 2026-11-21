@@ -1,10 +1,17 @@
 # openai-to-anthropic-proxy
 
-Run **Claude Code** on *any* **OpenAI-compatible** model — streaming, tool-use, extended
-thinking, and the experimental advisor tool included. Point Claude Code at a small Rust
-proxy listening on port `8085` (all interfaces by default — see [`proxy_key`](#if-the-proxy-is-configured-with-proxy_key)); it translates Anthropic Messages requests into OpenAI
-Responses API calls, forwards them to the upstream you choose (OpenAI, NVIDIA NIM,
-vLLM, an internal gateway …), and translates the answers back.
+[![CI](https://github.com/HeylonNHP/openai-to-anthropic-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/HeylonNHP/openai-to-anthropic-proxy/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/github/license/HeylonNHP/openai-to-anthropic-proxy)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org/tools/install)
+
+Run **Claude Code** on any **OpenAI-compatible** model — a small Rust proxy
+that translates Anthropic Messages requests into OpenAI Responses API calls and
+back.
+
+Claude Code only speaks Anthropic's API. This proxy speaks yours: point
+`ANTHROPIC_BASE_URL` at it and it forwards to OpenAI, NVIDIA NIM, vLLM, or any
+other OpenAI-compatible upstream — streaming, tool use, extended thinking and
+all.
 
 ```mermaid
 flowchart LR
@@ -14,58 +21,38 @@ flowchart LR
   B --> A
 ```
 
-**Not for you if** you need model-generated images, full multimodal assistant
-turns, Claude's other server-side tools (`code_execution`, …),
-or TLS termination — those are out of scope (see [`REFERENCE.md`](./REFERENCE.md)).
-`GET /v1/models` is implemented (for gateway model discovery).
-Images *sent to* the model — including images inside tool results — are supported.
-The server-side `web_fetch`, `web_search` and `advisor` tools *are* implemented
-by the proxy itself and can be used together in one turn — see
-[Server tools together](#server-tools-together).
-
-## Features
-
-- Streaming SSE end to end.
-- Tool-use round trips: `tool_use` ↔ `tool_calls`, `tool_result` ↔ `tool` messages.
-- Image input support: `image` blocks in user messages and in `tool_result` are forwarded upstream (see `tool_result_images` in [proxy.json-guide.md](./proxy.json-guide.md#tool-result-images-tool_result_images)).
-- Stop-reason and token-usage remapping into Anthropic shape.
-- `model_aliases` with a `default_model` safety net if an upstream rejects a model.
-- Reasoning-effort mapping (`low`/`medium`/`high`/`xhigh`/`max`) plus extended-thinking replay.
-- Unlocking 1M-context upstreams via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
-- Server-side `web_fetch`: the proxy fetches the URL, extracts the readable text, and hands it back to the model (opt-in).
-- Optional proxy-native `web_search`: DuckDuckGo scraping + page fetching + compaction, as a swap-in for the upstream's built-in search (opt-in).
-- Server tools work together: `web_search`, `web_fetch` and the advisor share one loop, honour the options the client sets on them (`max_uses`, domain lists, …), and stream each round to the client as it finishes.
-- `GET /healthz` for liveness checks.
-- `GET /v1/models` for Claude Code's gateway model discovery (opt-in via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`).
-- Optional shared-secret `proxy_key` auth for a bind-all listener.
-
 ## Quick start
 
-1. You need a Rust toolchain (edition 2024) and a Claude Code install. Set
-   `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY`, or copy `proxy.json.example` to
-   `proxy.json` and fill them in.
-   - For a fuller walkthrough of `proxy.json`, see the [proxy.json guide](./proxy.json-guide.md).
-2. Start the proxy:
+**Terminal 1 — the proxy:**
 
-   ```bash
-   cargo run --release
-   ```
+```bash
+# 1. point it at your upstream
+export UPSTREAM_BASE_URL=https://api.openai.com
+export UPSTREAM_API_KEY=sk-...
 
-   It listens on `http://localhost:8085` by default ("proxy listening on …").
-3. Launch Claude Code against it:
+# 2. run it
+cargo run --release
+```
 
-   - macOS/Linux: `./scripts/start-claude-code.sh`
-   - Windows: `./scripts/start-claude-code.ps1`
+It listens on `http://localhost:8085`. The proxy opens a full-screen TUI that
+owns its terminal, so run Claude Code from a **second terminal** — or pass
+`--no-tui` and background the process yourself.
 
-   All relative paths assume you run from the repo root.
+**Terminal 2 — Claude Code:**
 
-## Configure Claude Code once
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8085
+export ANTHROPIC_API_KEY=any
+claude
+```
 
-To use the proxy on every `claude` invocation, update your user-level settings file
-instead of the launch scripts. On Windows that is typically
-`%USERPROFILE%\.claude\settings.json` (e.g. `C:\Users\hwhite\.claude\settings.json`).
+Instead of the env vars you can copy
+[`proxy.json.example`](./proxy.json.example) to `proxy.json` and fill it in —
+the file and the env vars use the same names, and **env vars win**.
 
-Merge these into any existing `env` block:
+To make the client side permanent, put the `env` block in your user-level
+settings file (`~/.claude/settings.json`, or `%USERPROFILE%\.claude\settings.json`
+on Windows):
 
 ```json
 {
@@ -77,264 +64,182 @@ Merge these into any existing `env` block:
 }
 ```
 
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells Claude Code the real context window of the
-upstream model. Without it Claude Code assumes the Anthropic 200K default and
-auto-compacts too early for 1M-context models (e.g. GPT-5.4-mini, GPT-5.6-luna).
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` tells Claude Code the upstream's *real* context
+window. Without it Claude Code assumes Anthropic's 200K default and
+auto-compacts too early on 1M-context models.
 
-Then run `claude` directly. Config details, script behaviour, and protocol notes live
-in [`REFERENCE.md`](./REFERENCE.md).
+There are also launch scripts that start **Claude Code** against an already
+running proxy, and that pass `--setting-sources=project,local` so a
+project-local `settings.json` does not override your `ANTHROPIC_BASE_URL`:
+[`start-claude-code.sh`](./scripts/start-claude-code.sh) (macOS/Linux) and
+[`start-claude-code.ps1`](./scripts/start-claude-code.ps1) (Windows). They
+check the proxy is reachable first and tell you if it is not.
 
-### Configuration at a glance
+## Configuration
 
 | Variable | Default | Required? | Notes |
 |---|---|---|---|
 | `UPSTREAM_BASE_URL` | — | yes | e.g. `https://api.openai.com` |
 | `UPSTREAM_API_KEY` | — | yes | bearer token for the upstream |
 | `LISTEN_ADDR` | `0.0.0.0:8085` | no | socket to bind |
-| `UPSTREAM_PATH` | `/v1/responses` | no | appended to base URL |
-| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | positive whole-number byte cap for `/v1/messages`; invalid numeric values warn and use the default |
+| `UPSTREAM_PATH` | `/v1/responses` | no | appended to the base URL |
+| `MAX_REQUEST_BODY_BYTES` | `33554432` (32 MiB) | no | byte cap for `POST /v1/messages` |
 | `PROXY_KEY` | — | no | shared secret; see below |
 | `LOG_TO_DISK` | `false` | no | write `target/logs/proxy.log` |
 
-The proxy also reads `proxy.json` (same field names, snake_case), including
-`max_request_body_bytes` (positive whole number of bytes; defaults to 33,554,432
-bytes / 32 MiB). `MAX_REQUEST_BODY_BYTES` overrides the file. Invalid numeric
-values (zero, negative, fractional, or out of range) warn and fall back to the
-default; non-numeric environment text is ignored. Unknown fields fail fast at startup.
+That is the short list. The full one — every environment variable, every
+`proxy.json` field, and the reasoning-effort and caching settings — is in
+[`REFERENCE.md`](./REFERENCE.md#configuration) and
+[`proxy.json-guide.md`](./proxy.json-guide.md).
 
-### If the proxy is configured with `proxy_key`
+Unknown fields in `proxy.json` **fail fast at startup** rather than being
+silently ignored, so a typo is a startup error, not a mystery.
 
-The listener binds `0.0.0.0:8085` by default, so set a shared secret if anything
+### Securing the listener
+
+The proxy binds `0.0.0.0:8085` by default, so set a shared secret if anything
 else can reach it:
 
 ```json
 { "proxy_key": "any-shared-secret-string" }
 ```
 
-Then every `/v1/messages` request needs a matching `X-Proxy-Key` header, or the
-proxy returns 401. Wire it into Claude Code via `ANTHROPIC_CUSTOM_HEADERS`:
+Every `/v1/messages` request then needs a matching `X-Proxy-Key` header, or the
+proxy answers 401:
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:8085",
     "ANTHROPIC_API_KEY": "any",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "ANTHROPIC_CUSTOM_HEADERS": "X-Proxy-Key: your-secret-here"
   }
 }
 ```
 
-Launch scripts forward `PROXY_KEY` automatically. Details, constant-time compare,
-and `/healthz` exemption: [`REFERENCE.md`](./REFERENCE.md#client-auth-proxy_key--proxy_key).
+The launch scripts forward `PROXY_KEY` automatically. The comparison is
+constant-time, and `/healthz` stays unauthenticated.
 
-### Enabling the advisor tool
+### Gateway model discovery (`/v1/models`)
 
-The proxy implements Anthropic's experimental advisor tool server-side, off by
-default. Turn it on in `proxy.json`:
+Claude Code does not query `/v1/models` by default. To populate its `/model`
+autocomplete from the proxy instead of typing alias names by hand:
 
 ```json
-{ "advisor": { "enabled": true, "model": "beam", "max_uses": 2 } }
+{ "env": { "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1" } }
 ```
 
-Claude Code also needs a persistent advisor model. Merge into `~/.claude/settings.json`
-(keep your existing `env` block — it holds `ANTHROPIC_BASE_URL` and your keys):
+The proxy forwards to the upstream's `/v1/models` and translates each entry
+(id, display name, creation time) into Anthropic's shape. With an upstream
+that has no such endpoint, it returns your `model_aliases.map` keys plus
+`default_model`.
+
+## Features
+
+- **Streaming** end to end (SSE).
+- **Tool use** round trips: `tool_use` ↔ `tool_calls`, `tool_result` ↔ `tool`.
+- **Extended thinking**: reasoning is generated from the upstream's `reasoning`
+  output and replayed back upstream on the next turn.
+- **Reasoning-effort** mapping (`low`/`medium`/`high`/`xhigh`/`max`).
+- **Images** in user messages and in tool results, forwarded upstream.
+- **Stop reasons and token usage** remapped into Anthropic's shape.
+- **Model aliases** with a `default_model` fallback when the upstream rejects
+  a model outright.
+- **Prompt caching** on allowlisted models.
+- **`GET /v1/models`** for gateway model discovery, **`GET /healthz`** for
+  liveness checks.
+- An optional shared-secret `proxy_key` for a bind-all listener.
+
+**Not for you if** you need model-generated images, full multimodal assistant
+turns, Anthropic's other server-side tools (`code_execution`, …), or TLS
+termination. See [out of scope](./REFERENCE.md#out-of-scope).
+
+## Optional: the proxy's own server tools
+
+Three server-side tools, all **off by default**. They share one loop, so a
+request can use any mix of them in one turn.
+
+| Tool | What it does | Enable it with |
+|---|---|---|
+| `web_fetch` | fetches a URL, strips the chrome, hands the readable text to the model | `{ "web_fetch": { "enabled": true } }` |
+| `web_search` | DuckDuckGo scraping + page fetching + compaction, as a swap-in for the upstream's built-in search | `{ "web_search": { "enabled": true } }` |
+| `advisor` | a second-opinion consultation inside one assistant message | `{ "advisor": { "enabled": true, "model": "beam" } }` |
+
+Three things worth knowing:
+
+- **A round limit.** The shared loop runs at most `server_tools.max_rounds`
+  rounds (default 10, like Anthropic's own loop). `0` removes the limit — set
+  it if you also set an unlimited `advisor.max_uses`, or the default will end
+  the turn first.
+- **The client's own options apply.** `max_uses`, `allowed_domains` /
+  `blocked_domains`, `user_location` and `max_content_tokens`, as the client
+  sets them on its tool, are honoured.
+- **A failed tool call never fails the request.** The model is told what
+  happened and the turn continues.
+
+The advisor also needs the **client** side enabled — `advisorModel` and
+`CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL` in `~/.claude/settings.json`,
+because Claude Code otherwise waits for a feature flag it cannot fetch:
 
 ```json
 {
   "advisorModel": "opus",
-  "env": {
-    "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1"
-  }
+  "env": { "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1" }
 }
 ```
 
-`advisorModel` sets the advisor (`opus`/`sonnet`/full model id); the env var is
-required behind a custom `ANTHROPIC_BASE_URL` because Claude Code otherwise waits
-for a feature flag it cannot fetch. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` (or
-remove `advisorModel`) to turn it off. A failed consultation degrades to
-`advisor_tool_result_error` (`unavailable`) instead of failing the request; until
-`advisor.enabled` is true in `proxy.json`, Claude Code declares the tool but no
-consultation runs.
+Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` (or remove `advisorModel`) to turn it
+off again. Until `advisor.enabled` is true in `proxy.json`, Claude Code
+declares the tool but no consultation runs.
 
-Deep protocol notes and the advisor's configuration live in
-[`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor) and
-[`REFERENCE.md`](./REFERENCE.md#configuration); the faults still open are
-tracked in [`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md).
+> Claude Code CLI does **not** declare the server-side `web_fetch` tool — it has
+> its own client-side `WebFetch` and does the fetching itself. `web_fetch` is
+> for Anthropic-API clients that declare the server tool.
 
-### Enabling the proxy's own web search
-
-By default the client's `web_search` tool is handled by the upstream's built-in
-search. To use the proxy's own search instead (DuckDuckGo scraping, every result
-page fetched and, if long, compacted), enable it in `proxy.json`:
-
-```json
-{
-  "web_search": {
-    "enabled": true,
-    "compaction_model": "a-cheap-upstream-model",
-    "compaction_threshold_chars": 5000,
-    "max_queries": 3,
-    "max_results_per_query": 5
-  }
-}
-```
-
-Everything except `enabled` is optional and bounded — there is no unlimited
-setting. Without a `compaction_model`, long pages are truncated rather than
-summarised. Disable it again and the upstream's search is used as before. See
-[`src/tools/web_search/README.md`](./src/tools/web_search/README.md) for how it
-works, its limits, and how to remove it.
-
-### Server tools together
-
-`web_search` (if enabled), `web_fetch` (if enabled) and the advisor (if enabled)
-all run on one shared loop, so a request can declare any mix of them and the
-model can use all of them in one turn. Three things worth knowing:
-
-- **A round limit.** A request runs at most `server_tools.max_rounds` rounds
-  (default 10, like Anthropic's own loop). At the limit the model is told and
-  gets one last run to answer. `0` removes the limit — set it if you also set an
-  unlimited `advisor.max_uses`, or the 10-round default will end the turn first.
-- **`pause_turn`.** `server_tools.pause_turn: true` returns the work so far with
-  `stop_reason: "pause_turn"` at the limit instead, as Anthropic's API does, for
-  clients that resume. **Claude Code does not resume it**, so it is off by default.
-- **The client's own options apply.** `max_uses`, `allowed_domains` /
-  `blocked_domains`, `user_location` and `max_content_tokens`, as the client sets
-  them on its tool, are honoured by the proxy's search and fetch.
-
-```json
-{ "server_tools": { "max_rounds": 10, "pause_turn": false } }
-```
-
-Full details: [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md).
-
-### Enabling the web_fetch tool
-
-Anthropic's `web_fetch` is a *server* tool: the client declares it and the
-server does the HTTP GET. The proxy implements it, off by default. Turn it on in
-`proxy.json`:
-
-```json
-{ "web_fetch": { "enabled": true } }
-```
-
-When a client declares the server-side tool and the model asks for a URL, the
-proxy fetches the page, strips the navigation and other chrome, and hands the
-readable text back to the model so it can answer with the page in context.
-
-- `timeout_secs` (default 20) bounds the whole fetch — connect, read, extract.
-- `max_bytes` and `max_content_bytes` are **unlimited** by default; set either
-  to cap the download or the extracted text.
-- The operator sets no domain allow-list and no URL-length limit — the proxy
-  fetches any `http`/`https` URL the model asks for, unless the *client* put
-  `allowed_domains` / `blocked_domains` on its tool (then those apply). It
-  always refuses private and reserved addresses (loopback, LAN, cloud
-  metadata …) and re-checks every redirect.
-- A failed fetch never fails the request: the model is told the fetch failed and
-  the turn continues.
-
-Note: **Claude Code CLI does not declare this tool** — it has its own client-side
-`WebFetch` tool and does the fetching itself. This is for Anthropic-API clients
-that declare the server tool (the Claude Agent SDK, direct Messages API calls,
-gateways that add it for the client). Details: [`REFERENCE.md`](./REFERENCE.md#server-side-web_fetch).
-
-#### Removing the limits
-
-The advisor's three limits in `proxy.json` are removed by **zeroing** them:
-
-```json
-"advisor": {
-  "enabled": true,
-  "model": "beam",
-  "max_uses": 0,
-  "max_tokens": 0,
-  "reasoning_max_tokens": 0,
-  "timeout_secs": 0
-}
-```
-
-A **`0` means "no limit"** for `max_uses`, `max_tokens`, `reasoning_max_tokens` and `timeout_secs`
-(in `proxy.json` and in the `ADVISOR_*` env vars alike). **Omitting a key is
-not the same thing** — an absent key keeps the shipped default (`max_uses` 2,
-`max_tokens` 4096, `reasoning_max_tokens` 16384; `timeout_secs` has no limit by default), so a config that only sets
-`"enabled": true` gets the safe, bounded behaviour.
-
-"No limit" means something different per field, so read the caveats in
-[`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor) before setting
-it:
-
-- **`max_uses: 0`** removes the consultation loop's only backstop — the
-  executor may call `advisor` as often as it likes, and each iteration costs
-  **two** upstream calls (the executor re-run *and* the advisor). The proxy
-  imposes no ceiling of its own, but warns once at startup and once per turn
-  that passes 10 consultations.
-- **`max_tokens`** caps the advisor's *answer* and **`reasoning_max_tokens`**
-  is the extra allowance for its *thinking* (the upstream counts both in one
-  limit, so the proxy sends their sum, 20480 by default). **Either set to
-  `0`** means the *proxy* stops capping: it omits `max_output_tokens` so the
-  **upstream's** own default applies, which may be *smaller* than the shipped
-  one. If your upstream's default is too small, set explicit numbers instead.
-- **`timeout_secs: 0`** applies no per-request timeout override, so the
-  global `request_timeout_secs` still bounds the call. A *finite*
-  `timeout_secs` is always clamped to that global bound.
-
-The advisor's prompt (the executor's whole conversation) is also held to a
-fixed built-in budget of 1,200,000 characters, roughly 400,000 tokens, so a
-long session cannot overflow the advisor model's context window. Tool results,
-then long strings, then the oldest items are trimmed; the user's task and the
-latest items are always kept. It is not configurable; see
-[`proxy.json-guide.md`](./proxy.json-guide.md#the-advisor-prompt-is-trimmed-to-a-fixed-size).
-
-An invalid limit (negative, fractional, or too large) is never a startup
-failure: the proxy starts anyway, falls back to that limit's shipped default,
-and prints a warning.
+Limits, caveats and every knob:
+[`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor),
+[`src/tools/web_search/README.md`](./src/tools/web_search/README.md) and
+[`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md).
 
 ## Troubleshooting
 
-- **Claude Code still hits Anthropic.** Your user-level `settings.json` re-applies
-  `ANTHROPIC_BASE_URL`. Run via the launch scripts (which pass
-  `--setting-sources=project,local`), or move the proxy settings into that file.
-- **`401 Unauthorized`.** `proxy_key` is set but `X-Proxy-Key` is missing or wrong.
-  Add it via `ANTHROPIC_CUSTOM_HEADERS` (see above) or run through the launch
+- **Claude Code still hits Anthropic.** Your user-level `settings.json`
+  re-applies `ANTHROPIC_BASE_URL`. Run via the launch scripts (which pass
+  `--setting-sources=project,local`), or move the proxy settings into that
+  file.
+- **`401 Unauthorized`.** `proxy_key` is set but `X-Proxy-Key` is missing or
+  wrong. Add it via `ANTHROPIC_CUSTOM_HEADERS`, or run through the launch
   scripts with `PROXY_KEY` exported.
-- **Conversations auto-compact too early.** Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to
-  the upstream model's real window.
-- **Nothing happens after `cargo run`.** Confirm `UPSTREAM_BASE_URL`/`UPSTREAM_API_KEY`
-  or a valid `proxy.json`; unknown fields fail fast at startup.
+- **Conversations auto-compact too early.** Set
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the upstream model's real window.
+- **Nothing happens after `cargo run`.** Confirm
+  `UPSTREAM_BASE_URL`/`UPSTREAM_API_KEY` or a valid `proxy.json`; unknown fields
+  fail fast at startup.
+- **The proxy exits immediately.** It starts a TUI by default; pass `--no-tui`
+  for a plain foreground process.
 
-## License, contributing, and more
+## Documentation
 
-- **License:** GPL-3.0 — see [`LICENSE`](./LICENSE). You may use, modify and
-  redistribute the code; any derivative must also be GPL-3.0 with its source
-  available.
-- **Development:** `cargo test`; `cargo clippy --all-targets`; `cargo fmt --all -- --check`
-  (details in [`REFERENCE.md`](./REFERENCE.md#development)).
-- **Architecture, translation overview, out-of-scope notes:** [`REFERENCE.md`](./REFERENCE.md).
+| Document | What is in it |
+|---|---|
+| [`REFERENCE.md`](./REFERENCE.md) | Architecture, the full configuration reference, translation overview, out-of-scope list |
+| [`proxy.json-guide.md`](./proxy.json-guide.md) | Every `proxy.json` key, explained |
+| [`proxy.json.example`](./proxy.json.example) | A filled-in example config |
+| [`src/tools/web_search/README.md`](./src/tools/web_search/README.md) | How the proxy-native search works, and its limits |
+| [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md) | The shared server-tool loop |
+| [`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md) | The advisor faults still open |
 
----
+## Development
 
-*Built as a personal/professional tool. Bug reports and ideas welcome as issues.*
+```bash
+cargo test                      # unit + e2e tests
+cargo clippy --all-targets      # the lint gate; must stay warning-free
+cargo fmt --all -- --check      # formatting
+```
 
-### Enabling gateway model discovery (`/v1/models`)
+CI runs all three on every push, plus a build check on macOS and Windows.
 
-Claude Code does not query `/v1/models` by default. To populate the `/model`
-autocomplete from the proxy instead of typing alias names by hand, set, in your
-shell __before__ launching `claude`:
+## License
 
-    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-
-Or in `~/.claude/settings.json` so subagents, MCP and background agents inherit
-it (the same way `env` is already documented there):
-
-    {
-      "env": {
-        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
-      }
-    }
-
-The proxy answers `GET /v1/models` by forwarding to the upstream OpenAI-style
-`/v1/models`, translating each entry (id, display name, creation time) to the
-Anthropic shape. With an upstream lacking that endpoint, it returns the
-configured `model_aliases.map` keys plus `default_model`. Claude Code applies its
-own `availableModels` allow-list; no proxy config change is required.
+[GPL-3.0](./LICENSE). You may use, modify and redistribute the code; any
+derivative must also be distributed under GPL-3.0 with its source available.
