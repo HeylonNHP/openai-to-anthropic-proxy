@@ -341,7 +341,9 @@ Optional proxy-native replacement for the upstream's built-in web search. **Opt-
   "max_results_per_query": 5,
   "search_timeout_secs": 15,
   "page_timeout_secs": 15,
-  "max_page_bytes": 2097152
+  "max_page_bytes": 2097152,
+  "search_min_interval_ms": 1500,
+  "block_wait_minutes": 10
 }
 ```
 
@@ -350,8 +352,10 @@ Optional proxy-native replacement for the upstream's built-in web search. **Opt-
 - **Nothing is unlimited.** Unlike `web_fetch`, `0`, negative and fractional values are invalid: the default is used with a startup warning. Values above the maximum are clamped, with a warning.
 - Result pages are fetched through the same SSRF-hardened fetcher as `web_fetch`.
 - A blocked search (CAPTCHA, HTTP error) or an unreachable page is reported in the tool result and never fails the request. The proxy does not fall back to the upstream's search.
+- **Searches are paced.** DuckDuckGo is scraped, and it answers a burst of queries from one address with a bot challenge (CAPTCHA). So searches run **one at a time**, across every request the proxy is serving, with at least `search_min_interval_ms` (default 1500, max 30000) between the end of one search and the start of the next. Several queries in one call simply queue.
+- **When a search is blocked** (CAPTCHA, or an HTTP error that means rate limiting) the model is told what happened and to wait about `block_wait_minutes` (default 10, max 120) before searching again. The proxy does not refuse later searches: if the model comes back sooner and is blocked again, the message also says how long ago the previous blocked search was, in seconds and minutes, so the model can see how fast it is retrying. A search that returns results clears that record. The record lives in memory and starts empty after a restart.
 - `search_endpoint` overrides where searches are POSTed (default DuckDuckGo's HTML interface) — mainly useful for tests.
-- Env overrides use the same env > file > default precedence: `WEB_SEARCH_ENABLED`, `WEB_SEARCH_COMPACTION_MODEL`, `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS`, `WEB_SEARCH_MAX_QUERIES`, `WEB_SEARCH_MAX_RESULTS_PER_QUERY`, `WEB_SEARCH_SEARCH_TIMEOUT_SECS`, `WEB_SEARCH_PAGE_TIMEOUT_SECS`, `WEB_SEARCH_MAX_PAGE_BYTES`, `WEB_SEARCH_ENDPOINT`.
+- Env overrides use the same env > file > default precedence: `WEB_SEARCH_ENABLED`, `WEB_SEARCH_COMPACTION_MODEL`, `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS`, `WEB_SEARCH_MAX_QUERIES`, `WEB_SEARCH_MAX_RESULTS_PER_QUERY`, `WEB_SEARCH_SEARCH_TIMEOUT_SECS`, `WEB_SEARCH_PAGE_TIMEOUT_SECS`, `WEB_SEARCH_MAX_PAGE_BYTES`, `WEB_SEARCH_ENDPOINT`, `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS`, `WEB_SEARCH_BLOCK_WAIT_MINUTES`.
 - It works alongside `web_fetch` and the advisor in the same turn. The client's own options on its `web_search` tool are applied: `max_uses` (queries per request), `allowed_domains` / `blocked_domains`, and `user_location` (the search region). What the model read is carried into later turns, so it still knows what it found.
 
 Full documentation: [`src/tools/web_search/README.md`](./src/tools/web_search/README.md).

@@ -1667,7 +1667,24 @@ fn web_search_defaults_are_off_and_bounded() {
     assert_eq!(ws.max_queries, 3);
     assert_eq!(ws.max_results_per_query, 5);
     assert_eq!(ws.search_endpoint, DEFAULT_WEB_SEARCH_ENDPOINT);
+    assert_eq!(ws.search_min_interval_ms, 1_500);
+    assert_eq!(ws.block_wait_minutes, 10);
     assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn web_search_pacing_values_resolve_and_are_bounded() {
+    let file = web_search_file(r#"{ "search_min_interval_ms": 3000, "block_wait_minutes": 15 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.search_min_interval_ms, 3_000);
+    assert_eq!(cfg.web_search.block_wait_minutes, 15);
+    assert!(cfg.warnings.is_empty());
+
+    let file = web_search_file(r#"{ "search_min_interval_ms": 0, "block_wait_minutes": 9999 }"#);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.search_min_interval_ms, 1_500, "0 = default");
+    assert_eq!(cfg.web_search.block_wait_minutes, 120, "clamped");
+    assert_eq!(cfg.warnings.len(), 2);
 }
 
 #[test]

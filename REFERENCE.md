@@ -54,6 +54,8 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `WEB_SEARCH_PAGE_TIMEOUT_SECS` | `web_search.page_timeout_secs` | `15` | no | Per-page fetch budget. Max `120`. |
 | `WEB_SEARCH_MAX_PAGE_BYTES` | `web_search.max_page_bytes` | `2097152` | no | Per-page network read cap. Max 16 MiB. |
 | `WEB_SEARCH_ENDPOINT` | `web_search.search_endpoint` | DuckDuckGo HTML | no | Search endpoint (mostly for tests). |
+| `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS` | `web_search.search_min_interval_ms` | `1500` | no | Searches run one at a time with at least this gap between them. Max 30000. |
+| `WEB_SEARCH_BLOCK_WAIT_MINUTES` | `web_search.block_wait_minutes` | `10` | no | Minutes the model is told to wait after a blocked search (CAPTCHA). Max 120. |
 | `SERVER_TOOLS_MAX_ROUNDS` | `server_tools.max_rounds` | `10` | no | Most rounds (executor runs whose server-tool calls were served) one request may run. `0` = no limit (needed for an unlimited `advisor.max_uses` or `web_fetch` to be truly unlimited). Negative / fractional values fall back to the default + warning. |
 | `SERVER_TOOLS_PAUSE_TURN` | `server_tools.pause_turn` | `false` | no | At the round limit, return `stop_reason: "pause_turn"` for the client to resume (as Anthropic's API does) instead of making the model answer. Claude Code does **not** resume a `pause_turn`, so leave it off for Claude Code. Accepts `1` / `true` / `yes` / `on`. |
 | `PREFIX_MODELS_FOR_DISCOVERY` | `prefix_models_for_discovery` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. |

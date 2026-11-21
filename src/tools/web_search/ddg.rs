@@ -30,11 +30,32 @@ pub struct ParsedPage {
 /// A failed search. A plain message: it becomes tool output, never a client
 /// error.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SearchError(pub String);
+pub struct SearchError {
+    pub message: String,
+    /// The engine refused this client (bot challenge, rate limit) rather than
+    /// the search failing for some other reason.
+    pub blocked: bool,
+}
+
+impl SearchError {
+    fn failed(message: String) -> Self {
+        Self {
+            message,
+            blocked: false,
+        }
+    }
+
+    fn blocked(message: String) -> Self {
+        Self {
+            message,
+            blocked: true,
+        }
+    }
+}
 
 impl std::fmt::Display for SearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -214,24 +235,24 @@ pub async fn search(
     let response = request
         .send()
         .await
-        .map_err(|e| SearchError(format!("search request failed: {e}")))?;
+        .map_err(|e| SearchError::failed(format!("search request failed: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
         // DuckDuckGo answers a flagged client with a 202 and no results.
-        return Err(SearchError(format!(
+        return Err(SearchError::blocked(format!(
             "the search engine returned {status} (it may be rate-limiting or challenging this IP)"
         )));
     }
     let html = response
         .text()
         .await
-        .map_err(|e| SearchError(format!("reading the search response failed: {e}")))?;
+        .map_err(|e| SearchError::failed(format!("reading the search response failed: {e}")))?;
 
     let page = parse_results(&html, limit);
     if page.challenged {
-        return Err(SearchError(
-            "the search engine returned a bot challenge (CAPTCHA); try again later".to_owned(),
+        return Err(SearchError::blocked(
+            "the search engine returned a bot challenge (CAPTCHA)".to_owned(),
         ));
     }
     Ok(page.hits)

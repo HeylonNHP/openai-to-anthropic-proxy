@@ -27,6 +27,7 @@ pub mod backend;
 pub mod compact;
 pub mod ddg;
 pub mod format;
+pub mod gate;
 pub mod history;
 pub mod protocol;
 pub mod run;

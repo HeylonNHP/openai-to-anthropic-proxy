@@ -7280,6 +7280,43 @@ async fn web_search_captcha_degrades_to_an_error_result() {
     let second = String::from_utf8_lossy(&sent[1]).into_owned();
     assert!(second.contains("search_error"));
     assert!(second.contains("CAPTCHA"));
+    // The model is told how long to wait, and is not told to give up.
+    assert!(second.contains("Wait about 10 minutes before searching again"));
+}
+
+/// A second blocked search tells the model how long ago the previous blocked
+/// one was, so it can see how fast it is retrying.
+#[tokio::test]
+async fn web_search_repeat_block_reports_time_since_the_previous_one() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_per_attempt.lock().await = VecDeque::from([
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(web_search_call_response(&["first", "second"])),
+        },
+        FakeResponse {
+            status: StatusCode::OK,
+            body: Some(completed_response_with_id("resp_after", "done")),
+        },
+    ]);
+    let (engine, _) = start_fake_search_engine(FAKE_CAPTCHA_HTML).await;
+    let proxy_addr = start_proxy(web_search_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, web_search_request(false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let sent = upstream.received_all.lock().await.clone();
+    let second = String::from_utf8_lossy(&sent[1]).into_owned();
+    assert_eq!(
+        second.matches("bot challenge (CAPTCHA)").count(),
+        2,
+        "both searches are blocked: {second}"
+    );
+    assert!(
+        second.contains("The previous blocked search was"),
+        "the repeat must say how recent the last block was: {second}"
+    );
+    assert!(second.contains("ago, so searches"), "{second}");
 }
 
 /// A streaming client gets ONE synthetic SSE sequence containing the pair.

@@ -13,6 +13,7 @@ use crate::tools::domains::DomainRules;
 use crate::tools::web_fetch::fetch as page_fetch;
 use crate::tools::web_search::compact::{CompactRequest, Compactor, UpstreamCompactor};
 use crate::tools::web_search::ddg::{self, SearchHit};
+use crate::tools::web_search::gate;
 
 /// A fetched, readable page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,15 +89,33 @@ impl Compactor for LiveBackend {
 
 impl Backend for LiveBackend {
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
-        ddg::search(
+        // One search at a time, spaced out, across every request.
+        let gate = gate::gate_for(&self.cfg.search_endpoint);
+        let mut slot = gate
+            .acquire(Duration::from_millis(self.cfg.search_min_interval_ms))
+            .await;
+        let result = ddg::search(
             &self.client,
             &self.cfg.search_endpoint,
             query,
             self.region,
             limit,
         )
-        .await
-        .map_err(|e| e.to_string())
+        .await;
+        let outcome = match result {
+            Ok(hits) => {
+                slot.succeeded();
+                Ok(hits)
+            }
+            Err(error) if error.blocked => Err(gate::blocked_message(
+                &error.message,
+                slot.blocked(),
+                self.cfg.block_wait_minutes,
+            )),
+            Err(error) => Err(error.message),
+        };
+        drop(slot);
+        outcome
     }
 
     async fn fetch_page(&self, url: &str) -> Result<PageText, String> {

@@ -96,6 +96,10 @@ const MAX_WEB_SEARCH_COMPACTION_THRESHOLD_CHARS: u64 = 100_000;
 const DEFAULT_WEB_SEARCH_SEARCH_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS: u64 = 15;
 const MAX_WEB_SEARCH_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_WEB_SEARCH_MIN_INTERVAL_MS: u64 = 1_500;
+const MAX_WEB_SEARCH_MIN_INTERVAL_MS: u64 = 30_000;
+const DEFAULT_WEB_SEARCH_BLOCK_WAIT_MINUTES: u64 = 10;
+const MAX_WEB_SEARCH_BLOCK_WAIT_MINUTES: u64 = 120;
 const DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WEB_SEARCH_MAX_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -453,6 +457,13 @@ pub struct WebSearchConfig {
     pub max_page_bytes: u64,
     /// The search endpoint (DuckDuckGo's HTML interface by default).
     pub search_endpoint: String,
+    /// Searches run one at a time, with at least this many milliseconds
+    /// between the end of one and the start of the next (per endpoint, across
+    /// all requests), so a burst of queries does not look like a bot.
+    pub search_min_interval_ms: u64,
+    /// How many minutes the model is told to wait before searching again when
+    /// the search engine blocks a search (bot challenge / rate limit).
+    pub block_wait_minutes: u64,
 }
 
 impl Default for WebSearchConfig {
@@ -467,6 +478,8 @@ impl Default for WebSearchConfig {
             page_timeout_secs: DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS,
             max_page_bytes: DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES,
             search_endpoint: DEFAULT_WEB_SEARCH_ENDPOINT.to_owned(),
+            search_min_interval_ms: DEFAULT_WEB_SEARCH_MIN_INTERVAL_MS,
+            block_wait_minutes: DEFAULT_WEB_SEARCH_BLOCK_WAIT_MINUTES,
         }
     }
 }
@@ -1185,6 +1198,26 @@ impl Config {
                 .map(|e| e.trim().to_owned())
                 .filter(|e| !e.is_empty())
                 .unwrap_or(web_search_defaults.search_endpoint),
+            search_min_interval_ms: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.search_min_interval_ms.as_ref()),
+                    env.web_search_search_min_interval_ms.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_MIN_INTERVAL_MS,
+                MAX_WEB_SEARCH_MIN_INTERVAL_MS,
+                "web_search.search_min_interval_ms",
+                &mut warnings,
+            ),
+            block_wait_minutes: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.block_wait_minutes.as_ref()),
+                    env.web_search_block_wait_minutes.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_BLOCK_WAIT_MINUTES,
+                MAX_WEB_SEARCH_BLOCK_WAIT_MINUTES,
+                "web_search.block_wait_minutes",
+                &mut warnings,
+            ),
         };
 
         let prefix_models_for_discovery = env.prefix_models_for_discovery.unwrap_or_else(|| {
@@ -1438,6 +1471,8 @@ pub struct EnvInputs {
     pub web_search_page_timeout_secs: Option<serde_json::Number>,
     pub web_search_max_page_bytes: Option<serde_json::Number>,
     pub web_search_endpoint: Option<String>,
+    pub web_search_search_min_interval_ms: Option<serde_json::Number>,
+    pub web_search_block_wait_minutes: Option<serde_json::Number>,
     /// `server_tools` overrides.
     pub server_tools_max_rounds: Option<serde_json::Number>,
     pub server_tools_pause_turn: Option<bool>,
@@ -1525,6 +1560,12 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             web_search_endpoint: env::var("WEB_SEARCH_ENDPOINT").ok(),
+            web_search_search_min_interval_ms: env::var("WEB_SEARCH_SEARCH_MIN_INTERVAL_MS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_block_wait_minutes: env::var("WEB_SEARCH_BLOCK_WAIT_MINUTES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
             prefix_models_for_discovery: env::var("PREFIX_MODELS_FOR_DISCOVERY")
                 .ok()
                 .map(|s| parse_truthy(&s)),
@@ -2016,6 +2057,8 @@ pub struct JsonWebSearchConfig {
     pub max_page_bytes: Option<serde_json::Number>,
     /// Search endpoint override (default: DuckDuckGo's HTML interface).
     pub search_endpoint: Option<String>,
+    pub search_min_interval_ms: Option<serde_json::Number>,
+    pub block_wait_minutes: Option<serde_json::Number>,
 }
 
 /// JSON shape of the `server_tools` section of `proxy.json`. `max_rounds` is a

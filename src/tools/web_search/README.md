@@ -126,6 +126,17 @@ or page never discards the others. If you see CAPTCHAs, DuckDuckGo is
 rate-limiting your IP; the proxy does **not** silently fall back to the
 upstream's search (see below).
 
+### Pacing and blocks (`gate.rs`)
+
+Searches are serialised and spaced by `search_min_interval_ms`, process-wide
+and per endpoint, so a burst of queries cannot reach the engine at once. A
+blocked search (bot challenge, or the HTTP status DuckDuckGo uses for a flagged
+client) tells the model to wait `block_wait_minutes`. Searches are never
+refused on the proxy's side; if the model is blocked again, the message adds how
+long ago the previous blocked search was (seconds and minutes). A search that
+returns results clears that record. The wording deliberately only asks the
+model to wait, never to stop searching.
+
 ## Configuration
 
 All keys are optional; every one has an env override
@@ -142,6 +153,8 @@ All keys are optional; every one has an env override
 | `page_timeout_secs` | `15` | 120 | Budget for fetching one page. |
 | `max_page_bytes` | `2097152` | 16 MiB | Network read cap per page. |
 | `search_endpoint` | DuckDuckGo's HTML endpoint | — | Where searches are POSTed. Mostly for tests. |
+| `search_min_interval_ms` | `1500` | 30000 | Searches run one at a time; this is the minimum gap between the end of one and the start of the next. |
+| `block_wait_minutes` | `10` | 120 | Minutes the model is told to wait after a blocked search. |
 
 **There is no "unlimited".** Unlike `web_fetch`, `0`, negative or fractional
 values are invalid: the default is used and a startup warning is printed.
