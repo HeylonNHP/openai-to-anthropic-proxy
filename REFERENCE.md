@@ -329,6 +329,20 @@ Set the upstream model's real context window explicitly:
 
 Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
 
+### Context-overflow errors
+
+When the upstream rejects a prompt as too long for its context window, the
+proxy answers HTTP 400 `invalid_request_error` with Anthropic's own wording,
+`prompt is too long: <actual> tokens > <max> maximum` (just
+`prompt is too long` when the upstream gave no numbers). Claude Code
+recognises that message and compacts the conversation and retries; the
+upstream's own wording would not be recognised. An overflow reported inside a
+stream becomes an SSE `error` event with the same type and message. Detection
+is conservative and lives in `src/context_overflow.rs`: output-limit,
+image/file and token-per-minute errors are not treated as overflows, and an
+overflow never triggers the `default_model` fallback or a parameter-strip
+retry.
+
 ## Development
 
 - `cargo test` runs unit and e2e tests.

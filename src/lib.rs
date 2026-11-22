@@ -4,6 +4,7 @@ pub use tools::advisor;
 pub use tools::web_fetch;
 pub mod capabilities;
 pub mod config;
+mod context_overflow;
 mod error;
 pub mod responses;
 pub mod stream;

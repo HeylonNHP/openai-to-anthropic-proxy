@@ -143,14 +143,16 @@ where
         };
         match &event {
             ResponsesStreamEvent::Failed { response } => {
-                let text = response
-                    .error
-                    .as_ref()
-                    .map_or("upstream response failed", |e| e.message.as_str());
-                return Err(upstream_failure(text.to_owned()));
+                let Some(error) = response.error.as_ref() else {
+                    return Err(upstream_failure("upstream response failed".to_owned()));
+                };
+                return Err(stream_failure(
+                    &crate::responses::code_text(error.code.as_ref()),
+                    &error.message,
+                ));
             }
-            ResponsesStreamEvent::Error { message, .. } => {
-                return Err(upstream_failure(message.clone()));
+            ResponsesStreamEvent::Error { message, code, .. } => {
+                return Err(stream_failure(code.as_deref().unwrap_or_default(), message));
             }
             ResponsesStreamEvent::Completed { response }
             | ResponsesStreamEvent::Incomplete { response } => {
@@ -164,6 +166,15 @@ where
         let produced = translator.feed_event(&event);
         out.send_live(produced, translator.next_index());
     }
+}
+
+/// A failure the upstream reported inside the stream: an overflow keeps
+/// Anthropic's wording, anything else is a generic upstream error.
+fn stream_failure(code: &str, message: &str) -> AppError {
+    crate::context_overflow::detect_event(code, message).map_or_else(
+        || upstream_failure(message.to_owned()),
+        |overflow| AppError::ContextOverflow(overflow.anthropic_message()),
+    )
 }
 
 fn upstream_failure(message: String) -> AppError {

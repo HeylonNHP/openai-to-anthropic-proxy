@@ -852,7 +852,12 @@ impl Attempt {
             // `capabilities::unsupported_parameter`). Each fact is recorded
             // for the rest of the process, so the retry costs at most one
             // wasted request per (model, parameter) per process lifetime.
-            if self.param_retries < capabilities::RequestParam::ALL.len()
+            // An overflow is never a parameter or model problem; retrying
+            // would only hide it (and a fallback model may have a smaller
+            // window), so keep both retries away from it.
+            let overflow = crate::context_overflow::detect(status.as_u16(), &body).is_some();
+            if !overflow
+                && self.param_retries < capabilities::RequestParam::ALL.len()
                 && let Some(param) = capabilities::unsupported_parameter(status, &body)
                 && param.is_set(&self.outbound)
             {
@@ -895,7 +900,11 @@ impl Attempt {
             // `outbound.model` is the *alias-resolved* upstream name — the
             // same name the fallback would carry — so comparing the two is
             // exactly right.
-            let rejection = model_rejection::detect_model_rejection(status.as_u16(), &body);
+            let rejection = if overflow {
+                None
+            } else {
+                model_rejection::detect_model_rejection(status.as_u16(), &body)
+            };
             // `default_model` may be written as an inbound name or as an
             // upstream name; resolving it through the alias map makes both
             // work, and makes the comparison below like-for-like (both sides
@@ -1441,20 +1450,32 @@ where
                         // envelope.
                         let (kind, message) = match &event {
                             responses::ResponsesStreamEvent::Failed { response } => {
-                                let msg = response
-                                    .error
-                                    .as_ref()
-                                    .map(|e| e.message.clone())
-                                    .unwrap_or_else(|| "upstream response failed".to_owned());
-                                ("upstream_error", msg)
+                                response.error.as_ref().map_or_else(
+                                    || {
+                                        (
+                                            "upstream_error".to_owned(),
+                                            "upstream response failed".to_owned(),
+                                        )
+                                    },
+                                    |e| {
+                                        crate::context_overflow::stream_error(
+                                            &crate::responses::code_text(e.code.as_ref()),
+                                            &e.message,
+                                        )
+                                    },
+                                )
                             }
                             _ => unreachable!(),
                         };
                         let events = this.take_and_report_error(kind, message);
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
-                    if let responses::ResponsesStreamEvent::Error { message, .. } = &event {
-                        let events = this.take_and_report_error("upstream_error", message.clone());
+                    if let responses::ResponsesStreamEvent::Error { message, code, .. } = &event {
+                        let (kind, message) = crate::context_overflow::stream_error(
+                            code.as_deref().unwrap_or_default(),
+                            message,
+                        );
+                        let events = this.take_and_report_error(kind, message);
                         return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                     }
                     let terminal = matches!(
@@ -1571,6 +1592,11 @@ fn fallback_unavailable_error(fallback: &str, error: AppError) -> AppError {
 }
 
 fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
+    // A prompt that does not fit the context window is reported in
+    // Anthropic's own words so Claude Code can compact and retry.
+    if let Some(overflow) = crate::context_overflow::detect(status.as_u16(), body) {
+        return AppError::ContextOverflow(overflow.anthropic_message());
+    }
     // Upstreams use two envelopes: the flat Responses shape
     // (`{"message": "...", "type": "..."}`) and the nested one
     // (`{"error": {"message": "...", "type": "..."}}`) that the gateway in

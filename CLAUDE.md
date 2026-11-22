@@ -114,6 +114,10 @@ Change the file that owns the topic; don't spread one fact across several.
 - **Server tools** (`web_search`, `web_fetch`, `advisor`) share one loop in
   `src/tools/server_loop/`. They honour the client's `max_uses`, domain lists
   and similar options, and each round streams to the client as it finishes.
+- **Context overflow** (upstream says the prompt is too long) is re-worded into
+  Anthropic's `prompt is too long: N tokens > M maximum` in
+  `src/context_overflow.rs`, so Claude Code can compact. It must never be
+  mistaken for a model or parameter rejection.
 - **Model rejection** (upstream says "no such model" / "parameter unsupported")
   is handled in `src/model_rejection.rs`, which distinguishes a *model*
   rejection from a *tool* rejection before retrying.

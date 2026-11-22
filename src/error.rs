@@ -31,6 +31,12 @@ pub enum AppError {
     #[error("request too large: {0}")]
     PayloadTooLarge(String),
 
+    /// The prompt does not fit the model's context window. Carries
+    /// Anthropic's exact wording (`prompt is too long: N tokens > M maximum`)
+    /// so Claude Code recognises it and compacts. Always HTTP 400.
+    #[error("{0}")]
+    ContextOverflow(String),
+
     /// The upstream returned a non-success status. The status is preserved
     /// so the client sees the same code Anthropic would have returned.
     #[error("upstream returned {status}: {body}")]
@@ -55,6 +61,7 @@ impl AppError {
             Self::BadRequest(msg) => Self::BadRequest(scrub(&msg)),
             Self::Unauthorized => Self::Unauthorized,
             Self::PayloadTooLarge(msg) => Self::PayloadTooLarge(scrub(&msg)),
+            Self::ContextOverflow(msg) => Self::ContextOverflow(scrub(&msg)),
             Self::Upstream { status, body } => Self::Upstream {
                 status,
                 body: scrub(&body),
@@ -72,6 +79,7 @@ impl AppError {
                 "missing or invalid X-Proxy-Key header".to_owned(),
             ),
             Self::PayloadTooLarge(msg) => ("request_too_large", msg.clone()),
+            Self::ContextOverflow(msg) => (crate::context_overflow::ERROR_KIND, msg.clone()),
             Self::Upstream { status, body } => {
                 let kind = match status.as_u16() {
                     401 | 403 => "authentication_error",
@@ -112,7 +120,7 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadRequest(_) | Self::ContextOverflow(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             // 4xx and 5xx upstream statuses are passed through, but if the
@@ -158,3 +166,6 @@ impl From<serde_json::Error> for AppError {
         Self::BadRequest(format!("invalid JSON: {err}"))
     }
 }
+
+#[cfg(test)]
+mod tests;

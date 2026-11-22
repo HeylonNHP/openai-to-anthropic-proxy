@@ -355,11 +355,20 @@ impl StreamTranslator {
                 // block is closed with a matching `content_block_stop`
                 // before the terminal `MessageStop` — otherwise the
                 // Anthropic client sees a half-streamed response.
-                let msg = response
-                    .error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "upstream response failed".to_owned());
+                let (kind, msg) = response.error.as_ref().map_or_else(
+                    || {
+                        (
+                            "upstream_error".to_owned(),
+                            "upstream response failed".to_owned(),
+                        )
+                    },
+                    |e| {
+                        crate::context_overflow::stream_error(
+                            &crate::responses::code_text(e.code.as_ref()),
+                            &e.message,
+                        )
+                    },
+                );
                 if !self.started {
                     events.push(self.build_message_start());
                     self.started = true;
@@ -367,13 +376,17 @@ impl StreamTranslator {
                 self.finalize(&mut events);
                 events.push(StreamEvent::Error {
                     error: ApiErrorBody {
-                        r#type: "upstream_error".to_string(),
+                        r#type: kind,
                         message: msg,
                     },
                 });
                 events.push(StreamEvent::MessageStop {});
             }
-            ResponsesStreamEvent::Error { message, .. } => {
+            ResponsesStreamEvent::Error { message, code, .. } => {
+                let (kind, message) = crate::context_overflow::stream_error(
+                    code.as_deref().unwrap_or_default(),
+                    message,
+                );
                 // Top-level error event: same path — close any open
                 // blocks before the terminal `MessageStop` so the
                 // client sees a well-formed sequence.
@@ -384,8 +397,8 @@ impl StreamTranslator {
                 self.finalize(&mut events);
                 events.push(StreamEvent::Error {
                     error: ApiErrorBody {
-                        r#type: "upstream_error".to_string(),
-                        message: message.clone(),
+                        r#type: kind,
+                        message,
                     },
                 });
                 events.push(StreamEvent::MessageStop {});

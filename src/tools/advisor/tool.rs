@@ -560,15 +560,17 @@ impl FailureKind {
 
     /// Sort an upstream HTTP failure.
     fn from_http(status: u16, body: &str) -> Self {
+        let shared = crate::context_overflow::detect(status, body).is_some();
         let body = body.to_ascii_lowercase();
-        let too_long = [
-            "too long",
-            "context length",
-            "context window",
-            "context_length",
-        ]
-        .iter()
-        .any(|needle| body.contains(needle));
+        let too_long = shared
+            || [
+                "too long",
+                "context length",
+                "context window",
+                "context_length",
+            ]
+            .iter()
+            .any(|needle| body.contains(needle));
         match status {
             429 => Self::TooManyRequests,
             504 => Self::Timeout,

@@ -544,6 +544,16 @@ pub struct ResponsesError {
     pub param: Option<Value>,
 }
 
+/// A `code` field as text: a string as is, a number (`"code": 400`) printed.
+#[must_use]
+pub fn code_text(code: Option<&Value>) -> String {
+    match code {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
 // ─── Streaming SSE events (response) ───────────────────────────────────────
 
 /// Wire envelope for one Responses SSE event. The `type` field is the
