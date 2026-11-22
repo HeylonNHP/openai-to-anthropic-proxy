@@ -67,3 +67,38 @@ fn function_call_output_round_trips_both_forms() {
         _ => panic!("wrong item type"),
     }
 }
+
+fn usage_with(input: u32, cached: u32, written: u32) -> ResponsesUsage {
+    ResponsesUsage {
+        input_tokens: input,
+        output_tokens: 0,
+        total_tokens: input,
+        input_tokens_details: Some(InputTokensDetails {
+            cached_tokens: cached,
+            cache_write_tokens: written,
+        }),
+        output_tokens_details: None,
+    }
+}
+
+#[test]
+fn net_input_plus_cache_fields_equals_the_upstream_gross_total() {
+    // Anthropic clients sum input + cache read + cache creation for the
+    // context size, so the three must add back up to the upstream's figure.
+    let u = usage_with(12_000, 4_000, 7_000);
+    assert_eq!(u.net_input_tokens(), 1_000);
+    assert_eq!(u.net_input_tokens() + 4_000 + 7_000, u.input_tokens);
+}
+
+#[test]
+fn net_input_without_details_is_the_gross_total() {
+    let mut u = usage_with(50, 0, 0);
+    u.input_tokens_details = None;
+    assert_eq!(u.net_input_tokens(), 50);
+}
+
+#[test]
+fn net_input_saturates_when_cache_counts_exceed_the_total() {
+    assert_eq!(usage_with(10, 8, 8).net_input_tokens(), 0);
+    assert_eq!(net_input_tokens(5, u32::MAX, u32::MAX), 0);
+}

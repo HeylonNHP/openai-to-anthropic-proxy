@@ -19,10 +19,13 @@
 //! outputs, or dropped. Images in *assistant* turns have no valid home in
 //! the Responses API and are dropped with a warning.
 //!
-//! On the response side, OpenAI's `usage.input_tokens` becomes Anthropic's
-//! `input_tokens`, `output_tokens` stays `output_tokens`, and
-//! `output_tokens_details.reasoning_tokens` becomes `thinking_tokens`;
-//! cache fields are 0.
+//! On the response side, OpenAI's `usage.input_tokens` (gross, cache included)
+//! becomes Anthropic's `input_tokens` NET of the cache counts, because
+//! Anthropic's `input_tokens` excludes them and clients add the three fields
+//! together; `cached_tokens` / `cache_write_tokens` become
+//! `cache_read_input_tokens` / `cache_creation_input_tokens`.
+//! `output_tokens` stays `output_tokens`, and
+//! `output_tokens_details.reasoning_tokens` becomes `thinking_tokens`.
 
 use crate::anthropic::{
     CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
@@ -2553,9 +2556,10 @@ use crate::responses::{OutputContentPart, OutputItem};
 ///   - `status == "failed"` → `EndTurn`; the inner error message is
 ///     surfaced as a `[error] ` text block so the client sees it.
 ///   - `status == "cancelled"` → `EndTurn`.
-/// - `usage`: `input_tokens` → `input_tokens`, `output_tokens` →
-///   `output_tokens`, `output_tokens_details.reasoning_tokens` →
-///   `thinking_tokens`. Cache fields are 0.
+/// - `usage`: `input_tokens` minus the cache counts → `input_tokens`,
+///   `cached_tokens` → `cache_read_input_tokens`, `cache_write_tokens` →
+///   `cache_creation_input_tokens`, `output_tokens` → `output_tokens`,
+///   `output_tokens_details.reasoning_tokens` → `thinking_tokens`.
 #[must_use]
 pub fn responses_to_anthropic(
     resp: &ResponsesResponse,
@@ -2593,7 +2597,7 @@ pub fn responses_to_anthropic(
         .usage
         .as_ref()
         .map(|u| AnthropicUsage {
-            input_tokens: u.input_tokens,
+            input_tokens: u.net_input_tokens(),
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u
                 .input_tokens_details

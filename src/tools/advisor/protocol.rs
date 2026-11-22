@@ -139,7 +139,8 @@ pub fn new_id() -> String {
 fn token_counts(usage: &ResponsesUsage) -> (u32, u32, u32, u32) {
     let details = usage.input_tokens_details.as_ref();
     (
-        usage.input_tokens,
+        // Net of the cache fields, as Anthropic reports it.
+        usage.net_input_tokens(),
         usage.output_tokens,
         details.map_or(0, |d| d.cached_tokens),
         details.map_or(0, |d| d.cache_write_tokens),

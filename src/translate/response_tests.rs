@@ -251,7 +251,8 @@ fn cache_usage_fields_map_from_input_details() {
         output_tokens_details: None,
     });
     let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
-    assert_eq!(out.usage.input_tokens, 100);
+    // 100 gross - 20 cached - 7 written: Anthropic's input_tokens excludes both.
+    assert_eq!(out.usage.input_tokens, 73);
     assert_eq!(out.usage.output_tokens, 50);
     assert_eq!(out.usage.cache_read_input_tokens, 20);
     assert_eq!(out.usage.cache_creation_input_tokens, 7);

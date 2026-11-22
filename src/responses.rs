@@ -482,6 +482,34 @@ pub struct ResponsesUsage {
     pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
+impl ResponsesUsage {
+    /// Input tokens in Anthropic's sense: the tokens that were neither read
+    /// from nor written to the cache.
+    ///
+    /// OpenAI's `input_tokens` is the gross total and `cached_tokens` /
+    /// `cache_write_tokens` are subsets of it, whereas Anthropic's
+    /// `input_tokens` EXCLUDES both. Clients such as Claude Code add the
+    /// three Anthropic fields to get the context size, so reporting the gross
+    /// figure next to the cache fields counts cached tokens twice.
+    /// Invariant: this + cached + written == `input_tokens` (saturating for an
+    /// upstream whose cache counts are not a subset).
+    #[must_use]
+    pub fn net_input_tokens(&self) -> u32 {
+        let d = self.input_tokens_details.as_ref();
+        net_input_tokens(
+            self.input_tokens,
+            d.map_or(0, |d| d.cached_tokens),
+            d.map_or(0, |d| d.cache_write_tokens),
+        )
+    }
+}
+
+/// See [`ResponsesUsage::net_input_tokens`].
+#[must_use]
+pub const fn net_input_tokens(input: u32, cached: u32, written: u32) -> u32 {
+    input.saturating_sub(cached.saturating_add(written))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputTokensDetails {
     #[serde(default)]

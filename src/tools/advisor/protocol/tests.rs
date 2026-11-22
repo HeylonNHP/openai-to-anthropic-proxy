@@ -166,7 +166,7 @@ fn advisor_iteration_shape_is_exact() {
         json!({
             "type": "advisor_message",
             "model": "beam",
-            "input_tokens": 823,
+            "input_tokens": 805,
             "output_tokens": 1612,
             "cache_read_input_tokens": 7,
             "cache_creation_input_tokens": 11,
@@ -187,7 +187,7 @@ fn message_iteration_shape_is_exact() {
         v,
         json!({
             "type": "message",
-            "input_tokens": 823,
+            "input_tokens": 805,
             "output_tokens": 1612,
             "cache_read_input_tokens": 7,
             "cache_creation_input_tokens": 11,

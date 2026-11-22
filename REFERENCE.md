@@ -397,7 +397,7 @@ fails the test run.
 - `role` is always `assistant`.
 - Text becomes `text` blocks.
 - Each `tool_call` becomes a `tool_use` block.
-- `stop_reason` and token usage are mapped into Anthropic shape.
+- `stop_reason` and token usage are mapped into Anthropic shape. `input_tokens` is reported **net of cache**: OpenAI's gross `input_tokens` minus `cached_tokens` and `cache_write_tokens`, which become `cache_read_input_tokens` and `cache_creation_input_tokens`. Claude Code adds the three, so reporting the gross figure would count cached tokens twice and trigger auto-compaction early. The proxy's own log lines and TUI still show the upstream's gross figure.
 
 ### Streaming
 

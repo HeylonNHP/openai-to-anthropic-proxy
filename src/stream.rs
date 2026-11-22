@@ -519,7 +519,13 @@ impl StreamTranslator {
     fn build_message_start(&self) -> StreamEvent {
         let usage = if self.input_usage_seen {
             AnthropicUsage {
-                input_tokens: self.input_tokens,
+                // `self.input_tokens` stays gross (stats and the TUI want the
+                // upstream's figure); the client gets Anthropic's net one.
+                input_tokens: crate::responses::net_input_tokens(
+                    self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
+                ),
                 output_tokens: 0,
                 cache_creation_input_tokens: self.cache_creation_input_tokens,
                 cache_read_input_tokens: self.cache_read_input_tokens,
@@ -1113,7 +1119,7 @@ fn repair_arguments(registry: &crate::repair::ToolSchemaRegistry, tool: &str, ra
 
 fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
     AnthropicUsage {
-        input_tokens: u.input_tokens,
+        input_tokens: u.net_input_tokens(),
         output_tokens: u.output_tokens,
         cache_creation_input_tokens: u
             .input_tokens_details

@@ -693,7 +693,8 @@ fn completed_event_usage_includes_cache_fields() {
     match &closing[0] {
         StreamEvent::MessageDelta { usage, .. } => {
             let u = usage.as_ref().unwrap();
-            assert_eq!(u.input_tokens, 100);
+            // 100 gross - 20 cached - 7 written.
+            assert_eq!(u.input_tokens, 73);
             assert_eq!(u.output_tokens, 50);
             assert_eq!(u.cache_read_input_tokens, 20);
             assert_eq!(u.cache_creation_input_tokens, 7);
@@ -786,7 +787,8 @@ fn created_event_usage_surfaces_in_message_start() {
     let evs = t.feed_event(&ev);
     match &evs[0] {
         StreamEvent::MessageStart { message } => {
-            assert_eq!(message.usage.input_tokens, 42);
+            // 42 gross, all of it cache read (30) or write (12): none is plain input.
+            assert_eq!(message.usage.input_tokens, 0);
             assert_eq!(message.usage.cache_read_input_tokens, 30);
             assert_eq!(message.usage.cache_creation_input_tokens, 12);
             assert_eq!(message.usage.output_tokens, 0);
