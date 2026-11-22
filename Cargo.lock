@@ -1515,6 +1515,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "cookie_store",
  "crossterm",
  "dom_query",
  "dom_smoothie",

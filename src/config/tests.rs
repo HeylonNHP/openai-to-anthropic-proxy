@@ -1672,7 +1672,62 @@ fn web_search_defaults_are_off_and_bounded() {
     assert_eq!(ws.search_endpoint, DEFAULT_WEB_SEARCH_ENDPOINT);
     assert_eq!(ws.search_min_interval_ms, 1_500);
     assert_eq!(ws.block_wait_minutes, 10);
+    assert_eq!(ws.cache_ttl_secs, 600);
+    assert_eq!(ws.cache_max_entries, 128);
+    assert_eq!(ws.session_ttl_hours, 168);
+    assert_eq!(
+        ws.state_dir.as_deref(),
+        Some(std::path::Path::new(DEFAULT_WEB_SEARCH_STATE_DIR)),
+        "a resolved configuration keeps the session beside proxy.json"
+    );
     assert!(cfg.warnings.is_empty());
+}
+
+#[test]
+fn web_search_session_and_cache_values_resolve_and_are_bounded() {
+    let file = web_search_file(
+        r#"{ "state_dir": " /var/lib/proxy ", "cache_ttl_secs": 30,
+             "cache_max_entries": 9, "session_ttl_hours": 2 }"#,
+    );
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    let ws = &cfg.web_search;
+    assert_eq!(
+        ws.state_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/proxy"))
+    );
+    assert_eq!(ws.cache_ttl_secs, 30);
+    assert_eq!(ws.cache_max_entries, 9);
+    assert_eq!(ws.session_ttl_hours, 2);
+    assert!(cfg.warnings.is_empty());
+
+    let file = web_search_file(
+        r#"{ "cache_ttl_secs": 999999, "cache_max_entries": 0, "session_ttl_hours": 99999 }"#,
+    );
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.web_search.cache_ttl_secs, 86_400, "clamped");
+    assert_eq!(cfg.web_search.cache_max_entries, 128, "0 = default");
+    assert_eq!(cfg.web_search.session_ttl_hours, 720, "clamped");
+    assert_eq!(cfg.warnings.len(), 3);
+}
+
+#[test]
+fn web_search_state_dir_env_overrides_the_file_and_blank_means_default() {
+    let file = web_search_file(r#"{ "state_dir": "from-file" }"#);
+    let mut env = env_with_required();
+    env.web_search_state_dir = Some("from-env".to_owned());
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(
+        cfg.web_search.state_dir.as_deref(),
+        Some(std::path::Path::new("from-env"))
+    );
+
+    env.web_search_state_dir = Some("   ".to_owned());
+    let file = web_search_file(r#"{}"#);
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(
+        cfg.web_search.state_dir.as_deref(),
+        Some(std::path::Path::new(DEFAULT_WEB_SEARCH_STATE_DIR))
+    );
 }
 
 #[test]

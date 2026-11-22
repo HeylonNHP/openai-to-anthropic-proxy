@@ -75,7 +75,11 @@
     "compaction_model": null,
     "compaction_threshold_chars": 5000,
     "max_queries": 3,
-    "max_results_per_query": 5
+    "max_results_per_query": 5,
+    "state_dir": "proxy-state",
+    "cache_ttl_secs": 600,
+    "cache_max_entries": 128,
+    "session_ttl_hours": 168
   },
 
   "server_tools": {

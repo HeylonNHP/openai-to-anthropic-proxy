@@ -102,6 +102,14 @@ const DEFAULT_WEB_SEARCH_PAGE_TIMEOUT_SECS: u64 = 15;
 const MAX_WEB_SEARCH_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_WEB_SEARCH_MIN_INTERVAL_MS: u64 = 1_500;
 const MAX_WEB_SEARCH_MIN_INTERVAL_MS: u64 = 30_000;
+/// Where the search session (cookies) is kept, beside `proxy.json`.
+pub const DEFAULT_WEB_SEARCH_STATE_DIR: &str = "proxy-state";
+const DEFAULT_WEB_SEARCH_CACHE_TTL_SECS: u64 = 600;
+const MAX_WEB_SEARCH_CACHE_TTL_SECS: u64 = 86_400;
+const DEFAULT_WEB_SEARCH_CACHE_MAX_ENTRIES: u64 = 128;
+const MAX_WEB_SEARCH_CACHE_MAX_ENTRIES: u64 = 4_096;
+const DEFAULT_WEB_SEARCH_SESSION_TTL_HOURS: u64 = 168;
+const MAX_WEB_SEARCH_SESSION_TTL_HOURS: u64 = 720;
 const DEFAULT_WEB_SEARCH_BLOCK_WAIT_MINUTES: u64 = 10;
 const MAX_WEB_SEARCH_BLOCK_WAIT_MINUTES: u64 = 120;
 const DEFAULT_WEB_SEARCH_MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
@@ -472,6 +480,17 @@ pub struct WebSearchConfig {
     /// How many minutes the model is told to wait before searching again when
     /// the search engine blocks a search (bot challenge / rate limit).
     pub block_wait_minutes: u64,
+    /// Directory holding the persisted search session (cookies). `None` keeps
+    /// the session in memory only. A configured run defaults to
+    /// [`DEFAULT_WEB_SEARCH_STATE_DIR`], i.e. beside `proxy.json`.
+    pub state_dir: Option<std::path::PathBuf>,
+    /// How long a search result stays cached, in seconds.
+    pub cache_ttl_secs: u64,
+    /// Most distinct searches kept in the result cache.
+    pub cache_max_entries: usize,
+    /// A search session (its cookies) is discarded and restarted after this
+    /// many hours, however long the cookies themselves are valid.
+    pub session_ttl_hours: u64,
 }
 
 impl Default for WebSearchConfig {
@@ -488,6 +507,11 @@ impl Default for WebSearchConfig {
             search_endpoint: DEFAULT_WEB_SEARCH_ENDPOINT.to_owned(),
             search_min_interval_ms: DEFAULT_WEB_SEARCH_MIN_INTERVAL_MS,
             block_wait_minutes: DEFAULT_WEB_SEARCH_BLOCK_WAIT_MINUTES,
+            // No disk by default: only a resolved configuration persists.
+            state_dir: None,
+            cache_ttl_secs: DEFAULT_WEB_SEARCH_CACHE_TTL_SECS,
+            cache_max_entries: DEFAULT_WEB_SEARCH_CACHE_MAX_ENTRIES as usize,
+            session_ttl_hours: DEFAULT_WEB_SEARCH_SESSION_TTL_HOURS,
         }
     }
 }
@@ -1293,6 +1317,45 @@ impl Config {
                 "web_search.block_wait_minutes",
                 &mut warnings,
             ),
+            state_dir: Some(
+                env.web_search_state_dir
+                    .clone()
+                    .or_else(|| web_search_json.and_then(|w| w.state_dir.clone()))
+                    .map(|d| d.trim().to_owned())
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| DEFAULT_WEB_SEARCH_STATE_DIR.to_owned())
+                    .into(),
+            ),
+            cache_ttl_secs: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.cache_ttl_secs.as_ref()),
+                    env.web_search_cache_ttl_secs.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_CACHE_TTL_SECS,
+                MAX_WEB_SEARCH_CACHE_TTL_SECS,
+                "web_search.cache_ttl_secs",
+                &mut warnings,
+            ),
+            cache_max_entries: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.cache_max_entries.as_ref()),
+                    env.web_search_cache_max_entries.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_CACHE_MAX_ENTRIES,
+                MAX_WEB_SEARCH_CACHE_MAX_ENTRIES,
+                "web_search.cache_max_entries",
+                &mut warnings,
+            ) as usize,
+            session_ttl_hours: resolve_bounded_limit(
+                pick_limit(
+                    web_search_json.and_then(|w| w.session_ttl_hours.as_ref()),
+                    env.web_search_session_ttl_hours.as_ref(),
+                ),
+                DEFAULT_WEB_SEARCH_SESSION_TTL_HOURS,
+                MAX_WEB_SEARCH_SESSION_TTL_HOURS,
+                "web_search.session_ttl_hours",
+                &mut warnings,
+            ),
         };
 
         let prefix_models_for_discovery = env.prefix_models_for_discovery.unwrap_or_else(|| {
@@ -1553,6 +1616,10 @@ pub struct EnvInputs {
     pub web_search_endpoint: Option<String>,
     pub web_search_search_min_interval_ms: Option<serde_json::Number>,
     pub web_search_block_wait_minutes: Option<serde_json::Number>,
+    pub web_search_state_dir: Option<String>,
+    pub web_search_cache_ttl_secs: Option<serde_json::Number>,
+    pub web_search_cache_max_entries: Option<serde_json::Number>,
+    pub web_search_session_ttl_hours: Option<serde_json::Number>,
     /// `server_tools` overrides.
     pub server_tools_max_rounds: Option<serde_json::Number>,
     pub server_tools_pause_turn: Option<bool>,
@@ -1645,6 +1712,16 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             web_search_block_wait_minutes: env::var("WEB_SEARCH_BLOCK_WAIT_MINUTES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_state_dir: env::var("WEB_SEARCH_STATE_DIR").ok(),
+            web_search_cache_ttl_secs: env::var("WEB_SEARCH_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_cache_max_entries: env::var("WEB_SEARCH_CACHE_MAX_ENTRIES")
+                .ok()
+                .and_then(|s| parse_env_limit(&s)),
+            web_search_session_ttl_hours: env::var("WEB_SEARCH_SESSION_TTL_HOURS")
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             prefix_models_for_discovery: env::var("PREFIX_MODELS_FOR_DISCOVERY")
@@ -2145,6 +2222,12 @@ pub struct JsonWebSearchConfig {
     pub search_endpoint: Option<String>,
     pub search_min_interval_ms: Option<serde_json::Number>,
     pub block_wait_minutes: Option<serde_json::Number>,
+    /// Directory for the persisted search session (default `proxy-state`,
+    /// relative to the working directory, where `proxy.json` is read from).
+    pub state_dir: Option<String>,
+    pub cache_ttl_secs: Option<serde_json::Number>,
+    pub cache_max_entries: Option<serde_json::Number>,
+    pub session_ttl_hours: Option<serde_json::Number>,
 }
 
 /// JSON shape of the `server_tools` section of `proxy.json`. `max_rounds` is a

@@ -11,6 +11,9 @@
 /proxy.err.log
 /proxy*.json
 
+# The web_search session (cookies) the proxy persists beside proxy.json
+/proxy-state/
+
 # Editor
 .vscode/
 .idea/

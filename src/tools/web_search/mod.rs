@@ -24,13 +24,16 @@ use crate::responses::{ResponsesRequest, ResponsesTool, ToolDefinition};
 use serde_json::json;
 
 pub mod backend;
+pub mod cache;
 pub mod compact;
+pub mod cookies;
 pub mod ddg;
 pub mod format;
 pub mod gate;
 pub mod history;
 pub mod protocol;
 pub mod run;
+pub mod session;
 pub mod tool;
 
 /// The tool name the CLIENT declares (and sees in `server_tool_use`).

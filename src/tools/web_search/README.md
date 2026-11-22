@@ -137,6 +137,43 @@ long ago the previous blocked search was (seconds and minutes). A search that
 returns results clears that record. The wording deliberately only asks the
 model to wait, never to stop searching.
 
+### The session: cookies, cache and fingerprint (`session.rs`, `cookies.rs`, `cache.rs`)
+
+A browser keeps its connection and cookies and does not repeat a search it just
+ran. So the search client's state outlives a request, process-wide and per
+endpoint, like the gate:
+
+- **One HTTP client** is reused, so connections are reused.
+- **Cookies are kept** (`cookies.rs`). DuckDuckGo sets a year-long `kl` cookie.
+  Cookies are sent back to their own site only and are written to
+  `<state_dir>/search-session.json` (default `proxy-state/`, beside
+  `proxy.json`; owner-only on Unix; written through a temp file and renamed).
+  A missing, corrupt or wrong-version file just starts an empty session; a
+  failed save is logged and the session stays in memory. The jar is never given
+  to the page-fetching client.
+- **Two expiry checks, on every use.** A cookie's own `Expires` / `Max-Age`:
+  an expired cookie is not sent, saved or loaded. And the session's age
+  (`session_ttl_hours`): past it, every cookie (session cookies included) is
+  dropped and a new session starts, on load and while running. A start time in
+  the future (the clock moved back) is not trusted.
+- **Results are cached** (`cache.rs`) by region and normalised query for
+  `cache_ttl_secs`, at most `cache_max_entries` of them. The lookup happens
+  before the gate, so a repeat neither waits nor reaches the engine. Only
+  non-empty successes are stored; blocks and errors never are. Entries are
+  checked for expiry on every lookup and swept on every insert.
+- **Requests look like a browser's.** The form POST carries `Origin`, an
+  origin-only `Referer`, same-origin Fetch Metadata and Chrome's header order
+  (`http_profile.rs`). The HTTP/2 connection settings are tuned to Chrome's:
+  stream window, connection window and header-list size.
+
+**What this does not match.** The client is `reqwest` over `rustls`, so the TLS
+ClientHello (JA3 / JA4: cipher and extension lists and order), the HTTP/2
+`HEADER_TABLE_SIZE` / `MAX_FRAME_SIZE` settings and the HTTP/2 pseudo-header
+order are those of `rustls` and `hyper`, not Chrome's. Matching them needs a
+different TLS stack (BoringSSL, e.g. the `wreq` crate), which is a heavy
+dependency and was not added. If DuckDuckGo still challenges you, the likely
+cause is the address (a datacenter or VPN IP) rather than anything here.
+
 ## Configuration
 
 All keys are optional; every one has an env override
@@ -155,6 +192,10 @@ All keys are optional; every one has an env override
 | `search_endpoint` | DuckDuckGo's HTML endpoint | — | Where searches are POSTed. Mostly for tests. |
 | `search_min_interval_ms` | `1500` | 30000 | Searches run one at a time; this is the minimum gap between the end of one and the start of the next. |
 | `block_wait_minutes` | `10` | 120 | Minutes the model is told to wait after a blocked search. |
+| `state_dir` | `proxy-state` | — | Directory where the search session (cookies) is saved, relative to the working directory (where `proxy.json` is read from). Blank = the default. |
+| `cache_ttl_secs` | `600` | 86400 | How long a search result is cached. |
+| `cache_max_entries` | `128` | 4096 | Most searches kept in the cache. |
+| `session_ttl_hours` | `168` | 720 | A session's cookies are dropped and a new session started after this long. |
 
 **There is no "unlimited".** Unlike `web_fetch`, `0`, negative or fractional
 values are invalid: the default is used and a startup warning is printed.
@@ -222,7 +263,8 @@ and is unaffected.)
 ### Other deferred items
 
 - Pagination (more than ~10 results per query).
-- A page cache (Locopilot caches pages for a few minutes).
+- A page cache (search results are cached; fetched pages are not).
+- Matching Chrome's TLS and HTTP/2 fingerprint (see [the session](#the-session-cookies-cache-and-fingerprint-sessionrs-cookiesrs-cachers)).
 - Playwright / JavaScript rendering for SPA pages.
 - Extracting outbound links from pages (Locopilot returns them).
 - A fallback search engine (or fallback to the upstream's) when DuckDuckGo
@@ -280,6 +322,10 @@ removal (the config schema denies unknown fields) — delete that section too.
 | `run.rs` | orchestrates one tool call, generic over `Backend`; no I/O |
 | `backend.rs` | the `Backend` trait and `LiveBackend` (the only I/O) |
 | `ddg.rs` | DuckDuckGo HTML parsing (pure) and the search request |
+| `session.rs` | the shared search HTTP client, cookie jar and result cache, per endpoint |
+| `cookies.rs` | the persistent cookie jar: expiry, session rotation, atomic save |
+| `cache.rs` | the result cache: ttl, capacity |
+| `gate.rs` | pacing and the record of blocked searches |
 | `compact.rs` | threshold, summarisation passes, truncation fallback |
 | `format.rs` | the result text the executor reads, and the text carried into later turns |
 | `history.rs` | `encrypted_content`: write a result's text, read it back on a later turn |

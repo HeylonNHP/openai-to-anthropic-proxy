@@ -7,6 +7,8 @@
 //! which is also the ceiling `web_search.max_results_per_query` is clamped to,
 //! so pagination (and the `vqd` token it needs) is not implemented.
 
+use std::time::Duration;
+
 use dom_query::{Document, Selection};
 
 use crate::tools::http_profile;
@@ -226,12 +228,16 @@ pub async fn search(
     query: &str,
     region: &str,
     limit: usize,
+    timeout: Duration,
 ) -> Result<Vec<SearchHit>, SearchError> {
-    let request = http_profile::apply_form_submit(client.post(endpoint), endpoint).form(&[
-        ("q", query),
-        ("b", ""),
-        ("kl", region),
-    ]);
+    // The client is shared (it carries the session), so the budget is set per
+    // request rather than on the client.
+    let request = http_profile::apply_form_submit(
+        client.post(endpoint),
+        endpoint,
+        &[("q", query), ("b", ""), ("kl", region)],
+    )
+    .timeout(timeout);
     let response = request
         .send()
         .await

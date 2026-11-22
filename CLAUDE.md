@@ -16,7 +16,7 @@ Read [`README.md`](./README.md) for what it does and how to run it;
 ```bash
 cargo fmt --all -- --check   # must be clean
 cargo clippy --all-targets    # must be warning-free
-cargo test                    # unit + e2e (953 tests as of this writing)
+cargo test                    # unit + e2e (985 tests as of this writing)
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these three on every push and pull

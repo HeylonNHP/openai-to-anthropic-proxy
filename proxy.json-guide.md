@@ -364,7 +364,11 @@ Optional proxy-native replacement for the upstream's built-in web search. **Opt-
   "page_timeout_secs": 15,
   "max_page_bytes": 2097152,
   "search_min_interval_ms": 1500,
-  "block_wait_minutes": 10
+  "block_wait_minutes": 10,
+  "state_dir": "proxy-state",
+  "cache_ttl_secs": 600,
+  "cache_max_entries": 128,
+  "session_ttl_hours": 168
 }
 ```
 
@@ -375,8 +379,10 @@ Optional proxy-native replacement for the upstream's built-in web search. **Opt-
 - A blocked search (CAPTCHA, HTTP error) or an unreachable page is reported in the tool result and never fails the request. The proxy does not fall back to the upstream's search.
 - **Searches are paced.** DuckDuckGo is scraped, and it answers a burst of queries from one address with a bot challenge (CAPTCHA). So searches run **one at a time**, across every request the proxy is serving, with at least `search_min_interval_ms` (default 1500, max 30000) between the end of one search and the start of the next. Several queries in one call simply queue.
 - **When a search is blocked** (CAPTCHA, or an HTTP error that means rate limiting) the model is told what happened and to wait about `block_wait_minutes` (default 10, max 120) before searching again. The proxy does not refuse later searches: if the model comes back sooner and is blocked again, the message also says how long ago the previous blocked search was, in seconds and minutes, so the model can see how fast it is retrying. A search that returns results clears that record. The record lives in memory and starts empty after a restart.
+- **The search keeps a session.** The cookies DuckDuckGo sets are sent back on later searches and saved in `state_dir` (default `proxy-state`, beside `proxy.json`, created on demand and gitignored), so a restart continues the same session. Expired cookies are never sent or saved, and a session older than `session_ttl_hours` (default 168, max 720) is dropped and restarted. A file that is missing, corrupt or unwritable never fails a search.
+- **Results are cached.** The same query (same region, case and spacing ignored) within `cache_ttl_secs` (default 600, max 86400) is answered from memory and never reaches DuckDuckGo; `cache_max_entries` (default 128, max 4096) bounds the cache. Blocked and failed searches are never cached. The cache lives in memory and starts empty after a restart.
 - `search_endpoint` overrides where searches are POSTed (default DuckDuckGo's HTML interface) — mainly useful for tests.
-- Env overrides use the same env > file > default precedence: `WEB_SEARCH_ENABLED`, `WEB_SEARCH_COMPACTION_MODEL`, `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS`, `WEB_SEARCH_MAX_QUERIES`, `WEB_SEARCH_MAX_RESULTS_PER_QUERY`, `WEB_SEARCH_SEARCH_TIMEOUT_SECS`, `WEB_SEARCH_PAGE_TIMEOUT_SECS`, `WEB_SEARCH_MAX_PAGE_BYTES`, `WEB_SEARCH_ENDPOINT`, `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS`, `WEB_SEARCH_BLOCK_WAIT_MINUTES`.
+- Env overrides use the same env > file > default precedence: `WEB_SEARCH_ENABLED`, `WEB_SEARCH_COMPACTION_MODEL`, `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS`, `WEB_SEARCH_MAX_QUERIES`, `WEB_SEARCH_MAX_RESULTS_PER_QUERY`, `WEB_SEARCH_SEARCH_TIMEOUT_SECS`, `WEB_SEARCH_PAGE_TIMEOUT_SECS`, `WEB_SEARCH_MAX_PAGE_BYTES`, `WEB_SEARCH_ENDPOINT`, `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS`, `WEB_SEARCH_BLOCK_WAIT_MINUTES`, `WEB_SEARCH_STATE_DIR`, `WEB_SEARCH_CACHE_TTL_SECS`, `WEB_SEARCH_CACHE_MAX_ENTRIES`, `WEB_SEARCH_SESSION_TTL_HOURS`.
 - It works alongside `web_fetch` and the advisor in the same turn. The client's own options on its `web_search` tool are applied: `max_uses` (queries per request), `allowed_domains` / `blocked_domains`, and `user_location` (the search region). What the model read is carried into later turns, so it still knows what it found.
 
 Full documentation: [`src/tools/web_search/README.md`](./src/tools/web_search/README.md).
