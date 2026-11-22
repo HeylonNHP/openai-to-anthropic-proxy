@@ -174,6 +174,29 @@ different TLS stack (BoringSSL, e.g. the `wreq` crate), which is a heavy
 dependency and was not added. If DuckDuckGo still challenges you, the likely
 cause is the address (a datacenter or VPN IP) rather than anything here.
 
+### Diagnosing failures (`diagnostics.rs`)
+
+A failed search is logged as ONE `warn` event, `web_search search failed`, with
+what it takes to tell the causes apart:
+
+| field | tells you |
+|---|---|
+| `kind` | `blocked` (bot challenge or a rate-limiting status) or `failed` (transport) |
+| `status`, `http_version`, `content_type`, `server`, `retry_after`, `set_cookies` (names only) | the engine's answer. DuckDuckGo's challenge is a **202** with an image puzzle |
+| `markers`, `page_head`, `body_bytes` | what the page is: `challenge-form`, `bots-use-duckduckgo`, `web-result`, … and the start of its visible text |
+| `transport`, `elapsed_ms` | for no response: `timeout` / `connect` / … plus the error chain |
+| `cookies_sent`, `session_age_secs` | whether this request carried the session |
+| `searches_in_session`, `ok_before_this` | **blocked after how many good searches**: 0 is the address or fingerprint, 40 is the rate |
+| `secs_since_last_ok`, `secs_since_last_block` | how fast it is being retried |
+| `saved_page` | the page itself, see below |
+
+A block also saves the page it got to `<state_dir>/blocked-pages/search-<ms>.html`
+(the newest 5 are kept, owner-only), so the challenge can be read after the
+fact. A search that returns **no results and no "no results" message** is
+logged (`returned no results and no 'no results' message`) and saved the same
+way: a silent soft block, or changed markup, looks like that. Successful
+searches log at `debug`. None of this changes what a search returns.
+
 ## Configuration
 
 All keys are optional; every one has an env override
@@ -325,6 +348,7 @@ removal (the config schema denies unknown fields) — delete that section too.
 | `session.rs` | the shared search HTTP client, cookie jar and result cache, per endpoint |
 | `cookies.rs` | the persistent cookie jar: expiry, session rotation, atomic save |
 | `cache.rs` | the result cache: ttl, capacity |
+| `diagnostics.rs` | the failure log line, the engine-side `Report`, saved blocked pages |
 | `gate.rs` | pacing and the record of blocked searches |
 | `compact.rs` | threshold, summarisation passes, truncation fallback |
 | `format.rs` | the result text the executor reads, and the text carried into later turns |

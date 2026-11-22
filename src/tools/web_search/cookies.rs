@@ -135,6 +135,18 @@ impl PersistentJar {
         (!header.is_empty()).then_some(header)
     }
 
+    /// How many cookies would be sent to `url`, and how old the session is.
+    #[must_use]
+    pub fn summary(&self, url: &url::Url) -> (usize, u64) {
+        let now = unix_now();
+        let mut state = self.lock();
+        self.rotate_if_stale(&mut state, now);
+        let count = state.store.get_request_values(url).count();
+        let age = now.saturating_sub(state.started_at);
+        drop(state);
+        (count, age)
+    }
+
     /// The text that would be written now: only unexpired cookies.
     fn snapshot(state: &State) -> Option<String> {
         let file = SessionFile {
@@ -236,7 +248,7 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -245,12 +257,12 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
 #[cfg(unix)]
-fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
@@ -261,7 +273,7 @@ fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::create(path)
 }
 

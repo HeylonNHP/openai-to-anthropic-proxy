@@ -14,6 +14,7 @@ use crate::tools::domains::DomainRules;
 use crate::tools::web_fetch::fetch as page_fetch;
 use crate::tools::web_search::compact::{CompactRequest, Compactor, UpstreamCompactor};
 use crate::tools::web_search::ddg::{self, SearchHit};
+use crate::tools::web_search::diagnostics;
 use crate::tools::web_search::gate;
 use crate::tools::web_search::session::{self, SearchSession};
 
@@ -108,18 +109,62 @@ impl Backend for LiveBackend {
             Duration::from_secs(self.cfg.search_timeout_secs),
         )
         .await;
+        let state_dir = self.cfg.state_dir.as_deref();
         let outcome = match result {
-            Ok(hits) => {
+            Ok(searched) => {
                 slot.succeeded();
-                cache.put(self.region, query, limit, &hits);
-                Ok(hits)
+                self.session.note_ok();
+                if searched.hits.is_empty() && !searched.report.says_no_results() {
+                    // Nothing found and no explanation: a soft block or a
+                    // markup change looks exactly like this.
+                    let ctx = self.session.context(
+                        &self.cfg.search_endpoint,
+                        self.region,
+                        query,
+                        self.session.snapshot(),
+                    );
+                    let saved = diagnostics::save_page(state_dir, &searched.report);
+                    diagnostics::log_unexplained_empty(&ctx, &searched.report, saved.as_deref());
+                } else {
+                    tracing::debug!(
+                        query,
+                        hits = searched.hits.len(),
+                        status = ?searched.report.status,
+                        http_version = %searched.report.http_version,
+                        elapsed_ms = searched.report.elapsed_ms,
+                        "web_search search ok"
+                    );
+                }
+                cache.put(self.region, query, limit, &searched.hits);
+                Ok(searched.hits)
             }
-            Err(error) if error.blocked => Err(gate::blocked_message(
-                &error.message,
-                slot.blocked(),
-                self.cfg.block_wait_minutes,
-            )),
-            Err(error) => Err(error.message),
+            Err(error) => {
+                let snapshot = self.session.note_failure(error.blocked);
+                let ctx =
+                    self.session
+                        .context(&self.cfg.search_endpoint, self.region, query, snapshot);
+                let saved = error
+                    .report
+                    .as_deref()
+                    .filter(|_| error.blocked)
+                    .and_then(|r| diagnostics::save_page(state_dir, r));
+                diagnostics::log_failure(
+                    &ctx,
+                    error.blocked,
+                    &error.message,
+                    error.report.as_deref(),
+                    saved.as_deref(),
+                );
+                if error.blocked {
+                    Err(gate::blocked_message(
+                        &error.message,
+                        slot.blocked(),
+                        self.cfg.block_wait_minutes,
+                    ))
+                } else {
+                    Err(error.message)
+                }
+            }
         };
         drop(slot);
         outcome

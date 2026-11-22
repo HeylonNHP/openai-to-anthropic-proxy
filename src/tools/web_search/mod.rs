@@ -28,6 +28,7 @@ pub mod cache;
 pub mod compact;
 pub mod cookies;
 pub mod ddg;
+pub mod diagnostics;
 pub mod format;
 pub mod gate;
 pub mod history;

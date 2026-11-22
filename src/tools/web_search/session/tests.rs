@@ -10,7 +10,7 @@ const PAGE: &str = r#"<html><body><div id="links"><div class="web-result">
 <h2><a href="https://example.com/a">Title A</a></h2>
 <a class="result__snippet">Snippet A</a></div></div></body></html>"#;
 
-/// A search engine that sets a `kl` cookie and records every request it gets.
+/// A search engine that records every request it gets.
 struct FakeEngine {
     endpoint: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -18,6 +18,12 @@ struct FakeEngine {
 
 impl FakeEngine {
     async fn start() -> Self {
+        Self::start_with(200, PAGE).await
+    }
+
+    /// An engine that answers every search with `status` and `page`, setting a
+    /// `kl` cookie.
+    async fn start_with(status: u16, page: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}/html/", listener.local_addr().expect("addr"));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -41,8 +47,8 @@ impl FakeEngine {
                         .unwrap()
                         .push(String::from_utf8_lossy(&raw).into_owned());
                     let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nset-cookie: kl=wt-wt; Max-Age=3600\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{PAGE}",
-                        PAGE.len()
+                        "HTTP/1.1 {status} X\r\ncontent-type: text/html\r\nretry-after: 30\r\nset-cookie: kl=wt-wt; Max-Age=3600\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+                        page.len()
                     );
                     let _ = socket.write_all(reply.as_bytes()).await;
                 });
@@ -84,7 +90,7 @@ fn config(endpoint: &str, state_dir: Option<&std::path::Path>) -> WebSearchConfi
 }
 
 async fn search(session: &SearchSession, endpoint: &str, query: &str) {
-    let hits = ddg::search(
+    let searched = ddg::search(
         &session.client,
         endpoint,
         query,
@@ -94,7 +100,7 @@ async fn search(session: &SearchSession, endpoint: &str, query: &str) {
     )
     .await
     .expect("search");
-    assert_eq!(hits.len(), 1);
+    assert_eq!(searched.hits.len(), 1);
 }
 
 #[tokio::test]
@@ -182,4 +188,111 @@ async fn the_cache_follows_the_config() {
         "capacity is 1"
     );
     assert!(session.cache.get("wt-wt", "b", 5).is_some());
+}
+
+const CHALLENGE_PAGE: &str = r#"<html><head><title>DuckDuckGo</title></head><body>
+<form id="challenge-form"><div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div></form></body></html>"#;
+
+async fn run(engine: &FakeEngine) -> Result<ddg::Searched, ddg::SearchError> {
+    let session = SearchSession::open(&config(&engine.endpoint, None)).expect("session");
+    ddg::search(
+        &session.client,
+        &engine.endpoint,
+        "rust",
+        "wt-wt",
+        5,
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_successful_search_reports_the_exchange() {
+    let engine = FakeEngine::start().await;
+    let searched = run(&engine).await.expect("search");
+    let r = searched.report;
+    assert_eq!(r.status, Some(200));
+    assert_eq!(r.http_version, "HTTP/1.1");
+    assert_eq!(r.content_type.as_deref(), Some("text/html"));
+    assert_eq!(r.set_cookie_names, ["kl"]);
+    assert_eq!(r.body_bytes, PAGE.len());
+    assert!(r.markers().contains(&"web-result"));
+}
+
+#[tokio::test]
+async fn a_challenge_is_a_block_that_carries_its_page() {
+    let engine = FakeEngine::start_with(202, CHALLENGE_PAGE).await;
+    let error = run(&engine).await.expect_err("challenged");
+    assert!(error.blocked);
+    let r = error.report.expect("report");
+    assert_eq!(r.status, Some(202));
+    assert!(r.markers().contains(&"challenge-form"));
+    assert_eq!(r.body, CHALLENGE_PAGE);
+}
+
+#[tokio::test]
+async fn a_rate_limit_status_is_a_block_that_carries_its_headers() {
+    let engine = FakeEngine::start_with(429, "slow down").await;
+    let error = run(&engine).await.expect_err("limited");
+    assert!(error.blocked);
+    let r = error.report.expect("report");
+    assert_eq!(r.status, Some(429));
+    assert_eq!(r.retry_after.as_deref(), Some("30"));
+    assert_eq!(r.body, "slow down");
+}
+
+#[tokio::test]
+async fn a_dead_endpoint_is_a_failure_with_the_transport_kind() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!("http://{}/html/", listener.local_addr().expect("addr"));
+    drop(listener);
+    let session = SearchSession::open(&config(&endpoint, None)).expect("session");
+    let error = ddg::search(
+        &session.client,
+        &endpoint,
+        "q",
+        "wt-wt",
+        5,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("refused");
+    assert!(!error.blocked);
+    let transport = error.report.expect("report").transport.expect("transport");
+    assert!(transport.starts_with("connect:"), "{transport}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_stats_say_how_many_searches_succeeded_before_a_block() {
+    let session = SearchSession::open(&config("http://127.0.0.1:1/stats/", None)).expect("session");
+    for _ in 0..3 {
+        session.note_ok();
+    }
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let first = session.note_failure(true);
+    assert_eq!(first.searches, 4);
+    assert_eq!(first.ok_streak, 3, "three good searches before the block");
+    assert_eq!(first.secs_since_last_ok, Some(20));
+    assert_eq!(first.secs_since_last_block, None, "the first block");
+
+    tokio::time::advance(Duration::from_secs(40)).await;
+    let second = session.note_failure(true);
+    assert_eq!(
+        second.ok_streak, 0,
+        "the streak was reset by the first block"
+    );
+    assert_eq!(second.secs_since_last_block, Some(40));
+}
+
+#[tokio::test]
+async fn the_context_carries_the_session_and_the_request() {
+    let engine = FakeEngine::start().await;
+    let session = SearchSession::open(&config(&engine.endpoint, None)).expect("session");
+    search(&session, &engine.endpoint, "one").await;
+    session.note_ok();
+    let ctx = session.context(&engine.endpoint, "wt-wt", "two", session.snapshot());
+    assert_eq!(ctx.query, "two");
+    assert_eq!(ctx.cookies_sent, 1, "the kl cookie the engine set");
+    assert_eq!(ctx.searches, 1);
+    assert_eq!(ctx.ok_streak, 1);
 }

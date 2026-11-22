@@ -12,6 +12,7 @@ use std::time::Duration;
 use dom_query::{Document, Selection};
 
 use crate::tools::http_profile;
+use crate::tools::web_search::diagnostics::Report;
 
 /// One organic search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,22 +38,33 @@ pub struct SearchError {
     /// The engine refused this client (bot challenge, rate limit) rather than
     /// the search failing for some other reason.
     pub blocked: bool,
+    /// The engine's side of the exchange, for the log.
+    pub report: Option<Box<Report>>,
 }
 
 impl SearchError {
-    fn failed(message: String) -> Self {
+    fn failed(message: String, report: Report) -> Self {
         Self {
             message,
             blocked: false,
+            report: Some(Box::new(report)),
         }
     }
 
-    fn blocked(message: String) -> Self {
+    fn blocked(message: String, report: Report) -> Self {
         Self {
             message,
             blocked: true,
+            report: Some(Box::new(report)),
         }
     }
+}
+
+/// A search that got a results page.
+#[derive(Debug)]
+pub struct Searched {
+    pub hits: Vec<SearchHit>,
+    pub report: Report,
 }
 
 impl std::fmt::Display for SearchError {
@@ -229,7 +241,9 @@ pub async fn search(
     region: &str,
     limit: usize,
     timeout: Duration,
-) -> Result<Vec<SearchHit>, SearchError> {
+) -> Result<Searched, SearchError> {
+    let started = std::time::Instant::now();
+    let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The client is shared (it carries the session), so the budget is set per
     // request rather than on the client.
     let request = http_profile::apply_form_submit(
@@ -238,30 +252,45 @@ pub async fn search(
         &[("q", query), ("b", ""), ("kl", region)],
     )
     .timeout(timeout);
-    let response = request
-        .send()
-        .await
-        .map_err(|e| SearchError::failed(format!("search request failed: {e}")))?;
+    let response = request.send().await.map_err(|e| {
+        SearchError::failed(
+            format!("search request failed: {e}"),
+            Report::from_transport_error(&e, elapsed()),
+        )
+    })?;
 
     let status = response.status();
+    let mut report = Report::from_response(&response, elapsed());
+    let html = response.text().await.map_err(|e| {
+        report.transport = Some(format!("body: {e}"));
+        SearchError::failed(
+            format!("reading the search response failed: {e}"),
+            report.clone(),
+        )
+    })?;
+    report.set_body(&html, elapsed());
+
     if !status.is_success() {
         // DuckDuckGo answers a flagged client with a 202 and no results.
-        return Err(SearchError::blocked(format!(
-            "the search engine returned {status} (it may be rate-limiting or challenging this IP)"
-        )));
+        return Err(SearchError::blocked(
+            format!(
+                "the search engine returned {status} (it may be rate-limiting or challenging this IP)"
+            ),
+            report,
+        ));
     }
-    let html = response
-        .text()
-        .await
-        .map_err(|e| SearchError::failed(format!("reading the search response failed: {e}")))?;
 
     let page = parse_results(&html, limit);
     if page.challenged {
         return Err(SearchError::blocked(
             "the search engine returned a bot challenge (CAPTCHA)".to_owned(),
+            report,
         ));
     }
-    Ok(page.hits)
+    Ok(Searched {
+        hits: page.hits,
+        report,
+    })
 }
 
 #[cfg(test)]
