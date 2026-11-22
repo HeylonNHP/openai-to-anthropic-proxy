@@ -146,8 +146,9 @@ that has no such endpoint, it returns your `model_aliases.map` keys plus
 - **Model aliases** with a `default_model` fallback when the upstream rejects
   a model outright.
 - **Prompt caching** on allowlisted models.
-- **`GET /v1/models`** for gateway model discovery, **`GET /healthz`** for
-  liveness checks.
+- **`POST /v1/messages/count_tokens`** (the upstream's count, or a local
+  estimate), **`GET /v1/models`** for gateway model discovery, **`GET /healthz`**
+  for liveness checks.
 - An optional shared-secret `proxy_key` for a bind-all listener.
 
 **Not for you if** you need model-generated images, full multimodal assistant

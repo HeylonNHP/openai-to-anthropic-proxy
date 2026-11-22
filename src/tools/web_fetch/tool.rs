@@ -64,7 +64,7 @@ const LIMIT_REACHED: &str = "The web_fetch limit for this request was reached. A
 /// Characters per token, for turning the client's `max_content_tokens` into
 /// a byte budget. A rough, conservative rule of thumb: the fetch layer has no
 /// tokenizer.
-const CHARS_PER_TOKEN: u64 = 4;
+const CHARS_PER_TOKEN: u64 = crate::count_tokens::CHARS_PER_TOKEN as u64;
 
 /// Serves `web_fetch` calls.
 pub struct WebFetchTool {

@@ -544,6 +544,51 @@ pub struct ResponsesError {
     pub param: Option<Value>,
 }
 
+/// Body for the upstream's token-counting endpoint
+/// (`POST /v1/responses/input_tokens`).
+///
+/// It takes the same payload as a Responses call, but only the fields that
+/// make up the *input*. Generation settings (`stream`, `max_output_tokens`,
+/// `store`, `user`, `prompt_cache_key`, ...) are left out because the
+/// endpoint does not document them and a strict gateway may reject them.
+/// `reasoning` is left out too: it adds no input tokens.
+#[derive(Debug, Serialize)]
+pub struct InputTokensRequest<'a> {
+    pub model: &'a str,
+    pub input: &'a Input,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<&'a [ToolDefinition]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<&'a ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<&'a TextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+}
+
+impl<'a> From<&'a ResponsesRequest> for InputTokensRequest<'a> {
+    fn from(req: &'a ResponsesRequest) -> Self {
+        Self {
+            model: &req.model,
+            input: &req.input,
+            instructions: req.instructions.as_deref(),
+            tools: req.tools.as_deref(),
+            tool_choice: req.tool_choice.as_ref(),
+            text: req.text.as_ref(),
+            parallel_tool_calls: req.parallel_tool_calls,
+        }
+    }
+}
+
+/// The token-counting endpoint's answer: `{"object":"response.input_tokens",
+/// "input_tokens": N}`.
+#[derive(Debug, Deserialize)]
+pub struct InputTokensResponse {
+    pub input_tokens: u64,
+}
+
 /// A `code` field as text: a string as is, a number (`"code": 400`) printed.
 #[must_use]
 pub fn code_text(code: Option<&Value>) -> String {

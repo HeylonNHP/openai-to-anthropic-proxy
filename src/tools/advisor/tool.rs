@@ -139,10 +139,10 @@ fn output_token_limit(cfg: &AdvisorConfig) -> Option<u32> {
     Some(answer.saturating_add(reasoning))
 }
 
-/// Characters per token assumed when holding the answer to `max_tokens`.
-/// Deliberately generous (English averages about 4), so a cut only ever
-/// removes an answer that was well over budget.
-const CHARS_PER_TOKEN: usize = 4;
+// Characters per token assumed when holding the answer to `max_tokens`.
+// Generous (English averages about 4), so a cut only ever removes an answer
+// that was well over budget.
+use crate::count_tokens::CHARS_PER_TOKEN;
 
 /// Hold the advisor's answer to `max_tokens`, which the upstream cannot do
 /// for us because it counts reasoning in the same limit. The cut is an

@@ -64,6 +64,10 @@ pub struct AppState {
     /// unremarked. This set makes the passthrough visible without
     /// flooding the log with one line per request.
     pub unmapped_models: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Set once the upstream has said it has no token-counting endpoint
+    /// (see [`crate::count_tokens`]), so later counts go straight to the
+    /// local estimate instead of costing a wasted request each.
+    pub count_endpoint_unsupported: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Make a client-controlled string safe to put in a log line.
@@ -145,6 +149,7 @@ pub fn router_with_stores(
         mappings,
         client,
         unmapped_models: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        count_endpoint_unsupported: Arc::default(),
         output,
         stats,
         capabilities,
@@ -157,21 +162,26 @@ pub fn router_with_stores(
     // the proxy hold a large body in memory.
     let auth_state = state.clone();
     let limit_state = state.clone();
+    // Both message routes take the same body, so they share one guard stack:
+    // a configurable route-local cap keeps large tool-result screenshots
+    // possible while rejecting oversized bodies before translation.
+    let guarded = |route: axum::routing::MethodRouter<AppState>| {
+        route
+            .layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth_state.clone(),
+                require_proxy_key,
+            ))
+            .route_layer(axum::middleware::map_response_with_state(
+                limit_state.clone(),
+                explain_body_limit_rejection,
+            ))
+    };
     Router::new()
-        // A configurable route-local cap keeps large tool-result screenshots
-        // possible while rejecting oversized bodies before translation.
+        .route("/v1/messages", guarded(post(handle_messages)))
         .route(
-            "/v1/messages",
-            post(handle_messages)
-                .layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes))
-                .route_layer(axum::middleware::from_fn_with_state(
-                    auth_state,
-                    require_proxy_key,
-                ))
-                .route_layer(axum::middleware::map_response_with_state(
-                    limit_state,
-                    explain_body_limit_rejection,
-                )),
+            "/v1/messages/count_tokens",
+            guarded(post(crate::count_tokens::handle_count_tokens)),
         )
         .route("/healthz", get(handle_health))
         .route(
@@ -434,6 +444,74 @@ pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
     )
 }
 
+/// Resolve the inbound model name to the upstream model name BEFORE
+/// building the request — so the reasoning-effort lookup uses the
+/// *resolved* name (e.g. an aliased `claude-sonnet-5` request picks
+/// up the reasoning entry for `gpt-5.4-mini`, not the entry for
+/// `claude-sonnet-5`). The snapshot is what makes TUI edits take
+/// effect: the static `Config::model_aliases` is the startup-only
+/// seed, while `mappings` is what the operator sees when they hit `e`
+/// in the TUI.
+///
+/// Shared by `/v1/messages` and `/v1/messages/count_tokens`, so a count
+/// is always made against the model the real request would use.
+pub(crate) fn resolve_upstream_model(
+    state: &AppState,
+    mappings: &crate::tui::RuntimeMappings,
+    inbound: &str,
+) -> String {
+    let upstream_model = {
+        let resolved = mappings.resolve(inbound);
+        if resolved == inbound
+            && state.config.prefix_models_for_discovery
+            && (inbound.starts_with("claude-") || inbound.starts_with("anthropic-"))
+        {
+            inbound
+                .strip_prefix("claude-")
+                .or_else(|| inbound.strip_prefix("anthropic-"))
+                .unwrap_or(inbound)
+                .to_owned()
+        } else {
+            resolved
+        }
+    };
+    // An inbound name that is not in the alias map is passed through
+    // unchanged. That is legitimate when the upstream serves the name
+    // itself, but it is also exactly how a request ends up 404ing — and
+    // it used to happen silently. Say so, once per distinct name.
+    if !mappings.map.contains_key(inbound) {
+        let first_time = state
+            .unmapped_models
+            .lock()
+            .map(|mut seen| {
+                // Bounded: a client could otherwise send an unbounded
+                // number of distinct model names.
+                if seen.len() >= MAX_TRACKED_UNMAPPED_MODELS {
+                    return false;
+                }
+                seen.insert(inbound.to_owned())
+            })
+            .unwrap_or(false);
+        if first_time {
+            tracing::warn!(
+                inbound_model = %log_safe(inbound),
+                upstream_model = %log_safe(&upstream_model),
+                "inbound model is not in the alias map; passing it through unchanged"
+            );
+            state.output.emit(crate::tui::LogLine {
+                kind: crate::tui::LogKind::Warning,
+                text: format!(
+                    "  \u{26a0} {} is not in the alias map — add it to model_aliases.map \
+                     (sent to the upstream as {})",
+                    log_safe(inbound),
+                    log_safe(&upstream_model)
+                ),
+            });
+        }
+    }
+    upstream_model
+}
+
 async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -453,63 +531,7 @@ async fn handle_messages(
     // refcount bump and release the snapshot when the handler ends.
     let mappings_snapshot = state.mappings.load_live().clone();
 
-    // Resolve the inbound model name to the upstream model name BEFORE
-    // building the request — so the reasoning-effort lookup uses the
-    // *resolved* name (e.g. an aliased `claude-sonnet-5` request picks
-    // up the reasoning entry for `gpt-5.4-mini`, not the entry for
-    // `claude-sonnet-5`). The snapshot is what makes TUI edits take
-    // effect: the static `Config::model_aliases` is the startup-only
-    // seed, while `mappings_snapshot` is what the operator sees when
-    // they hit `e` in the TUI.
-    let upstream_model = {
-        let resolved = mappings_snapshot.resolve(&req.model);
-        if resolved == req.model
-            && state.config.prefix_models_for_discovery
-            && (req.model.starts_with("claude-") || req.model.starts_with("anthropic-"))
-        {
-            req.model
-                .strip_prefix("claude-")
-                .or_else(|| req.model.strip_prefix("anthropic-"))
-                .unwrap_or(&req.model)
-                .to_owned()
-        } else {
-            resolved
-        }
-    };
-    // An inbound name that is not in the alias map is passed through
-    // unchanged. That is legitimate when the upstream serves the name
-    // itself, but it is also exactly how a request ends up 404ing — and
-    // it used to happen silently. Say so, once per distinct name.
-    if !mappings_snapshot.map.contains_key(&req.model) {
-        let first_time = state
-            .unmapped_models
-            .lock()
-            .map(|mut seen| {
-                // Bounded: a client could otherwise send an unbounded
-                // number of distinct model names.
-                if seen.len() >= MAX_TRACKED_UNMAPPED_MODELS {
-                    return false;
-                }
-                seen.insert(req.model.clone())
-            })
-            .unwrap_or(false);
-        if first_time {
-            tracing::warn!(
-                inbound_model = %log_safe(&req.model),
-                upstream_model = %log_safe(&upstream_model),
-                "inbound model is not in the alias map; passing it through unchanged"
-            );
-            state.output.emit(crate::tui::LogLine {
-                kind: crate::tui::LogKind::Warning,
-                text: format!(
-                    "  \u{26a0} {} is not in the alias map — add it to model_aliases.map \
-                     (sent to the upstream as {})",
-                    log_safe(&req.model),
-                    log_safe(&upstream_model)
-                ),
-            });
-        }
-    }
+    let upstream_model = resolve_upstream_model(&state, &mappings_snapshot, &req.model);
     // Resolve the reasoning intent from the client's explicit signals
     // (output_config.effort, thinking.type = "disabled") against the
     // configured effort/thinking-disabled maps, falling back to the
@@ -612,11 +634,11 @@ async fn handle_messages(
 /// for THIS request only (reqwest documents that behaviour). The advisor's
 /// own consultation uses it to keep a hung reviewer model from stalling the
 /// whole turn; ordinary executor calls pass `None`.
-pub(crate) async fn send_upstream_once(
+pub(crate) async fn send_upstream_once<B: serde::Serialize + Sync + ?Sized>(
     state: &AppState,
     url: &str,
     headers: &HeaderMap,
-    outbound: &responses::ResponsesRequest,
+    outbound: &B,
     timeout: Option<Duration>,
 ) -> Result<reqwest::Response, AppError> {
     let mut upstream_req = state
@@ -705,7 +727,7 @@ pub(crate) enum Outcome {
 /// attempt and the `default_model` fallback call this, so reasoning,
 /// prompt-caching, reasoning-replay and the cache key are recomputed from
 /// the same policy rather than being hand-applied twice.
-fn build_outbound(
+pub(crate) fn build_outbound(
     req: &CreateMessageRequest,
     config: &Config,
     model: &str,
@@ -795,13 +817,18 @@ fn build_outbound(
     Ok((outbound, registry, reasoning_replay))
 }
 
+/// The upstream Responses endpoint: the base URL plus `upstream_path`.
+pub(crate) fn upstream_url(config: &Config) -> String {
+    format!(
+        "{}{}",
+        config.upstream_base_url.trim_end_matches('/'),
+        config.upstream_path
+    )
+}
+
 impl Attempt {
     pub(crate) fn url(&self) -> String {
-        format!(
-            "{}{}",
-            self.state.config.upstream_base_url.trim_end_matches('/'),
-            self.state.config.upstream_path
-        )
+        upstream_url(&self.state.config)
     }
 
     /// Send repeatedly until the upstream answers with a success status.
@@ -1591,7 +1618,7 @@ fn fallback_unavailable_error(fallback: &str, error: AppError) -> AppError {
     }
 }
 
-fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
+pub(crate) fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
     // A prompt that does not fit the context window is reported in
     // Anthropic's own words so Claude Code can compact and retry.
     if let Some(overflow) = crate::context_overflow::detect(status.as_u16(), body) {

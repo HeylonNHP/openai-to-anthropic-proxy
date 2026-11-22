@@ -5,6 +5,7 @@ pub use tools::web_fetch;
 pub mod capabilities;
 pub mod config;
 mod context_overflow;
+mod count_tokens;
 mod error;
 pub mod responses;
 pub mod stream;

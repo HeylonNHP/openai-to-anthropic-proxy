@@ -13,6 +13,7 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 - Optional prompt-caching translation from Anthropic `cache_control` to OpenAI `prompt_cache_breakpoint`.
 - The server-side `web_fetch` tool, implemented by the proxy: it fetches the URL itself, extracts the readable text, and returns it as an Anthropic `web_fetch_tool_result` (see "Server-side `web_fetch`" below).
 - Optional proxy-native `web_search` (DuckDuckGo scraping + page fetching + compaction) as a swap-in for the upstream's built-in search — see "Proxy-native `web_search`" below.
+- `POST /v1/messages/count_tokens`, answered from the upstream's own token-counting endpoint when it has one, else a local estimate (see "Token counting" below).
 - `GET /healthz` for liveness checks.
 
 ## Configuration
@@ -85,7 +86,7 @@ or via env:
 export PROXY_KEY="any-shared-secret-string"
 ```
 
-When `proxy_key` is set, every `/v1/messages` request must include a matching `X-Proxy-Key` header. Without it, the proxy returns `401 Unauthorized` with an Anthropic-shaped error envelope. The `/healthz` endpoint is always open for liveness checks. The header value is compared in constant time to avoid timing leaks. The startup output prints a warning when `proxy_key` is unset.
+When `proxy_key` is set, every `/v1/messages` and `/v1/messages/count_tokens` request must include a matching `X-Proxy-Key` header. Without it, the proxy returns `401 Unauthorized` with an Anthropic-shaped error envelope. The `/healthz` endpoint is always open for liveness checks. The header value is compared in constant time to avoid timing leaks. The startup output prints a warning when `proxy_key` is unset.
 
 **Wiring it into Claude Code.** Claude Code and the Anthropic SDK inject custom HTTP headers via the `ANTHROPIC_CUSTOM_HEADERS` env var, in `Name: Value` format. Add it to your `~/.claude/settings.json`:
 
@@ -329,6 +330,22 @@ Set the upstream model's real context window explicitly:
 
 Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
 
+### Token counting
+
+`POST /v1/messages/count_tokens` translates the request exactly as
+`/v1/messages` would (same alias resolution, same tool and image handling) and
+asks the upstream to count it at `{upstream_path}/input_tokens` (OpenAI's
+`/v1/responses/input_tokens`). Only the input fields are sent: no `stream`,
+`max_output_tokens`, `store`, `user`, `prompt_cache_key` or `reasoning`.
+
+If the upstream has no such endpoint (404, 405 or 501, other than a "no such
+model" 404), the proxy remembers that for the life of the process and
+estimates locally from then on. Any other failure estimates for that one call.
+The estimate is about 4 characters per token over the translated request
+(tool schemas included), with each base64 image counted as a flat 1,600
+tokens. A count never fails the client because of the upstream, and is not
+added to the TUI token totals.
+
 ### Context-overflow errors
 
 When the upstream rejects a prompt as too long for its context window, the
@@ -437,7 +454,7 @@ OpenAI-compatible upstream.
 See also [`README.md`](./README.md#features) for the shorter visitor-facing list.
 
 ### Endpoints and transport
-- Anthropic endpoints other than Messages, `GET /v1/models` and `/healthz` (such as batches/files)
+- Anthropic endpoints other than Messages, `count_tokens`, `GET /v1/models` and `/healthz` (such as batches/files)
 - TLS termination (bind a plain HTTP listener; put a reverse proxy in front)
 - One upstream target per instance: no multi-tenant or per-user routing
 
