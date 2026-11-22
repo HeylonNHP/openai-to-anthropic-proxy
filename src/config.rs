@@ -235,6 +235,12 @@ pub struct Config {
     /// the encoding the Responses API specifies; `lift` and `drop` are
     /// escape hatches for gateways that only accept string tool outputs.
     pub tool_result_images: ToolResultImages,
+    /// Whether `document` blocks with a `base64` or `url` source (PDFs) are
+    /// sent upstream as `input_file` parts. Off by default, because many
+    /// OpenAI-compatible gateways reject that part type and would fail the
+    /// whole request; when off, such a block becomes a short text note.
+    /// `text` and `content` document sources are always forwarded as text.
+    pub forward_documents: bool,
     /// Where a `role: "system"` message in the middle of the conversation
     /// goes. See [`SystemMessagePlacement`].
     pub system_message_placement: SystemMessagePlacement,
@@ -1050,6 +1056,12 @@ impl Config {
             })
         });
 
+        // `forward_documents`: env wins over file, default `false`.
+        let forward_documents = env
+            .forward_documents
+            .or_else(|| file.and_then(|f| f.forward_documents))
+            .unwrap_or(false);
+
         // `log_to_disk`: env wins over file, then default to `false`.
         // For a boolean we can't reuse `pick_str`; do it inline.
         let log_to_disk = env
@@ -1376,6 +1388,7 @@ impl Config {
             prompt_caching,
             reasoning_replay,
             tool_result_images,
+            forward_documents,
             system_message_placement,
             proxy_key,
             log_to_disk,
@@ -1577,6 +1590,8 @@ pub struct EnvInputs {
     /// same as a bad value in `proxy.json` (warn + fall back to the
     /// default), never a hard startup failure.
     pub tool_result_images: Option<String>,
+    /// `FORWARD_DOCUMENTS=1|true|…`. See [`Config::forward_documents`].
+    pub forward_documents: Option<bool>,
     /// `SYSTEM_MESSAGE_PLACEMENT=instructions|inline`. See
     /// [`SystemMessagePlacement`]; judged by the resolver like
     /// `TOOL_RESULT_IMAGES`.
@@ -1646,6 +1661,7 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| parse_env_limit(&s)),
             tool_result_images: env::var("TOOL_RESULT_IMAGES").ok(),
+            forward_documents: env::var("FORWARD_DOCUMENTS").ok().map(|s| parse_truthy(&s)),
             system_message_placement: env::var("SYSTEM_MESSAGE_PLACEMENT").ok(),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
@@ -2136,6 +2152,11 @@ pub struct JsonConfig {
     /// it round-trips unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_images: Option<String>,
+    /// Forward `base64`/`url` `document` blocks upstream as `input_file`.
+    /// See [`Config::forward_documents`]. Unset keeps the file unchanged when
+    /// the TUI rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_documents: Option<bool>,
     /// Where a `role: "system"` message inside the conversation goes. See
     /// [`SystemMessagePlacement`]. Unset keeps the file unchanged when the
     /// TUI rewrites it.

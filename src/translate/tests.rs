@@ -1450,6 +1450,7 @@ fn tool_result_is_error_true_prefixes_output() {
         &tr,
         &ToolResultImages::default(),
         &PromptCachingConfig::default(),
+        false,
     );
     let text = out.output.text();
     assert!(
@@ -1472,6 +1473,7 @@ fn tool_result_is_error_false_passes_output_through() {
         &tr,
         &ToolResultImages::default(),
         &PromptCachingConfig::default(),
+        false,
     );
     assert_eq!(out.output, FunctionCallOutputBody::Text("ok".to_string()));
 }
@@ -1489,6 +1491,7 @@ fn tool_result_is_error_none_passes_output_through() {
         &tr,
         &ToolResultImages::default(),
         &PromptCachingConfig::default(),
+        false,
     );
     assert_eq!(
         out.output,
@@ -1618,6 +1621,7 @@ fn tool_result_image_lift_mode_sends_images_in_follow_up_user_message() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        false,
         Default::default(),
     )
     .unwrap();
@@ -1679,6 +1683,7 @@ fn tool_result_image_drop_mode_drops_images_and_keeps_text() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Drop,
+        false,
         Default::default(),
     )
     .unwrap();
@@ -3722,6 +3727,7 @@ fn lift_mode_keeps_parallel_tool_outputs_adjacent_and_labels_images() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        false,
         Default::default(),
     )
     .unwrap();
@@ -3777,6 +3783,7 @@ fn lift_mode_image_only_result_gets_a_placeholder_output_not_an_empty_string() {
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::Lift,
+        false,
         Default::default(),
     )
     .unwrap();
@@ -4064,6 +4071,7 @@ fn translate_with(
         &PromptCachingConfig::default(),
         &ReasoningReplay::default(),
         ToolResultImages::default(),
+        false,
         placement,
     )
     .unwrap()
@@ -4165,5 +4173,210 @@ fn inline_placement_strips_the_advisor_section_when_no_advisor_tool_is_sent() {
     assert!(
         text.contains("# Environment") && text.contains("keep"),
         "{text}"
+    );
+}
+
+// ── document blocks ─────────────────────────────────────
+
+/// Translate a request whose user turn is `content`, as JSON, and return the
+/// upstream `input` array.
+fn translate_document_turn(content: Value, forward_documents: bool) -> Vec<Value> {
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": content}],
+    }))
+    .unwrap();
+    let (out, _) = anthropic_to_responses_with(
+        &req,
+        None,
+        &PromptCachingConfig::default(),
+        &ReasoningReplay::default(),
+        ToolResultImages::default(),
+        forward_documents,
+        Default::default(),
+    )
+    .unwrap();
+    serde_json::to_value(out).unwrap()["input"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn user_parts(input: &[Value]) -> Vec<Value> {
+    input[0]["content"].as_array().unwrap().clone()
+}
+
+#[test]
+fn a_text_document_becomes_input_text_whatever_the_setting() {
+    let content = json!([
+        {"type": "text", "text": "Summarise this"},
+        {"type": "document", "title": "notes.txt", "context": "from the user",
+         "source": {"type": "text", "media_type": "text/plain", "data": "hello world"}}
+    ]);
+    for forward in [false, true] {
+        let parts = user_parts(&translate_document_turn(content.clone(), forward));
+        assert_eq!(parts.len(), 2, "forward={forward}");
+        assert_eq!(parts[1]["type"], "input_text");
+        assert_eq!(
+            parts[1]["text"],
+            "[attached document: notes.txt]\nfrom the user\nhello world"
+        );
+    }
+}
+
+#[test]
+fn a_content_document_keeps_its_text_and_images() {
+    let content = json!([{"type": "document", "source": {"type": "content", "content": [
+        {"type": "text", "text": "page one"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        {"type": "text", "text": "page two"}
+    ]}}]);
+    let parts = user_parts(&translate_document_turn(content, false));
+    let kinds: Vec<&str> = parts.iter().map(|p| p["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["input_text", "input_text", "input_image", "input_text"]
+    );
+    assert_eq!(parts[0]["text"], "[attached document]");
+    assert_eq!(parts[1]["text"], "page one");
+    assert_eq!(parts[2]["image_url"], "data:image/png;base64,AAAA");
+}
+
+#[test]
+fn a_string_content_document_is_text() {
+    let content = json!([{"type": "document",
+        "source": {"type": "content", "content": "just a string"}}]);
+    let parts = user_parts(&translate_document_turn(content, false));
+    assert_eq!(parts[1]["text"], "just a string");
+}
+
+#[test]
+fn a_pdf_is_replaced_by_a_note_when_forwarding_is_off() {
+    let content = json!([{"type": "document", "title": "report.pdf",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]);
+    let parts = user_parts(&translate_document_turn(content, false));
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["type"], "input_text");
+    assert_eq!(
+        parts[0]["text"],
+        "[attached document omitted: report.pdf (application/pdf)]"
+    );
+}
+
+#[test]
+fn a_pdf_is_forwarded_as_input_file_when_enabled() {
+    let content = json!([{"type": "document", "title": "report.pdf",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]);
+    let parts = user_parts(&translate_document_turn(content, true));
+    assert_eq!(
+        parts,
+        [json!({
+            "type": "input_file",
+            "filename": "report.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi0="
+        })]
+    );
+    // An untitled PDF still gets the filename the upstream requires.
+    let untitled = json!([{"type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]);
+    let parts = user_parts(&translate_document_turn(untitled, true));
+    assert_eq!(parts[0]["filename"], "document.pdf");
+}
+
+#[test]
+fn a_url_document_follows_the_setting() {
+    let content = json!([{"type": "document",
+        "source": {"type": "url", "url": "https://example.com/a.pdf"}}]);
+    let on = user_parts(&translate_document_turn(content.clone(), true));
+    assert_eq!(
+        on,
+        [json!({"type": "input_file", "file_url": "https://example.com/a.pdf"})]
+    );
+    let off = user_parts(&translate_document_turn(content, false));
+    assert_eq!(off[0]["text"], "[attached document omitted: untitled]");
+}
+
+#[test]
+fn an_unresolvable_or_malformed_document_never_fails_the_request() {
+    for source in [
+        json!({"type": "file", "file_id": "file_123"}),
+        json!({"type": "mystery"}),
+        json!({"type": "text"}),
+        json!(null),
+    ] {
+        let content = json!([{"type": "document", "title": 7, "source": source}]);
+        let parts = user_parts(&translate_document_turn(content, true));
+        assert_eq!(parts.len(), 1);
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[attached document omitted:"),
+            "{parts:?}"
+        );
+    }
+}
+
+#[test]
+fn a_document_in_a_tool_result_follows_the_same_rules() {
+    let result = |forward: bool| {
+        let tr: ToolResultBlockParam = serde_json::from_value(json!({
+            "tool_use_id": "t1",
+            "content": [
+                {"type": "text", "text": "read it"},
+                {"type": "document", "title": "a.pdf",
+                 "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+                {"type": "document",
+                 "source": {"type": "text", "media_type": "text/plain", "data": "plain"}}
+            ]
+        }))
+        .unwrap();
+        tool_result_output(
+            &tr,
+            &ToolResultImages::default(),
+            &PromptCachingConfig::default(),
+            forward,
+        )
+    };
+    let off = serde_json::to_value(result(false).output).unwrap();
+    assert!(
+        off.as_str()
+            .unwrap()
+            .contains("[attached document omitted: a.pdf (application/pdf)]")
+    );
+    assert!(off.as_str().unwrap().contains("plain"));
+
+    let on = serde_json::to_value(result(true).output).unwrap();
+    let kinds: Vec<&str> = on
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["input_text", "input_file", "input_text"]);
+}
+
+#[test]
+fn a_document_in_lift_mode_gets_a_note_not_a_file() {
+    let tr: ToolResultBlockParam = serde_json::from_value(json!({
+        "tool_use_id": "t1",
+        "content": [{"type": "document", "title": "a.pdf",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}]
+    }))
+    .unwrap();
+    let out = tool_result_output(
+        &tr,
+        &ToolResultImages::Lift,
+        &PromptCachingConfig::default(),
+        true,
+    );
+    assert!(out.lifted_images.is_empty());
+    assert!(
+        serde_json::to_value(out.output)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("omitted")
     );
 }

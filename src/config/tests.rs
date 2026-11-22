@@ -1966,3 +1966,36 @@ fn system_message_placement_unknown_value_warns_and_uses_the_default() {
     assert_eq!(cfg.warnings.len(), 1);
     assert!(cfg.warnings[0].message.contains("system_message_placement"));
 }
+
+// ── forward_documents ───────────────────────────────────
+
+#[test]
+fn forward_documents_is_off_by_default() {
+    let cfg = cfg_from_json(
+        r#"{"upstream_base_url": "https://api.example.com", "upstream_api_key": "k"}"#,
+    );
+    assert!(!cfg.forward_documents);
+}
+
+#[test]
+fn forward_documents_can_be_turned_on_in_the_file_and_overridden_by_env() {
+    let parsed = JsonConfig::parse(
+        r#"{"upstream_base_url": "https://api.example.com",
+                 "upstream_api_key": "k", "forward_documents": true}"#,
+    )
+    .unwrap();
+    assert!(
+        Config::resolve(Some(&parsed), &EnvInputs::default())
+            .unwrap()
+            .forward_documents
+    );
+    let env = EnvInputs {
+        forward_documents: Some(false),
+        ..EnvInputs::default()
+    };
+    assert!(
+        !Config::resolve(Some(&parsed), &env)
+            .unwrap()
+            .forward_documents
+    );
+}

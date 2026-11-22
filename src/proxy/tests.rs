@@ -113,6 +113,7 @@ fn test_config_minimal() -> Config {
         server_tools: crate::config::ServerToolsConfig::default(),
         prefix_models_for_discovery: false,
         tool_result_images: crate::config::ToolResultImages::default(),
+        forward_documents: false,
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     }

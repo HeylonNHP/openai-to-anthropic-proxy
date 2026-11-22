@@ -34,6 +34,7 @@ The proxy reads environment variables first, then an optional `proxy.json`, then
 | `PROMPT_CACHE_KEY` | `prompt_cache_key` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
 | `SYSTEM_MESSAGE_PLACEMENT` | `system_message_placement` | `inline` | no | Where a `role: "system"` message inside the conversation goes: kept in place as `inline` (default), which keeps the prompt start stable for the upstream's cache, or folded into `instructions`, for an upstream that rejects a late system message. |
 | `TOOL_RESULT_IMAGES` | `tool_result_images` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, `drop`). |
+| `FORWARD_DOCUMENTS` | `forward_documents` | `false` | no | Send `base64`/`url` `document` blocks (PDFs) upstream as `input_file`. Off: they become a short text note. `text`/`content` documents are always forwarded as text. |
 | `LOG_TO_DISK` | `log_to_disk` | `false` | no | Set `1` / `true` / `yes` to also write `target/logs/proxy.log`. |
 | `PROXY_KEY` | `proxy_key` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |
 | `ADVISOR_ENABLED` | `advisor.enabled` | `false` | no | Enable the experimental advisor tool. Accepts `1` / `true` / `yes` / `on`. |
@@ -163,6 +164,12 @@ For multiple custom headers, separate them with newlines (a single line is enoug
 - `tool_result_images` controls how `image` blocks inside a `tool_result`
   are forwarded upstream (`array`, `lift` or `drop`; default `array`). See
   [`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).
+
+- `forward_documents` controls whether PDF `document` blocks (`base64` / `url`
+  sources) are sent upstream as `input_file` (default `false`, which sends a
+  short text note instead). `text` and `content` document sources are always
+  forwarded as text. See
+  [`proxy.json-guide.md`](./proxy.json-guide.md#documents-and-pdfs-forward_documents).
 
 A small example of these in `proxy.json`:
 
@@ -340,7 +347,9 @@ asks the upstream to count it at `{upstream_path}/input_tokens` (OpenAI's
 
 If the upstream has no such endpoint (404, 405 or 501, other than a "no such
 model" 404), the proxy remembers that for the life of the process and
-estimates locally from then on. Any other failure estimates for that one call.
+estimates locally from then on. Any other failure estimates for that one call,
+including a count that takes longer than 10 seconds (a fixed limit, not
+configurable, so a slow upstream never stalls the client).
 The estimate is about 4 characters per token over the translated request
 (tool schemas included), with each base64 image counted as a flat 1,600
 tokens. A count never fails the client because of the upstream, and is not

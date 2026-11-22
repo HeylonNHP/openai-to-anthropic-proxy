@@ -209,6 +209,46 @@ Environment variable: `SYSTEM_MESSAGE_PLACEMENT` (`inline` or `instructions`, ca
 
 The `# Advisor Tool` section Claude Code puts in one of these messages is removed from the inline copy too, under the same rule as for the instructions, and the advisor's reviewer never sees it there either.
 
+### Documents and PDFs (`forward_documents`)
+
+Claude Code attaches files as Anthropic `document` blocks, in a user message or
+inside a `tool_result` (its Read tool returns a PDF that way). What the proxy
+does depends on the block's `source`:
+
+- `text` and `content` sources are **always** forwarded, as plain text
+  (`input_text`; a `content` source's images go as `input_image`). A `title` and
+  `context`, when present, lead the text. This needs no setting.
+- `base64` and `url` sources (PDFs) are controlled by `forward_documents`:
+  - `false` (**default**) — the file is not sent. The model gets a short note,
+    such as `[attached document omitted: report.pdf (application/pdf)]`, so it
+    knows a file existed instead of seeing nothing.
+  - `true` — the file is sent as an `input_file` part (`file_data` for
+    `base64`, `file_url` for `url`).
+- Any other source (such as a Files API `file` reference) cannot be resolved by
+  the proxy and always becomes the note.
+
+```json
+{
+  "forward_documents": true
+}
+```
+
+Environment variable: `FORWARD_DOCUMENTS` (`1` / `true` / `yes` / `on` turn it
+on; anything else is off). Env wins over the file.
+
+It is off by default because `input_file` is an OpenAI feature that many
+OpenAI-compatible gateways and local servers reject with a 400, which would fail
+the whole request, and every later turn that repeats the attachment. Turn it on
+only for an upstream you have confirmed accepts `input_file`.
+
+Notes:
+
+- Inside a `tool_result`, a file part is sent only when `tool_result_images` is
+  `array` (the default), because that is the only form that can carry it. With
+  `lift` or `drop` the block becomes the note.
+- `POST /v1/messages/count_tokens` estimates a forwarded file as a single
+  image-sized item, not by its size, so a large PDF is under-counted.
+
 ### Tool result images (`tool_result_images`)
 
 A tool can return images (a screenshot from a browser tool, an image produced by

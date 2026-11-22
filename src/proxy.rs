@@ -756,6 +756,7 @@ pub(crate) fn build_outbound(
         &prompt_caching,
         &reasoning_replay,
         config.tool_result_images,
+        config.forward_documents,
         config.system_message_placement,
     )
     .map_err(|e| AppError::BadRequest(format!("translation error: {e}")))?;

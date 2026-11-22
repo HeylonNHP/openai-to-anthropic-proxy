@@ -17,6 +17,10 @@
 //! assistant turns have no counterpart in the Responses API and are dropped
 //! with a warning.
 //!
+//! `document` blocks are parsed too ([`DocumentBlockParam`]): text sources go
+//! upstream as text, PDFs as `input_file` only when `forward_documents` is on,
+//! otherwise as a short note.
+//!
 //! Out of scope (will produce a `serde` deserialization error if Claude
 //! sends them): extended thinking budget enforcement, prompt caching,
 //! server tools, container reuse, service tier. Note that
@@ -150,6 +154,8 @@ pub enum MessageContent {
 pub enum ContentBlockParam {
     Text(TextBlockParam),
     Image(ImageBlockParam),
+    /// A PDF or other attachment (`document` block). See [`DocumentBlockParam`].
+    Document(DocumentBlockParam),
     /// Tool invocation produced by the model in a prior turn.
     ToolUse(ToolUseBlockParam),
     /// Tool result returned to the model in response to a prior `tool_use`.
@@ -359,6 +365,26 @@ pub struct TextBlockParam {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageBlockParam {
     pub source: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// A `document` block: a PDF, a plain-text file or a nested content list.
+///
+/// `source` is kept opaque and judged by the translator: `text` and `content`
+/// sources become text, `base64` and `url` sources are sent upstream as a file
+/// only when `forward_documents` is on, and anything else (such as a Files API
+/// `file` reference) is replaced by a note. Every field is defaulted and
+/// tolerant of a wrong JSON type, so a malformed block can never fail the
+/// whole request the way a matched tag with a bad payload would.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentBlockParam {
+    #[serde(default)]
+    pub source: Value,
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub title: String,
+    #[serde(default, deserialize_with = "tolerant_text")]
+    pub context: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }

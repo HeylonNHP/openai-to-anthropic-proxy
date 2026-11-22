@@ -6,6 +6,8 @@
 
   "system_message_placement": "inline",
 
+  "forward_documents": false,
+
   "reasoning": {
     "default": "none",
     "models": {

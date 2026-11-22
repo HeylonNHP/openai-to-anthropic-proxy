@@ -28,8 +28,8 @@
 //! `output_tokens_details.reasoning_tokens` becomes `thinking_tokens`.
 
 use crate::anthropic::{
-    CacheControl, ContentBlockParam, CreateMessageRequest, ImageBlockParam, Message,
-    MessageContent, MessageParam, MessageRole, ResponseContentBlock, ServerToolUseUsage,
+    CacheControl, ContentBlockParam, CreateMessageRequest, DocumentBlockParam, ImageBlockParam,
+    Message, MessageContent, MessageParam, MessageRole, ResponseContentBlock, ServerToolUseUsage,
     StopReason, SystemPrompt, ToolChoice, ToolResultBlockParam, ToolResultContent,
     Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
@@ -154,6 +154,7 @@ pub fn anthropic_to_responses(
         prompt_caching,
         replay,
         ToolResultImages::default(),
+        false,
         SystemMessagePlacement::default(),
     )
 }
@@ -198,6 +199,7 @@ pub fn anthropic_to_responses_with(
     prompt_caching: &PromptCachingConfig,
     replay: &ReasoningReplay,
     tool_result_images: ToolResultImages,
+    forward_documents: bool,
     system_messages: SystemMessagePlacement,
 ) -> Result<(ResponsesRequest, crate::repair::ToolSchemaRegistry)> {
     let stream = req.stream.unwrap_or(false);
@@ -238,6 +240,7 @@ pub fn anthropic_to_responses_with(
             prompt_caching,
             replay,
             &tool_result_images,
+            forward_documents,
         )?;
     }
 
@@ -1504,11 +1507,16 @@ fn append_message_translation(
     prompt_caching: &PromptCachingConfig,
     replay: &ReasoningReplay,
     tool_result_images: &ToolResultImages,
+    forward_documents: bool,
 ) -> Result<()> {
     match msg.role {
-        MessageRole::User => {
-            append_user_message(out, &msg.content, prompt_caching, tool_result_images)
-        }
+        MessageRole::User => append_user_message(
+            out,
+            &msg.content,
+            prompt_caching,
+            tool_result_images,
+            forward_documents,
+        ),
         MessageRole::Assistant => append_assistant_message(out, &msg.content, replay),
         MessageRole::System => append_system_message(instructions, &msg.content),
     }
@@ -1519,6 +1527,7 @@ fn append_user_message(
     content: &MessageContent,
     prompt_caching: &PromptCachingConfig,
     tool_result_images: &ToolResultImages,
+    forward_documents: bool,
 ) -> Result<()> {
     match content {
         MessageContent::Text(s) => {
@@ -1574,7 +1583,12 @@ fn append_user_message(
                     }
                     ContentBlockParam::ToolResult(tr) => {
                         flush_user_parts(out, &mut parts);
-                        let translated = tool_result_output(tr, tool_result_images, prompt_caching);
+                        let translated = tool_result_output(
+                            tr,
+                            tool_result_images,
+                            prompt_caching,
+                            forward_documents,
+                        );
                         out.push(InputItem::FunctionCallOutput {
                             call_id: tr.tool_use_id.clone(),
                             output: translated.output,
@@ -1602,6 +1616,16 @@ fn append_user_message(
                             let ephemeral = !prompt_caching.models.is_empty()
                                 && is_ephemeral(&img.cache_control);
                             parts.push((image_part, ephemeral));
+                        }
+                    }
+                    ContentBlockParam::Document(doc) => {
+                        flush_lifted_images(out, &mut lifted);
+                        let converted = convert_document_block(doc, forward_documents);
+                        let last = converted.len().saturating_sub(1);
+                        let ephemeral =
+                            !prompt_caching.models.is_empty() && is_ephemeral(&doc.cache_control);
+                        for (i, part) in converted.into_iter().enumerate() {
+                            parts.push((part, ephemeral && i == last));
                         }
                     }
                     ContentBlockParam::ToolUse(_) => {
@@ -1693,6 +1717,120 @@ fn flush_user_parts(out: &mut Vec<InputItem>, parts: &mut Vec<(InputContentPart,
     }
 }
 
+/// Translate a `document` block into upstream content parts.
+///
+/// - `text` source → one `input_text` part (the file's text).
+/// - `content` source → its text blocks as `input_text`, its image blocks as
+///   `input_image`.
+/// - `base64` / `url` source → an `input_file` part when `forward_files` is
+///   on; otherwise a short note, so the model knows a file existed.
+/// - Anything else (a Files API `file_id`, an unknown type) → the note, since
+///   the proxy has no way to resolve it.
+///
+/// `title` and `context` lead the text of the document as a header.
+fn convert_document_block(doc: &DocumentBlockParam, forward_files: bool) -> Vec<InputContentPart> {
+    let text_part = |text: String| InputContentPart::InputText {
+        text,
+        prompt_cache_breakpoint: None,
+    };
+    let title = doc.title.trim();
+    let source_type = doc.source.get("type").and_then(Value::as_str);
+
+    let mut header = if title.is_empty() {
+        "[attached document]".to_owned()
+    } else {
+        format!("[attached document: {title}]")
+    };
+    if !doc.context.trim().is_empty() {
+        header.push('\n');
+        header.push_str(doc.context.trim());
+    }
+
+    let note = || {
+        let media = doc
+            .source
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let label = match (title.is_empty(), media.is_empty()) {
+            (false, false) => format!("{title} ({media})"),
+            (false, true) => title.to_owned(),
+            (true, false) => media.to_owned(),
+            (true, true) => "untitled".to_owned(),
+        };
+        tracing::warn!(
+            document = label,
+            "document block not forwarded upstream (forward_documents is off or the source \
+             cannot be resolved)"
+        );
+        vec![text_part(format!("[attached document omitted: {label}]"))]
+    };
+
+    match source_type {
+        Some("text") => {
+            let Some(data) = doc.source.get("data").and_then(Value::as_str) else {
+                return note();
+            };
+            vec![text_part(format!("{header}\n{data}"))]
+        }
+        Some("content") => {
+            let mut parts = vec![text_part(header)];
+            match doc.source.get("content") {
+                Some(Value::String(s)) => parts.push(text_part(s.clone())),
+                Some(Value::Array(blocks)) => {
+                    for block in blocks {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                    parts.push(text_part(t.to_owned()));
+                                }
+                            }
+                            Some("image") => {
+                                if let Some(part) = ImageBlockParam::deserialize(block)
+                                    .ok()
+                                    .and_then(|img| convert_image_block(&img))
+                                {
+                                    parts.push(part);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return note(),
+            }
+            parts
+        }
+        Some("base64") if forward_files => {
+            let media = doc.source.get("media_type").and_then(Value::as_str);
+            let data = doc.source.get("data").and_then(Value::as_str);
+            let (Some(media), Some(data)) = (media, data) else {
+                return note();
+            };
+            vec![InputContentPart::InputFile {
+                filename: Some(if title.is_empty() {
+                    "document.pdf".to_owned()
+                } else {
+                    title.to_owned()
+                }),
+                file_data: Some(format!("data:{media};base64,{data}")),
+                file_url: None,
+            }]
+        }
+        Some("url") if forward_files => {
+            let Some(url) = doc.source.get("url").and_then(Value::as_str) else {
+                return note();
+            };
+            vec![InputContentPart::InputFile {
+                filename: None,
+                file_data: None,
+                file_url: Some(url.to_owned()),
+            }]
+        }
+        _ => note(),
+    }
+}
+
 /// True if the Anthropic block asks for an ephemeral cache checkpoint.
 fn is_ephemeral(cache_control: &Option<CacheControl>) -> bool {
     cache_control
@@ -1767,6 +1905,7 @@ fn tool_result_output(
     tr: &ToolResultBlockParam,
     mode: &ToolResultImages,
     prompt_caching: &PromptCachingConfig,
+    forward_documents: bool,
 ) -> TranslatedToolResult {
     let mut ordered: Vec<InputContentPart> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
@@ -1828,6 +1967,32 @@ fn tool_result_output(
                             tracing::warn!(
                                 "dropping image block in tool_result that could not be decoded"
                             );
+                        }
+                    }
+                    continue;
+                }
+                if block.get("type").and_then(Value::as_str) == Some("document") {
+                    // A PDF the tool returned (Claude Code's Read tool does
+                    // this). Only the array form can carry a file part, so
+                    // `lift` and `drop` modes get the note instead.
+                    let forward = forward_documents && matches!(mode, ToolResultImages::Array);
+                    for part in DocumentBlockParam::deserialize(block)
+                        .map_or_else(|_| Vec::new(), |doc| convert_document_block(&doc, forward))
+                    {
+                        match part {
+                            InputContentPart::InputText { text, .. } => {
+                                push_text(text, &mut ordered);
+                            }
+                            // A file or image part makes the output the
+                            // array form, like an image does.
+                            other => {
+                                image_count += 1;
+                                match mode {
+                                    ToolResultImages::Array => ordered.push(other),
+                                    ToolResultImages::Lift => images.push(other),
+                                    ToolResultImages::Drop => {}
+                                }
+                            }
                         }
                     }
                     continue;
@@ -2286,6 +2451,7 @@ fn append_assistant_message(
                         ));
                     }
                     ContentBlockParam::Image(_)
+                    | ContentBlockParam::Document(_)
                     | ContentBlockParam::ToolResult(_)
                     | ContentBlockParam::Unknown => {
                         tracing::warn!("dropping unsupported block from assistant message");

@@ -33,6 +33,7 @@ fn outbound_with_native_search() -> ResponsesRequest {
         &Default::default(),
         &Default::default(),
         Default::default(),
+        false,
         Default::default(),
     )
     .expect("translate");
