@@ -13,6 +13,8 @@ categories = ["network-programming", "web-programming::http-server"]
 # Async runtime + HTTP
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 axum = { version = "0.8", features = ["macros"] }
+# `Retry-After` HTTP dates. Already in the tree through hyper.
+httpdate = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "gzip", "brotli", "deflate", "charset", "http2", "cookies", "system-proxy", "query", "form"] }
 # The cookie store behind the search session. Same version reqwest uses, so one
 # copy is compiled; `serde` lets the session be written to disk.

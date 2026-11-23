@@ -358,7 +358,7 @@ impl StreamTranslator {
                 let (kind, msg) = response.error.as_ref().map_or_else(
                     || {
                         (
-                            "upstream_error".to_owned(),
+                            "api_error".to_owned(),
                             "upstream response failed".to_owned(),
                         )
                     },

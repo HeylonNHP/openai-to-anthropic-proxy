@@ -584,7 +584,7 @@ impl FailureKind {
     /// HTTP 504 and a connection failure as 502 (see `From<reqwest::Error>`).
     fn from_app_error(err: &AppError) -> Self {
         match err {
-            AppError::Upstream { status, body } => Self::from_http(status.as_u16(), body),
+            AppError::Upstream { status, body, .. } => Self::from_http(status.as_u16(), body),
             _ => Self::Overloaded,
         }
     }

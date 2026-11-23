@@ -369,6 +369,37 @@ image/file and token-per-minute errors are not treated as overflows, and an
 overflow never triggers the `default_model` fallback or a parameter-strip
 retry.
 
+### Upstream errors, overload and rate limits
+
+An upstream HTTP error keeps its status code and gets the Anthropic error
+`type` for it, so Claude Code's own retry logic recognises it:
+
+| Upstream status | `error.type` |
+|---|---|
+| 400 | `invalid_request_error` |
+| 401 | `authentication_error` |
+| 403 | `permission_error` |
+| 404 | `not_found_error` |
+| 413 | `request_too_large` |
+| 429 | `rate_limit_error` |
+| 503, 529 | `overloaded_error` |
+| anything else | `api_error` |
+
+The proxy's own connect failures (502) and timeouts (504) are `api_error`, not
+overloaded. On a 429 or a 5xx the upstream's `Retry-After` (seconds or an HTTP
+date) or `retry-after-ms` is passed on as both `retry-after` and
+`retry-after-ms`, rounded up and capped at 60 s, the longest the Anthropic SDK
+honours. The proxy never retries a 429 or 5xx itself; Claude Code does, and a
+second layer of retries would stack the delays.
+
+An error inside a stream cannot carry a status or header, only a type, taken
+from the upstream's error code: `rate_limit_*` / `insufficient_quota` →
+`rate_limit_error`; `*overloaded*` / `service_unavailable` →
+`overloaded_error`; `invalid_api_key` → `authentication_error`; anything
+unrecognised → `api_error`. A context overflow is still checked first and
+keeps its own wording (see above). An `insufficient_quota` 429 is not
+transient, but is still a `rate_limit_error`, as it is upstream.
+
 ## Development
 
 - `cargo test` runs unit and e2e tests.

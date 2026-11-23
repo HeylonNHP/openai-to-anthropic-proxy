@@ -1523,6 +1523,7 @@ dependencies = [
  "eventsource-stream",
  "fast_html2md",
  "futures-util",
+ "httpdate",
  "ratatui",
  "regex",
  "reqwest",

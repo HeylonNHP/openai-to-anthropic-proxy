@@ -639,9 +639,11 @@ fn http_failures_are_sorted_into_kinds() {
 
 #[test]
 fn a_timeout_or_connection_error_from_the_shared_client_is_sorted() {
-    let upstream = |status: u16| AppError::Upstream {
-        status: axum::http::StatusCode::from_u16(status).unwrap(),
-        body: "x".into(),
+    let upstream = |status: u16| {
+        AppError::upstream(
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            "x".into(),
+        )
     };
     // `From<reqwest::Error>`: a timeout is 504, a connection failure 502.
     assert_eq!(

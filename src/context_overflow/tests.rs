@@ -122,6 +122,6 @@ fn stream_errors_are_reworded_or_left_alone() {
     );
     assert_eq!(
         stream_error("server_error", "boom"),
-        ("upstream_error".to_owned(), "boom".to_owned())
+        ("api_error".to_owned(), "boom".to_owned())
     );
 }

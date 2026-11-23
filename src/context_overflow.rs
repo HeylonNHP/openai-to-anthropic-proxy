@@ -95,7 +95,12 @@ pub fn detect_event(code: &str, message: &str) -> Option<ContextOverflow> {
 #[must_use]
 pub fn stream_error(code: &str, message: &str) -> (String, String) {
     detect_event(code, message).map_or_else(
-        || ("upstream_error".to_owned(), message.to_owned()),
+        || {
+            (
+                crate::error::stream_error_kind(code, message).to_owned(),
+                message.to_owned(),
+            )
+        },
         |o| (ERROR_KIND.to_owned(), o.anthropic_message()),
     )
 }

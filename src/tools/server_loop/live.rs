@@ -170,18 +170,27 @@ where
 
 /// A failure the upstream reported inside the stream: an overflow keeps
 /// Anthropic's wording, anything else is a generic upstream error.
-fn stream_failure(code: &str, message: &str) -> AppError {
-    crate::context_overflow::detect_event(code, message).map_or_else(
-        || upstream_failure(message.to_owned()),
-        |overflow| AppError::ContextOverflow(overflow.anthropic_message()),
+fn upstream_failure(message: String) -> AppError {
+    AppError::upstream(
+        StatusCode::BAD_GATEWAY,
+        format!("upstream_error: {message}"),
     )
 }
 
-fn upstream_failure(message: String) -> AppError {
-    AppError::Upstream {
-        status: StatusCode::BAD_GATEWAY,
-        body: format!("upstream_error: {message}"),
-    }
+fn stream_failure(code: &str, message: &str) -> AppError {
+    crate::context_overflow::detect_event(code, message).map_or_else(
+        || {
+            // A stream error has no HTTP status; pick the one whose Anthropic
+            // error type matches what the upstream said.
+            let status = match crate::error::stream_error_kind(code, message) {
+                "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+                "overloaded_error" => StatusCode::from_u16(529).unwrap_or(StatusCode::BAD_GATEWAY),
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            AppError::upstream(status, format!("upstream_error: {message}"))
+        },
+        |overflow| AppError::ContextOverflow(overflow.anthropic_message()),
+    )
 }
 
 /// The output items of a run, built up from its events.

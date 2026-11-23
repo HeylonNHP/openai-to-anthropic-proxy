@@ -36,6 +36,8 @@ struct FakeUpstream {
     canned_stream: Arc<Mutex<Option<String>>>,
     /// Canned error response (status + body) to return.
     canned_error: Arc<Mutex<Option<(StatusCode, String)>>>,
+    /// Extra response headers sent with `canned_error`.
+    canned_error_headers: Arc<Mutex<Vec<(String, String)>>>,
     /// Per-attempt canned responses, served in order. When the vec is
     /// exhausted the handler falls back to the legacy `canned` /
     /// `canned_error` fields. Lets tests drive multi-attempt
@@ -94,12 +96,19 @@ async fn handle_fake(State(s): State<FakeUpstream>, body: Bytes) -> Response {
     }
     let err = s.canned_error.lock().await.clone();
     if let Some((status, body)) = err {
-        return (
+        let mut response = (
             status,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
             .into_response();
+        for (name, value) in s.canned_error_headers.lock().await.iter() {
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        return response;
     }
     let stream = s.canned_stream.lock().await.clone();
     if let Some(stream) = stream {
@@ -9844,4 +9853,128 @@ async fn a_pdf_reaches_the_upstream_as_input_file_when_enabled() {
         parts[1]["file_data"],
         "data:application/pdf;base64,JVBERi0="
     );
+}
+
+// ── upstream overload and rate-limit errors ─────────────
+
+/// Send a non-streaming request to a proxy whose upstream answers with the
+/// given error; return the proxy's response and the upstream's request count.
+async fn post_with_upstream_error(
+    status: u16,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (reqwest::Response, usize) {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned_error.lock().await =
+        Some((StatusCode::from_u16(status).unwrap(), body.to_owned()));
+    *upstream.canned_error_headers.lock().await = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+    let count = *upstream.request_count.lock().await;
+    (res, count)
+}
+
+#[tokio::test]
+async fn a_429_keeps_its_status_type_and_retry_after_and_is_not_retried() {
+    let (res, count) = post_with_upstream_error(
+        429,
+        r#"{"error":{"message":"slow down","type":"rate_limit_error"}}"#,
+        &[("retry-after", "7")],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.headers()["retry-after"], "7");
+    assert_eq!(res.headers()["retry-after-ms"], "7000");
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(count, 1, "the proxy must leave retrying to the client");
+}
+
+#[tokio::test]
+async fn overload_statuses_are_reported_as_overloaded_error() {
+    for status in [503, 529] {
+        let (res, _) =
+            post_with_upstream_error(status, r#"{"error":{"message":"busy"}}"#, &[]).await;
+        assert_eq!(res.status().as_u16(), status);
+        assert!(!res.headers().contains_key("retry-after"));
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error", "{status}");
+    }
+}
+
+#[tokio::test]
+async fn a_403_is_a_permission_error() {
+    let (res, _) = post_with_upstream_error(403, r#"{"error":{"message":"no"}}"#, &[]).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "permission_error");
+}
+
+#[tokio::test]
+async fn a_tokens_per_minute_429_stays_a_rate_limit_not_an_overflow() {
+    let (res, count) = post_with_upstream_error(
+        429,
+        r#"{"error":{"message":"Request too large for gpt-4: tokens per min (TPM): Limit 30000, Requested 45000","code":"rate_limit_exceeded"}}"#,
+        &[("retry-after", "2")],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("prompt is too long")
+    );
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn a_stream_error_event_gets_the_type_its_code_names() {
+    for (code, kind) in [
+        ("rate_limit_exceeded", "rate_limit_error"),
+        ("server_is_overloaded", "overloaded_error"),
+        ("server_error", "api_error"),
+    ] {
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        let sse = format!(
+            r#"event: response.created
+data: {{"type":"response.created","response":{{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}}}
+
+event: error
+data: {{"type":"error","code":"{code}","message":"upstream trouble"}}
+
+"#
+        );
+        *upstream.canned_stream.lock().await = Some(sse);
+        let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+        let text = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(
+                r#"{"model":"gpt-4o","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"x"}]}"#,
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            text.contains(&format!(r#""type":"{kind}""#)),
+            "{code}: {text}"
+        );
+    }
 }

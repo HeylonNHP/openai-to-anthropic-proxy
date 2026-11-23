@@ -673,9 +673,11 @@ pub(crate) async fn parse_upstream_body(
         raw_body = %String::from_utf8_lossy(&bytes),
         "raw upstream response (non-streaming)"
     );
-    serde_json::from_slice(&bytes).map_err(|e| AppError::Upstream {
-        status: StatusCode::BAD_GATEWAY,
-        body: format!("upstream returned non-JSON body: {e}"),
+    serde_json::from_slice(&bytes).map_err(|e| {
+        AppError::upstream(
+            StatusCode::BAD_GATEWAY,
+            format!("upstream returned non-JSON body: {e}"),
+        )
     })
 }
 
@@ -857,6 +859,8 @@ impl Attempt {
             if status.is_success() {
                 break Ok(resp);
             }
+            // Read before the body consumes the response.
+            let retry_after = crate::error::parse_retry_after(resp.headers());
             let body = resp.text().await.unwrap_or_default();
             // The body of the request that actually failed. Serialised from
             // `outbound` right here, so it reflects *this* attempt — including
@@ -1018,11 +1022,11 @@ impl Attempt {
             if self.fallback_used && default_model_unavailable(status, rejection.is_some()) {
                 return Err(fallback_unavailable_error(
                     &self.outbound.model,
-                    map_upstream_error(status, &body),
+                    map_upstream_error(status, &body).with_retry_after(retry_after),
                 ));
             }
 
-            return Err(map_upstream_error(status, &body));
+            return Err(map_upstream_error(status, &body).with_retry_after(retry_after));
         }
     }
 
@@ -1481,7 +1485,7 @@ where
                                 response.error.as_ref().map_or_else(
                                     || {
                                         (
-                                            "upstream_error".to_owned(),
+                                            "api_error".to_owned(),
                                             "upstream response failed".to_owned(),
                                         )
                                     },
@@ -1606,8 +1610,13 @@ fn default_model_unavailable(status: StatusCode, rejected: bool) -> bool {
 /// Re-word the fallback's error so it names `default_model` as the problem.
 fn fallback_unavailable_error(fallback: &str, error: AppError) -> AppError {
     match error {
-        AppError::Upstream { status, body } => AppError::Upstream {
+        AppError::Upstream {
             status,
+            body,
+            retry_after,
+        } => AppError::Upstream {
+            status,
+            retry_after,
             body: format!(
                 "the requested model was not available and the proxy's default_model \
                  `{}` is not available either; update default_model in the proxy \
@@ -1634,20 +1643,14 @@ pub(crate) fn map_upstream_error(status: StatusCode, body: &str) -> AppError {
     if env.message.is_empty() {
         // Nothing extractable — hand the body over verbatim so the client
         // never loses the upstream's text.
-        return AppError::Upstream {
-            status,
-            body: body.to_string(),
-        };
+        return AppError::upstream(status, body.to_string());
     }
     let kind = if env.kind.is_empty() {
         "upstream_error"
     } else {
         env.kind.as_str()
     };
-    AppError::Upstream {
-        status,
-        body: format!("{kind}: {}", env.message),
-    }
+    AppError::upstream(status, format!("{kind}: {}", env.message))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
