@@ -1,6 +1,8 @@
 # Reference
 
-Detailed config, script, and protocol notes that were trimmed from the main README.
+Protocol, architecture and behaviour notes that were trimmed from the main
+README. Configuration lives in [`CONFIGURATION.md`](./CONFIGURATION.md) and
+[`proxy.json-guide.md`](./proxy.json-guide.md).
 
 ## Features
 
@@ -18,198 +20,30 @@ Detailed config, script, and protocol notes that were trimmed from the main READ
 
 ## Configuration
 
-The proxy reads environment variables first, then an optional `proxy.json`, then built-in defaults. Environment variables win on conflict.
+Every configuration option - the `proxy.json` fields, the environment variable
+that overrides each one, and the Claude Code settings that point Claude Code at
+the proxy - is documented in [`CONFIGURATION.md`](./CONFIGURATION.md).
 
-| Environment Variable | `proxy.json` field | Default | Required? | Notes |
-|---|---|---|---|---|
-| `UPSTREAM_BASE_URL` | `upstream_base_url` | (none) | yes | Upstream OpenAI-compatible base URL (e.g. `https://api.openai.com`). |
-| `UPSTREAM_API_KEY` | `upstream_api_key` | (none) | yes | Bearer token for the upstream. |
-| `LISTEN_ADDR` | `listen_addr` | `0.0.0.0:8085` | no | Socket address the proxy binds. |
-| `UPSTREAM_PATH` | `upstream_path` | `/v1/responses` | no | Path appended to the upstream base URL (`null` = fall back to default). |
-| `REQUEST_TIMEOUT_SECS` | `request_timeout_secs` | `600` | no | Per-request timeout in seconds (also clamps `advisor` / `web_fetch` budgets when those set higher). |
-| `MAX_REQUEST_BODY_BYTES` | `max_request_body_bytes` | `33554432` (32 MiB) | no | Positive whole-number byte cap for `POST /v1/messages`. Invalid/zero/negative/fractional/out-of-range values warn and fall back to the default; non-numeric strings are ignored. |
-| `REASONING_EFFORT` | `reasoning_effort` | (none) | no | Default reasoning effort label applied to inbound requests (`low` / `medium` / `high` / `xhigh` / `max` / `none`). |
-| `PROMPT_CACHING_ENABLED` | `prompt_caching` (object) | `false` | no | Set `true` to forward OpenAI prompt-cache hints; also see `prompt_caching`. |
-| `PROMPT_CACHING_MODELS` | `prompt_caching.models` | (none) | no | Comma-separated inbound model IDs that the cache path is allowed for. |
-| `PROMPT_CACHE_KEY` | `prompt_cache_key` | (none) | no | Optional stable key forwarded as `prompt_cache_key`. |
-| `SYSTEM_MESSAGE_PLACEMENT` | `system_message_placement` | `inline` | no | Where a `role: "system"` message inside the conversation goes: kept in place as `inline` (default), which keeps the prompt start stable for the upstream's cache, or folded into `instructions`, for an upstream that rejects a late system message. |
-| `TOOL_RESULT_IMAGES` | `tool_result_images` | `array` | no | How `image` blocks inside a `tool_result` are forwarded upstream (`array`, `lift`, `drop`). |
-| `FORWARD_DOCUMENTS` | `forward_documents` | `false` | no | Send `base64`/`url` `document` blocks (PDFs) upstream as `input_file`. Off: they become a short text note. `text`/`content` documents are always forwarded as text. |
-| `LOG_TO_DISK` | `log_to_disk` | `false` | no | Set `1` / `true` / `yes` to also write `target/logs/proxy.log`. |
-| `PROXY_KEY` | `proxy_key` | (none) | no | Shared secret for `X-Proxy-Key` auth on the bind-all `0.0.0.0:8085` listener. No-op when unset. |
-| `ADVISOR_ENABLED` | `advisor.enabled` | `false` | no | Enable the experimental advisor tool. Accepts `1` / `true` / `yes` / `on`. |
-| `ADVISOR_MODEL` | `advisor.model` | `beam` | no | Upstream model name the advisor is routed to (not alias-resolved; written as-is into the advisor request). |
-| `ADVISOR_EFFORT` | `advisor.effort` | (none) | no | Reasoning-effort string applied to the advisor request only. Omit to send none. |
-| `ADVISOR_MAX_USES` | `advisor.max_uses` | `2` | no | Cap on consultations per turn. `0` removes the bound. Negative / fractional / out-of-range values fall back to the default + warning. |
-| `ADVISOR_MAX_TOKENS` | `advisor.max_tokens` | `4096` | no | Cap on the advisor *answer* (output tokens, reasoning excluded). `0` removes the cap (upstream default then applies). |
-| `ADVISOR_REASONING_MAX_TOKENS` | `advisor.reasoning_max_tokens` | `16384` | no | Extra output tokens the advisor may spend *reasoning*. The request limit is `max_tokens` + this. `0` removes the cap (upstream default then applies). |
-| `ADVISOR_TIMEOUT_SECS` | `advisor.timeout_secs` | none | no | Per-advisor-call timeout. Default and `0`: no limit of its own, only the global `request_timeout_secs`. |
-| `WEB_FETCH_ENABLED` | `web_fetch.enabled` | `false` | no | Enable the server-side `web_fetch` tool. Accepts `1` / `true` / `yes` / `on`. |
-| `WEB_FETCH_TIMEOUT_SECS` | `web_fetch.timeout_secs` | `20` | no | Whole-fetch budget (connect + read + extract) in seconds. |
-| `WEB_FETCH_MAX_BYTES` | `web_fetch.max_bytes` | (none = unlimited) | no | Network download cap for one fetch. Unset leaves it unlimited. |
-| `WEB_FETCH_MAX_CONTENT_BYTES` | `web_fetch.max_content_bytes` | (none = unlimited) | no | Cap on extracted text returned to the model (truncated at a paragraph boundary). Unset leaves it unlimited. |
-| `WEB_SEARCH_ENABLED` | `web_search.enabled` | `false` | no | Answer the client's `web_search` tool with the proxy's own search instead of the upstream's built-in one. Accepts `1` / `true` / `yes` / `on`. |
-| `WEB_SEARCH_COMPACTION_MODEL` | `web_search.compaction_model` | (unset) | no | Explicit upstream model used to summarise long pages. Unset = truncate (no model call). |
-| `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS` | `web_search.compaction_threshold_chars` | `5000` | no | Pages longer than this are summarised/truncated to fit. Max `100000`. |
-| `WEB_SEARCH_MAX_QUERIES` | `web_search.max_queries` | `3` | no | Queries per tool call. Max `10`. |
-| `WEB_SEARCH_MAX_RESULTS_PER_QUERY` | `web_search.max_results_per_query` | `5` | no | Result pages fetched per query. Max `10`. |
-| `WEB_SEARCH_SEARCH_TIMEOUT_SECS` | `web_search.search_timeout_secs` | `15` | no | Per-search request budget. Max `120`. |
-| `WEB_SEARCH_PAGE_TIMEOUT_SECS` | `web_search.page_timeout_secs` | `15` | no | Per-page fetch budget. Max `120`. |
-| `WEB_SEARCH_MAX_PAGE_BYTES` | `web_search.max_page_bytes` | `2097152` | no | Per-page network read cap. Max 16 MiB. |
-| `WEB_SEARCH_ENDPOINT` | `web_search.search_endpoint` | DuckDuckGo HTML | no | Search endpoint (mostly for tests). |
-| `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS` | `web_search.search_min_interval_ms` | `1500` | no | Searches run one at a time with at least this gap between them. Max 30000. |
-| `WEB_SEARCH_BLOCK_WAIT_MINUTES` | `web_search.block_wait_minutes` | `10` | no | Minutes the model is told to wait after a blocked search (CAPTCHA). Max 120. |
-| `SERVER_TOOLS_MAX_ROUNDS` | `server_tools.max_rounds` | `10` | no | Most rounds (executor runs whose server-tool calls were served) one request may run. `0` = no limit (needed for an unlimited `advisor.max_uses` or `web_fetch` to be truly unlimited). Negative / fractional values fall back to the default + warning. |
-| `SERVER_TOOLS_PAUSE_TURN` | `server_tools.pause_turn` | `false` | no | At the round limit, return `stop_reason: "pause_turn"` for the client to resume (as Anthropic's API does) instead of making the model answer. Claude Code does **not** resume a `pause_turn`, so leave it off for Claude Code. Accepts `1` / `true` / `yes` / `on`. |
-| `PREFIX_MODELS_FOR_DISCOVERY` | `prefix_models_for_discovery` | `false` | no | Prefix every model ID returned by `GET /v1/models` with `claude-` so Claude Code auto-discovers non-Claude IDs in the `/model` picker. The proxy strips the prefix back off when the user picks a model. |
+The deep dives (edge cases, invalid-value handling, per-tool semantics) are in
+[`proxy.json-guide.md`](./proxy.json-guide.md).
 
+The rules that never change:
 
-`proxy.json` uses the same field names in snake_case.
+- **Precedence.** Environment variables, then `proxy.json`, then built-in
+  defaults. An env var is the field path in upper snake case -
+  `advisor.max_uses` is `ADVISOR_MAX_USES`.
+- **The file is strict JSON** - no comments, no trailing commas. Unknown fields
+  are rejected at startup with a list of accepted names, so a typo fails fast
+  rather than being silently ignored. See `proxy.json.example` for a starter.
+- **Field names are lower-case snake_case.** Pasting an env var name such as
+  `UPSTREAM_BASE_URL` as a JSON key makes the proxy reject the file.
+- **An invalid value is a warning, not a startup failure.** Negative,
+  fractional, zero or out-of-range limits fall back to the shipped default and
+  the proxy still starts.
+- **`0` means "no limit"** for the limit-style options. An **absent** key keeps
+  the shipped default, which is usually not "no limit".
 
-**Important:** the `proxy.json` field names are lower-case snake_case (second column). The uppercase strings in the first column are ENVIRONMENT VARIABLES only. Pasting uppercase names such as `UPSTREAM_BASE_URL` as JSON object keys makes the proxy reject the file (`deny_unknown_fields`). Environment variables win on conflict, then the JSON file, then built-in defaults.
- See `proxy.json.example` for a starter. The file is strict JSON — no comments and no trailing commas. Unknown fields are rejected at startup, so a typo will fail fast with a list of accepted keys.
-
-`max_request_body_bytes` (overridden by `MAX_REQUEST_BODY_BYTES`) is a positive whole number of bytes; its default is 33,554,432 bytes (32 MiB). Numeric values that are zero, negative, fractional, or out of range produce a warning and fall back to the default without failing startup. Non-numeric `MAX_REQUEST_BODY_BYTES` text is ignored, so the file value or default applies.
-
-### Client auth (`proxy_key` / `PROXY_KEY`)
-
-The proxy binds `0.0.0.0:8085` by default, which means anyone on the network can reach it. If you don't set `proxy_key`, every reachable client can use your upstream API key. To lock it down, set a shared secret in `proxy.json`:
-
-```json
-{
-  "proxy_key": "any-shared-secret-string"
-}
-```
-
-or via env:
-
-```bash
-export PROXY_KEY="any-shared-secret-string"
-```
-
-When `proxy_key` is set, every `/v1/messages` and `/v1/messages/count_tokens` request must include a matching `X-Proxy-Key` header. Without it, the proxy returns `401 Unauthorized` with an Anthropic-shaped error envelope. The `/healthz` endpoint is always open for liveness checks. The header value is compared in constant time to avoid timing leaks. The startup output prints a warning when `proxy_key` is unset.
-
-**Wiring it into Claude Code.** Claude Code and the Anthropic SDK inject custom HTTP headers via the `ANTHROPIC_CUSTOM_HEADERS` env var, in `Name: Value` format. Add it to your `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:8085",
-    "ANTHROPIC_API_KEY": "any",
-    "ANTHROPIC_CUSTOM_HEADERS": "X-Proxy-Key: your-shared-secret"
-  }
-}
-```
-
-For multiple custom headers, separate them with newlines (a single line is enough for `X-Proxy-Key`).
-
-**Wiring it into the helper scripts.** The `scripts/start-claude-code.sh` and `scripts/start-claude-code.ps1` launchers detect `PROXY_KEY` in the calling shell and forward it to the child as `ANTHROPIC_CUSTOM_HEADERS=X-Proxy-Key: ...` automatically. If you launch through the helper, you don't need to edit `settings.json`.
-
-### Advanced config
-
-- `REASONING_EFFORT` sets the legacy default effort when no per-model override applies.
-- The `reasoning` object lets you set a default effort plus per-model overrides.
-- `reasoning.effort_map` translates Claude Code's `output_config.effort`
-  (`low`/`medium`/`high`/`xhigh`/`max`) into the upstream model's effort
-  vocabulary. Has `default` (all models) and per-model `models` maps; a
-  `null` value omits the upstream `reasoning` object.
-- `reasoning.thinking_disabled` translates Claude Code's
-  `thinking: {"type": "disabled"}` into the upstream no-reasoning
-  representation (e.g. `reasoning.effort = "none"`). Disabled thinking
-  takes precedence over `output_config.effort` and the fixed config.
-- The `model_aliases` object maps inbound model names to upstream model names.
-- `model_aliases.default_model` is an optional fallback if the upstream rejects an alias or passthrough model. The proxy recognises a model rejection from the upstream's error body — a message that names the model as the subject of an absence ("model \"claude-sonnet-5\" not found"), or a `model_not_found` / `model_not_supported` code — and retries once, before any bytes reach the client. Unrelated rejections — a tool the upstream does not support, a bad request, a schema error — are not retried, including ones that merely mention the model in passing.
-- The `prompt_caching` object lets you enable translation of Anthropic `cache_control: {type: "ephemeral"}` into OpenAI `prompt_cache_breakpoint` markers.
-- `prompt_caching.models` defaults to `[]`; when empty, no OpenAI-specific cache fields are emitted, keeping non-OpenAI upstreams unaffected.
-- `prompt_caching.cache_key` is optional and forwarded as `prompt_cache_key`.
-- The `advisor` object enables the server-side advisor: a second, cheaper
-  model is consulted mid-turn and its advice is fed back to the executor. The
-  feature is **off by default** (`enabled` defaults to `false`), and when it
-  is off the request path is byte-for-byte unchanged.
-- **`advisor.max_uses`, `advisor.max_tokens`, `advisor.reasoning_max_tokens`
-  and `advisor.timeout_secs` are
-  removed by setting them to `0`.** A **`0` means "no limit"**; an
-  **absent key keeps the shipped default** (`max_uses` 2, `max_tokens` 4096, `reasoning_max_tokens` 16384;
-  `timeout_secs` has no default limit). The same rule applies to the `ADVISOR_MAX_USES`,
-  `ADVISOR_MAX_TOKENS`, `ADVISOR_REASONING_MAX_TOKENS` and
-  `ADVISOR_TIMEOUT_SECS` env vars.
-- **The advisor prompt is trimmed to a fixed 1,200,000 characters** (roughly
-  400,000 tokens; `MAX_TRANSCRIPT_CHARS` in `src/tools/advisor/tool.rs`). It
-  is a built-in constant with no config key or env var. Over budget, tool
-  results are shortened (16,000 / 4,000 / 1,000 bytes), then every long string
-  is capped at 20,000 bytes, then the oldest items are dropped; the first item
-  and the latest items are kept.
-
-  ```json
-  "advisor": {
-    "enabled": true,
-    "model": "beam",
-    "max_uses": 0,
-    "max_tokens": 0,
-    "reasoning_max_tokens": 0,
-    "timeout_secs": 0
-  }
-  ```
-
-  "No limit" differs per field: `max_uses: 0` removes the consultation
-  loop's only backstop (each iteration costs two upstream calls);
-  `max_tokens: 0` or `reasoning_max_tokens: 0` means the *upstream's* default
-  output cap applies rather than the proxy's; `timeout_secs: 0` means no per-request override, so the
-  global `request_timeout_secs` still bounds the call. An invalid limit
-  (negative, fractional, too large) is a warning, not a startup failure —
-  the proxy starts and falls back to the default. Full detail in
-  [`proxy.json-guide.md`](./proxy.json-guide.md#advisor-advisor).
-- `advisor.model` is an **explicit upstream model name**, not an inbound
-  alias; `model_aliases.map` is not applied to it.
-- `tool_result_images` controls how `image` blocks inside a `tool_result`
-  are forwarded upstream (`array`, `lift` or `drop`; default `array`). See
-  [`proxy.json-guide.md`](./proxy.json-guide.md#tool-result-images-tool_result_images).
-
-- `forward_documents` controls whether PDF `document` blocks (`base64` / `url`
-  sources) are sent upstream as `input_file` (default `false`, which sends a
-  short text note instead). `text` and `content` document sources are always
-  forwarded as text. See
-  [`proxy.json-guide.md`](./proxy.json-guide.md#documents-and-pdfs-forward_documents).
-
-A small example of these in `proxy.json`:
-
-```json
-{
-  "upstream_base_url": "https://api.example.com",
-  "upstream_api_key":  "sk-...",
-  "reasoning": {
-    "default": "none",
-    "models": {
-      "gpt-5.4-mini": "high",
-      "gpt-5.6-luna":  "medium"
-    },
-    "effort_map": {
-      "default": {
-        "low": "none",
-        "medium": "low",
-        "high": "medium",
-        "xhigh": "high",
-        "max": "high"
-      }
-    },
-    "thinking_disabled": {
-      "default": { "disabled": "none" }
-    }
-  },
-  "model_aliases": {
-    "default_model": "gpt-4o-mini",
-    "map": {
-      "claude-sonnet-5": "gpt-5.4-mini"
-    }
-  },
-  "prompt_caching": {
-    "models": ["gpt-5.6-luna", "gpt-5.6-terra"],
-    "cache_key": "my-app"
-  }
-}
-```
-
-### Server-side `web_fetch`
+## Server-side `web_fetch`
 
 Anthropic's `web_fetch` is a **server** tool: the client declares it in `tools[]`
 with a versioned `type` (`web_fetch_20250910` and later) and **no**
@@ -271,7 +105,7 @@ A turn that passes ten fetches is still logged with a warning.
 > client's behalf. Claude Code's own `WebFetch` continues to work through the
 > ordinary client-tool path and is unaffected by this feature.
 
-### Proxy-native `web_search`
+## Proxy-native `web_search`
 
 By default the client's server-side `web_search` tool is mapped to the
 upstream's built-in search. With `web_search.enabled`, the proxy answers it
@@ -295,7 +129,7 @@ still knows on the next turn what it found.
 Full details — how it works, design decisions, known limitations, and how to
 remove it — are in [`src/tools/web_search/README.md`](./src/tools/web_search/README.md).
 
-### Server tools together: the shared loop
+## Server tools together: the shared loop
 
 `web_search`, `web_fetch` and the advisor all run on one loop,
 `src/tools/server_loop/`, so a request can declare any mix of them and the model
@@ -320,22 +154,20 @@ can use all of them in one turn, in any order. Details are in
 
 ## Launching Claude Code
 
-- `scripts/start-claude-code.sh` is the Linux/macOS launcher.
-- `scripts/start-claude-code.ps1` is the Windows launcher.
-- Both scripts set `ANTHROPIC_BASE_URL` to the proxy, set `ANTHROPIC_API_KEY=any`, and scrub leaked Anthropic/Claude Code env vars so the child stays routed through the proxy.
-- Both default to `http://localhost:8085` and pass `--setting-sources=project,local` unless you override it.
+`scripts/start-claude-code.sh` (macOS/Linux) and `scripts/start-claude-code.ps1`
+(Windows) start Claude Code against a running proxy. See
+[CONFIGURATION.md](./CONFIGURATION.md#launch-scripts) for what they set and when
+to use them.
 
 ## Context-window workaround
 
 Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, not from API responses. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to a hardcoded 200K. That causes premature auto-compaction for 1M-context models.
 
-Set the upstream model's real context window explicitly:
-
-- Windows PowerShell: `$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = 1000000`
-- Linux/macOS shell: `export CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`
-- Claude Code `~/.claude/settings.json`: add `"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"` inside the `env` object.
-
-Use the value your upstream model actually supports (e.g., `1000000` for GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
+Tell Claude Code the real window with `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (or the
+`autoCompactWindow` setting) - see
+[CONFIGURATION.md](./CONFIGURATION.md#claude-code-settings-claudesettingsjson).
+Use the value your upstream model actually supports (e.g., `1000000` for
+GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
 
 ### Token counting
 

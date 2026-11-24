@@ -1,8 +1,9 @@
 # CONFIGURATION.md
 
-Plain-English reference for setting the proxy up: every `proxy.json` option, and
-the Claude Code settings that point it at the proxy. For the full details (env
-vars, edge cases, deep dives), see [`proxy.json-guide.md`](./proxy.json-guide.md).
+Plain-English reference for setting the proxy up: every `proxy.json` option, the
+environment variable that overrides it, and the Claude Code settings that point
+Claude Code at the proxy. For the full details (edge cases, deep dives), see
+[`proxy.json-guide.md`](./proxy.json-guide.md).
 
 ## Minimal config
 
@@ -15,124 +16,133 @@ vars, edge cases, deep dives), see [`proxy.json-guide.md`](./proxy.json-guide.md
 
 That's enough to run. Everything else has a sensible default.
 
+## How the two sources fit together
+
+Every option can be set in `proxy.json` or in an environment variable. The
+environment variable wins, then the file, then the built-in default.
+
+The env var is the field path in upper snake case - `advisor.max_uses` becomes
+`ADVISOR_MAX_USES`, `web_search.max_queries` becomes `WEB_SEARCH_MAX_QUERIES`.
+The table below spells each one out. A `—` means the option is file-only.
+
 ## Upstream connection
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `upstream_base_url` | (required) | Address of your OpenAI-compatible API. |
-| `upstream_api_key` | (required) | Your API key for that service. |
-| `upstream_path` | `/v1/responses` | Don't change unless your provider uses a different endpoint. |
-| `request_timeout_secs` | 600 | How long to wait before giving up on one request (10 minutes). |
-| `listen_addr` | `0.0.0.0:8085` | Where the proxy listens locally. |
-| `max_request_body_bytes` | 33554432 | Biggest request Claude Code can send (32 MB). Leave alone. |
-| `proxy_key` | (none) | A shared secret clients must send with `X-Proxy-Key`. Recommended if anyone else can reach the proxy. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `upstream_base_url` | `UPSTREAM_BASE_URL` | (required) | Address of your OpenAI-compatible API. |
+| `upstream_api_key` | `UPSTREAM_API_KEY` | (required) | Your API key for that service. |
+| `upstream_path` | `UPSTREAM_PATH` | `/v1/responses` | Don't change unless your provider uses a different endpoint. |
+| `request_timeout_secs` | `REQUEST_TIMEOUT_SECS` | 600 | How long to wait before giving up on one request (10 minutes). |
+| `listen_addr` | `LISTEN_ADDR` | `0.0.0.0:8085` | Where the proxy listens locally. |
+| `max_request_body_bytes` | `MAX_REQUEST_BODY_BYTES` | 33554432 | Biggest request Claude Code can send (32 MB). Leave alone. |
+| `proxy_key` | `PROXY_KEY` | (none) | A shared secret clients must send with `X-Proxy-Key`. Recommended if anyone else can reach the proxy. |
 
 ## Model routing
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `model_aliases.map` | empty | Rewrites names like `claude-sonnet-5` to your upstream model names. |
-| `model_aliases.default_model` | (none) | Fallback used if the upstream rejects a model. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `model_aliases.map` | — | empty | Rewrites names like `claude-sonnet-5` to your upstream model names. |
+| `model_aliases.default_model` | — | (none) | Fallback used if the upstream rejects a model. |
 
 ## Reasoning (extended thinking)
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `reasoning.default` | `none` | Reasoning effort when the client doesn't ask. |
-| `reasoning.models` | empty | Per-model reasoning effort (keys are upstream model names). |
-| `reasoning.effort_map` | (shipped map) | Translates Claude Code's effort levels (`low`/`medium`/`high`/`xhigh`/`max`). |
-| `reasoning.thinking_disabled` | maps `disabled` to `none` | What happens when Claude Code turns thinking off. |
-| `reasoning_effort` | (none) | A blunt fallback effort for every request. `reasoning.default` is usually better. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `reasoning.default` | — | `none` | Reasoning effort when the client doesn't ask. |
+| `reasoning.models` | — | empty | Per-model reasoning effort (keys are upstream model names). |
+| `reasoning.effort_map` | — | (shipped map) | Translates Claude Code's effort levels (`low`/`medium`/`high`/`xhigh`/`max`). |
+| `reasoning.thinking_disabled` | — | maps `disabled` to `none` | What happens when Claude Code turns thinking off. |
+| `reasoning_effort` | `REASONING_EFFORT` | (none) | A blunt fallback effort for every request. `reasoning.default` is usually better. |
 
 ## Replaying the model's own prior thinking
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `reasoning_replay.default` | `text` | How a prior turn's thinking is sent back: `text` (safe, works everywhere), `off` (drop it), or `native` (OpenAI's reasoning item - provider-specific, opt in per model). |
-| `reasoning_replay.models` | empty | Per-model override of the mode above. |
-| `reasoning_replay.max_chars` | 0 | Cap on replayed reasoning text per turn (`0` = unlimited). |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `reasoning_replay.default` | — | `text` | How a prior turn's thinking is sent back: `text` (safe, works everywhere), `off` (drop it), or `native` (OpenAI's reasoning item - provider-specific, opt in per model). |
+| `reasoning_replay.models` | — | empty | Per-model override of the mode above. |
+| `reasoning_replay.max_chars` | — | 0 | Cap on replayed reasoning text per turn (`0` = unlimited). |
 
 ## Prompt caching
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `prompt_caching.models` | empty (off) | Upstream models that support prompt caching. |
-| `prompt_caching.cache_key` | (none) | Optional tag to help the upstream group similar prompts. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `prompt_caching.models` | `PROMPT_CACHING_MODELS` | empty (off) | Upstream models that support prompt caching. A comma-separated list. |
+| `prompt_caching.cache_key` | `PROMPT_CACHE_KEY` | (none) | Optional tag to help the upstream group similar prompts. |
 
 ## System messages
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `system_message_placement` | `inline` | `inline` keeps the start of the prompt stable so more is cached. `instructions` is safer for strict upstreams. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `system_message_placement` | `SYSTEM_MESSAGE_PLACEMENT` | `inline` | `inline` keeps the start of the prompt stable so more is cached. `instructions` is safer for strict upstreams. |
 
 ## Documents (PDFs and files Claude attaches)
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `forward_documents` | false | Forward PDFs and base64 file blocks. Text files always go through. |
-| `tool_result_images` | `array` | How images inside tool results are sent: `array`, `lift`, or `drop`. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `forward_documents` | `FORWARD_DOCUMENTS` | false | Forward PDFs and base64 file blocks. Text files always go through. |
+| `tool_result_images` | `TOOL_RESULT_IMAGES` | `array` | How images inside tool results are sent: `array`, `lift`, or `drop`. |
 
 ## Server tools (Claude Code-style tools the proxy runs for the model)
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `server_tools.max_rounds` | 10 | How many rounds one request may run (`0` = no limit). |
-| `server_tools.pause_turn` | false | At the limit, end with no answer (Anthropic style) instead of refusing the next tool call. Leave false for Claude Code. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `server_tools.max_rounds` | `SERVER_TOOLS_MAX_ROUNDS` | 10 | How many rounds one request may run (`0` = no limit). |
+| `server_tools.pause_turn` | `SERVER_TOOLS_PAUSE_TURN` | false | At the limit, end with no answer (Anthropic style) instead of refusing the next tool call. Leave false for Claude Code. |
 
 ## Advisor (optional second opinion)
 
 Off by default. Only enable if you want the model to consult another model mid-task.
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `advisor.enabled` | false | Turn the advisor on. |
-| `advisor.model` | (required if on) | Which model advises (must be cheap - the advisor re-runs conversations). |
-| `advisor.effort` | (none) | Reasoning effort for the advisor only. |
-| `advisor.max_uses` | 2 | Consultations per turn (`0` = no limit). |
-| `advisor.max_tokens` | 4096 | Cap on the advisor's answer. |
-| `advisor.reasoning_max_tokens` | 16384 | Cap on the advisor's thinking. |
-| `advisor.timeout_secs` | 0 | Per-request timeout (`0` = none; bounded by global). |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `advisor.enabled` | `ADVISOR_ENABLED` | false | Turn the advisor on. |
+| `advisor.model` | `ADVISOR_MODEL` | `beam` | Which model advises (must be cheap - the advisor re-runs conversations). |
+| `advisor.effort` | `ADVISOR_EFFORT` | (none) | Reasoning effort for the advisor only. |
+| `advisor.max_uses` | `ADVISOR_MAX_USES` | 2 | Consultations per turn (`0` = no limit). |
+| `advisor.max_tokens` | `ADVISOR_MAX_TOKENS` | 4096 | Cap on the advisor's answer. |
+| `advisor.reasoning_max_tokens` | `ADVISOR_REASONING_MAX_TOKENS` | 16384 | Cap on the advisor's thinking. |
+| `advisor.timeout_secs` | `ADVISOR_TIMEOUT_SECS` | 0 | Per-request timeout (`0` = none; bounded by global). |
 
 ## Web fetch
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `web_fetch.enabled` | false | Let the model fetch web pages. |
-| `web_fetch.timeout_secs` | 20 | Total fetch timeout. |
-| `web_fetch.max_bytes` | null (unlimited) | Max bytes downloaded per fetch. |
-| `web_fetch.max_content_bytes` | null (unlimited) | Max extracted text handed to the model. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `web_fetch.enabled` | `WEB_FETCH_ENABLED` | false | Let the model fetch web pages. |
+| `web_fetch.timeout_secs` | `WEB_FETCH_TIMEOUT_SECS` | 20 | Total fetch timeout. |
+| `web_fetch.max_bytes` | `WEB_FETCH_MAX_BYTES` | null (unlimited) | Max bytes downloaded per fetch. |
+| `web_fetch.max_content_bytes` | `WEB_FETCH_MAX_CONTENT_BYTES` | null (unlimited) | Max extracted text handed to the model. |
 
 ## Web search
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `web_search.enabled` | false | Let the model search the web (DuckDuckGo by default). |
-| `web_search.max_queries` | 3 | Queries per call (max 10). |
-| `web_search.max_results_per_query` | 5 | Pages fetched per query (max 10). |
-| `web_search.compaction_model` | null | Model used to summarise long pages; null truncates instead. |
-| `web_search.compaction_threshold_chars` | 5000 | Page length above which the summary/truncation kicks in. |
-| `web_search.search_timeout_secs` | 15 | Time budget for the search request itself. |
-| `web_search.page_timeout_secs` | 15 | Time budget for fetching one result page. |
-| `web_search.max_page_bytes` | 2097152 | Max bytes read from one result page (2 MB). |
-| `web_search.search_endpoint` | DuckDuckGo HTML | Which search endpoint to use. Rarely needs changing. |
-| `web_search.search_min_interval_ms` | 1500 | Minimum gap between searches (rate limiting). |
-| `web_search.block_wait_minutes` | 10 | How long to tell the model to wait after a CAPTCHA. |
-| `web_search.state_dir` | `proxy-state` | Where cookies and caches are stored. |
-| `web_search.cache_ttl_secs` | 600 | Cache lifetime. |
-| `web_search.cache_max_entries` | 128 | Cache size. |
-| `web_search.session_ttl_hours` | 168 | Cookie session lifetime (~1 week). |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `web_search.enabled` | `WEB_SEARCH_ENABLED` | false | Let the model search the web (DuckDuckGo by default). |
+| `web_search.max_queries` | `WEB_SEARCH_MAX_QUERIES` | 3 | Queries per call (max 10). |
+| `web_search.max_results_per_query` | `WEB_SEARCH_MAX_RESULTS_PER_QUERY` | 5 | Pages fetched per query (max 10). |
+| `web_search.compaction_model` | `WEB_SEARCH_COMPACTION_MODEL` | null | Model used to summarise long pages; null truncates instead. |
+| `web_search.compaction_threshold_chars` | `WEB_SEARCH_COMPACTION_THRESHOLD_CHARS` | 5000 | Page length above which the summary/truncation kicks in. |
+| `web_search.search_timeout_secs` | `WEB_SEARCH_SEARCH_TIMEOUT_SECS` | 15 | Time budget for the search request itself. |
+| `web_search.page_timeout_secs` | `WEB_SEARCH_PAGE_TIMEOUT_SECS` | 15 | Time budget for fetching one result page. |
+| `web_search.max_page_bytes` | `WEB_SEARCH_MAX_PAGE_BYTES` | 2097152 | Max bytes read from one result page (2 MB). |
+| `web_search.search_endpoint` | `WEB_SEARCH_ENDPOINT` | DuckDuckGo HTML | Which search endpoint to use. Rarely needs changing. |
+| `web_search.search_min_interval_ms` | `WEB_SEARCH_SEARCH_MIN_INTERVAL_MS` | 1500 | Minimum gap between searches (rate limiting). |
+| `web_search.block_wait_minutes` | `WEB_SEARCH_BLOCK_WAIT_MINUTES` | 10 | How long to tell the model to wait after a CAPTCHA. |
+| `web_search.state_dir` | `WEB_SEARCH_STATE_DIR` | `proxy-state` | Where cookies and caches are stored. |
+| `web_search.cache_ttl_secs` | `WEB_SEARCH_CACHE_TTL_SECS` | 600 | Cache lifetime. |
+| `web_search.cache_max_entries` | `WEB_SEARCH_CACHE_MAX_ENTRIES` | 128 | Cache size. |
+| `web_search.session_ttl_hours` | `WEB_SEARCH_SESSION_TTL_HOURS` | 168 | Cookie session lifetime (~1 week). |
 
 ## Logging
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `log_to_disk` | false | Write a log file to disk. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `log_to_disk` | `LOG_TO_DISK` | false | Write a log file to disk. |
 
 ## Model picker
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `prefix_models_for_discovery` | false | Prefix every model ID the proxy lists with `claude-`, so Claude Code's `/model` picker discovers non-Claude model names. The proxy strips the prefix back off. |
+| Option | Env var | Default | What it does |
+| --- | --- | --- | --- |
+| `prefix_models_for_discovery` | `PREFIX_MODELS_FOR_DISCOVERY` | false | Prefix every model ID the proxy lists with `claude-`, so Claude Code's `/model` picker discovers non-Claude model names. The proxy strips the prefix back off. |
 
 ## Claude Code settings (`~/.claude/settings.json`)
 
@@ -237,4 +247,4 @@ Claude Code keeps hitting Anthropic instead of the proxy.
 - `0` means no limit for the limit-style options - but leaving the key out keeps the default, which is not "no limit".
 - Unknown or misspelled fields are rejected at startup, so typos fail fast.
 - Leaving a key out keeps its default, so you only need to set what you change.
-
+- `proxy.json` field names are lower-case snake_case. Pasting an env var name such as `UPSTREAM_BASE_URL` as a JSON key makes the proxy reject the file.
