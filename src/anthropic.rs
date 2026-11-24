@@ -21,12 +21,19 @@
 //! upstream as text, PDFs as `input_file` only when `forward_documents` is on,
 //! otherwise as a short note.
 //!
-//! Out of scope (will produce a `serde` deserialization error if Claude
-//! sends them): extended thinking budget enforcement, prompt caching,
-//! server tools, container reuse, service tier. Note that
-//! `output_config.effort` and `thinking.type = "disabled"` **are** parsed
-//! (see [`OutputConfig`] / [`ThinkingConfig`]); they drive the upstream
-//! reasoning-effort selection rather than being rejected.
+//! Request fields this module does not declare (`container`,
+//! `context_management`, `mcp_servers`, `service_tier`, `speed`, ...) are
+//! **silently ignored**: [`CreateMessageRequest`] has no
+//! `deny_unknown_fields`, so they neither fail the request nor are
+//! forwarded. Fields that are declared but not acted on (`top_k`,
+//! `thinking.budget_tokens`, `stop_sequences`) are parsed and then dropped
+//! in translation. See `REFERENCE.md` for the full out-of-scope list.
+//!
+//! Prompt caching and the `web_search` / `web_fetch` / `advisor` server tools
+//! **are** handled (see `translate.rs` and `tools/`). So are
+//! `output_config.effort` and `thinking.type = "disabled"` (see
+//! [`OutputConfig`] / [`ThinkingConfig`]); they drive the upstream
+//! reasoning-effort selection.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

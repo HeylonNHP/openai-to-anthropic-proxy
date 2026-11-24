@@ -341,7 +341,7 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 
 ### Server-side / built-in tools
 - Server-side tools beyond OpenAI's `web_search` and the proxy's own `web_search`, `web_fetch` and `advisor` (no `code_execution`, `tool_search`, etc.)
-- Server-tool continuation loops (`pause_turn` re-sends, mixed server/client turns)
+- Proxy-driven resumption of a paused server-tool turn. The proxy can end a turn with `stop_reason: "pause_turn"` (opt-in via `server_tools.pause_turn`, see [Server tools together](#server-tools-together-the-shared-loop)) and accepts the client's resend, but it never re-sends the conversation itself: resuming is the client's job, and Claude Code does not do it
 - Claude Code's standby advisor path (only an explicitly configured `advisorModel` works behind a proxy)
 
 ### Request parameters and caching
