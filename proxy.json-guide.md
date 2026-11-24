@@ -2,6 +2,8 @@
 
 This is the human-readable walkthrough for the on-disk config file. The checked-in template is `proxy.json.example`; copy it to `proxy.json` and edit the values for your setup. The real `proxy.json` stays local so it can hold secrets and provider-specific settings.
 
+This file explains **what each setting means and what goes wrong at the edges** — invalid values, precedence, and per-tool semantics. For the flat list of every option with its environment variable and default, see [`CONFIGURATION.md`](./CONFIGURATION.md); for the architecture behind the translation, see [`REFERENCE.md`](./REFERENCE.md).
+
 ## The short version
 
 Config is resolved in this order:
@@ -98,6 +100,14 @@ By default the proxy **drops** every `tracing` event — nothing reaches the ter
   "log_to_disk": true
 }
 ```
+
+`RUST_LOG` chooses **which** events are recorded. It is the standard `tracing-subscriber` filter variable, and the proxy reads it at startup:
+
+- Unset, the filter is `info,openai_to_anthropic_proxy=debug` — the proxy's own events at debug, everything else at info.
+- Set it to raise or lower the level, or to target one module: `RUST_LOG=debug`, `RUST_LOG=openai_to_anthropic_proxy=trace`, `RUST_LOG=warn`.
+- **`RUST_LOG` alone shows you nothing.** It picks the events; `log_to_disk` decides whether they are written anywhere. With `log_to_disk` off, the events go to a sink and are discarded whatever the filter says. To see anything you need **both**: `LOG_TO_DISK=1` and `RUST_LOG=...`, then read `target/logs/proxy.log`.
+
+These two are the only logging knobs the proxy has. There is **no** way to dump a request or response body. The log records an INFO summary per request (inbound and upstream model, stream flag, tool count, thinking and effort settings), the raw upstream **response** body at DEBUG wherever the response is buffered rather than streamed (a non-streaming `/v1/messages`, an advisor consult, a `web_search` compaction), and the upstream error body at WARN. For the request side, add a temporary `tracing::debug!` around `send_upstream_once` in `src/proxy.rs`, or put a logging proxy between the proxy and the upstream.
 
 ### Reasoning
 
@@ -593,6 +603,38 @@ In the redacted example:
 - `claude-opus-4-8` → `gpt-5.6-luna`
 - `claude-sonnet-5` → `gpt-5.4-mini`
 - `claude-haiku-4-5` → `gpt-5.4-nano`
+
+### Model discovery (`prefix_models_for_discovery`)
+
+Claude Code's `/model` picker only lists model ids that begin with `claude` or
+`anthropic`, so an upstream whose models are called `gpt-5.6-luna` or
+`glm-5.3-flash` shows nothing to pick from. This flag makes the proxy present
+those models under a `claude-` name, and strip the prefix again when a request
+comes back in.
+
+- **Off by default.** Set `prefix_models_for_discovery: true` in `proxy.json`,
+  or `PREFIX_MODELS_FOR_DISCOVERY=1` in the env (`1` / `true` / `yes` / `on`),
+  to turn it on.
+- **On the way out** (`GET /v1/models`): every upstream model id that does not
+  already start with `claude` or `anthropic` is listed with a `claude-` prefix
+  in front of it. The `display_name` keeps the upstream's own name, so the
+  picker shows the real model behind the alias.
+- **On the way back in**: when the client asks for a `claude-`- or
+  `anthropic-`-prefixed model that is **not** in `model_aliases.map`, the proxy
+  strips the prefix and sends the remainder upstream — `claude-gpt-5.6-luna`
+  goes to the upstream as `gpt-5.6-luna`. A name that **is** in the alias map
+  is resolved through the map instead, so the alias wins and the prefix is
+  left alone.
+- This only works with gateway model discovery switched on in Claude Code
+  too: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` in your
+  `~/.claude/settings.json` (see [CONFIGURATION.md](./CONFIGURATION.md)).
+- The alias map is still the better tool when you want specific inbound names.
+  This flag is for "show me everything the upstream has, under names Claude
+  Code will accept".
+- **Watch out for the context window.** Claude Code estimates when to
+  auto-compact from the model name, so a prefixed name it has never seen falls
+  back to 200K. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` if your upstream supports
+  a larger window (see [REFERENCE.md](./REFERENCE.md#context-window-workaround)).
 
 ### Switching providers
 
