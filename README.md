@@ -223,7 +223,7 @@ Limits, caveats and every knob:
 
 | Document | What is in it |
 |---|---|
-| [`REFERENCE.md`](./REFERENCE.md) | Architecture, the full configuration reference, translation overview, out-of-scope list |
+| [`REFERENCE.md`](./REFERENCE.md) | Architecture, translation overview, out-of-scope list |
 | [`CONFIGURATION.md`](./CONFIGURATION.md) | Every `proxy.json` option with its environment variable, plus the Claude Code settings that point at the proxy |
 | [`proxy.json.example`](./proxy.json.example) | A filled-in example config |
 | [`src/tools/web_search/README.md`](./src/tools/web_search/README.md) | How the proxy-native search works, and its limits |

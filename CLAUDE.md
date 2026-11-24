@@ -16,7 +16,7 @@ Read [`README.md`](./README.md) for what it does and how to run it;
 ```bash
 cargo fmt --all -- --check   # must be clean
 cargo clippy --all-targets    # must be warning-free
-cargo test                    # unit + e2e (1002 tests as of this writing)
+cargo test                    # unit + e2e
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these three on every push and pull
@@ -94,8 +94,9 @@ output. Log with `tracing` instead.
 | File | Holds |
 |---|---|
 | `README.md` | Visitor-facing: what it is, how to run it, feature list |
-| `REFERENCE.md` | Architecture, translation overview, config reference, out-of-scope list |
-| `proxy.json-guide.md` | Every `proxy.json` key, explained |
+| `REFERENCE.md` | Architecture, translation overview, out-of-scope list |
+| `CONFIGURATION.md` | Every `proxy.json` option with its environment variable, plus the Claude Code settings that point at the proxy |
+| `proxy.json-guide.md` | The deep dives: edge cases, invalid-value handling, per-tool semantics |
 | `proxy.json.example` | A filled-in example config (keep it in sync with the guide) |
 | `src/tools/server_loop/README.md` | The shared server-tool loop |
 | `src/tools/web_search/README.md` | The proxy-native web search |
@@ -124,8 +125,9 @@ Change the file that owns the topic; don't spread one fact across several.
 
 ## Working on this repo
 
-- `dev` and `master` currently point at the same commit; `dev` is where new
-  work lands, `master` is the stable line.
+- `dev` is where new work lands, `master` is the stable line. `master` is
+  merged from `dev` periodically; the two drift apart in between, so never
+  assume they hold the same commit.
 - Commit messages: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`, `perf:` —
   lowercase, imperative, one line of summary.
 - Don't commit `proxy.json` or any other `proxy*.json` — they are gitignored
