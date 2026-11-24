@@ -229,7 +229,7 @@ fn iteration_types_are_distinct_and_billing_fields_match() {
 
 #[test]
 fn blocks_serialize_verbatim_through_the_raw_extension_point() {
-    // §11.6: the module's Values travel through the shared enums with
+    // The module's Values travel through the shared enums with
     // no per-feature variants and no byte changes.
     use crate::anthropic::{ContentBlockKind, ResponseContentBlock};
     let id = new_id();

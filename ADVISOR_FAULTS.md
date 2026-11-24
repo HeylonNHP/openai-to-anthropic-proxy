@@ -1,9 +1,14 @@
-# Advisor faults still to fix
+# Advisor faults — closed record
 
 Findings from reading the Raspberry Pi proxy log for 2026-11-19 against the code.
 The advisor (`beam`, a reasoning model) kept returning "Advisor unavailable" in
-Claude Code. Faults #1 to #5 are fixed; this file records the three that remain
-(#6 to #8; the #5 entry is kept as the original analysis), with enough detail to pick them up cold on another machine.
+Claude Code.
+
+**All eight faults are fixed in this repository.** The analysis below is kept
+as the record of what went wrong and why each fix looks the way it does; there
+is nothing left to implement here. What is still outstanding is *deployment*
+work on the Pi, not code — that is listed in [Still open](#still-open) at the
+end of this file.
 
 Line numbers drift, so code is referred to by function and constant name.
 The log lines quoted here are the evidence; the log itself is not in the repo.
@@ -17,11 +22,12 @@ The log lines quoted here are the evidence; the log itself is not in the repo.
 | 3 | Advisor acts as the executor and calls a tool instead of answering | Fixed, `b45d3f5` |
 | 4 | Failed consults burn `max_uses`; no retry | Fixed, `1831a89` |
 | 5 | Executor and UI only ever see a generic "unavailable" | Fixed (commit "report why an advisor consultation failed") |
-| 6 | Retired `default_model` makes unmapped model names fail completely | Code fixed (commit "name default_model when the fallback is itself unavailable"); **config change on the Pi still needed** |
+| 6 | Retired `default_model` makes unmapped model names fail completely | Code fixed (commit "name default_model when the fallback is itself unavailable"); the remaining piece is a `proxy.json` change on the Pi — see [Still open](#still-open) |
 | 7 | Only the first failure per turn is logged | Fixed (commit "log every failed advisor consultation") |
 | 8 | 45 s timeout vs. huge prompts; transcript re-sent uncached on every consult | Fixed: timeout removed (`7dbf6ce`), prompt caching added (commit "let the advisor's prompt be cached") |
 
-Ranked most severe and likely first. Fix them in order.
+The faults are listed roughly most-severe-first; the order is the one they were
+found in.
 
 A correction to an earlier note: the "85" `advisor result carries no plaintext
 advice` lines in the log are the proxy re-reading old error blocks from the
@@ -67,8 +73,7 @@ maximum context length: 1048576`.
    `NoAdvice` (no text, or a tool call), `Other`.
 2. Map the kind to the matching `protocol::ERROR_CODE_*` for the client block
    instead of always `unavailable`. Check `protocol.rs` first for what each code
-   is allowed to look like, and `ADVISOR_TOOL_RESEARCH.md` (the error-code
-   section) for how Claude Code renders them. The comments around
+   is allowed to look like. The comments around
    `scrub_error_body` and the "latching" note explain why advisor error text must
    not leak tokens like `advisor_20260301` to the client.
 3. Put a short, honest reason in the text given to the executor (for example
@@ -86,7 +91,7 @@ the executor text without `scrub_error_body`.
 
 ## #6. A retired `default_model` makes unmapped model names fail completely (CODE FIXED, CONFIG STILL OPEN)
 
-> Code: when the `default_model` fallback is itself refused (a 400/404 model rejection or a 410 retirement), the client error now says the proxy's `default_model` is unavailable and to update it, followed by the upstream's reason. The request still fails, so the Pi's `proxy.json` still needs a live `default_model` and the missing `claude-sonnet-5`/`sonnet-5` aliases (step 1 below).
+> Code: when the `default_model` fallback is itself refused (a 400/404 model rejection or a 410 retirement), the client error now says the proxy's `default_model` is unavailable and to update it, followed by the upstream's reason. The request still fails, so the Pi's `proxy.json` still needs a live `default_model` and the missing `claude-sonnet-5`/`sonnet-5` aliases — see [Still open](#still-open).
 
 **Plain English.** Your `default_model` points at `deepseek-v4-flash:0731`, which
 the upstream retired on 25 September 2026. When a client asks for a model name
@@ -206,23 +211,37 @@ time) rather than recomputing it.
 
 ---
 
-## Things to know before starting
+## Still open
 
-- **Rebuild on the Pi.** The Pi runs its own build, so none of the fixes so far
-  take effect there until it is rebuilt and redeployed.
-- **Built-in limits introduced so far** (constants in `src/tools/advisor/tool.rs`,
-  documented in `proxy.json-guide.md`): `MAX_TRANSCRIPT_CHARS` (1,200,000),
-  `RESULT_CAPS` (16,000 / 4,000 / 1,000), `ANY_STRING_CAP` (20,000),
-  `CHARS_PER_TOKEN` (4), `RETRY_DELAY` (250 ms), `MAX_FAILED_CONSULTATIONS` (2).
-  New config keys: `advisor.reasoning_max_tokens` (default 16384, env
+These are deployment actions on the Raspberry Pi that runs the proxy. None of
+them needs a code change here.
+
+1. **Give the Pi's `proxy.json` a live `default_model` and the missing
+   aliases.** Fault #6's code fix reports the problem clearly, but the request
+   still fails until the config names a model the upstream still serves. Set
+   `model_aliases.default_model` to a live model (the upstream suggested
+   `glm-5.3-flash:cloud` at the time of the log) and add the inbound names
+   that were missing from `model_aliases.map` — `claude-sonnet-5` and
+   `sonnet-5` — plus any other `claude-*` name the log shows arriving
+   unmapped.
+2. **Rebuild and redeploy.** The Pi runs its own build, so none of the fixes
+   above take effect there until it is rebuilt and redeployed.
+3. **Verify against the real model.** Every fix is covered by unit and
+   end-to-end tests against a scripted fake upstream; none has been run
+   against `beam`. After deploying, watch the log for `advisor transcript
+   trimmed`, `advisor consultation failed; retrying once` (debug level) and any
+   remaining `advisor consultation failed` warnings.
+
+## Reference
+
+- **Built-in limits** (constants in `src/tools/advisor/tool.rs`, documented in
+  `proxy.json-guide.md`): `MAX_TRANSCRIPT_CHARS` (1,200,000), `RESULT_CAPS`
+  (16,000 / 4,000 / 1,000), `ANY_STRING_CAP` (20,000), `CHARS_PER_TOKEN` (4),
+  `RETRY_DELAY` (250 ms), `MAX_FAILED_CONSULTATIONS` (2). New config keys:
+  `advisor.reasoning_max_tokens` (default 16384, env
   `ADVISOR_REASONING_MAX_TOKENS`); `advisor.max_tokens` default is now 4096.
-- **Known gap from an earlier task, unrelated to the advisor:** a binary file
+- **A known gap from an earlier task, unrelated to the advisor:** a binary file
   served as `application/octet-stream` is still downloaded in full before the
-  binary check when `web_fetch.max_bytes` is unset.
-- **Not yet verified against the real model.** All fixes are covered by unit and
-  end-to-end tests with a scripted fake upstream; none has been run against `beam`.
-  After deploying, watch the log for `advisor transcript trimmed`,
-  `advisor consultation failed; retrying once` (debug level) and any remaining
-  `advisor consultation failed` warnings.
-- Run `cargo test` and `cargo clippy --all-targets` before each commit. The one
-  existing clippy warning at `tests/proxy_e2e.rs:81` is old and unrelated.
+  binary check when `web_fetch.max_bytes` is unset. It is tracked as open
+  work in [`REFERENCE.md`](./REFERENCE.md#open).
+- Run `cargo test` and `cargo clippy --all-targets` before each commit.

@@ -1,5 +1,4 @@
-//! Advisor feature — detection-triggered second opinion (§§3, 11, 17 of
-//! `ADVISOR_TOOL_RESEARCH.md`).
+//! Advisor feature — detection-triggered second opinion.
 //!
 //! Anthropic's advisor is a *server-side* tool: Claude Code declares it, the
 //! executor model calls it like any other function tool, and the server runs
@@ -21,7 +20,7 @@
 //! `function_call{name:"advisor"}`, bounded by `AdvisorConfig::max_uses`
 //! (unless `max_uses` is `0` = "no limit", which removes the bound
 //! entirely — the proxy only WARNs about that, it does not cap it).
-//! The executor's request is built with `stream: false` (§11.3), which is how a
+//! The executor's request is built with `stream: false`, which is how a
 //! buffered client's whole chain runs. For a streaming client the shared loop
 //! turns streaming back on per run and forwards each run as it is generated
 //! (`crate::tools::server_loop::{live, stream}`, with the event builders in
@@ -34,7 +33,7 @@
 //! with `error_code: "unavailable"` (or `max_uses_exceeded`). The advisor's
 //! own POST bypasses `Attempt::send_success` entirely, so it can never burn
 //! the executor's `default_model` fallback or turn the second opinion into a
-//! self-review (§11.4). At most one TUI warning is emitted per turn.
+//! self-review. At most one TUI warning is emitted per turn.
 //!
 //! ## One assistant message
 //!
@@ -67,7 +66,7 @@ const ADVISOR_TOOL_NAME: &str = "advisor";
 
 /// Tokens that must NEVER reach the client in an error body on the advisor
 /// path: Claude Code reads them as "the server does not know the advisor
-/// tool" and latches the feature off for the whole process (§18.4). Applied
+/// tool" and latches the feature off for the whole process. Applied
 /// to every `AppError` body leaving `Attempt::run` on an advisor-active turn.
 const FORBIDDEN_ERROR_TOKENS: [&str; 3] =
     ["advisor_20260301", "advisor-tool-2026-03-01", "Input tag"];
@@ -170,7 +169,7 @@ pub fn prepare(
         }));
     }
 
-    // §11.3: the default for the chain is buffered (a buffered client gets the
+    // The default for the chain is buffered (a buffered client gets the
     // whole turn at once). A streaming client's loop sets `stream` per run
     // (`server_loop::run::drive`), because `prepare` runs again on a
     // `default_model` fallback and would otherwise reset it.

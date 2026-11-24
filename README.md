@@ -228,7 +228,7 @@ Limits, caveats and every knob:
 | [`proxy.json.example`](./proxy.json.example) | A filled-in example config |
 | [`src/tools/web_search/README.md`](./src/tools/web_search/README.md) | How the proxy-native search works, and its limits |
 | [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md) | The shared server-tool loop |
-| [`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md) | The advisor faults still open |
+| [`ADVISOR_FAULTS.md`](./ADVISOR_FAULTS.md) | The advisor fault record (all fixed) and the Pi deployment steps that remain |
 
 ## Development
 

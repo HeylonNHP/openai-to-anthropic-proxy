@@ -3,7 +3,7 @@
 //! Every function here returns a [`serde_json::Value`] (or a [`String`] id)
 //! and performs no I/O. The blocks are carried through the shared wire types
 //! as [`crate::anthropic::ResponseContentBlock::Raw`], so no per-feature enum
-//! variant is needed. See `ADVISOR_TOOL_RESEARCH.md` §§3.3, 3.5, 11.5, 11.6.
+//! variant is needed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::responses::ResponsesUsage;
 
-/// The six error codes Claude Code's renderer knows (§3.3). Emitting an
+/// The six error codes Claude Code's renderer knows. Emitting an
 /// unknown one renders "Advisor unavailable (unknown)".
 pub const ERROR_CODE_MAX_USES_EXCEEDED: &str = "max_uses_exceeded";
 pub const ERROR_CODE_TOO_MANY_REQUESTS: &str = "too_many_requests";
@@ -23,7 +23,7 @@ pub const ERROR_CODE_EXECUTION_TIME_EXCEEDED: &str = "execution_time_exceeded";
 ///
 /// Every advisor failure degrades to this so the client never sees a 400
 /// naming the advisor tool/beta (which would latch the feature off for the
-/// whole Claude Code process, §11.5).
+/// whole Claude Code process.
 pub const ERROR_CODE_UNAVAILABLE: &str = "unavailable";
 /// Listed in Anthropic's SDK but **not** recognised by Claude Code. Kept as
 /// a constant only so a future version can avoid inventing a string; it
@@ -78,7 +78,7 @@ pub fn advisor_result(id: &str, text: &str) -> Value {
 #[must_use]
 pub fn error_result(id: &str, error_code: &str) -> Value {
     // An unknown code renders "Advisor unavailable (unknown)" in Claude
-    // Code (§3.3). Keeping the client-known list referenced here also
+    // Code. Keeping the client-known list referenced here also
     // catches a future code accidentally added to the SDK-only list.
     debug_assert!(
         ADVISOR_ERROR_CODES.contains(&error_code),
@@ -150,7 +150,7 @@ fn token_counts(usage: &ResponsesUsage) -> (u32, u32, u32, u32) {
 /// An `advisor_message` entry for `usage.iterations[]`.
 ///
 /// Advisor tokens are billed at the advisor model's rate and must NOT be folded
-/// into the top-level totals (§3.5). `cache_creation` is the explicit `null` Claude
+/// into the top-level totals. `cache_creation` is the explicit `null` Claude
 /// Code sees on the wire for an advisor iteration.
 #[must_use]
 pub fn advisor_iteration(model: &str, usage: &ResponsesUsage) -> Value {

@@ -140,6 +140,7 @@ Change the file that owns the topic; don't spread one fact across several.
 
 ## Open work
 
-[`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md) records the
-advisor faults still to fix, with enough detail to pick them up cold. Fix them
-in the order listed and update the table as you go.
+[`ADVISOR_FAULTS.md`](./ADVISOR_FAULTS.md) is the closed record of the advisor
+faults — all eight are fixed; what it still lists is deployment work on the
+Pi. Self-contained code work is tracked in
+[`REFERENCE.md`](./REFERENCE.md#open).

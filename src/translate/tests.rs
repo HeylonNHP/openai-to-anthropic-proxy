@@ -421,7 +421,7 @@ fn assistant_output_text(item: &InputItem) -> &str {
 }
 
 /// Translate a request whose assistant turn carries echoed advisor
-/// blocks, mirroring §11.5's exact wire shape.
+/// blocks, mirroring the advisor's exact wire shape.
 fn request_with_advisor_echo(result_content: Value) -> CreateMessageRequest {
     let mut req = fixture_request();
     req.messages = vec![
@@ -447,7 +447,7 @@ fn request_with_advisor_echo(result_content: Value) -> CreateMessageRequest {
                     content: result_content,
                     extra: Default::default(),
                 }),
-                // §11.5 allows executor text AFTER the pair; the advice
+                // The executor may send text AFTER the pair; the advice
                 // must stay in wire order inside the same output_text.
                 ContentBlockParam::Text(TextBlockParam {
                     text: "Here's the implementation.".into(),

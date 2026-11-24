@@ -162,7 +162,7 @@ impl AppError {
     /// tokens scrubbed out. Called on the advisor-active path before an
     /// `AppError` is returned to the client: a 400 mentioning
     /// `advisor_20260301` / `advisor-tool-2026-03-01` / `Input tag` latches
-    /// the feature off in Claude Code for the whole process (§18.4).
+    /// the feature off in Claude Code for the whole process.
     /// Only the client-visible bodies are touched; log messages keep their
     /// original text.
     pub(crate) fn scrub_advisor_error(err: Self) -> Self {

@@ -536,9 +536,8 @@ fn advisor_is_off_by_default_with_cheap_model() {
 
 #[test]
 fn advisor_json_section_parses_and_resolves() {
-    // The exact shape from §17.2 must parse despite JsonConfig's
-    // deny_unknown_fields, and every value must reach the resolved
-    // config.
+    // The exact shape must parse despite JsonConfig's deny_unknown_fields,
+    // and every value must reach the resolved config.
     let raw = r#"{
             "upstream_base_url": "https://api.example.com",
             "upstream_api_key":  "k",
@@ -1159,7 +1158,7 @@ fn advisor_explicit_section_survives_a_save_round_trip() {
 #[test]
 fn the_raw_json_limits_survive_the_tui_save_round_trip() {
     // The TUI rewrites `proxy.json` wholesale from the parsed
-    // `JsonConfig` (§17.2). The RAW JSON numbers must not change that
+    // `JsonConfig`. The RAW JSON numbers must not change that
     // round-trip: an in-range value is written back unchanged, and an
     // out-of-range value — which the resolver falls back on — is
     // PRESERVED verbatim instead of being silently rewritten, so the

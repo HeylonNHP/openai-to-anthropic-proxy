@@ -49,9 +49,8 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_REASONING_EFFORT: &str = "none";
 /// Cheap advisor model used when `advisor.model` is unset. `beam` is
 /// deliberately the default: it is the cheapest sensible upstream in the
-/// catalogue (§7 of `ADVISOR_TOOL_RESEARCH.md`), and an advisor consult
-/// re-runs the executor, so a wrong default multiplies cost. Never default
-/// to a kimi model.
+/// catalogue, and an advisor consult re-runs the executor, so a wrong default
+/// multiplies cost. Never default to a kimi model.
 const DEFAULT_ADVISOR_MODEL: &str = "beam";
 const DEFAULT_ADVISOR_MAX_USES: u32 = 2;
 /// Cap on the advisor's ANSWER (not its reasoning; see
@@ -2290,7 +2289,7 @@ pub struct JsonServerToolsConfig {
 /// number in range → that bound, and anything else (negative,
 /// fractional, too large) → the shipped default WITH a warning. The
 /// serialized shape is unchanged for every value, so the TUI's rewrite of
-/// `proxy.json` (§17.2) and its rollback guarantee are unaffected: an
+/// `proxy.json` and its rollback guarantee are unaffected: an
 /// invalid value is written back VERBATIM, so the operator can still see
 /// (and fix) their typo.
 ///

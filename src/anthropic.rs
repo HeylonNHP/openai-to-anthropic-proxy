@@ -172,7 +172,7 @@ pub enum ContentBlockParam {
     /// `data` is an opaque Anthropic-encrypted blob with no readable text.
     RedactedThinking(RedactedThinkingBlockParam),
     /// Claude Code echoes the advisor's `server_tool_use` block verbatim on
-    /// the next request (§11.5). It used to land in `Unknown` and be dropped,
+    /// the next request. It used to land in `Unknown` and be dropped,
     /// taking the paired advice with it. Parse it explicitly so the pair can
     /// be replayed as prior context instead of as an orphan `function_call`.
     ServerToolUse(ServerToolUseBlockParam),
@@ -598,8 +598,7 @@ pub enum ResponseContentBlock {
     /// natively (e.g. advisor `server_tool_use` / `advisor_tool_result`).
     /// `untagged` on an internally-tagged `Serialize` enum emits the
     /// `Value` verbatim, including its own `type` field — so a future
-    /// Anthropic block needs no new variant here. See §11.6 of
-    /// `ADVISOR_TOOL_RESEARCH.md`.
+    /// Anthropic block needs no new variant here.
     #[serde(untagged)]
     Raw(Value),
 }
@@ -784,8 +783,8 @@ pub enum ContentBlockKind {
         block: WebSearchToolResultBlock,
     },
     /// Generic escape hatch for content-block shells the proxy does not
-    /// model natively. See [`ResponseContentBlock::Raw`] and §11.6 of
-    /// `ADVISOR_TOOL_RESEARCH.md`; `untagged` emits the `Value` verbatim.
+    /// model natively. See [`ResponseContentBlock::Raw`]; `untagged` emits
+    /// the `Value` verbatim.
     #[serde(untagged)]
     Raw(Value),
 }

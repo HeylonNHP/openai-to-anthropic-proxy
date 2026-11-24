@@ -182,7 +182,7 @@ fn thinking_block_tolerates_missing_fields() {
     }
 }
 
-// ── Generic wire extension points (§11.6) ────────────────────────
+// ── Generic wire extension points ─────────────────────────────
 
 #[test]
 fn raw_response_content_block_serializes_verbatim() {
@@ -262,7 +262,7 @@ fn usage_iterations_some_is_forwarded_as_an_array() {
     assert_eq!(value["iterations"], serde_json::Value::Array(iterations));
 }
 
-// ── Advisor echo blocks (§11.5) ────────────────────────────────────────
+// ── Advisor echo blocks ─────────────────────────────────────────
 //
 // Claude Code echoes `server_tool_use` + `advisor_tool_result` verbatim
 // on the next turn. They used to land in `Unknown` and be dropped, so the

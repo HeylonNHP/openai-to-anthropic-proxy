@@ -3,8 +3,7 @@
 //! The loop around it (running the executor, finding calls, injecting
 //! outputs, assembling the response) is the shared
 //! [`server_loop`](crate::tools::server_loop); this module is only what is
-//! specific to consulting the advisor model (§§11.3, 11.4, 11.5, 15, 17.1 of
-//! `ADVISOR_TOOL_RESEARCH.md`).
+//! specific to consulting the advisor model.
 //!
 //! ## The executor and the advisor are deliberately asymmetric
 //!
@@ -12,9 +11,9 @@
 //! use `default_model` fallback). Advisor responses go through a plain
 //! `send_upstream_once` with an explicit per-request timeout: **no**
 //! `detect_model_rejection`, **no** `mappings_snapshot.default_model()`, no
-//! capability learning, no corrective retry. §11.4 spells out why applying
-//! the executor's fallback to the advisor would turn a second opinion into
-//! a self-review and corrupt stats attribution.
+//! capability learning, no corrective retry. Applying the executor's
+//! fallback to the advisor would turn a second opinion into a self-review
+//! and corrupt stats attribution.
 //!
 //! ## Fail closed
 //!
@@ -39,7 +38,7 @@
 //! [`on_rerun_failure`](ServerTool::on_rerun_failure) appends an
 //! `unavailable` pair. No `AppError` from a re-run can reach the client: a
 //! 400 naming the advisor beta/tool would latch the feature off in Claude
-//! Code for the whole process (§18.4), so [`scrub_error`](ServerTool::scrub_error)
+//! Code for the whole process, so [`scrub_error`](ServerTool::scrub_error)
 //! also cleans the first one.
 
 // `tools` is a private module, so these crate-visible items look redundant to
@@ -92,7 +91,7 @@ const MAX_FAILED_CONSULTATIONS: usize = 2;
 /// Clamp the advisor's own per-request timeout to the operator's global
 /// `request_timeout`. reqwest's per-request `.timeout()` OVERRIDES the
 /// client-level one, so a large `advisor.timeout_secs` must not be allowed
-/// to EXTEND the operator's bound (§11.4).
+/// to EXTEND the operator's bound.
 ///
 /// `None` = **no per-request override** ("no limit"): the global
 /// `request_timeout` — the timeout the reqwest client itself was built
@@ -179,7 +178,7 @@ do not repeat the question. Reply with the advice as plain text only.";
 
 /// Build the separate, tool-free advisor request. `model` is the explicit
 /// UPSTREAM name from `proxy.json` — alias resolution is intentionally
-/// bypassed (§11.4).
+/// bypassed.
 fn advisor_request(cfg: &AdvisorConfig, transcript: &str) -> ResponsesRequest {
     ResponsesRequest {
         model: cfg.model.clone(),
@@ -964,7 +963,7 @@ impl AdvisorTool {
 
         // Server-side advice injection: emitting the Anthropic block alone is
         // NOT enough. The loop injects `advice` into the executor's own
-        // prompt (§3.4).
+        // prompt.
         let mut summary = CallSummary::new(ADVISOR_TOOL_NAME, self.cfg.model.as_str(), outcome);
         if let Some(detail) = detail {
             summary = summary.with_detail(detail);

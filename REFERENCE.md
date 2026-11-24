@@ -372,10 +372,17 @@ This is a planning note for future changes. It is separate from the current
 
 ### Open
 
-Nothing self-contained is queued here. The remaining work is either a
-user-facing feature (see the "out of scope" list above) or bug fixes in the
-`advisor`, whose open faults are tracked in
-[`ADVISOR_REMAINING_FAULTS.md`](./ADVISOR_REMAINING_FAULTS.md).
+- **A binary `web_fetch` response is downloaded in full before it is
+  recognised.** A body served as `application/octet-stream` (which servers
+  also use for plain text) is classified `Unknown`, so the proxy reads the
+  whole body and only then sniffs for a NUL byte to decide it is binary. With
+  `web_fetch.max_bytes` unset — the default — that means an arbitrarily large
+  file is fetched in full. Fixing it means sniffing the first bytes as they
+  arrive and stopping early, rather than reading the body and then deciding.
+
+Everything else is either a user-facing feature (see the "out of scope" list
+above) or deployment work on the Pi, tracked in
+[`ADVISOR_FAULTS.md`](./ADVISOR_FAULTS.md#still-open).
 
 ### De-prioritise for now
 - TLS termination: better handled by a reverse proxy (Caddy/nginx/Traefik).

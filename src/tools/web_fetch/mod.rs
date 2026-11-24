@@ -93,8 +93,7 @@ pub const WEB_FETCH_TOOL_TYPES: &[&str] = &[
 /// and must NOT activate this pipeline — it would be forwarded upstream
 /// like any other function tool.
 ///
-/// This mirrors the advisor's `has_advisor_tool` exactly (§16.1 of
-/// `ADVISOR_TOOL_RESEARCH.md`).
+/// This mirrors the advisor's `has_advisor_tool` exactly.
 #[must_use]
 pub fn has_server_side_web_fetch(req: &CreateMessageRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
@@ -117,9 +116,8 @@ pub fn active(config: &WebFetchConfig, req: &CreateMessageRequest) -> bool {
 /// request a fetch, and force the outbound request to be buffered.
 ///
 /// The executor must be re-run with the fetched text before the turn can
-/// end, so the whole chain is buffered (§11.3 of
-/// `ADVISOR_TOOL_RESEARCH.md`); a streaming client is sent each round as it
-/// finishes by [`crate::tools::server_loop::stream`].
+/// end, so the whole chain is buffered; a streaming client is sent each
+/// round as it finishes by [`crate::tools::server_loop::stream`].
 ///
 /// Called from `proxy::build_outbound`, which BOTH the first attempt and
 /// the `default_model` fallback re-translation go through — so a fallback

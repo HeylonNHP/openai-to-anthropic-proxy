@@ -1,5 +1,4 @@
-//! Buffered `Message` → synthetic Anthropic SSE events (§11.3 of
-//! `ADVISOR_TOOL_RESEARCH.md`).
+//! Buffered `Message` → synthetic Anthropic SSE events.
 //!
 //! When the advisor is enabled, the proxy will force the *upstream* request
 //! to `stream: false`, run the whole consultation chain through the existing
@@ -71,7 +70,7 @@ pub fn message_to_events(msg: Message) -> Vec<StreamEvent> {
 ///
 /// House convention (`src/stream.rs` `build_message_start`): the start event
 /// carries input tokens but no output tokens yet. `iterations[]` belongs on
-/// the terminal delta only (§11.5), so a client that reads both events cannot
+/// the terminal delta only, so a client that reads both events cannot
 /// double-count advisor tokens.
 #[must_use]
 pub fn start_event(msg: &Message) -> StreamEvent {
@@ -179,7 +178,7 @@ pub fn block_events(index: u32, block: ResponseContentBlock) -> Vec<StreamEvent>
         }
         ResponseContentBlock::Raw(v) => {
             // The tools' own blocks. `untagged` on the target enum emits the
-            // Value verbatim (§11.6), so this is a plain move.
+            // Value verbatim, so this is a plain move.
             events.push(StreamEvent::ContentBlockStart {
                 index,
                 content_block: ContentBlockKind::Raw(v),
