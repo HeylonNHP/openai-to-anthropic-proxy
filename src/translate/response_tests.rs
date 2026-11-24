@@ -337,7 +337,7 @@ fn web_search_tool_choice_translates_to_auto() {
         name: "web_search".into(),
         disable_parallel_tool_use: None,
     };
-    let (mapped, _) = map_tool_choice(&choice);
+    let (mapped, _) = map_tool_choice(&choice, true);
     match mapped {
         ResponsesToolChoice::Simple(s) => assert_eq!(s, "auto"),
         other => panic!("expected Simple(\"auto\"), got {other:?}"),
@@ -353,7 +353,7 @@ fn function_tool_choice_keeps_function_form() {
         name: "get_weather".into(),
         disable_parallel_tool_use: None,
     };
-    let (mapped, _) = map_tool_choice(&choice);
+    let (mapped, _) = map_tool_choice(&choice, false);
     match mapped {
         ResponsesToolChoice::Function { kind, name } => {
             assert_eq!(kind, "function");
@@ -361,6 +361,51 @@ fn function_tool_choice_keeps_function_form() {
         }
         other => panic!("expected Function, got {other:?}"),
     }
+}
+
+#[test]
+fn a_client_web_search_function_tool_can_be_forced() {
+    // The client declared its OWN function tool called `web_search` (it has a
+    // schema), so the upstream gets a function and the choice must name it.
+    let choice = ToolChoice::Tool {
+        name: "web_search".into(),
+        disable_parallel_tool_use: None,
+    };
+    let (mapped, _) = map_tool_choice(&choice, false);
+    match mapped {
+        ResponsesToolChoice::Function { kind, name } => {
+            assert_eq!(kind, "function");
+            assert_eq!(name, "web_search");
+        }
+        other => panic!("expected Function, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_call_to_a_client_web_search_function_is_a_plain_tool_use() {
+    let mut registry = crate::repair::ToolSchemaRegistry::new();
+    registry.insert("web_search".into(), json!({"type": "object"}));
+    let mut resp = fixture_response();
+    resp.output = vec![OutputItem::FunctionCall {
+        id: Some("fc_x".into()),
+        status: Some("completed".into()),
+        call_id: "call_1".into(),
+        name: "web_search".into(),
+        arguments: "{}".into(),
+    }];
+    let out = responses_to_anthropic(&resp, &registry);
+    assert_eq!(out.content.len(), 1, "no synthetic search blocks");
+    assert!(matches!(
+        out.content[0],
+        ResponseContentBlock::ToolUse { .. }
+    ));
+
+    // With no such tool declared, the same call is still read as a search.
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    assert!(matches!(
+        out.content[0],
+        ResponseContentBlock::ServerToolUse { .. }
+    ));
 }
 
 /// Regression: when the upstream emits a `web_search_call` output

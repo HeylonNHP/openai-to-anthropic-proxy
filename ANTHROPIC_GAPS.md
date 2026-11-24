@@ -43,7 +43,7 @@ so the proxy can only approximate it.
   - Severity: medium. Check upstream compatibility, because some
     OpenAI-compatible servers may reject the field.
 
-- [ ] **A4. Match server tools by schema, not name only**
+- [x] **A4. Match server tools by schema, not name only**
   - Where: `src/translate.rs:276` (`web_search`) and `:208-210` (`advisor`)
   - Problem: a custom tool named `web_search` that has an `input_schema` is
     replaced by the built-in search.

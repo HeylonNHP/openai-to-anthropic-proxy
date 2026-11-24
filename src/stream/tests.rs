@@ -1143,6 +1143,27 @@ fn web_search_function_call_emits_blocks_then_tool_use() {
     }
 }
 
+/// A `web_search` the client declared as its own function tool is in the
+/// registry, and a call to it is an ordinary `tool_use`: no `server_tool_use`
+/// block, no search count.
+#[test]
+fn a_client_web_search_function_call_does_not_emit_search_blocks() {
+    let mut registry = crate::repair::ToolSchemaRegistry::new();
+    registry.insert("web_search".into(), serde_json::json!({"type": "object"}));
+    let mut t = StreamTranslator::new(msg_id(), model(), registry);
+    t.feed_event(&created_event());
+
+    let evs = t.feed_event(&function_call_added(0, "call_1", "web_search"));
+    assert_eq!(evs.len(), 1, "only the tool_use start: {evs:?}");
+    assert!(matches!(
+        &evs[0],
+        StreamEvent::ContentBlockStart {
+            content_block: ContentBlockKind::ToolUse { name, .. },
+            ..
+        } if name == "web_search"
+    ));
+}
+
 /// A non-web-search function call (e.g. `get_weather`) must NOT emit
 /// the web search blocks — only the normal `tool_use` block. Pin this
 /// so the name-based detection doesn't over-trigger.

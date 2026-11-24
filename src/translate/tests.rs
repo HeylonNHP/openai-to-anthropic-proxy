@@ -3883,6 +3883,53 @@ fn options_openai_lacks_are_not_sent() {
     assert!(native.get("filters").is_none());
 }
 
+// ── Server tool vs client function tool of the same name ──
+
+fn outbound_tools(
+    tools: serde_json::Value,
+) -> (Vec<ToolDefinition>, crate::repair::ToolSchemaRegistry) {
+    let req: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools,
+    }))
+    .unwrap();
+    let (out, registry) = translate_plain(&req).unwrap();
+    (out.tools.unwrap_or_default(), registry)
+}
+
+#[test]
+fn a_schema_less_web_search_declaration_is_the_native_tool() {
+    let (tools, registry) = outbound_tools(json!([{"name": "web_search"}]));
+    assert!(matches!(tools.as_slice(), [ToolDefinition::WebSearch(_)]));
+    assert!(registry.get("web_search").is_none());
+}
+
+#[test]
+fn a_versioned_web_search_declaration_is_the_native_tool_even_with_a_schema() {
+    let (tools, _) = outbound_tools(json!([{
+        "type": "web_search_20250305", "name": "web_search",
+        "input_schema": {"type": "object", "properties": {}}
+    }]));
+    assert!(matches!(tools.as_slice(), [ToolDefinition::WebSearch(_)]));
+}
+
+#[test]
+fn a_client_function_tool_named_web_search_stays_a_function_tool() {
+    let (tools, registry) = outbound_tools(json!([{
+        "name": "web_search", "description": "Search our wiki",
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
+    }]));
+    match tools.as_slice() {
+        [ToolDefinition::Function(f)] => {
+            assert_eq!(f.name, "web_search");
+            assert_eq!(f.description.as_deref(), Some("Search our wiki"));
+        }
+        other => panic!("expected one function tool, got {other:?}"),
+    }
+    assert!(registry.get("web_search").is_some(), "schema is registered");
+}
+
 // ── Echoed `web_search` results stay in context ──
 
 /// Translate a conversation whose assistant turn carries `assistant_blocks`

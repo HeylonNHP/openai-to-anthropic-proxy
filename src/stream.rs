@@ -647,7 +647,7 @@ impl StreamTranslator {
                 // through to the normal tool_use handling. The matching
                 // `web_search_tool_result` block is emitted later when
                 // annotations are available.
-                if name == "WebSearch" || name == "web_search" {
+                if crate::translate::is_web_search_function_call(name, &self.registry) {
                     self.emit_server_tool_use(events);
                 }
 

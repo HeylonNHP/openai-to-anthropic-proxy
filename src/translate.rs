@@ -272,8 +272,10 @@ pub fn anthropic_to_responses_with(
             .iter()
             .filter_map(|t| {
                 // Anthropic server-side web_search tool → OpenAI native web_search.
-                // Server tools have no input_schema; we detect them by name.
-                if t.name == "web_search" {
+                // Claude Code's declaration has no input_schema (a versioned
+                // `type` marks one too); a client function tool that merely
+                // shares the name has a schema, so it stays a function tool.
+                if t.is_server_tool("web_search", "web_search_") {
                     return Some(ToolDefinition::WebSearch(native_web_search_tool(t)));
                 }
 
@@ -296,8 +298,16 @@ pub fn anthropic_to_responses_with(
         enforce_strict_property_budget(list, STRICT_PROPERTY_BUDGET);
     }
 
+    // `tool_choice` naming `web_search` is downgraded to `auto` only when the
+    // upstream gets the built-in search; a client function tool of that name
+    // is a normal function and can be forced.
+    let native_web_search = req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| t.is_server_tool("web_search", "web_search_"))
+    });
     let (tool_choice, parallel_tool_calls) = req.tool_choice.as_ref().map_or((None, None), |c| {
-        let (tc, disable) = map_tool_choice(c);
+        let (tc, disable) = map_tool_choice(c, native_web_search);
         // Anthropic's `disable_parallel_tool_use: true` means "the
         // model may call at most one tool per turn." On Responses,
         // that's `parallel_tool_calls: false`. We only forward the
@@ -2654,7 +2664,13 @@ pub fn strip_advisor_from_system_items(items: &mut [InputItem]) {
 /// capture the `disable_parallel_tool_use` flag separately so the
 /// caller can set `parallel_tool_calls` on the outbound request.
 /// Returns `(tool_choice, disable_parallel_tool_use)`.
-fn map_tool_choice(choice: &ToolChoice) -> (ResponsesToolChoice, Option<bool>) {
+///
+/// `native_web_search` says whether the outbound tools include the built-in
+/// `web_search` (the client declared the server tool, not a function tool).
+fn map_tool_choice(
+    choice: &ToolChoice,
+    native_web_search: bool,
+) -> (ResponsesToolChoice, Option<bool>) {
     match choice {
         ToolChoice::Auto {
             disable_parallel_tool_use,
@@ -2681,7 +2697,7 @@ fn map_tool_choice(choice: &ToolChoice) -> (ResponsesToolChoice, Option<bool>) {
             // upstream rejects with: Tool choice 'function' not found in
             // 'tools' parameter. For built-in server tools, fall back to
             // `"auto"` so the model can decide when to invoke them.
-            let tc = if name == "web_search" {
+            let tc = if native_web_search && name == "web_search" {
                 ResponsesToolChoice::Simple("auto".to_string())
             } else {
                 ResponsesToolChoice::Function {
@@ -2858,7 +2874,23 @@ fn map_status_to_stop_reason(
 /// `url_citation` annotations on `OutputText` parts, which is what the
 /// non-streaming response path populates once content is fully
 /// materialized.
-fn extract_web_search_citations(items: &[OutputItem]) -> (Vec<(String, String)>, u32) {
+/// Whether a function call from the model is a web search made as a function
+/// (`WebSearch` or `web_search`) rather than through the built-in tool.
+///
+/// A `web_search` the client declared as its own function tool is in the
+/// registry (only function tools with a schema are), and a call to it is an
+/// ordinary tool call, not a search the proxy should dress up as a server tool.
+pub fn is_web_search_function_call(
+    name: &str,
+    registry: &crate::repair::ToolSchemaRegistry,
+) -> bool {
+    name == "WebSearch" || (name == "web_search" && registry.get(name).is_none())
+}
+
+fn extract_web_search_citations(
+    items: &[OutputItem],
+    registry: &crate::repair::ToolSchemaRegistry,
+) -> (Vec<(String, String)>, u32) {
     let mut citations = Vec::new();
     let mut search_count = 0u32;
 
@@ -2869,7 +2901,7 @@ fn extract_web_search_citations(items: &[OutputItem]) -> (Vec<(String, String)>,
                 search_count = search_count.saturating_add(1);
             }
             OutputItem::FunctionCall { name, .. }
-                if name == "WebSearch" || name == "web_search" =>
+                if is_web_search_function_call(name, registry) =>
             {
                 tracing::debug!(name = %name, "detected web search FunctionCall");
                 search_count = search_count.saturating_add(1);
@@ -2923,7 +2955,7 @@ fn build_content_blocks(
     items: &[OutputItem],
     registry: &crate::repair::ToolSchemaRegistry,
 ) -> (Vec<ResponseContentBlock>, u32) {
-    let (citations, web_search_count) = extract_web_search_citations(items);
+    let (citations, web_search_count) = extract_web_search_citations(items, registry);
 
     let mut blocks = Vec::new();
 
