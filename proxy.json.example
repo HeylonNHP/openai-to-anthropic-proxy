@@ -38,6 +38,11 @@
       "default": {
         "disabled": "none"
       }
+    },
+
+    "summary": "auto",
+    "summary_models": {
+      "gpt-4o-mini": "off"
     }
   },
 

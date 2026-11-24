@@ -693,6 +693,93 @@ async fn per_model_reasoning_effort_lookup() {
     assert_eq!(second["reasoning"]["effort"], "medium");
 }
 
+/// The proxy asks the upstream for a reasoning summary whenever reasoning is
+/// on, because an OpenAI-style upstream returns reasoning text only when asked.
+/// It asks for none when reasoning is `none`, or for a model switched `off`.
+#[tokio::test]
+async fn reasoning_summary_is_requested_unless_off_or_reasoning_is_none() {
+    use openai_to_anthropic_proxy::config::ReasoningSummary;
+
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_ok", "object": "response", "created_at": 1,
+            "status": "completed", "model": "any",
+            "output": [{"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok", "annotations": []}]}],
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }"#
+        .into(),
+    );
+
+    let config = Arc::new(Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream_base_url: format!("http://{upstream_addr}"),
+        upstream_api_key: "sk-fake".into(),
+        upstream_path: "/v1/responses".into(),
+        request_timeout: Duration::from_secs(10),
+        max_request_body_bytes: openai_to_anthropic_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
+        reasoning_effort: None,
+        reasoning: ReasoningConfig {
+            default: Some("medium".into()),
+            models: std::iter::once(("no-reasoning".into(), "none".into())).collect(),
+            summary_models: std::iter::once(("picky-upstream".into(), ReasoningSummary::Off))
+                .collect(),
+            ..ReasoningConfig::default()
+        },
+        model_aliases: Default::default(),
+        prompt_caching: Default::default(),
+        reasoning_replay: Default::default(),
+        log_to_disk: false,
+        proxy_key: None,
+        advisor: AdvisorConfig::default(),
+        web_fetch: WebFetchConfig::default(),
+        web_search: WebSearchConfig::default(),
+        server_tools: ServerToolsConfig::default(),
+        prefix_models_for_discovery: false,
+        tool_result_images: ToolResultImages::default(),
+        forward_documents: false,
+        system_message_placement: Default::default(),
+        warnings: Vec::new(),
+    });
+    let proxy_addr = start_proxy(config).await;
+    let client = reqwest::Client::new();
+
+    let send = |model: &'static str| {
+        let client = client.clone();
+        let upstream = upstream.clone();
+        async move {
+            let body = format!(
+                r#"{{"model":"{model}","max_tokens":4,"messages":[{{"role":"user","content":"a"}}]}}"#
+            );
+            let _ = client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(ReqBody::from(body))
+                .send()
+                .await
+                .unwrap();
+            let raw = upstream.received.lock().await.clone().unwrap();
+            serde_json::from_slice::<serde_json::Value>(&raw).unwrap()
+        }
+    };
+
+    // Reasoning on (default effort "medium") → a summary is requested.
+    let on = send("gpt-5.4-mini").await;
+    assert_eq!(on["reasoning"]["effort"], "medium");
+    assert_eq!(on["reasoning"]["summary"], "auto");
+
+    // Reasoning "none" → no summary field.
+    let none = send("no-reasoning").await;
+    assert_eq!(none["reasoning"]["effort"], "none");
+    assert!(none["reasoning"].get("summary").is_none());
+
+    // A model switched off → effort still sent, no summary field.
+    let off = send("picky-upstream").await;
+    assert_eq!(off["reasoning"]["effort"], "medium");
+    assert!(off["reasoning"].get("summary").is_none());
+}
+
 /// A Claude Code request that carries `output_config.effort` (or
 /// `thinking.type = "disabled"`) is translated through the configured
 /// effort/thinking-disabled maps before it reaches the upstream.
@@ -741,6 +828,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
                 default: BTreeMap::from([("disabled".into(), Some("none".into()))]),
                 models: Default::default(),
             },
+            ..ReasoningConfig::default()
         },
         model_aliases: Default::default(),
         prompt_caching: Default::default(),
@@ -3618,6 +3706,68 @@ async fn advisor_uses_one_stable_cache_key_per_conversation() {
 async fn advisor_uses_the_configured_cache_key_as_given() {
     let keys = advisor_cache_keys(&["beam"], Some("my-key")).await;
     assert!(keys.iter().all(|k| k == "my-key"), "{keys:?}");
+}
+
+/// The `reasoning` object of each advisor request, for an advisor with the
+/// given effort and the proxy's `reasoning.summary` setting.
+async fn advisor_reasoning(
+    effort: Option<&str>,
+    summary: openai_to_anthropic_proxy::config::ReasoningSummary,
+) -> Vec<serde_json::Value> {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_response("resp_c1", "call_t1"),
+            advisor_answer("advice"),
+            advisor_executor_message("resp_final", "done"),
+        ],
+    );
+    let mut config = (*advisor_config(upstream_addr)).clone();
+    config.advisor.effort = effort.map(str::to_owned);
+    config.reasoning.summary = summary;
+    let proxy_addr = start_proxy(Arc::new(config)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    upstream
+        .received_all
+        .lock()
+        .await
+        .iter()
+        .map(|b| serde_json::from_slice::<serde_json::Value>(b).unwrap())
+        .filter(|b| b["model"] == "beam")
+        .map(|b| b["reasoning"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn advisor_follows_the_reasoning_summary_setting() {
+    use openai_to_anthropic_proxy::config::ReasoningSummary;
+
+    // Reasoning on → the advisor asks for a summary, like the main request.
+    let on = advisor_reasoning(Some("low"), ReasoningSummary::Auto).await;
+    assert_eq!(on.len(), 1);
+    assert_eq!(on[0]["effort"], "low");
+    assert_eq!(on[0]["summary"], "auto");
+
+    // Switched off → effort still sent, no summary.
+    let off = advisor_reasoning(Some("low"), ReasoningSummary::Off).await;
+    assert_eq!(off[0]["effort"], "low");
+    assert!(off[0].get("summary").is_none(), "{}", off[0]);
+
+    // Effort "none" → no summary even when the setting is on.
+    let none = advisor_reasoning(Some("none"), ReasoningSummary::Auto).await;
+    assert!(none[0].get("summary").is_none(), "{}", none[0]);
+
+    // No advisor effort → no `reasoning` object at all, so nothing to add to.
+    let unset = advisor_reasoning(None, ReasoningSummary::Auto).await;
+    assert!(unset[0].is_null(), "{}", unset[0]);
 }
 
 /// 2. Happy path: 3 POSTs (executor call → advisor text → final executor

@@ -766,6 +766,14 @@ pub(crate) fn build_outbound(
     // it here so the upstream sees the alias-resolved name.
     outbound.model = model.to_owned();
 
+    // Ask for a reasoning summary: an OpenAI-style upstream returns reasoning
+    // text only when it is requested, and that text becomes the `thinking`
+    // block. Done here, after the model is final, so a `default_model` retry
+    // picks the summary setting of the model it actually calls.
+    if let Some(reasoning) = outbound.reasoning.as_mut() {
+        reasoning.summary = config.reasoning_summary_for(model, &reasoning.effort);
+    }
+
     // B9: the translator's NAME-ONLY check preserves the `# Advisor Tool`
     // section whenever an inbound tool is named `advisor`, but the
     // schema-less declaration is DROPPED on translation. With the shipped

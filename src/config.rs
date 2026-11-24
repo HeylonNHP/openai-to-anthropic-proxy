@@ -615,6 +615,59 @@ pub struct ReasoningConfig {
     /// the upstream `reasoning` object. Disabled thinking takes precedence
     /// over both `output_config.effort` and the fixed per-model config.
     pub thinking_disabled: EffortMap,
+    /// What to put in the upstream's `reasoning.summary` when reasoning is on.
+    /// Defaults to [`ReasoningSummary::Auto`]: an OpenAI-style upstream only
+    /// returns reasoning text if it is asked for a summary, and that text is
+    /// what becomes the Anthropic `thinking` block.
+    pub summary: ReasoningSummary,
+    /// Per-upstream-model override of [`Self::summary`]. Keys are upstream
+    /// model names, compared exactly. Use `off` here for an upstream that
+    /// rejects the `summary` field.
+    pub summary_models: BTreeMap<String, ReasoningSummary>,
+}
+
+/// The value sent as the upstream's `reasoning.summary`.
+///
+/// The Responses API takes `auto`, `concise` or `detailed`; `Off` sends no
+/// `summary` field at all, for an upstream that rejects or mishandles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningSummary {
+    /// `"auto"`: the most detailed summary the model offers. Default.
+    #[default]
+    Auto,
+    /// `"concise"`. Not every model supports it.
+    Concise,
+    /// `"detailed"`.
+    Detailed,
+    /// Send no `summary` field.
+    Off,
+}
+
+impl ReasoningSummary {
+    /// Lenient parse used by the config resolver. Matching is
+    /// case-insensitive; anything else returns `None` so the caller can fall
+    /// back to the default with a warning.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "concise" => Some(Self::Concise),
+            "detailed" => Some(Self::Detailed),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The string to send upstream, or `None` for [`Self::Off`].
+    #[must_use]
+    pub const fn upstream_value(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => Some("auto"),
+            Self::Concise => Some("concise"),
+            Self::Detailed => Some("detailed"),
+            Self::Off => None,
+        }
+    }
 }
 
 /// A translation map from a client intent key (a Claude effort value or a
@@ -909,7 +962,7 @@ impl Config {
         // (see `reasoning_for_model`), so the operator can use either
         // surface area to set the global default.
         let reasoning_json = file.and_then(|f| f.reasoning.as_ref());
-        let reasoning = ReasoningConfig {
+        let mut reasoning = ReasoningConfig {
             default: reasoning_json
                 .and_then(|r| r.default.clone())
                 .or_else(|| env.reasoning_effort.clone()),
@@ -920,6 +973,9 @@ impl Config {
             thinking_disabled: reasoning_json
                 .map(|r| r.thinking_disabled.clone().into())
                 .unwrap_or_default(),
+            // Resolved below, once the warning list exists.
+            summary: ReasoningSummary::default(),
+            summary_models: BTreeMap::new(),
         };
 
         let model_aliases = ModelAliases {
@@ -986,6 +1042,47 @@ impl Config {
         // does not exist yet (the binary installs it after this returns), so
         // a `tracing::warn!` here would hit no subscriber and vanish.
         let mut warnings: Vec<ConfigWarning> = Vec::new();
+
+        // `reasoning.summary`: env wins over file, default `auto`. An
+        // unrecognised value falls back to the default with a warning, like
+        // `tool_result_images`; a bad per-model entry is skipped the same way.
+        let summary_raw = env
+            .reasoning_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                reasoning_json
+                    .and_then(|r| r.summary.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(v) = summary_raw {
+            reasoning.summary = ReasoningSummary::parse(v).unwrap_or_else(|| {
+                warnings.push(
+                    ConfigWarning::new(format!(
+                        "reasoning.summary = {v:?} is not one of \"auto\", \"concise\", \"detailed\" or \"off\"; using the default \"auto\""
+                    ))
+                    .with_field("reasoning.summary", v.to_owned()),
+                );
+                ReasoningSummary::default()
+            });
+        }
+        if let Some(models) = reasoning_json.map(|r| &r.summary_models) {
+            for (model, v) in models {
+                match ReasoningSummary::parse(v) {
+                    Some(mode) => {
+                        reasoning.summary_models.insert(model.clone(), mode);
+                    }
+                    None => warnings.push(
+                        ConfigWarning::new(format!(
+                            "reasoning.summary_models[{model:?}] = {v:?} is not one of \"auto\", \"concise\", \"detailed\" or \"off\"; ignoring that entry"
+                        ))
+                        .with_field("reasoning.summary_models", model.clone()),
+                    ),
+                }
+            }
+        }
 
         // Env > file > default. The request body limit must be a positive
         // whole number of bytes; invalid numeric values warn and use the
@@ -1493,6 +1590,27 @@ impl Config {
         ReasoningDecision::Effort(self.reasoning_for_model(upstream_model).unwrap_or_default())
     }
 
+    /// The `reasoning.summary` to send for a request going to `upstream_model`
+    /// with the given upstream `effort`, or `None` to send no summary field.
+    ///
+    /// No summary is asked for when reasoning is off (`effort` is `none`),
+    /// when the model's setting is [`ReasoningSummary::Off`], or when there is
+    /// no effort at all. Otherwise the per-model entry wins over the global
+    /// `reasoning.summary`.
+    #[must_use]
+    pub fn reasoning_summary_for(&self, upstream_model: &str, effort: &str) -> Option<String> {
+        if effort.trim().is_empty() || effort.trim().eq_ignore_ascii_case("none") {
+            return None;
+        }
+        self.reasoning
+            .summary_models
+            .get(upstream_model)
+            .copied()
+            .unwrap_or(self.reasoning.summary)
+            .upstream_value()
+            .map(str::to_owned)
+    }
+
     /// Normalize a raw Claude Code `output_config.effort` value. Returns
     /// `None` for absent/blank values so callers can treat them as "no
     /// effort signal".
@@ -1575,6 +1693,8 @@ pub struct EnvInputs {
     /// Raw numeric override; invalid numbers are warned about by the resolver.
     pub max_request_body_bytes: Option<serde_json::Number>,
     pub reasoning_effort: Option<String>,
+    /// `REASONING_SUMMARY`: `auto` (default), `concise`, `detailed` or `off`.
+    pub reasoning_summary: Option<String>,
     pub prompt_caching_models: Option<String>,
     pub prompt_cache_key: Option<String>,
     /// `LOG_TO_DISK=1` enables file logging (and silences the
@@ -1663,6 +1783,7 @@ impl EnvInputs {
             forward_documents: env::var("FORWARD_DOCUMENTS").ok().map(|s| parse_truthy(&s)),
             system_message_placement: env::var("SYSTEM_MESSAGE_PLACEMENT").ok(),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
+            reasoning_summary: env::var("REASONING_SUMMARY").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
             prompt_cache_key: env::var("PROMPT_CACHE_KEY").ok(),
             log_to_disk: env::var("LOG_TO_DISK").ok().map(|s| parse_truthy(&s)),
@@ -2339,6 +2460,13 @@ pub struct JsonReasoningConfig {
     pub effort_map: JsonEffortMap,
     #[serde(default)]
     pub thinking_disabled: JsonEffortMap,
+    /// `auto` (default), `concise`, `detailed` or `off`. See
+    /// [`ReasoningSummary`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Per-upstream-model override of `summary`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub summary_models: BTreeMap<String, String>,
 }
 
 /// JSON shape of a translation map (`effort_map` / `thinking_disabled`).

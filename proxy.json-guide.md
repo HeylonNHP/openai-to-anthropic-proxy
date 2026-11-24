@@ -147,6 +147,34 @@ A useful rule: if a model gets renamed by `model_aliases.map`, key the
 reasoning entries by the renamed upstream model, not the Claude-facing name.
 That way an aliased request lands on the right effort automatically.
 
+#### Reasoning summary
+
+An OpenAI-style upstream only returns reasoning text when the request asks for
+a summary (`reasoning.summary`, one of `auto`, `concise`, `detailed`). That text
+is what the proxy turns into the Anthropic `thinking` block, and what
+[`reasoning_replay`](#reasoning-replay) sends back on the next turn. Without it
+the thinking block is empty and replay does nothing.
+
+So the proxy sends `reasoning.summary` by default (`"auto"`) on every request
+that has reasoning on. It sends none when the effort is `none`, or when the
+reasoning object is omitted.
+
+- `reasoning.summary` (env `REASONING_SUMMARY`): `auto` (default), `concise`,
+  `detailed`, or `off` to send no `summary` field. Env wins over the file. An
+  unrecognised value warns at startup and uses `auto`.
+- `reasoning.summary_models`: per-upstream-model override, same values. Use
+  `"off"` for an upstream that rejects the field with a 400.
+- The advisor follows the same setting, using the advisor model's entry. Its
+  reply is read as plain text, so it never shows the summary; the setting just
+  keeps the advisor's request consistent with the main one.
+
+Not every model supports every value (`concise` in particular), and OpenAI may
+require organisation verification before returning summaries for its newest
+reasoning models. If an upstream rejects the request after this was introduced,
+set that model to `off`. This does not help an upstream that returns its
+reasoning in a different field (DeepSeek's first-party API uses `content`
+parts); that is a separate limitation.
+
 ```json
 {
   "reasoning": {

@@ -53,6 +53,8 @@ The table below spells each one out. A `—` means the option is file-only.
 | `reasoning.effort_map` | — | (shipped map) | Translates Claude Code's effort levels (`low`/`medium`/`high`/`xhigh`/`max`). |
 | `reasoning.thinking_disabled` | — | maps `disabled` to `none` | What happens when Claude Code turns thinking off. |
 | `reasoning_effort` | `REASONING_EFFORT` | (none) | A blunt fallback effort for every request. `reasoning.default` is usually better. |
+| `reasoning.summary` | `REASONING_SUMMARY` | `auto` | What to send as the upstream's `reasoning.summary` when reasoning is on: `auto`, `concise`, `detailed`, or `off` (send nothing). Without a summary an OpenAI-style upstream returns no reasoning text, so the thinking block is empty. Applies to the advisor too. |
+| `reasoning.summary_models` | — | empty | Per-model override of `reasoning.summary` (keys are upstream model names). Set `off` for an upstream that rejects the field. |
 
 ## Replaying the model's own prior thinking
 

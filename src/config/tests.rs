@@ -1998,3 +1998,92 @@ fn forward_documents_can_be_turned_on_in_the_file_and_overridden_by_env() {
             .forward_documents
     );
 }
+
+// ─── reasoning.summary ──────────────────────────────────────────────────────
+
+fn summary_file(summary: Option<&str>, models: &[(&str, &str)]) -> JsonConfig {
+    JsonConfig {
+        reasoning: Some(JsonReasoningConfig {
+            summary: summary.map(str::to_owned),
+            summary_models: models
+                .iter()
+                .map(|(m, v)| ((*m).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..JsonReasoningConfig::default()
+        }),
+        ..JsonConfig::default()
+    }
+}
+
+#[test]
+fn reasoning_summary_defaults_to_auto_and_is_asked_for_when_reasoning_is_on() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.reasoning.summary, ReasoningSummary::Auto);
+    assert!(cfg.warnings.is_empty());
+    assert_eq!(
+        cfg.reasoning_summary_for("m", "medium").as_deref(),
+        Some("auto")
+    );
+}
+
+#[test]
+fn reasoning_summary_is_not_asked_for_when_reasoning_is_none_or_blank() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.reasoning_summary_for("m", "none"), None);
+    assert_eq!(cfg.reasoning_summary_for("m", "NONE"), None);
+    assert_eq!(cfg.reasoning_summary_for("m", ""), None);
+}
+
+#[test]
+fn reasoning_summary_off_sends_nothing() {
+    let file = summary_file(Some("off"), &[]);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.reasoning_summary_for("m", "high"), None);
+}
+
+#[test]
+fn reasoning_summary_value_is_forwarded_and_case_insensitive() {
+    let file = summary_file(Some(" Detailed "), &[]);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(
+        cfg.reasoning_summary_for("m", "high").as_deref(),
+        Some("detailed")
+    );
+}
+
+#[test]
+fn reasoning_summary_per_model_entry_beats_the_global_setting() {
+    let file = summary_file(Some("auto"), &[("picky", "off"), ("terse", "concise")]);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.reasoning_summary_for("picky", "high"), None);
+    assert_eq!(
+        cfg.reasoning_summary_for("terse", "high").as_deref(),
+        Some("concise")
+    );
+    assert_eq!(
+        cfg.reasoning_summary_for("other", "high").as_deref(),
+        Some("auto")
+    );
+}
+
+#[test]
+fn reasoning_summary_env_overrides_the_file() {
+    let file = summary_file(Some("detailed"), &[]);
+    let env = EnvInputs {
+        reasoning_summary: Some("off".into()),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.reasoning_summary_for("m", "high"), None);
+}
+
+#[test]
+fn an_unknown_reasoning_summary_warns_and_falls_back_to_auto() {
+    let file = summary_file(Some("loud"), &[("m", "quiet")]);
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.reasoning.summary, ReasoningSummary::Auto);
+    assert!(cfg.reasoning.summary_models.is_empty(), "bad entry skipped");
+    assert_eq!(cfg.warnings.len(), 2);
+    assert!(cfg.warnings[0].message.contains("reasoning.summary"));
+    assert!(cfg.warnings[1].message.contains("summary_models"));
+}

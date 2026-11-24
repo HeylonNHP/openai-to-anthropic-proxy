@@ -34,7 +34,7 @@ so the proxy can only approximate it.
     unsupported, but a `server_tools.pause_turn` option is documented.
   - Fix: check the code, then make the docs agree.
 
-- [ ] **A3. Request a reasoning summary**
+- [x] **A3. Request a reasoning summary**
   - Where: `src/translate.rs:340-343` (`ReasoningConfig::default()`)
   - Problem: `reasoning.summary` is never requested, so thinking text depends on
     the upstream's default.

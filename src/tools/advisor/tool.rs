@@ -707,6 +707,14 @@ async fn consult_once(
     prompt: &str,
 ) -> Result<(String, Option<ResponsesUsage>), ConsultError> {
     let mut outbound = advisor_request(cfg, prompt);
+    // The advisor follows the same `reasoning.summary` setting as the main
+    // request, keyed by the advisor's own upstream model.
+    if let Some(reasoning) = outbound.reasoning.as_mut() {
+        reasoning.summary = attempt
+            .state
+            .config
+            .reasoning_summary_for(&cfg.model, &reasoning.effort);
+    }
     outbound.prompt_cache_key = advisor_cache_key(
         &attempt.state.config,
         cfg,
