@@ -89,8 +89,9 @@ check the proxy is reachable first and tell you if it is not.
 
 That is the short list. The full one — every environment variable, every
 `proxy.json` field, and the reasoning-effort and caching settings — is in
-[`REFERENCE.md`](./REFERENCE.md#configuration) and
-[`proxy.json-guide.md`](./proxy.json-guide.md).
+[`REFERENCE.md`](./REFERENCE.md#configuration),
+[`proxy.json-guide.md`](./proxy.json-guide.md), or the concise at-a-glance
+table in [`CONFIGURATION.md`](./CONFIGURATION.md).
 
 Unknown fields in `proxy.json` **fail fast at startup** rather than being
 silently ignored, so a typo is a startup error, not a mystery.
@@ -224,7 +225,7 @@ Limits, caveats and every knob:
 | Document | What is in it |
 |---|---|
 | [`REFERENCE.md`](./REFERENCE.md) | Architecture, the full configuration reference, translation overview, out-of-scope list |
-| [`proxy.json-guide.md`](./proxy.json-guide.md) | Every `proxy.json` key, explained |
+| [`CONFIGURATION.md`](./CONFIGURATION.md) | Concise at-a-glance table of every `proxy.json` option, in plain English |
 | [`proxy.json.example`](./proxy.json.example) | A filled-in example config |
 | [`src/tools/web_search/README.md`](./src/tools/web_search/README.md) | How the proxy-native search works, and its limits |
 | [`src/tools/server_loop/README.md`](./src/tools/server_loop/README.md) | The shared server-tool loop |
