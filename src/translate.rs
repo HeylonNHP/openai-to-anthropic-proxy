@@ -1555,7 +1555,6 @@ fn append_user_message(
                     prompt_cache_breakpoint: None,
                 }],
             });
-            Ok(())
         }
         MessageContent::Blocks(blocks) => {
             // Walk the block list in order, accumulating text and image
@@ -1688,9 +1687,9 @@ fn append_user_message(
             }
             flush_lifted_images(out, &mut lifted);
             flush_user_parts(out, &mut parts);
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Emit the images lifted out of tool results as one user message, then
@@ -2259,7 +2258,6 @@ fn append_assistant_message(
                 role: "assistant".into(),
                 content: vec![InputContentPart::OutputText { text: s.clone() }],
             });
-            Ok(())
         }
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
@@ -2557,9 +2555,9 @@ fn append_assistant_message(
                     arguments,
                 });
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// Build a Responses `reasoning` input item for a replayed thinking block.
