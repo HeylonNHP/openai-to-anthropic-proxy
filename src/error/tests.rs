@@ -145,3 +145,102 @@ fn a_stream_error_code_maps_to_the_matching_anthropic_type() {
         assert_eq!(stream_error_kind(code, message), kind, "{code}/{message}");
     }
 }
+
+// ─── a failed reply that came back as 200 ───────────────────────────────────
+
+fn reply(status: &str, error: Option<serde_json::Value>) -> crate::responses::ResponsesResponse {
+    serde_json::from_value(json!({
+        "id": "resp_x", "object": "response", "created_at": 1,
+        "status": status, "model": "m", "output": [],
+        "error": error,
+    }))
+    .unwrap()
+}
+
+fn failed_with(code: &str, message: &str) -> AppError {
+    let resp = reply("failed", Some(json!({"code": code, "message": message})));
+    AppError::from_failed_response(&resp).expect("a failed reply is an error")
+}
+
+fn status_and_kind(err: AppError) -> (StatusCode, String) {
+    let kind = err.anthropic_error_body()["error"]["type"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (err.into_response().status(), kind)
+}
+
+#[test]
+fn a_reply_that_did_not_fail_is_not_an_error() {
+    for status in ["completed", "incomplete", "cancelled", "in_progress"] {
+        assert!(
+            AppError::from_failed_response(&reply(status, None)).is_none(),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_rate_limit_is_a_429() {
+    let err = failed_with("rate_limit_exceeded", "slow down");
+    assert_eq!(
+        status_and_kind(err),
+        (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error".to_owned())
+    );
+}
+
+#[test]
+fn a_failed_overload_is_a_529() {
+    let err = failed_with("server_overloaded", "busy");
+    let (status, kind) = status_and_kind(err);
+    assert_eq!(status.as_u16(), 529);
+    assert_eq!(kind, "overloaded_error");
+}
+
+#[test]
+fn a_failed_server_error_is_a_502_api_error() {
+    let err = failed_with("server_error", "boom");
+    assert_eq!(
+        status_and_kind(err),
+        (StatusCode::BAD_GATEWAY, "api_error".to_owned())
+    );
+}
+
+#[test]
+fn a_failed_context_overflow_keeps_anthropics_wording_as_a_400() {
+    let err = failed_with(
+        "context_length_exceeded",
+        "The prompt is too long: 10, model maximum context length: 5",
+    );
+    assert!(matches!(&err, AppError::ContextOverflow(m)
+        if m == "prompt is too long: 10 tokens > 5 maximum"));
+    assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn a_failed_auth_or_invalid_request_is_a_502_not_the_clients_fault() {
+    // The credentials and the request are the proxy's, not the client's:
+    // a 401 or 400 would send the client the wrong way.
+    for code in [
+        "invalid_api_key",
+        "permission_denied",
+        "invalid_request_error",
+    ] {
+        let (status, kind) = status_and_kind(failed_with(code, "nope"));
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{code}");
+        assert_eq!(kind, "api_error", "{code}");
+    }
+}
+
+#[test]
+fn a_failed_reply_with_no_error_object_is_a_generic_502() {
+    let err = AppError::from_failed_response(&reply("failed", None)).unwrap();
+    let body = err.anthropic_error_body();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upstream response failed")
+    );
+    assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+}

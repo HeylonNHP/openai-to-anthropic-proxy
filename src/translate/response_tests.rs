@@ -197,6 +197,8 @@ fn incomplete_response_content_filter_maps_to_end_turn() {
 
 #[test]
 fn failed_response_surfaces_error_message_in_text_block() {
+    // The translator's defensive fallback (see the note above
+    // `failed_status_with_existing_output_keeps_output`).
     let mut resp = fixture_response();
     resp.status = "failed".into();
     resp.error = Some(ResponsesError {
@@ -306,9 +308,10 @@ fn output_refusal_becomes_text_with_prefix() {
 
 #[test]
 fn failed_status_with_existing_output_keeps_output() {
-    // If `status == "failed"` AND there is output (the model
-    // produced something before the error), the output blocks are
-    // kept and stop_reason is EndTurn.
+    // This pins only the translator's defensive fallback: the proxy turns a
+    // failed reply into an error before it is translated (see the e2e tests
+    // `a_failed_200_*`). If a failed reply with output ever does reach here,
+    // the output blocks are kept and stop_reason is EndTurn.
     let mut resp = fixture_response();
     resp.status = "failed".into();
     resp.error = Some(ResponsesError {

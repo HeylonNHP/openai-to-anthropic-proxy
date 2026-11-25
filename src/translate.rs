@@ -2743,7 +2743,11 @@ use crate::responses::{OutputContentPart, OutputItem};
 ///   - `status == "incomplete"` with `reason: "max_output_tokens"` → `MaxTokens`.
 ///   - `status == "incomplete"` with `reason: "content_filter"` → `EndTurn`.
 ///   - `status == "failed"` → `EndTurn`; the inner error message is
-///     surfaced as a `[error] ` text block so the client sees it.
+///     surfaced as a `[error] ` text block so the client sees it. This is a
+///     fallback only: the proxy turns a failed reply into an error before it
+///     gets here (`AppError::from_failed_response`, checked in
+///     `Attempt::execute`), so a client sees a real error status it can
+///     retry on, not a message.
 ///   - `status == "cancelled"` → `EndTurn`.
 /// - `usage`: `input_tokens` minus the cache counts → `input_tokens`,
 ///   `cached_tokens` → `cache_read_input_tokens`, `cache_write_tokens` →
@@ -2756,12 +2760,11 @@ pub fn responses_to_anthropic(
 ) -> Message {
     let (mut content, web_search_count) = build_content_blocks(&resp.output, registry);
 
-    // If the response failed AND we have no output blocks of our own,
-    // surface the upstream error message as a `[error] ...` text block
-    // so the client sees what went wrong (instead of an empty message
-    // body). If the response produced output before failing, we keep
-    // the output and skip the synthetic error block — the model's
-    // reply is more useful than the failure message in that case.
+    // Defensive fallback: the proxy normally never gets here with a failed
+    // reply (see the doc comment above). If it does, and we have no output
+    // blocks of our own, surface the upstream error message as a
+    // `[error] ...` text block instead of an empty message body. If the reply
+    // produced output before failing, keep the output and skip the block.
     if resp.status == "failed"
         && content.is_empty()
         && let Some(err) = &resp.error

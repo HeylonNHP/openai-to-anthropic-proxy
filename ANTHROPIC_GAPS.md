@@ -73,7 +73,7 @@ so the proxy can only approximate it.
 
 ## B. Response correctness (highest value)
 
-- [ ] **B1. Non-streaming failed response returns HTTP 200**
+- [x] **B1. Non-streaming failed response returns HTTP 200**
   - Where: `src/translate.rs:2742-2749`, `:2835`
   - Problem: a `status: "failed"` response becomes a `[error] …` text block with
     `end_turn`. Claude Code never retries and never sees an error. The

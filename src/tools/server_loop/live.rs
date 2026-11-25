@@ -33,7 +33,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use axum::http::StatusCode;
 use eventsource_stream::Event as SseEvent;
 use futures_util::{Stream, StreamExt};
 
@@ -115,10 +114,14 @@ where
         };
         let message = match next {
             Some(Ok(message)) => message,
-            Some(Err(err)) => return Err(upstream_failure(format!("upstream SSE error: {err}"))),
+            Some(Err(err)) => {
+                return Err(AppError::upstream_failure(&format!(
+                    "upstream SSE error: {err}"
+                )));
+            }
             None => {
-                return Err(upstream_failure(
-                    "upstream stream ended before a terminal response event".to_owned(),
+                return Err(AppError::upstream_failure(
+                    "upstream stream ended before a terminal response event",
                 ));
             }
         };
@@ -126,8 +129,8 @@ where
             continue;
         }
         if message.data.trim() == "[DONE]" {
-            return Err(upstream_failure(
-                "upstream stream ended before a terminal response event".to_owned(),
+            return Err(AppError::upstream_failure(
+                "upstream stream ended before a terminal response event",
             ));
         }
         let event: ResponsesStreamEvent = match serde_json::from_str(&message.data) {
@@ -144,15 +147,18 @@ where
         match &event {
             ResponsesStreamEvent::Failed { response } => {
                 let Some(error) = response.error.as_ref() else {
-                    return Err(upstream_failure("upstream response failed".to_owned()));
+                    return Err(AppError::upstream_failure("upstream response failed"));
                 };
-                return Err(stream_failure(
+                return Err(AppError::reported_failure(
                     &crate::responses::code_text(error.code.as_ref()),
                     &error.message,
                 ));
             }
             ResponsesStreamEvent::Error { message, code, .. } => {
-                return Err(stream_failure(code.as_deref().unwrap_or_default(), message));
+                return Err(AppError::reported_failure(
+                    code.as_deref().unwrap_or_default(),
+                    message,
+                ));
             }
             ResponsesStreamEvent::Completed { response }
             | ResponsesStreamEvent::Incomplete { response } => {
@@ -166,31 +172,6 @@ where
         let produced = translator.feed_event(&event);
         out.send_live(produced, translator.next_index());
     }
-}
-
-/// A failure the upstream reported inside the stream: an overflow keeps
-/// Anthropic's wording, anything else is a generic upstream error.
-fn upstream_failure(message: String) -> AppError {
-    AppError::upstream(
-        StatusCode::BAD_GATEWAY,
-        format!("upstream_error: {message}"),
-    )
-}
-
-fn stream_failure(code: &str, message: &str) -> AppError {
-    crate::context_overflow::detect_event(code, message).map_or_else(
-        || {
-            // A stream error has no HTTP status; pick the one whose Anthropic
-            // error type matches what the upstream said.
-            let status = match crate::error::stream_error_kind(code, message) {
-                "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
-                "overloaded_error" => StatusCode::from_u16(529).unwrap_or(StatusCode::BAD_GATEWAY),
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            AppError::upstream(status, format!("upstream_error: {message}"))
-        },
-        |overflow| AppError::ContextOverflow(overflow.anthropic_message()),
-    )
 }
 
 /// The output items of a run, built up from its events.

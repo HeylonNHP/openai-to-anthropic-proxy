@@ -1080,6 +1080,17 @@ impl Attempt {
 
         let mut upstream_resp_body = parse_upstream_body(upstream_resp).await?;
 
+        // A `200` whose body says `status: "failed"` is a failure, not a
+        // message. Anthropic would have answered with an error status that its
+        // clients retry or compact on, so return one here, before anything
+        // renders the body. In the server-tool loop this lands in the same arm
+        // as an HTTP error: a failed first run is the client's error, a failed
+        // later run returns the work already done.
+        if let Some(err) = AppError::from_failed_response(&upstream_resp_body) {
+            tracing::warn!(error = %err, "the upstream reported a failed response");
+            return Err(err);
+        }
+
         // Hidden validation retry: if the repaired tool input still
         // violates the client's *original* schema (e.g. a genuinely
         // required parameter the model botched), give the model one
@@ -1110,7 +1121,14 @@ impl Attempt {
                 // (already-successful) response body for error mapping.
                 break;
             }
-            upstream_resp_body = parse_upstream_body(resp).await?;
+            let retried = parse_upstream_body(resp).await?;
+            if retried.status == "failed" {
+                // Same rule as an HTTP error on the retry: keep the original
+                // (already-successful) response body.
+                tracing::warn!("the corrective retry failed; keeping the original response");
+                break;
+            }
+            upstream_resp_body = retried;
             validation_retries += 1;
         }
 

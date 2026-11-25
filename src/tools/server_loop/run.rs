@@ -537,9 +537,12 @@ async fn run_streamed(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("application/json"));
     if is_json {
-        return crate::proxy::parse_upstream_body(raw)
-            .await
-            .map(|body| (body, false));
+        let body = crate::proxy::parse_upstream_body(raw).await?;
+        // The same rule as `Attempt::execute`: a failed reply is an error.
+        if let Some(err) = AppError::from_failed_response(&body) {
+            return Err(err);
+        }
+        return Ok((body, false));
     }
     let msg_id = crate::tools::server_loop::stream::placeholder_message(&attempt.req.model).id;
     let events = eventsource_stream::Eventsource::eventsource(raw.bytes_stream());

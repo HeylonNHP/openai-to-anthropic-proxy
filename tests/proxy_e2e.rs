@@ -10247,3 +10247,202 @@ async fn max_tokens_zero_with_streaming_is_refused_before_the_upstream_is_called
     );
     assert_eq!(sent, None, "the upstream was never called");
 }
+
+// ── A buffered upstream reply that is `200` with `status: "failed"` ──
+
+/// A Responses body with `status: "failed"`, an optional `error` object and
+/// optional partial output text.
+fn failed_reply(error: Option<&str>, partial_text: Option<&str>) -> String {
+    let output = partial_text.map_or_else(
+        || "[]".to_owned(),
+        |text| {
+            format!(
+                r#"[{{"type":"message","role":"assistant",
+                    "content":[{{"type":"output_text","text":"{text}","annotations":[]}}]}}]"#
+            )
+        },
+    );
+    let error = error.unwrap_or("null");
+    format!(
+        r#"{{"id":"resp_f","object":"response","created_at":1,"status":"failed",
+            "model":"any","output":{output},"error":{error},
+            "usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}"#
+    )
+}
+
+/// POST a plain buffered request to a proxy whose upstream answers `canned`.
+async fn post_to_canned_upstream(canned: String) -> reqwest::Response {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(canned);
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+    reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{"model":"gpt-4o","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn error_of(res: reqwest::Response) -> (u16, serde_json::Value) {
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn a_failed_200_is_a_real_error_not_a_message() {
+    let res = post_to_canned_upstream(failed_reply(
+        Some(r#"{"code":"server_error","message":"boom"}"#),
+        None,
+    ))
+    .await;
+    let (status, body) = error_of(res).await;
+    assert_eq!(status, 502);
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert!(body["error"]["message"].as_str().unwrap().contains("boom"));
+}
+
+#[tokio::test]
+async fn a_failed_200_rate_limit_is_a_429_the_client_can_retry() {
+    let res = post_to_canned_upstream(failed_reply(
+        Some(r#"{"code":"rate_limit_exceeded","message":"slow down"}"#),
+        None,
+    ))
+    .await;
+    let (status, body) = error_of(res).await;
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+}
+
+#[tokio::test]
+async fn a_failed_200_overload_is_a_529() {
+    let res = post_to_canned_upstream(failed_reply(
+        Some(r#"{"code":"server_overloaded","message":"busy"}"#),
+        None,
+    ))
+    .await;
+    let (status, body) = error_of(res).await;
+    assert_eq!(status, 529);
+    assert_eq!(body["error"]["type"], "overloaded_error");
+}
+
+#[tokio::test]
+async fn a_failed_200_context_overflow_is_anthropics_prompt_too_long() {
+    let res = post_to_canned_upstream(failed_reply(
+        Some(
+            r#"{"code":"context_length_exceeded",
+                "message":"The prompt is too long: 10, model maximum context length: 5"}"#,
+        ),
+        None,
+    ))
+    .await;
+    let (status, body) = error_of(res).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "prompt is too long: 10 tokens > 5 maximum"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_200_with_no_error_object_is_a_generic_502() {
+    let (status, body) = error_of(post_to_canned_upstream(failed_reply(None, None)).await).await;
+    assert_eq!(status, 502);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upstream response failed")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_200_with_partial_output_is_still_an_error() {
+    // Streaming reports an error even after some text, and so does this.
+    let res = post_to_canned_upstream(failed_reply(
+        Some(r#"{"code":"server_error","message":"cut off"}"#),
+        Some("half an ans"),
+    ))
+    .await;
+    assert_eq!(res.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn an_incomplete_200_is_still_a_message() {
+    // Only `failed` is an error: a reply cut off at max_output_tokens stays a
+    // normal message with `stop_reason: max_tokens`.
+    let body = r#"{"id":"resp_i","object":"response","created_at":1,
+        "status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+        "model":"any","output":[{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"partial","annotations":[]}]}],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#;
+    let res = post_to_canned_upstream(body.to_owned()).await;
+    assert_eq!(res.status().as_u16(), 200);
+    let json: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(json["stop_reason"], "max_tokens");
+}
+
+#[tokio::test]
+async fn a_failed_first_server_tool_run_is_the_clients_error() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![FakeResponse {
+            status: StatusCode::OK,
+            body: Some(failed_reply(
+                Some(r#"{"code":"server_error","message":"first run failed"}"#),
+                None,
+            )),
+        }],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn a_failed_later_server_tool_run_keeps_the_work_already_done() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            advisor_call_with_text_and_bash("resp_first", "call_f1", "Let me consult the advisor."),
+            advisor_answer("Use a channel."),
+            FakeResponse {
+                status: StatusCode::OK,
+                body: Some(failed_reply(
+                    Some(r#"{"code":"server_error","message":"re-run failed"}"#),
+                    None,
+                )),
+            },
+        ],
+    );
+    let proxy_addr = start_proxy(advisor_config(upstream_addr)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(advisor_request(false)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200, "a later failure is swallowed");
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["text"] == "Let me consult the advisor."),
+        "the last good answer survives: {body}"
+    );
+}

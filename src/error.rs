@@ -141,6 +141,64 @@ impl AppError {
         }
     }
 
+    /// A generic failure the upstream reported without saying why: 502, with
+    /// the message marked as the upstream's.
+    #[must_use]
+    pub fn upstream_failure(message: &str) -> Self {
+        Self::upstream(
+            StatusCode::BAD_GATEWAY,
+            format!("upstream_error: {message}"),
+        )
+    }
+
+    /// A failure the upstream reported inside a response or a stream, where
+    /// there is no HTTP status.
+    ///
+    /// A context overflow keeps Anthropic's wording, so Claude Code compacts.
+    /// Otherwise the status is the one whose Anthropic error type matches what
+    /// the upstream said: 429 for a rate limit, 529 for an overload, and 502
+    /// for everything else. Auth, permission and invalid-request codes are
+    /// deliberately 502 too: they describe the proxy's own credentials or
+    /// request, and a 401 or 400 would send the client the wrong way.
+    #[must_use]
+    pub fn reported_failure(code: &str, message: &str) -> Self {
+        crate::context_overflow::detect_event(code, message).map_or_else(
+            || {
+                let status = match stream_error_kind(code, message) {
+                    "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+                    "overloaded_error" => {
+                        StatusCode::from_u16(529).unwrap_or(StatusCode::BAD_GATEWAY)
+                    }
+                    _ => StatusCode::BAD_GATEWAY,
+                };
+                Self::upstream(status, format!("upstream_error: {message}"))
+            },
+            |overflow| Self::ContextOverflow(overflow.anthropic_message()),
+        )
+    }
+
+    /// The error for a buffered upstream reply that came back `200` with
+    /// `status: "failed"`, or `None` for any other reply.
+    ///
+    /// Anthropic answers a failure with an error status, and its clients retry
+    /// or compact on it, so a failed reply must not be rendered as a message.
+    /// This is the streaming path's mapping, applied to a buffered body.
+    #[must_use]
+    pub fn from_failed_response(resp: &crate::responses::ResponsesResponse) -> Option<Self> {
+        if resp.status != "failed" {
+            return None;
+        }
+        Some(resp.error.as_ref().map_or_else(
+            || Self::upstream_failure("upstream response failed"),
+            |error| {
+                Self::reported_failure(
+                    &crate::responses::code_text(error.code.as_ref()),
+                    &error.message,
+                )
+            },
+        ))
+    }
+
     /// Attach the upstream's `Retry-After` to an upstream error. Only a 429
     /// or a 5xx carries one; anything else, or any other variant, is returned
     /// unchanged.
