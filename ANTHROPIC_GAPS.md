@@ -57,7 +57,7 @@ so the proxy can only approximate it.
   - Fix: read `strict` from the tool definition and respect it. Keep the strict
     budget downgrade for tools that asked for strict.
 
-- [ ] **A6. Reject or clamp `max_tokens: 0`**
+- [x] **A6. Reject or clamp `max_tokens: 0`**
   - Where: `src/translate.rs:347`
   - Problem: `0` is forwarded as `max_output_tokens: 0`, which the upstream will
     probably reject (*unverified*).

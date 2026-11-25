@@ -2087,3 +2087,46 @@ fn an_unknown_reasoning_summary_warns_and_falls_back_to_auto() {
     assert!(cfg.warnings[0].message.contains("reasoning.summary"));
     assert!(cfg.warnings[1].message.contains("summary_models"));
 }
+
+// ─── min_output_tokens ──────────────────────────────────────────────────────
+
+#[test]
+fn min_output_tokens_defaults_to_16() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.min_output_tokens, DEFAULT_MIN_OUTPUT_TOKENS);
+    assert_eq!(cfg.min_output_tokens, 16);
+}
+
+#[test]
+fn min_output_tokens_comes_from_the_file() {
+    let file = JsonConfig {
+        min_output_tokens: Some(32),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.min_output_tokens, 32);
+}
+
+#[test]
+fn min_output_tokens_env_overrides_the_file() {
+    let file = JsonConfig {
+        min_output_tokens: Some(32),
+        ..JsonConfig::default()
+    };
+    let env = EnvInputs {
+        min_output_tokens: Some(8),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.min_output_tokens, 8);
+}
+
+#[test]
+fn min_output_tokens_zero_turns_the_floor_off() {
+    let file = JsonConfig {
+        min_output_tokens: Some(0),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.min_output_tokens, 0);
+}

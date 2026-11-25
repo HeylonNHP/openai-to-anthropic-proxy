@@ -523,6 +523,14 @@ async fn handle_messages(
     let req: CreateMessageRequest = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
+    // `max_tokens: 0` is Anthropic's cache pre-warm, and it is a buffered
+    // call: Anthropic refuses it together with `stream: true`, so do we.
+    if req.max_tokens == 0 && req.stream == Some(true) {
+        return Err(AppError::BadRequest(
+            "max_tokens: 0 (a cache pre-warm) cannot be combined with stream: true".to_owned(),
+        ));
+    }
+
     // Snapshot the runtime mappings at handler entry. A change
     // applied mid-request never tears the snapshot — the request
     // finishes with the mappings it started with. This matches the
@@ -765,6 +773,23 @@ pub(crate) fn build_outbound(
     // The translator copies the inbound model name verbatim; rewrite
     // it here so the upstream sees the alias-resolved name.
     outbound.model = model.to_owned();
+
+    // Floor the output cap. OpenAI-style upstreams reportedly refuse a
+    // `max_output_tokens` below 16, but Claude Code probes with `max_tokens: 1`
+    // and Anthropic accepts 0 (a cache pre-warm). Done here, after the model
+    // is final, so every attempt gets it. `min_output_tokens = 0` disables it.
+    let floor = config.min_output_tokens;
+    if floor > 0
+        && let Some(cap) = outbound.max_output_tokens
+        && cap < floor
+    {
+        tracing::debug!(
+            requested = cap,
+            sent = floor,
+            "raised max_output_tokens to the configured floor"
+        );
+        outbound.max_output_tokens = Some(floor);
+    }
 
     // Ask for a reasoning summary: an OpenAI-style upstream returns reasoning
     // text only when it is requested, and that text becomes the `thinking`
@@ -1097,7 +1122,13 @@ impl Attempt {
         // Server tools the proxy serves itself (`web_search`, `web_fetch` and
         // the advisor). Each is off by default and detection-triggered, so
         // with none active `handlers` is empty and the request is untouched.
-        let tools = crate::tools::server_loop::handlers(&self)?;
+        // A `max_tokens: 0` pre-warm does none of that: its output is thrown
+        // away, so there is nothing for a tool to serve.
+        let tools = if self.req.max_tokens == 0 {
+            Vec::new()
+        } else {
+            crate::tools::server_loop::handlers(&self)?
+        };
         if !tools.is_empty() && self.req.stream == Some(true) {
             // A streaming client is sent each round as it finishes.
             return match crate::tools::server_loop::stream::respond(self, tools).await? {
@@ -1179,9 +1210,26 @@ fn render_json(
     attempt: &Attempt,
     upstream_resp_body: responses::ResponsesResponse,
 ) -> Result<Response, AppError> {
-    let anth = translate::responses_to_anthropic(&upstream_resp_body, &attempt.registry);
+    let mut anth = translate::responses_to_anthropic(&upstream_resp_body, &attempt.registry);
+    if attempt.req.max_tokens == 0 {
+        into_prewarm_reply(&mut anth);
+    }
     record_json_stats(attempt, &upstream_resp_body);
     Ok(Json(anth).into_response())
+}
+
+/// Turn a normal reply into Anthropic's answer to `max_tokens: 0`: no content,
+/// `stop_reason: "max_tokens"`, and usage that bills no output.
+///
+/// The upstream was asked for a few tokens (see `min_output_tokens`) so its
+/// prompt cache is primed; they are discarded here. The operator's stats still
+/// count what the upstream really generated, because they read its own body.
+fn into_prewarm_reply(message: &mut crate::anthropic::Message) {
+    message.content.clear();
+    message.stop_reason = Some(crate::anthropic::StopReason::MaxTokens);
+    message.stop_sequence = None;
+    message.usage.output_tokens = 0;
+    message.usage.thinking_tokens = 0;
 }
 
 /// Stats + operator log line for a buffered response. Extracted verbatim

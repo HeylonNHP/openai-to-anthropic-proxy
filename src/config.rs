@@ -36,6 +36,13 @@ const DEFAULT_UPSTREAM_PATH: &str = "/v1/responses";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Maximum accepted inbound `/v1/messages` body size, in bytes (32 MiB).
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Smallest `max_output_tokens` sent upstream by default.
+///
+/// OpenAI-style servers reportedly refuse anything below 16 (an HTTP 400),
+/// while Anthropic accepts `max_tokens` of 0 (a cache pre-warm) and Claude Code
+/// reportedly probes with 1. `min_output_tokens = 0` turns the floor off.
+pub const DEFAULT_MIN_OUTPUT_TOKENS: u32 = 16;
 /// Prompt caching is opt-in and off by default. When disabled, the
 /// proxy does not emit any OpenAI prompt-cache fields, so the feature
 /// has zero impact on upstreams that don't understand it.
@@ -202,6 +209,10 @@ pub struct Config {
     pub request_timeout: Duration,
     /// Maximum accepted inbound `/v1/messages` body size, in bytes.
     pub max_request_body_bytes: usize,
+    /// Floor for the upstream's `max_output_tokens`: a client `max_tokens`
+    /// below it is sent as this value instead (`0` turns the floor off). See
+    /// [`DEFAULT_MIN_OUTPUT_TOKENS`].
+    pub min_output_tokens: u32,
     /// Outbound `reasoning_effort` for Responses requests. See
     /// [`DEFAULT_REASONING_EFFORT`] for why this exists. Forwarded to
     /// the upstream as `reasoning: { effort: "..." }` (the Responses
@@ -1152,6 +1163,15 @@ impl Config {
             })
         });
 
+        // `min_output_tokens`: env wins over file, default 16, `0` = no floor.
+        let min_output_tokens = pick_u64(
+            file.and_then(|f| f.min_output_tokens),
+            env.min_output_tokens,
+        )
+        .map_or(DEFAULT_MIN_OUTPUT_TOKENS, |v| {
+            u32::try_from(v).unwrap_or(u32::MAX)
+        });
+
         // `forward_documents`: env wins over file, default `false`.
         let forward_documents = env
             .forward_documents
@@ -1478,6 +1498,7 @@ impl Config {
             upstream_path,
             request_timeout: Duration::from_secs(request_timeout_secs),
             max_request_body_bytes,
+            min_output_tokens,
             reasoning_effort,
             reasoning,
             model_aliases,
@@ -1692,6 +1713,9 @@ pub struct EnvInputs {
     pub request_timeout_secs: Option<u64>,
     /// Raw numeric override; invalid numbers are warned about by the resolver.
     pub max_request_body_bytes: Option<serde_json::Number>,
+    /// `MIN_OUTPUT_TOKENS`: a whole number; `0` turns the floor off. An
+    /// unparseable value is ignored, like `REQUEST_TIMEOUT_SECS`.
+    pub min_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// `REASONING_SUMMARY`: `auto` (default), `concise`, `detailed` or `off`.
     pub reasoning_summary: Option<String>,
@@ -1782,6 +1806,9 @@ impl EnvInputs {
             tool_result_images: env::var("TOOL_RESULT_IMAGES").ok(),
             forward_documents: env::var("FORWARD_DOCUMENTS").ok().map(|s| parse_truthy(&s)),
             system_message_placement: env::var("SYSTEM_MESSAGE_PLACEMENT").ok(),
+            min_output_tokens: env::var("MIN_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
             reasoning_summary: env::var("REASONING_SUMMARY").ok(),
             prompt_caching_models: env::var("PROMPT_CACHING_MODELS").ok(),
@@ -2248,6 +2275,11 @@ pub struct JsonConfig {
     /// time rather than failing config parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_body_bytes: Option<serde_json::Number>,
+    /// Floor for the upstream's `max_output_tokens`; `0` turns it off. See
+    /// [`DEFAULT_MIN_OUTPUT_TOKENS`]. Unset keeps the file unchanged when the
+    /// TUI rewrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_output_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared

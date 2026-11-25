@@ -114,6 +114,7 @@ fn test_config_minimal() -> Config {
         prefix_models_for_discovery: false,
         tool_result_images: crate::config::ToolResultImages::default(),
         forward_documents: false,
+        min_output_tokens: crate::config::DEFAULT_MIN_OUTPUT_TOKENS,
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     }

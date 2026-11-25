@@ -3,6 +3,7 @@
   "upstream_api_key":  "your-nvapi-key-here",
   "request_timeout_secs": 600,
   "max_request_body_bytes": 33554432,
+  "min_output_tokens": 16,
 
   "system_message_placement": "inline",
 
