@@ -67,9 +67,7 @@ pub struct StreamTranslator {
     thinking_blocks: BTreeMap<u32, ThinkingBlockState>,
     next_index: u32,
     stop_reason: Option<StopReason>,
-    /// Whether a tool call's arguments were cut short by the upstream
-    /// (it ran out of output tokens mid-call). Such a call is
-    /// incomplete, so the turn must not be reported as a finished one.
+    /// A tool call's arguments were cut short by the output cap.
     truncated_tool_call: bool,
     usage: Option<AnthropicUsage>,
     /// Number of web-search calls represented in the emitted Anthropic blocks.
@@ -875,9 +873,8 @@ impl StreamTranslator {
         let raw = std::mem::take(&mut state.arguments);
         let repaired = repair_arguments(&self.registry, &state.name, &raw);
         if repaired.truncated {
-            // The upstream ran out of output tokens mid-call. The call
-            // is incomplete, so the turn must not be reported as a
-            // finished one — see `capture_terminal`.
+            // Ran out of output tokens mid-call; `capture_terminal`
+            // reports the turn as `max_tokens`.
             self.truncated_tool_call = true;
         }
         if repaired.json.is_empty() {
@@ -947,29 +944,14 @@ impl StreamTranslator {
             },
         );
         // Close open blocks so the client sees a well-formed sequence
-        // before the message_delta. This is also where the arguments of
-        // a tool block that was never closed explicitly are flushed —
-        // and so where a truncated argument blob is noticed.
+        // before the message_delta. Unclosed tool blocks flush their
+        // arguments here, which is where a truncated blob is noticed.
         self.finalize(events);
-        // A tool call the upstream cut short is an *incomplete* call:
-        // the client must not run it. Anthropic reports `max_tokens`
-        // for one, and that is the signal the client keys on to retry
-        // the turn with a bigger budget.
-        //
-        // Only a reply that claims to be complete is overridden. A
-        // reply the upstream marked `incomplete` carries its own
-        // reason, and that reason wins — `max_output_tokens` already
-        // maps to `max_tokens`, and `content_filter` maps to
-        // `refusal`, which this must not overwrite.
-        if self.truncated_tool_call
-            && response.status == "completed"
-            && matches!(
-                self.stop_reason,
-                Some(StopReason::EndTurn) | Some(StopReason::ToolUse)
-            )
-        {
-            self.stop_reason = Some(StopReason::MaxTokens);
-        }
+        self.stop_reason = crate::translate::stop_reason_for_cut_short_call(
+            self.stop_reason.take(),
+            &response.status,
+            self.truncated_tool_call,
+        );
     }
 
     fn close_open_tool_blocks(&mut self, events: &mut Vec<StreamEvent>) {

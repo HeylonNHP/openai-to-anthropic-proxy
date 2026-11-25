@@ -2785,26 +2785,8 @@ pub fn responses_to_anthropic(
     } else {
         stop_reason
     };
-    // A tool call the upstream cut short is an *incomplete* call: the
-    // client must not run it. Anthropic reports `max_tokens` for one,
-    // and that is the signal the client keys on to retry the turn with
-    // a bigger budget.
-    //
-    // Only a reply that claims to be complete is overridden. A reply
-    // the upstream marked `incomplete` carries its own reason, and
-    // that reason wins — `max_output_tokens` already maps to
-    // `max_tokens`, and `content_filter` maps to `refusal`, which
-    // this must not overwrite.
-    let stop_reason = if truncated_tool_call
-        && resp.status == "completed"
-        && matches!(
-            stop_reason,
-            Some(StopReason::EndTurn) | Some(StopReason::ToolUse)
-        ) {
-        Some(StopReason::MaxTokens)
-    } else {
-        stop_reason
-    };
+    let stop_reason =
+        stop_reason_for_cut_short_call(stop_reason, &resp.status, truncated_tool_call);
 
     let usage = resp
         .usage
@@ -2865,6 +2847,27 @@ fn ensure_msg_prefix(id: &str) -> String {
         id.to_owned()
     } else {
         format!("msg_{id}")
+    }
+}
+
+/// The stop reason once a cut-short tool call is taken into account.
+///
+/// A call the upstream cut short is incomplete, so the client must not
+/// run it; Anthropic reports `max_tokens` for one. Only a reply that
+/// claims to be complete is overridden: an `incomplete` reply carries
+/// its own reason, which wins (`content_filter` must stay `refusal`).
+pub fn stop_reason_for_cut_short_call(
+    stop_reason: Option<StopReason>,
+    status: &str,
+    cut_short: bool,
+) -> Option<StopReason> {
+    if cut_short
+        && status == "completed"
+        && matches!(stop_reason, Some(StopReason::EndTurn | StopReason::ToolUse))
+    {
+        Some(StopReason::MaxTokens)
+    } else {
+        stop_reason
     }
 }
 
@@ -3061,10 +3064,8 @@ fn build_content_blocks(
                 // "missing required parameter" error the model can act
                 // on, rather than an opaque unexpected-key rejection.
                 //
-                // A blob the upstream cut short (it ran out of output
-                // tokens) is neither: the parameters that were finished
-                // are kept and the one in flight is dropped, which is
-                // what Anthropic's own API does.
+                // A blob cut short by the output cap keeps its finished
+                // parameters, as Anthropic's API does.
                 let parsed = match crate::repair::read_arguments(arguments) {
                     crate::repair::Arguments::Whole(value) => value,
                     crate::repair::Arguments::Truncated(value) => {

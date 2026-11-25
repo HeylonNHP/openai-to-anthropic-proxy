@@ -27,11 +27,9 @@
 //! - [`validate`] is a small JSON-Schema-subset validator (the subset
 //!   Claude Code emits) used both to drive repair decisions and to gate
 //!   the proxy's hidden retry loop for unrepairable inputs.
-//! - [`read_arguments`] reads a tool call's arguments off the wire. When
-//!   the upstream runs out of output tokens the argument JSON is cut
-//!   short mid-object; Anthropic's own API buffers each parameter and
-//!   drops the one that was still being written, so the proxy keeps the
-//!   parameters that *were* finished rather than throwing them away.
+//! - [`read_arguments`] reads a tool call's arguments off the wire. A blob
+//!   cut short by the output cap keeps its finished parameters, as
+//!   Anthropic's API does.
 //!
 //! Repair is best-effort by design: it only *removes* or *decodes*
 //! information the sanitizer added; it never invents values. When a
@@ -538,10 +536,9 @@ fn accepts_non_string(obj: &Map<String, Value>) -> bool {
 /// schema (or whose arguments are not valid JSON at all). Empty when
 /// everything conforms — i.e. when the client will accept the call.
 ///
-/// A call the upstream cut short *is* a violation — the client rejects
-/// an incomplete call — but it is not the model's mistake, so it is
-/// reported in its own words. Whether it is worth spending a
-/// corrective retry on is the caller's policy decision.
+/// A call cut short by the output cap is reported in its own words: it is
+/// incomplete, but not the model's mistake. Whether to retry is the
+/// caller's call.
 #[must_use]
 pub fn tool_input_violations(
     resp: &crate::responses::ResponsesResponse,
@@ -555,8 +552,6 @@ pub fn tool_input_violations(
         {
             let parsed = match read_arguments(arguments) {
                 Arguments::Whole(value) => value,
-                // The call is incomplete, so the client will reject it.
-                // The output cap ended the turn, not the model.
                 Arguments::Truncated(_) => {
                     out.push((
                         name.clone(),
@@ -634,26 +629,18 @@ pub fn append_corrective_input(
 pub enum Arguments {
     /// The arguments are well-formed JSON.
     Whole(Value),
-    /// The arguments were cut short — the upstream ran out of output
-    /// tokens mid-JSON. The value holds the parameters that *were*
-    /// finished; the one that was still being written is dropped, which
-    /// is what Anthropic's own API does with it.
+    /// Cut short by the output cap. Holds the parameters that were
+    /// finished; the one being written is dropped, as Anthropic does.
     Truncated(Value),
-    /// The arguments are not JSON at all, so there is nothing to
-    /// recover from them.
+    /// Not JSON at all; nothing to recover.
     Malformed,
 }
 
 /// Read a tool call's arguments from the upstream.
 ///
-/// A tool call's arguments are a JSON object carried in a string. When
-/// the upstream runs out of output tokens that string is cut short,
-/// mid-JSON. Anthropic's own API never ships a half-written parameter:
-/// it buffers each value and drops the one that was still being
-/// written. So a translated reply carries the parameters that were
-/// finished — the client then sees the same shape it would get from
-/// Anthropic, with `stop_reason: max_tokens` telling it the call is
-/// incomplete.
+/// Anthropic never ships a half-written parameter, so a cut-short blob
+/// yields only the parameters that were finished; `stop_reason:
+/// max_tokens` tells the client the call is incomplete.
 #[must_use]
 pub fn read_arguments(raw: &str) -> Arguments {
     if raw.trim().is_empty() {
@@ -670,10 +657,6 @@ pub fn read_arguments(raw: &str) -> Arguments {
 
 /// Whether any tool call in the response has arguments the upstream cut
 /// short.
-///
-/// A cut-short call is an *incomplete* call: Anthropic reports
-/// `max_tokens` for one, and that is the signal the client keys on to
-/// decide it must not run the call.
 #[must_use]
 pub fn has_truncated_call(resp: &crate::responses::ResponsesResponse) -> bool {
     resp.output.iter().any(|item| {
@@ -784,17 +767,11 @@ impl<'de> DeserializeSeed<'de> for Collector<'_> {
 
 /// The arguments to replay for a tool call the model made.
 ///
-/// The upstream's own text is replayed verbatim, so the model sees the
-/// call it made. The one exception is a blob the upstream cut short:
-/// replaying it as-is would hand the upstream a `function_call` whose
-/// arguments do not parse, which it may reject outright. So the
-/// parameters that were finished are replayed instead.
-///
-/// A blob that is not JSON at all is replayed verbatim too. It is the
-/// model's own bad JSON rather than a cut-off one, and replaying it
-/// lets the model see what it wrote. An upstream that rejects the
-/// replay costs the corrective retry, not the request: the proxy keeps
-/// the original response.
+/// Replayed verbatim, except a cut-short blob: it does not parse, and the
+/// upstream may reject it, so its finished parameters are replayed
+/// instead. A malformed blob is the model's own bad JSON and stays
+/// verbatim; if the upstream rejects it, only the corrective retry is
+/// lost.
 fn replayed_arguments(raw: &str) -> String {
     match read_arguments(raw) {
         Arguments::Whole(_) => raw.to_owned(),
