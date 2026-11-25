@@ -194,3 +194,160 @@ fn unauthorized_response_returns_401() {
     let resp = AppError::Unauthorized.into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ─── The plain streaming path's keep-alive ───────────────────────────────
+
+/// A `response.created` payload: enough for the translator to open the
+/// message.
+const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"test-model","output":[]}}"#;
+
+/// A text delta.
+const DELTA: &str = r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}"#;
+
+/// The terminal event.
+const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"test-model","output":[]}}"#;
+
+/// The upstream stream: the given events, then silence for good.
+fn upstream(
+    events: &[&str],
+) -> impl Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin {
+    let items: Vec<Result<SseEvent, EventStreamError<reqwest::Error>>> = events
+        .iter()
+        .map(|data| {
+            Ok(SseEvent {
+                data: (*data).to_owned(),
+                ..SseEvent::default()
+            })
+        })
+        .collect();
+    futures_util::stream::iter(items).chain(futures_util::stream::pending())
+}
+
+/// A translator over `inner`. The TUI sink keeps the response line out
+/// of stdout.
+fn translator_stream<S>(inner: S) -> TranslatorStream<S>
+where
+    S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
+{
+    let (sink, _rx) = crate::tui::OutputSink::tui();
+    TranslatorStream::new(
+        inner,
+        TranslatorStreamConfig {
+            msg_id: "msg_test".to_owned(),
+            model: "test-model".to_owned(),
+            registry: crate::repair::ToolSchemaRegistry::new(),
+            start: Instant::now(),
+            sink,
+            session_stats: Arc::new(crate::tui::SessionStatsStore::new()),
+            stats_model: "test-model".to_owned(),
+            fallback_used: false,
+        },
+    )
+}
+
+/// Poll a stream once by hand with a no-op waker: the test drives the
+/// stream, so the paused clock only moves when the test says so.
+fn poll_once<S>(stream: &mut S) -> Poll<Option<S::Item>>
+where
+    S: Stream + Unpin,
+{
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    Pin::new(stream).poll_next(&mut cx)
+}
+
+/// The chunk the poll produced, as text.
+fn chunk(poll: Poll<Option<Result<Bytes, std::io::Error>>>) -> String {
+    let Poll::Ready(Some(Ok(bytes))) = poll else {
+        panic!("expected a chunk");
+    };
+    String::from_utf8(bytes.to_vec()).expect("the chunk is UTF-8")
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_plain_stream_pings_after_a_quiet_spell() {
+    let mut stream = translator_stream(upstream(&[CREATED]));
+
+    // The first thing the client hears is the message opening.
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: message_start"), "{first}");
+
+    // Nothing has been said since, but the keep-alive is not due yet.
+    assert!(poll_once(&mut stream).is_pending());
+
+    // A full interval later it is.
+    tokio::time::advance(PING_INTERVAL).await;
+    assert_eq!(
+        chunk(poll_once(&mut stream)),
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_plain_stream_restarts_the_keep_alive_on_content() {
+    let mut stream = translator_stream(upstream(&[CREATED, DELTA]));
+
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: message_start"), "{first}");
+
+    // Content arrives; it must go out as content, not as a ping.
+    tokio::time::advance(PING_INTERVAL / 2).await;
+    let second = chunk(poll_once(&mut stream));
+    assert!(second.contains("event: content_block_delta"), "{second}");
+    assert!(!second.contains("event: ping"), "{second}");
+
+    // The content restarted the keep-alive: it is due a full interval
+    // from now, not from the message start.
+    assert_eq!(
+        stream
+            .ping_timer
+            .as_ref()
+            .expect("the keep-alive is running")
+            .deadline(),
+        tokio::time::Instant::now() + PING_INTERVAL
+    );
+
+    // And so the stream stays quiet until then.
+    assert!(poll_once(&mut stream).is_pending());
+    tokio::time::advance(PING_INTERVAL).await;
+    assert_eq!(
+        chunk(poll_once(&mut stream)),
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_plain_stream_does_not_ping_before_the_message_starts() {
+    // The upstream says nothing at all: there is no message yet, so
+    // there is nothing to keep alive.
+    let mut stream = translator_stream(upstream(&[]));
+    assert!(poll_once(&mut stream).is_pending());
+    tokio::time::advance(PING_INTERVAL * 2).await;
+    assert!(poll_once(&mut stream).is_pending());
+
+    // The upstream sends content without the `response.created` that
+    // opens the message. The keep-alive is running now, but it must
+    // still wait for the message itself.
+    let mut stream = translator_stream(upstream(&[DELTA]));
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: content_block_delta"), "{first}");
+    assert!(!first.contains("event: message_start"), "{first}");
+    tokio::time::advance(PING_INTERVAL).await;
+    assert!(poll_once(&mut stream).is_pending());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_plain_stream_does_not_ping_after_the_terminal_event() {
+    let mut stream = translator_stream(upstream(&[CREATED, COMPLETED]));
+
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: message_start"), "{first}");
+
+    // The upstream finishes long after the keep-alive would have fired.
+    tokio::time::advance(PING_INTERVAL * 2).await;
+    let last = chunk(poll_once(&mut stream));
+    assert!(last.contains("event: message_stop"), "{last}");
+    assert!(!last.contains("event: ping"), "{last}");
+
+    // And the stream ends there: no ping follows the message.
+    assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
+}

@@ -51,14 +51,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::anthropic::{Message, ResponseContentBlock, StreamEvent};
 use crate::error::AppError;
-use crate::proxy::{Attempt, encode_sse_events};
+use crate::proxy::{Attempt, PING_INTERVAL, encode_sse_events};
 use crate::tools::advisor::sse::{block_events, end_events, start_event};
 use crate::tools::server_loop::handler::ServerTool;
 use crate::tools::server_loop::render::{Tail, finish_streaming};
 use crate::tools::server_loop::run::{LoopEvent, SessionOutcome, drive};
-
-/// How long the stream may be silent before a `ping` is sent.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long the first executor run may take before the stream is started
 /// without it, so the client is never left without a byte for longer than

@@ -4,6 +4,7 @@
 //! forward to upstream → translate response (or stream) back → ship to
 //! Claude Code.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -1395,6 +1396,17 @@ fn print_stream_stats(
 
 // ─── Streaming bridge ─────────────────────────────────────────────────────
 
+/// How long the client may hear nothing before a `ping` is sent.
+///
+/// Anthropic's own API keeps a connection alive with `ping` events while
+/// the model is thinking, and Claude Code's streaming watchdogs count the
+/// bytes of a `ping` as activity: without them a quiet reasoning model
+/// aborts the turn with "Stream idle timeout" and the request is retried
+/// from the start. Ten seconds is the cadence the server-tool path has
+/// always used, and the one Claude Code's event-level watchdog expects
+/// ("about five minutes when bytes arrive at least every 10 seconds").
+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Bridges the upstream SSE event stream with our `StreamTranslator` and
 /// yields Anthropic-formatted SSE bytes ready to write to the client.
 ///
@@ -1419,6 +1431,16 @@ where
     fallback_used: bool,
     /// Output sink for the response log line. Cloned cheaply (Arc inside).
     sink: crate::tui::OutputSink,
+    /// Keep-alive timer: it fires when the client has heard nothing for
+    /// [`PING_INTERVAL`], and a `ping` goes out. It is `None` until the
+    /// message starts — the timer is created then, so building the
+    /// stream needs no runtime. Once it exists it is polled on every
+    /// pass, so its waker is always registered and the timer can be
+    /// restarted safely.
+    ping_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Whether `message_start` has gone out. A `ping` before it would
+    /// break the event order, so the keep-alive waits for it.
+    message_started: bool,
 }
 
 /// Configuration for creating a `TranslatorStream`.
@@ -1451,6 +1473,8 @@ where
             stats_model: config.stats_model,
             fallback_used: config.fallback_used,
             sink: config.sink,
+            ping_timer: None,
+            message_started: false,
         }
     }
 
@@ -1475,6 +1499,39 @@ where
         let t = self.translator.take().expect("translator already taken");
         self.stats = Some(t.stats());
         t.emit_error(kind, message)
+    }
+
+    /// Restart the keep-alive: the client has just heard something, so
+    /// the next `ping` is due [`PING_INTERVAL`] from now.
+    ///
+    /// An existing timer is polled on every pass of the stream before it
+    /// is restarted here, so it is registered with the runtime and the
+    /// reset takes effect. The first one is created here instead, with
+    /// the deadline it needs.
+    fn restart_ping(&mut self) {
+        let deadline = tokio::time::Instant::now() + PING_INTERVAL;
+        match self.ping_timer.as_mut() {
+            Some(timer) => timer.as_mut().reset(deadline),
+            None => self.ping_timer = Some(Box::pin(tokio::time::sleep_until(deadline))),
+        }
+    }
+
+    /// Record that `events` went to the client.
+    ///
+    /// The keep-alive restarts on every byte the client hears, and it
+    /// starts for good once `message_start` has been sent.
+    fn note_sent(&mut self, events: &[StreamEvent]) {
+        if events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageStart { .. }))
+        {
+            self.message_started = true;
+        }
+        // The message is over once the translator is gone: there is
+        // nothing left to keep alive.
+        if self.translator.is_some() {
+            self.restart_ping();
+        }
     }
 }
 
@@ -1525,6 +1582,13 @@ where
                     _ => return Poll::Ready(None),
                 }
             }
+            // Poll the keep-alive on every pass. That registers its
+            // waker, so the task wakes when the timer expires, and it
+            // makes restarting the timer afterwards safe.
+            let ping_due = this
+                .ping_timer
+                .as_mut()
+                .is_some_and(|timer| timer.as_mut().poll(cx).is_ready());
             match this.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     if msg.data.trim() == "[DONE]" {
@@ -1618,6 +1682,7 @@ where
                     if events.is_empty() {
                         continue;
                     }
+                    this.note_sent(&events);
                     return Poll::Ready(Some(Ok(encode_sse_events(&events))));
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -1645,7 +1710,17 @@ where
                     }
                     return Poll::Ready(None);
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // The upstream is quiet. If the keep-alive has
+                    // expired and the message has started, send a `ping`
+                    // so the client knows the connection is alive.
+                    if ping_due && this.message_started {
+                        this.restart_ping();
+                        let events = [StreamEvent::Ping {}];
+                        return Poll::Ready(Some(Ok(encode_sse_events(&events))));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }

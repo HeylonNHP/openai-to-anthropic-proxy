@@ -116,16 +116,27 @@ so the proxy can only approximate it.
   - Problem: non-streaming prefixes `[refusal] `, streaming sends raw text.
   - Fix: both paths prefix the refusal text with `[refusal] `.
 
-- [ ] **B5. Send `ping` events on the plain streaming path**
-  - Where: `src/proxy.rs:1425-1569` (only `server_loop/stream.rs:224` pings)
-  - Problem: a reasoning model that goes quiet sends nothing, so an intermediary
-    may drop the connection.
+- [x] **B5. Send `ping` events on the plain streaming path**
+  - Where: `src/proxy.rs` (`TranslatorStream`), `src/proxy/tests.rs`
+  - Problem: a reasoning model that goes quiet sends nothing, so the
+    connection goes silent.
   - Fix: interleave a timed `ping` in `TranslatorStream`.
-  - Unverified: Claude Code's idle timeout.
+  - Note: the gap file said "an intermediary may drop the connection"; it is
+    in fact **Claude Code** that drops it. Its streaming watchdogs abort a
+    turn after 300 s without bytes (the byte-level watchdog, which runs on a
+    custom `ANTHROPIC_BASE_URL`), after 5 minutes without bytes (the body idle
+    timeout), and after 300 s without a parsed event (the event-level
+    watchdog, which arriving bytes — pings included — hold off for as long as
+    they arrive at least every 10 s). The symptom is
+    `API Error: Stream idle timeout`, and Claude Code retries the whole
+    request, so the tokens already spent are paid for twice.
+  - A `ping` cannot cover an upstream that never sends its response headers:
+    the proxy only sends its own headers once the upstream's arrive, so that
+    window is a first-byte problem, not a keep-alive one.
   - Severity: medium.
 
 - [ ] **B6. Don't send `message_stop` after an `error` event**
-  - Where: `src/stream.rs:383`, `:404`, `:489`, `src/proxy.rs:1503`
+  - Where: `src/stream.rs:383`, `:404`, `:489`, `src/proxy.rs:1494`
   - Problem: Anthropic's docs show `error` as the terminal event.
   - Note: existing tests may assume the current behaviour.
   - Severity: low.
@@ -323,4 +334,4 @@ its own design rather than a quick fix.
 
 ## Suggested order
 
-A1 to A7 first, then B1 to B3, then B5, C1, D1, E1, and the rest as needed.
+A7 and B6 to B7 first, then C1, D1, E1, and the rest as needed.

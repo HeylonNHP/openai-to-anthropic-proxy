@@ -307,6 +307,18 @@ fails the test run.
 
 The stream translator keeps track of open text and tool-use blocks, emits the right Anthropic content-block events as OpenAI deltas arrive, then closes the message when the upstream finishes.
 
+A quiet upstream would leave the client with nothing to hear, so a `ping`
+event goes out every 10 seconds of silence — the same event Anthropic's own
+API sends, and the same cadence the server-tool path uses. Claude Code counts
+the bytes of a `ping` as activity: without them a reasoning model that goes
+quiet for five minutes trips Claude Code's stream-idle watchdog, which aborts
+the turn and retries the whole request. The keep-alive starts once
+`message_start` has been sent (a `ping` before it would break the event
+order), restarts whenever the client hears something else, and stops with the
+message. It does not cover an upstream that has not sent its response headers
+yet: the proxy's own headers go out only once the upstream's do, so that
+window is a first-byte problem, not a keep-alive one.
+
 ## Architecture
 
 ```text
