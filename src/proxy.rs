@@ -1105,6 +1105,22 @@ impl Attempt {
             if violations.is_empty() {
                 break;
             }
+            // A reply the output cap cut short is not a validation
+            // failure: the arguments did not break the schema, the cap
+            // ended the call mid-JSON, and re-asking with the same cap
+            // truncates the same way. The client gets `stop_reason:
+            // max_tokens` and handles it the way it would with Anthropic.
+            //
+            // This is the *policy* decision (whether to spend a
+            // retry); `tool_input_violations` above is the
+            // descriptive report (what is wrong with the call). Both
+            // agree that a truncated call is not the model's fault.
+            if crate::repair::has_truncated_call(&upstream_resp_body) {
+                tracing::warn!(
+                    "the reply was cut short by the output cap; not spending a corrective retry"
+                );
+                break;
+            }
             tracing::warn!(
                 violations = ?violations,
                 "tool input violates the original schema after repair; issuing corrective retry"

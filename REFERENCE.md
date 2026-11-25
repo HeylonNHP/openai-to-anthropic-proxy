@@ -301,6 +301,7 @@ fails the test run.
 - Text becomes `text` blocks.
 - Each `tool_call` becomes a `tool_use` block.
 - `stop_reason` and token usage are mapped into Anthropic shape. `input_tokens` is reported **net of cache**: OpenAI's gross `input_tokens` minus `cached_tokens` and `cache_write_tokens`, which become `cache_read_input_tokens` and `cache_creation_input_tokens`. Claude Code adds the three, so reporting the gross figure would count cached tokens twice and trigger auto-compaction early. The proxy's own log lines and TUI still show the upstream's gross figure.
+- A tool call the upstream cut short — it ran out of output tokens mid-JSON — keeps the parameters that were finished and drops the one that was still being written, the way Anthropic's own API buffers each parameter. The reply then carries `stop_reason: "max_tokens"`, which is the signal the client keys on to retry the turn with a bigger budget.
 
 ### Streaming
 

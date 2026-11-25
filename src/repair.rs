@@ -27,6 +27,11 @@
 //! - [`validate`] is a small JSON-Schema-subset validator (the subset
 //!   Claude Code emits) used both to drive repair decisions and to gate
 //!   the proxy's hidden retry loop for unrepairable inputs.
+//! - [`read_arguments`] reads a tool call's arguments off the wire. When
+//!   the upstream runs out of output tokens the argument JSON is cut
+//!   short mid-object; Anthropic's own API buffers each parameter and
+//!   drops the one that was still being written, so the proxy keeps the
+//!   parameters that *were* finished rather than throwing them away.
 //!
 //! Repair is best-effort by design: it only *removes* or *decodes*
 //! information the sanitizer added; it never invents values. When a
@@ -37,7 +42,9 @@
 
 use std::collections::HashMap;
 
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value};
+use std::fmt;
 
 /// Original (client-supplied) `input_schema` per tool name, captured at
 /// request-translation time and consulted when translating the
@@ -530,6 +537,11 @@ fn accepts_non_string(obj: &Map<String, Value>) -> bool {
 /// pair per call whose repaired input still violates the original
 /// schema (or whose arguments are not valid JSON at all). Empty when
 /// everything conforms — i.e. when the client will accept the call.
+///
+/// A call the upstream cut short *is* a violation — the client rejects
+/// an incomplete call — but it is not the model's mistake, so it is
+/// reported in its own words. Whether it is worth spending a
+/// corrective retry on is the caller's policy decision.
 #[must_use]
 pub fn tool_input_violations(
     resp: &crate::responses::ResponsesResponse,
@@ -541,9 +553,18 @@ pub fn tool_input_violations(
             name, arguments, ..
         } = item
         {
-            let parsed = match serde_json::from_str::<Value>(arguments) {
-                Ok(v) => v,
-                Err(_) => {
+            let parsed = match read_arguments(arguments) {
+                Arguments::Whole(value) => value,
+                // The call is incomplete, so the client will reject it.
+                // The output cap ended the turn, not the model.
+                Arguments::Truncated(_) => {
+                    out.push((
+                        name.clone(),
+                        "arguments were cut short before the call was finished".to_owned(),
+                    ));
+                    continue;
+                }
+                Arguments::Malformed => {
                     out.push((name.clone(), "arguments are not valid JSON".to_owned()));
                     continue;
                 }
@@ -586,7 +607,7 @@ pub fn append_corrective_input(
             items.push(crate::responses::InputItem::FunctionCall {
                 call_id: call_id.clone(),
                 name: name.clone(),
-                arguments: arguments.clone(),
+                arguments: replayed_arguments(arguments),
             });
             let violation = violations
                 .iter()
@@ -603,6 +624,184 @@ pub fn append_corrective_input(
                 .into(),
             });
         }
+    }
+}
+
+// ─── reading upstream arguments ────────────────────────────────────
+
+/// How a tool call's arguments were read off the wire.
+#[derive(Debug)]
+pub enum Arguments {
+    /// The arguments are well-formed JSON.
+    Whole(Value),
+    /// The arguments were cut short — the upstream ran out of output
+    /// tokens mid-JSON. The value holds the parameters that *were*
+    /// finished; the one that was still being written is dropped, which
+    /// is what Anthropic's own API does with it.
+    Truncated(Value),
+    /// The arguments are not JSON at all, so there is nothing to
+    /// recover from them.
+    Malformed,
+}
+
+/// Read a tool call's arguments from the upstream.
+///
+/// A tool call's arguments are a JSON object carried in a string. When
+/// the upstream runs out of output tokens that string is cut short,
+/// mid-JSON. Anthropic's own API never ships a half-written parameter:
+/// it buffers each value and drops the one that was still being
+/// written. So a translated reply carries the parameters that were
+/// finished — the client then sees the same shape it would get from
+/// Anthropic, with `stop_reason: max_tokens` telling it the call is
+/// incomplete.
+#[must_use]
+pub fn read_arguments(raw: &str) -> Arguments {
+    if raw.trim().is_empty() {
+        return Arguments::Whole(Value::Object(Map::new()));
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Arguments::Whole(value),
+        // Only a blob that ran out of input is a truncation. Anything
+        // else is malformed, and there is nothing to recover from it.
+        Err(error) if error.is_eof() => Arguments::Truncated(finished_parameters(raw)),
+        Err(_) => Arguments::Malformed,
+    }
+}
+
+/// Whether any tool call in the response has arguments the upstream cut
+/// short.
+///
+/// A cut-short call is an *incomplete* call: Anthropic reports
+/// `max_tokens` for one, and that is the signal the client keys on to
+/// decide it must not run the call.
+#[must_use]
+pub fn has_truncated_call(resp: &crate::responses::ResponsesResponse) -> bool {
+    resp.output.iter().any(|item| {
+        matches!(
+            item,
+            crate::responses::OutputItem::FunctionCall { arguments, .. }
+                if matches!(read_arguments(arguments), Arguments::Truncated(_))
+        )
+    })
+}
+
+/// The parameters of a cut-short argument blob that were finished.
+///
+/// `serde_json` stops at the first member it cannot read. Every member
+/// before that one was written in full, so it is kept; the member that
+/// was in flight is dropped.
+fn finished_parameters(raw: &str) -> Value {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let mut partial = PartialObject::default();
+    // `serde_json` insists on the closing brace of the object, so a
+    // cut-short blob always ends in an error — but the members it read
+    // before that are in `partial` now.
+    let _ = Collector {
+        partial: &mut partial,
+    }
+    .deserialize(&mut deserializer);
+    if partial.stopped_between_members
+        && partial
+            .members
+            .last()
+            .is_some_and(|(_, value)| value.is_number())
+        && raw.trim_end().ends_with(|c: char| c.is_ascii_digit())
+    {
+        // A number at the very end of the blob may have been cut
+        // mid-digits (`12` could have been `123`), so it is not a
+        // finished parameter. Anthropic drops it too. A number the blob
+        // ends *after* — one a comma or a brace terminated — is
+        // complete and stays.
+        partial.members.pop();
+    }
+    let mut object = Map::new();
+    for (key, value) in partial.members {
+        object.insert(key, value);
+    }
+    Value::Object(object)
+}
+
+/// A JSON object read as far as it could be read.
+#[derive(Default)]
+struct PartialObject {
+    /// The members that were read, in the order they were read.
+    members: Vec<(String, Value)>,
+    /// Whether the read stopped while looking for the *next* member,
+    /// i.e. the last value read may itself have been cut short.
+    stopped_between_members: bool,
+}
+
+/// Reads a JSON object into a [`PartialObject`], keeping what it could.
+struct Collector<'a> {
+    partial: &'a mut PartialObject,
+}
+
+impl<'de> DeserializeSeed<'de> for Collector<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct Reader<'a> {
+            partial: &'a mut PartialObject,
+        }
+
+        impl<'de> Visitor<'de> for Reader<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let partial = self.partial;
+                loop {
+                    let key = match map.next_key::<String>() {
+                        Ok(Some(key)) => key,
+                        // The object ended, or it was cut short. Either
+                        // way there are no more members to read.
+                        Ok(None) => break,
+                        Err(_) => {
+                            partial.stopped_between_members = true;
+                            break;
+                        }
+                    };
+                    let value = match map.next_value::<Value>() {
+                        Ok(value) => value,
+                        // The member was cut short, so it is not a
+                        // finished parameter and is not kept.
+                        Err(_) => break,
+                    };
+                    partial.members.push((key, value));
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_map(Reader {
+            partial: self.partial,
+        })
+    }
+}
+
+/// The arguments to replay for a tool call the model made.
+///
+/// The upstream's own text is replayed verbatim, so the model sees the
+/// call it made. The one exception is a blob the upstream cut short:
+/// replaying it as-is would hand the upstream a `function_call` whose
+/// arguments do not parse, which it may reject outright. So the
+/// parameters that were finished are replayed instead.
+///
+/// A blob that is not JSON at all is replayed verbatim too. It is the
+/// model's own bad JSON rather than a cut-off one, and replaying it
+/// lets the model see what it wrote. An upstream that rejects the
+/// replay costs the corrective retry, not the request: the proxy keeps
+/// the original response.
+fn replayed_arguments(raw: &str) -> String {
+    match read_arguments(raw) {
+        Arguments::Whole(_) => raw.to_owned(),
+        Arguments::Truncated(value) => {
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned())
+        }
+        Arguments::Malformed => raw.to_owned(),
     }
 }
 

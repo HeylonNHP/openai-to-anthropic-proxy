@@ -67,6 +67,10 @@ pub struct StreamTranslator {
     thinking_blocks: BTreeMap<u32, ThinkingBlockState>,
     next_index: u32,
     stop_reason: Option<StopReason>,
+    /// Whether a tool call's arguments were cut short by the upstream
+    /// (it ran out of output tokens mid-call). Such a call is
+    /// incomplete, so the turn must not be reported as a finished one.
+    truncated_tool_call: bool,
     usage: Option<AnthropicUsage>,
     /// Number of web-search calls represented in the emitted Anthropic blocks.
     web_search_count: u32,
@@ -169,6 +173,7 @@ impl StreamTranslator {
             thinking_blocks: BTreeMap::new(),
             next_index: 0,
             stop_reason: None,
+            truncated_tool_call: false,
             usage: None,
             web_search_count: 0,
             pending_web_search_ids: Vec::new(),
@@ -869,13 +874,19 @@ impl StreamTranslator {
         state.emitted = true;
         let raw = std::mem::take(&mut state.arguments);
         let repaired = repair_arguments(&self.registry, &state.name, &raw);
-        if repaired.is_empty() {
+        if repaired.truncated {
+            // The upstream ran out of output tokens mid-call. The call
+            // is incomplete, so the turn must not be reported as a
+            // finished one — see `capture_terminal`.
+            self.truncated_tool_call = true;
+        }
+        if repaired.json.is_empty() {
             return;
         }
         events.push(StreamEvent::ContentBlockDelta {
             index: state.index,
             delta: ContentDelta::InputJsonDelta {
-                partial_json: repaired,
+                partial_json: repaired.json,
             },
         });
     }
@@ -936,8 +947,29 @@ impl StreamTranslator {
             },
         );
         // Close open blocks so the client sees a well-formed sequence
-        // before the message_delta.
+        // before the message_delta. This is also where the arguments of
+        // a tool block that was never closed explicitly are flushed —
+        // and so where a truncated argument blob is noticed.
         self.finalize(events);
+        // A tool call the upstream cut short is an *incomplete* call:
+        // the client must not run it. Anthropic reports `max_tokens`
+        // for one, and that is the signal the client keys on to retry
+        // the turn with a bigger budget.
+        //
+        // Only a reply that claims to be complete is overridden. A
+        // reply the upstream marked `incomplete` carries its own
+        // reason, and that reason wins — `max_output_tokens` already
+        // maps to `max_tokens`, and `content_filter` maps to
+        // `refusal`, which this must not overwrite.
+        if self.truncated_tool_call
+            && response.status == "completed"
+            && matches!(
+                self.stop_reason,
+                Some(StopReason::EndTurn) | Some(StopReason::ToolUse)
+            )
+        {
+            self.stop_reason = Some(StopReason::MaxTokens);
+        }
     }
 
     fn close_open_tool_blocks(&mut self, events: &mut Vec<StreamEvent>) {
@@ -1093,31 +1125,58 @@ fn collect_url_citations(target: &mut Vec<(String, String)>, annotations: &[Valu
     }
 }
 
+/// The JSON text to ship for a tool call, and whether the upstream cut
+/// the arguments short.
+struct RepairedArguments {
+    /// The JSON text to ship downstream.
+    json: String,
+    /// Whether the arguments were cut short — the call is incomplete.
+    truncated: bool,
+}
+
 /// Parse + repair a raw upstream tool-argument blob against the original
 /// schema for `tool` (when registered). Returns the JSON text to ship
 /// downstream. Empty/whitespace input becomes `{}` (Anthropic
-/// `tool_use.input` must be an object); unparseable input is logged and
-/// shipped as `{}` rather than as a synthetic `_raw_arguments` key the
-/// client's strict schema would reject outright.
-fn repair_arguments(registry: &crate::repair::ToolSchemaRegistry, tool: &str, raw: &str) -> String {
+/// `tool_use.input` must be an object); input that is not JSON at all is
+/// logged and shipped as `{}` rather than as a synthetic `_raw_arguments`
+/// key the client's strict schema would reject outright. Input the
+/// upstream cut short keeps the parameters that were finished — the one
+/// that was in flight is dropped, as Anthropic's own API drops it.
+fn repair_arguments(
+    registry: &crate::repair::ToolSchemaRegistry,
+    tool: &str,
+    raw: &str,
+) -> RepairedArguments {
     if raw.trim().is_empty() {
-        return "{}".to_owned();
+        return RepairedArguments {
+            json: "{}".to_owned(),
+            truncated: false,
+        };
     }
-    let parsed = match serde_json::from_str::<Value>(raw) {
-        Ok(v) => v,
-        Err(e) => {
+    let (parsed, truncated) = match crate::repair::read_arguments(raw) {
+        crate::repair::Arguments::Whole(value) => (value, false),
+        crate::repair::Arguments::Truncated(value) => {
             tracing::warn!(
                 tool = %tool,
-                error = %e,
+                "upstream tool arguments were cut short; keeping the parameters that were finished"
+            );
+            (value, true)
+        }
+        crate::repair::Arguments::Malformed => {
+            tracing::warn!(
+                tool = %tool,
                 "upstream tool arguments are not valid JSON; shipping empty input"
             );
-            return "{}".to_owned();
+            (Value::Object(Default::default()), false)
         }
     };
     let Some(original) = registry.get(tool) else {
         // No original schema (tool not declared inbound, e.g. a
         // server-injected call): pass through untouched.
-        return serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_owned());
+        return RepairedArguments {
+            json: serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_owned()),
+            truncated,
+        };
     };
     let repaired = crate::repair::repair(parsed, original);
     if let Some(violation) = crate::repair::validate(&repaired, original) {
@@ -1127,7 +1186,10 @@ fn repair_arguments(registry: &crate::repair::ToolSchemaRegistry, tool: &str, ra
             "tool input still violates the original schema after repair"
         );
     }
-    serde_json::to_string(&repaired).unwrap_or_else(|_| "{}".to_owned())
+    RepairedArguments {
+        json: serde_json::to_string(&repaired).unwrap_or_else(|_| "{}".to_owned()),
+        truncated,
+    }
 }
 
 fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {

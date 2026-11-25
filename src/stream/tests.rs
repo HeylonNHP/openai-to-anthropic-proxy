@@ -1275,3 +1275,92 @@ fn closing_a_continuation_closes_open_blocks_once_and_never_ends_the_message() {
     );
     assert!(t.close_blocks().is_empty(), "idempotent");
 }
+
+#[test]
+fn a_truncated_tool_call_keeps_the_parameters_that_were_finished() {
+    // The upstream ran out of output tokens mid-call. Anthropic's own
+    // API keeps the parameters that were finished and drops the one
+    // that was still being written, so the client sees the same shape
+    // here — not `{}`, which would look like a valid empty call.
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&function_call_added(0, "call_1", "write_file"));
+    t.feed_event(&function_call_args_delta(
+        0,
+        r#"{"path":"/tmp/x","content":"half"#,
+    ));
+    let evs = t.feed_event(&function_call_args_done(
+        0,
+        r#"{"path":"/tmp/x","content":"half"#,
+    ));
+    assert_eq!(evs.len(), 1);
+    match &evs[0] {
+        StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentDelta::InputJsonDelta { partial_json },
+        } => {
+            assert_eq!(*index, 0);
+            assert_eq!(partial_json, r#"{"path":"/tmp/x"}"#);
+        }
+        _ => panic!("expected input_json_delta"),
+    }
+
+    // The stop reason is what tells the client the call is incomplete.
+    let evs = t.feed_event(&incomplete_event("max_output_tokens"));
+    let closing = t.finish();
+    let mut saw_max_tokens = false;
+    for event in evs.iter().chain(closing.iter()) {
+        if let StreamEvent::MessageDelta { delta, .. } = event
+            && delta.stop_reason == Some(StopReason::MaxTokens)
+        {
+            saw_max_tokens = true;
+        }
+    }
+    assert!(saw_max_tokens, "expected stop_reason max_tokens");
+}
+
+#[test]
+fn a_truncated_call_from_a_completed_stream_still_reports_max_tokens() {
+    // An upstream that claims the turn is complete but ships truncated
+    // arguments is lying: the call is incomplete whatever the status
+    // says. `max_tokens` is the honest stop reason, and it is the
+    // signal the client keys on to retry with a bigger budget — a
+    // `tool_use` stop reason would tell it to run the call.
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&function_call_added(0, "call_1", "write_file"));
+    let evs = t.feed_event(&function_call_args_done(
+        0,
+        r#"{"path":"/tmp/x","content":"half a sen"#,
+    ));
+    // The finished parameters survive.
+    match &evs[0] {
+        StreamEvent::ContentBlockDelta {
+            delta: ContentDelta::InputJsonDelta { partial_json },
+            ..
+        } => assert_eq!(partial_json, r#"{"path":"/tmp/x"}"#),
+        _ => panic!("expected input_json_delta"),
+    }
+
+    let evs = t.feed_event(&completed_event_with_output(
+        "completed",
+        vec![OutputItem::FunctionCall {
+            id: Some("fc_0".into()),
+            status: Some("completed".into()),
+            call_id: "call_1".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"/tmp/x","content":"half a sen"#.into(),
+        }],
+    ));
+    assert!(!evs.is_empty());
+    let closing = t.finish();
+    let mut saw_max_tokens = false;
+    for event in evs.iter().chain(closing.iter()) {
+        if let StreamEvent::MessageDelta { delta, .. } = event
+            && delta.stop_reason == Some(StopReason::MaxTokens)
+        {
+            saw_max_tokens = true;
+        }
+    }
+    assert!(saw_max_tokens, "expected stop_reason max_tokens");
+}

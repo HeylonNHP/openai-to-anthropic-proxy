@@ -10446,3 +10446,174 @@ async fn a_failed_later_server_tool_run_keeps_the_work_already_done() {
         "the last good answer survives: {body}"
     );
 }
+
+/// A tool call the upstream cut short (it ran out of output tokens)
+/// keeps the parameters that were finished and reports
+/// `stop_reason: max_tokens`. Anthropic's own API buffers each
+/// parameter and drops the one that was still being written, so the
+/// client sees the same shape here — not `{}`, which would look like a
+/// valid empty call.
+///
+/// The proxy also does not spend a corrective round-trip on it: the
+/// arguments did not break the schema, the output cap ended the call,
+/// and re-asking with the same cap truncates the same way.
+#[tokio::test]
+async fn a_truncated_tool_call_keeps_its_finished_parameters() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_cut",
+            "object": "response",
+            "created_at": 1,
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "model": "gpt-4o",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "status": "incomplete",
+                "call_id": "call_1",
+                "name": "Workflow",
+                "arguments": "{\"script\":\"export const meta = {}\",\"resumeFromRunId\":\"half a "
+            }],
+            "usage": {"input_tokens": 5, "output_tokens": 60, "total_tokens": 65}
+        }"#
+        .into(),
+    );
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [{
+                    "name": "Workflow",
+                    "description": "Run a workflow",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "script": {"type": "string"},
+                            "resumeFromRunId": {"type": "string", "pattern": "^wf_[a-z0-9-]{6,}$"}
+                        },
+                        "required": ["script"]
+                    }
+                }]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+
+    // The parameter that was finished survives; the one that was being
+    // written when the cap hit is dropped.
+    assert_eq!(
+        body["content"][0]["input"],
+        serde_json::json!({"script": "export const meta = {}"})
+    );
+    // The stop reason is what tells the client the call is incomplete.
+    assert_eq!(body["stop_reason"], "max_tokens");
+
+    // No corrective round-trip: the upstream was asked exactly once.
+    let sent = upstream.received_all.lock().await.clone();
+    assert_eq!(sent.len(), 1, "a truncated reply is not retried");
+}
+
+/// The same, through the streaming path: the argument deltas are
+/// buffered and shipped as one `input_json_delta` carrying the
+/// parameters that were finished.
+#[tokio::test]
+async fn a_truncated_tool_call_streams_its_finished_parameters() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let sse = [
+        r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","object":"response","created_at":0,"status":"in_progress","model":"gpt-4o","output":[]}}"#,
+        r#"event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","status":"in_progress","call_id":"call_1","name":"Workflow","arguments":""}}"#,
+        r#"event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"script\":\"export const meta = {}\",\"resumeFromRunId\":\"half a "}"#,
+        r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_1","object":"response","created_at":0,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":"gpt-4o","output":[{"type":"function_call","id":"fc_1","status":"incomplete","call_id":"call_1","name":"Workflow","arguments":"{\"script\":\"export const meta = {}\",\"resumeFromRunId\":\"half a "}],"usage":{"input_tokens":5,"output_tokens":60,"total_tokens":65}}}"#,
+    ]
+    .join("\n\n")
+        + "\n\n";
+    *upstream.canned_stream.lock().await = Some(sse);
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "run it"}],
+                "tools": [{
+                    "name": "Workflow",
+                    "description": "Run a workflow",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "script": {"type": "string"},
+                            "resumeFromRunId": {"type": "string", "pattern": "^wf_[a-z0-9-]{6,}$"}
+                        },
+                        "required": ["script"]
+                    }
+                }]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.unwrap();
+
+    // Exactly one input_json_delta, carrying the salvaged blob.
+    let input_deltas: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter(|s| s.contains("\"input_json_delta\""))
+        .filter_map(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .and_then(|d| serde_json::from_str(d).ok())
+        })
+        .collect();
+    assert_eq!(input_deltas.len(), 1);
+    let partial = input_deltas[0]["delta"]["partial_json"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(partial).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"script": "export const meta = {}"})
+    );
+
+    // The stop reason is what tells the client the call is incomplete.
+    let deltas: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter(|s| s.contains("\"message_delta\""))
+        .filter_map(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .and_then(|d| serde_json::from_str(d).ok())
+        })
+        .collect();
+    assert!(
+        deltas
+            .iter()
+            .any(|d| d["delta"]["stop_reason"] == "max_tokens"),
+        "expected stop_reason max_tokens in: {text}"
+    );
+}

@@ -2758,7 +2758,8 @@ pub fn responses_to_anthropic(
     resp: &ResponsesResponse,
     registry: &crate::repair::ToolSchemaRegistry,
 ) -> Message {
-    let (mut content, web_search_count) = build_content_blocks(&resp.output, registry);
+    let (mut content, web_search_count, truncated_tool_call) =
+        build_content_blocks(&resp.output, registry);
 
     // Defensive fallback: the proxy normally never gets here with a failed
     // reply (see the doc comment above). If it does, and we have no output
@@ -2781,6 +2782,26 @@ pub fn responses_to_anthropic(
     let stop_reason = map_status_to_stop_reason(&resp.status, resp.incomplete_details.as_ref());
     let stop_reason = if stop_reason == Some(StopReason::EndTurn) && has_tool_use {
         Some(StopReason::ToolUse)
+    } else {
+        stop_reason
+    };
+    // A tool call the upstream cut short is an *incomplete* call: the
+    // client must not run it. Anthropic reports `max_tokens` for one,
+    // and that is the signal the client keys on to retry the turn with
+    // a bigger budget.
+    //
+    // Only a reply that claims to be complete is overridden. A reply
+    // the upstream marked `incomplete` carries its own reason, and
+    // that reason wins — `max_output_tokens` already maps to
+    // `max_tokens`, and `content_filter` maps to `refusal`, which
+    // this must not overwrite.
+    let stop_reason = if truncated_tool_call
+        && resp.status == "completed"
+        && matches!(
+            stop_reason,
+            Some(StopReason::EndTurn) | Some(StopReason::ToolUse)
+        ) {
+        Some(StopReason::MaxTokens)
     } else {
         stop_reason
     };
@@ -2964,10 +2985,12 @@ fn extract_web_search_citations(
 fn build_content_blocks(
     items: &[OutputItem],
     registry: &crate::repair::ToolSchemaRegistry,
-) -> (Vec<ResponseContentBlock>, u32) {
+) -> (Vec<ResponseContentBlock>, u32, bool) {
     let (citations, web_search_count) = extract_web_search_citations(items, registry);
 
     let mut blocks = Vec::new();
+    // Whether a tool call's arguments were cut short by the upstream.
+    let mut truncated_tool_call = false;
 
     // Inject one server-tool/result pair per search with a distinct ID.
     for search_index in 0..web_search_count {
@@ -3037,12 +3060,24 @@ fn build_content_blocks(
                 // the client's validator then reports a specific
                 // "missing required parameter" error the model can act
                 // on, rather than an opaque unexpected-key rejection.
-                let parsed = match serde_json::from_str::<Value>(arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
+                //
+                // A blob the upstream cut short (it ran out of output
+                // tokens) is neither: the parameters that were finished
+                // are kept and the one in flight is dropped, which is
+                // what Anthropic's own API does.
+                let parsed = match crate::repair::read_arguments(arguments) {
+                    crate::repair::Arguments::Whole(value) => value,
+                    crate::repair::Arguments::Truncated(value) => {
                         tracing::warn!(
                             tool = %name,
-                            error = %e,
+                            "upstream tool arguments were cut short; keeping the parameters that were finished"
+                        );
+                        truncated_tool_call = true;
+                        value
+                    }
+                    crate::repair::Arguments::Malformed => {
+                        tracing::warn!(
+                            tool = %name,
                             "upstream tool arguments are not valid JSON; shipping empty input"
                         );
                         Value::Object(Default::default())
@@ -3100,7 +3135,7 @@ fn build_content_blocks(
             OutputItem::Unknown => {}
         }
     }
-    (blocks, web_search_count)
+    (blocks, web_search_count, truncated_tool_call)
 }
 
 #[cfg(test)]

@@ -82,14 +82,19 @@ so the proxy can only approximate it.
     (`stream_error_kind`).
   - Severity: medium.
 
-- [ ] **B2. Truncated tool call at `max_tokens` is sent as `{}`**
-  - Where: `src/stream.rs:1102-1115`, `src/translate.rs:2998-3007`
+- [x] **B2. Truncated tool call at `max_tokens` is sent as `{}`**
+  - Where: `src/repair.rs` (`read_arguments`), `src/stream.rs` (`repair_arguments`),
+    `src/translate.rs` (`build_content_blocks`), `src/proxy.rs` (corrective retry)
   - Problem: when the response is `incomplete` for `max_output_tokens` and the
-    arguments JSON is cut off, the proxy sends `tool_use` with input `{}`.
-    Anthropic sends partial JSON, and its docs say the call is unusable.
-  - Fix: drop the incomplete `tool_use` block, or send the raw partial JSON,
-    with `stop_reason: max_tokens`.
-  - Unverified: how Claude Code treats `{}` here. Test before and after.
+    arguments JSON is cut off, the proxy sent `tool_use` with input `{}` — a
+    shape that looks like a valid empty call.
+  - Fix: recover the parameters that were *finished* and drop the one that was
+    still being written, then ship them with `stop_reason: max_tokens`.
+  - Note: the original premise ("Anthropic sends partial JSON") is wrong for
+    Anthropic's standard mode — it buffers each parameter and drops the
+    incomplete one, so the completed parameters *are* shipped. Sending raw
+    partial JSON would also violate `tool_use.input: map[unknown]` and make the
+    wire result depend on which SDK partial parser the client uses.
   - Severity: medium.
 
 - [ ] **B3. Produce `refusal` stop reason**

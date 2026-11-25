@@ -134,6 +134,36 @@ fn malformed_tool_arguments_become_empty_object() {
 }
 
 #[test]
+fn truncated_tool_arguments_keep_the_parameters_that_were_finished() {
+    // The upstream ran out of output tokens mid-call. Anthropic's own
+    // API buffers each parameter and drops the one that was still being
+    // written, so the client sees the finished ones — not `{}`, which
+    // would look like a valid empty call.
+    let mut resp = fixture_response();
+    resp.status = "incomplete".into();
+    resp.incomplete_details = Some(IncompleteDetails {
+        reason: "max_output_tokens".into(),
+    });
+    resp.output = vec![OutputItem::FunctionCall {
+        id: Some("fc_x".into()),
+        status: Some("incomplete".into()),
+        call_id: "call_cut".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"/tmp/x","content":"half a sen"#.into(),
+    }];
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    match &out.content[0] {
+        ResponseContentBlock::ToolUse { input, .. } => {
+            assert_eq!(input, &serde_json::json!({"path": "/tmp/x"}));
+        }
+        _ => panic!("expected tool_use block"),
+    }
+    // The client keys its retry on the stop reason, not on the shape
+    // of the input.
+    assert_eq!(out.stop_reason, Some(StopReason::MaxTokens));
+}
+
+#[test]
 fn reasoning_item_becomes_thinking_block() {
     let mut resp = fixture_response();
     resp.output = vec![
@@ -825,4 +855,30 @@ fn sanitize_tool_schema_coerces_additional_properties_true_to_false_on_object() 
         "expected additionalProperties: false on object branch, got {}",
         branch["additionalProperties"]
     );
+}
+
+#[test]
+fn a_truncated_call_from_a_completed_reply_still_reports_max_tokens() {
+    // An upstream that claims the turn is complete but ships truncated
+    // arguments is lying: the call is incomplete whatever the status
+    // says. `max_tokens` is the honest stop reason, and it is the
+    // signal the client keys on to retry with a bigger budget — a
+    // `tool_use` stop reason would tell it to run the call.
+    let mut resp = fixture_response();
+    resp.status = "completed".into();
+    resp.output = vec![OutputItem::FunctionCall {
+        id: Some("fc_x".into()),
+        status: Some("completed".into()),
+        call_id: "call_cut".into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"/tmp/x","content":"half a sen"#.into(),
+    }];
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    match &out.content[0] {
+        ResponseContentBlock::ToolUse { input, .. } => {
+            assert_eq!(input, &serde_json::json!({"path": "/tmp/x"}));
+        }
+        _ => panic!("expected tool_use block"),
+    }
+    assert_eq!(out.stop_reason, Some(StopReason::MaxTokens));
 }
