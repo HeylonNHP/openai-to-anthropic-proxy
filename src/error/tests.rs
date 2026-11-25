@@ -244,3 +244,13 @@ fn a_failed_reply_with_no_error_object_is_a_generic_502() {
     );
     assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
 }
+
+#[test]
+fn a_missing_model_is_a_404_not_found_error() {
+    let err = AppError::NotFound("model with id \"nope\" not found".to_owned());
+    let body = err.anthropic_error_body();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert_eq!(body["error"]["message"], "model with id \"nope\" not found");
+    assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+}

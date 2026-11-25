@@ -492,3 +492,50 @@ fn no_config_leaves_the_row_alone() {
     assert!(row.max_input_tokens.is_none());
     assert_eq!(row.created_at, before);
 }
+
+// ─── GET /v1/models/{model_id}: the row lookup ──────────────────────────
+
+#[test]
+fn a_model_row_is_found_by_its_id() {
+    let rows = vec![
+        alias_model_row("claude-sonnet-5", None),
+        alias_model_row("gpt-4o-mini", None),
+    ];
+    assert_eq!(
+        find_model_row(&rows, "claude-sonnet-5").map(|r| r.id.as_str()),
+        Some("claude-sonnet-5"),
+        "an alias key is a row of its own"
+    );
+    assert_eq!(
+        find_model_row(&rows, "gpt-4o-mini").map(|r| r.id.as_str()),
+        Some("gpt-4o-mini"),
+        "the default-model row answers under its own id"
+    );
+}
+
+#[test]
+fn a_model_row_is_found_by_the_raw_id_behind_a_discovery_prefix() {
+    let mut row = alias_model_row("gpt-4o", None);
+    // What prefix_models_for_discovery produces: the client-facing id
+    // prefixed, the raw upstream id kept as the display name.
+    row.id = "claude-gpt-4o".to_owned();
+    let rows = vec![row];
+
+    assert_eq!(
+        find_model_row(&rows, "claude-gpt-4o").map(|r| r.id.as_str()),
+        Some("claude-gpt-4o"),
+        "the client-facing id matches exactly"
+    );
+    assert_eq!(
+        find_model_row(&rows, "gpt-4o").map(|r| r.id.as_str()),
+        Some("claude-gpt-4o"),
+        "the raw upstream id resolves to the same row"
+    );
+}
+
+#[test]
+fn an_unknown_model_id_finds_nothing() {
+    let rows = vec![alias_model_row("claude-sonnet-5", None)];
+    assert!(find_model_row(&rows, "claude-opus-9000").is_none());
+    assert!(find_model_row(&[], "claude-sonnet-5").is_none());
+}

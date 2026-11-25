@@ -268,9 +268,25 @@ so the proxy can only approximate it.
     passed through from config.
   - Severity: medium.
 
-- [ ] **E2. Add `GET /v1/models/{id}`**
-  - Where: routes in `src/proxy.rs:180-194`
-  - Problem: returns 404. Build it from the list and aliases.
+- [x] **E2. Add `GET /v1/models/{id}`**
+  - Where: `src/proxy.rs` (`handle_model`, `collect_model_rows`,
+    `find_model_row`), `src/error.rs` (`AppError::NotFound`)
+  - Fix: the single-model route serves the same rows as the list
+    (upstream mirror + alias/default entries + `model_info`) as a bare
+    object — no envelope — behind the same `proxy_key` layer. A miss is
+    the new `AppError::NotFound`: 404 with Anthropic's `not_found_error`
+    envelope. Lookup is exact id first (alias keys are rows), then the
+    raw upstream id behind a `prefix_models_for_discovery` rewrite.
+  - Note (decompiled Claude Code 2.1.330): the retrieve path parses no
+    schema at all — plain `JSON.parse`, bare object, JSON content-type
+    load-bearing — reads `id` / `max_input_tokens` / `max_tokens`, sends
+    no query string (the `?beta=true` route belongs to
+    `client.beta.models`, which has zero callers), percent-decodes ids
+    (axum's `Path<String>` does this), and treats 404 as status-only
+    (`not_found` → cache null, no retry, no retry storm). Still
+    hard-gated off (`NWe()` returns false) in this build, so this is
+    future-readiness, like E1's fields.
+  - Severity: low-medium.
 
 - [ ] **E3. Improve `count_tokens` accuracy**
   - Where: `src/count_tokens.rs:28-37`, `:69-76`

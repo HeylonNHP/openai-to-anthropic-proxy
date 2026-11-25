@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -194,6 +194,13 @@ pub fn router_with_stores(
                 require_proxy_key,
             )),
         )
+        .route(
+            "/v1/models/{model_id}",
+            get(handle_model).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_proxy_key,
+            )),
+        )
         .with_state(state)
 }
 
@@ -354,16 +361,63 @@ async fn handle_models(
     Query(q): Query<ModelsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<AnthropicModelsList>, AppError> {
+    let data = collect_model_rows(&state, &headers).await?;
+    page_models(data, q.after_id.as_deref(), q.before_id.as_deref(), q.limit).map(Json)
+}
+
+/// `GET /v1/models/{model_id}` — one model as Anthropic's bare Model
+/// object, no envelope.
+///
+/// The SDK reads `id` / `max_input_tokens` / `max_tokens` off the top
+/// level, and without a JSON content type the body would arrive as a
+/// string and every field would read as undefined. The id may be a
+/// client-facing alias key or an upstream name — "model identifier or
+/// alias", as the docs put it. Unknown query parameters (`?beta=true`
+/// from older SDK routes) are ignored: there is no `Query` extractor.
+async fn handle_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AnthropicModelInfo>, AppError> {
+    let rows = collect_model_rows(&state, &headers).await?;
+    find_model_row(&rows, &model_id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("model with id {model_id:?} not found")))
+}
+
+/// The row for `requested`: an exact id match first — alias keys are
+/// rows of their own — then the raw upstream id that
+/// `prefix_models_for_discovery` may have hidden behind a `claude-`
+/// prefix (`display_name` keeps the raw name).
+fn find_model_row<'a>(
+    rows: &'a [AnthropicModelInfo],
+    requested: &str,
+) -> Option<&'a AnthropicModelInfo> {
+    rows.iter()
+        .find(|row| row.id == requested)
+        .or_else(|| rows.iter().find(|row| row.display_name == requested))
+}
+
+/// Every row that `GET /v1/models` and `GET /v1/models/{id}` serve.
+///
+/// The upstream's own `/v1/models` mirrored into Anthropic shape (or,
+/// when the upstream has none, just the configured aliases), plus the
+/// alias and default-model entries, each enriched from `model_info`.
+async fn collect_model_rows(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Vec<AnthropicModelInfo>, AppError> {
     let url = format!(
         "{}/v1/models",
         state.config.upstream_base_url.trim_end_matches('/')
     );
     let mut req = state.client.get(&url);
-    let path_lower = state.config.upstream_api_key.clone();
-    let key = if path_lower.is_empty() {
+    let api_key = state.config.upstream_api_key.clone();
+    let key = if api_key.is_empty() {
         None
     } else {
-        Some(path_lower.as_str())
+        Some(api_key.as_str())
     };
     if let Some(k) = key {
         req = req.bearer_auth(k);
@@ -379,15 +433,11 @@ async fn handle_models(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        // Fall back to a list derived solely from configured aliases + default_model
-        // when the upstream does not expose /v1/models (common for some gateways).
+        // Fall back to rows derived solely from configured aliases +
+        // default_model when the upstream does not expose /v1/models
+        // (common for some gateways).
         if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
-            return Ok(Json(page_models(
-                build_models_list_from_aliases(&state),
-                q.after_id.as_deref(),
-                q.before_id.as_deref(),
-                q.limit,
-            )?));
+            return Ok(build_models_list_from_aliases(state));
         }
         return Err(map_upstream_error(status, &body));
     }
@@ -395,12 +445,7 @@ async fn handle_models(
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("upstream /v1/models returned non-JSON body: {e}");
-            return Ok(Json(page_models(
-                build_models_list_from_aliases(&state),
-                q.after_id.as_deref(),
-                q.before_id.as_deref(),
-                q.limit,
-            )?));
+            return Ok(build_models_list_from_aliases(state));
         }
     };
 
@@ -443,7 +488,7 @@ async fn handle_models(
 
     // Merge in configured alias keys (the inbound names like claude-sonnet-5)
     // so they show up in the /model picker and resolve through the alias map.
-    let (alias_map, default_model) = load_live_mappings(&state);
+    let (alias_map, default_model) = load_live_mappings(state);
     for inbound in alias_map.keys() {
         if !seen.insert(inbound.clone()) {
             continue;
@@ -467,7 +512,7 @@ async fn handle_models(
         data.push(row);
     }
 
-    page_models(data, q.after_id.as_deref(), q.before_id.as_deref(), q.limit).map(Json)
+    Ok(data)
 }
 
 /// The rows for a list built only from configured aliases — the upstream

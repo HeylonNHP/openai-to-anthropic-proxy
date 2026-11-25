@@ -343,7 +343,7 @@ OpenAI-compatible upstream.
 See also [`README.md`](./README.md#features) for the shorter visitor-facing list.
 
 ### Endpoints and transport
-- Anthropic endpoints other than Messages, `count_tokens`, `GET /v1/models` and `/healthz` (such as batches/files)
+- Anthropic endpoints other than Messages, `count_tokens`, `GET /v1/models` and `GET /v1/models/{id}` and `/healthz` (such as batches/files)
 - TLS termination (bind a plain HTTP listener; put a reverse proxy in front)
 - One upstream target per instance: no multi-tenant or per-user routing
 

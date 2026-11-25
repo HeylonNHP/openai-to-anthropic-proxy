@@ -50,6 +50,12 @@ pub enum AppError {
         retry_after: Option<Duration>,
     },
 
+    /// The requested resource does not exist — `GET /v1/models/{id}`
+    /// for an id no configured model answers to. 404, with Anthropic's
+    /// `not_found_error` envelope.
+    #[error("{0}")]
+    NotFound(String),
+
     /// Anything else (network failure, decode failure, etc.).
     #[error("internal error: {0}")]
     Internal(String),
@@ -229,6 +235,9 @@ impl AppError {
             Self::BadRequest(msg) => Self::BadRequest(scrub(&msg)),
             Self::Unauthorized => Self::Unauthorized,
             Self::PayloadTooLarge(msg) => Self::PayloadTooLarge(scrub(&msg)),
+            // Nothing advisor- or upstream-shaped can be in this message:
+            // it echoes the id the client itself asked for.
+            Self::NotFound(msg) => Self::NotFound(msg),
             Self::ContextOverflow(msg) => Self::ContextOverflow(scrub(&msg)),
             Self::Upstream {
                 status,
@@ -252,6 +261,7 @@ impl AppError {
                 "missing or invalid X-Proxy-Key header".to_owned(),
             ),
             Self::PayloadTooLarge(msg) => ("request_too_large", msg.clone()),
+            Self::NotFound(msg) => ("not_found_error", msg.clone()),
             Self::ContextOverflow(msg) => (crate::context_overflow::ERROR_KIND, msg.clone()),
             Self::Upstream { status, body, .. } => (
                 error_kind_for_status(status.as_u16()),
@@ -290,6 +300,7 @@ impl IntoResponse for AppError {
             Self::BadRequest(_) | Self::ContextOverflow(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
             // 4xx and 5xx upstream statuses are passed through, but if the
             // status itself is informational (1xx) or a success code (2xx/3xx)
             // we collapse to 502 — something is wrong if we got here.
