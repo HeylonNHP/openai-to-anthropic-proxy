@@ -572,3 +572,68 @@ fn server_tool_usage_omits_a_zero_count() {
         serde_json::json!({"web_search_requests": 1, "web_fetch_requests": 3})
     );
 }
+
+// ─── GET /v1/models serialization ────────────────────────────────────────
+
+/// A row the operator configured nothing for emits only its four base
+/// fields — Anthropic's own responder omits unconfigured metadata rather
+/// than sending `null`.
+#[test]
+fn a_model_row_omits_metadata_it_did_not_configure() {
+    let row = AnthropicModelInfo {
+        r#type: "model",
+        id: "claude-sonnet-5".to_owned(),
+        display_name: "claude-sonnet-5".to_owned(),
+        created_at: "1970-01-01T00:00:00Z".to_owned(),
+        description: None,
+        max_input_tokens: None,
+        max_tokens: None,
+        capabilities: None,
+    };
+    let value = serde_json::to_value(&row).unwrap();
+    let obj = value.as_object().unwrap();
+    // serde_json sorts keys alphabetically; the point is that these four
+    // are the whole row and no metadata key is present.
+    let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["created_at", "display_name", "id", "type"]);
+}
+
+/// Configured metadata rides along with Anthropic's field names and
+/// JSON types.
+#[test]
+fn a_model_row_carries_configured_metadata_with_its_types() {
+    let row = AnthropicModelInfo {
+        r#type: "model",
+        id: "claude-sonnet-5".to_owned(),
+        display_name: "claude-sonnet-5".to_owned(),
+        created_at: "1970-01-01T00:00:00Z".to_owned(),
+        description: Some("GPT-5.4-mini behind the alias".to_owned()),
+        max_input_tokens: Some(1_000_000),
+        max_tokens: Some(64_000),
+        capabilities: Some(serde_json::json!({"thinking": {"supported": true}})),
+    };
+    let value = serde_json::to_value(&row).unwrap();
+    assert_eq!(value["max_input_tokens"], 1_000_000);
+    assert_eq!(value["max_tokens"], 64_000);
+    assert_eq!(value["description"], "GPT-5.4-mini behind the alias");
+    assert_eq!(value["capabilities"]["thinking"]["supported"], true);
+}
+
+/// An empty page carries explicit `null` boundaries, as Anthropic's
+/// responder emits — present keys, null values, not omitted keys.
+#[test]
+fn an_empty_models_page_reports_null_boundaries() {
+    let list = AnthropicModelsList {
+        data: Vec::new(),
+        has_more: false,
+        first_id: None,
+        last_id: None,
+    };
+    let value = serde_json::to_value(&list).unwrap();
+    let obj = value.as_object().unwrap();
+    assert!(obj.contains_key("first_id"));
+    assert!(obj.contains_key("last_id"));
+    assert_eq!(value["first_id"], serde_json::Value::Null);
+    assert_eq!(value["last_id"], serde_json::Value::Null);
+    assert_eq!(value["has_more"], false);
+}

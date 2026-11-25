@@ -823,24 +823,38 @@ pub struct MessageDeltaPayload {
 
 /// A single model entry in the Anthropic `GET /v1/models` response.
 ///
-/// The CLI uses `id` when it echoes the model back in `model: ...` fields and
-/// `display_name` for the human-facing `/model` picker.
+/// The CLI uses `id` when it echoes the model back in `model: ...` fields,
+/// `display_name` for the human-facing `/model` picker, and `description`
+/// as that picker's subtitle. `max_input_tokens` / `max_tokens` /
+/// `capabilities` mirror the documented Anthropic model object; they come
+/// from `model_info` in `proxy.json` and are omitted when unconfigured —
+/// Anthropic's own responder omits them too rather than sending `null`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnthropicModelInfo {
     pub r#type: &'static str,
     pub id: String,
     pub display_name: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
 }
 
 /// `GET /v1/models` response shape (Anthropic's List Models endpoint).
+///
+/// `first_id` / `last_id` are the boundaries of the page just returned —
+/// the client feeds them back as `before_id` / `after_id` — and are
+/// explicit `null` when the page is empty, as Anthropic sends them.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AnthropicModelsList {
     pub data: Vec<AnthropicModelInfo>,
     pub has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub first_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_id: Option<String>,
 }
 

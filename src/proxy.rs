@@ -22,7 +22,9 @@ use eventsource_stream::{EventStream, Eventsource};
 use futures_util::{Stream, StreamExt};
 use std::time::Duration;
 
-use crate::anthropic::{AnthropicModelsList, CreateMessageRequest, StreamEvent};
+use crate::anthropic::{
+    AnthropicModelInfo, AnthropicModelsList, CreateMessageRequest, StreamEvent,
+};
 use crate::capabilities::{self, CapabilityStore};
 use crate::config::Config;
 use crate::error::AppError;
@@ -239,12 +241,13 @@ async fn handle_health() -> &'static str {
 
 #[derive(Debug, serde::Deserialize, Default)]
 struct ModelsQuery {
-    #[serde(rename = "after_id")]
-    _after_id: Option<String>,
-    #[serde(rename = "before_id")]
-    _before_id: Option<String>,
-    #[serde(rename = "limit")]
-    _limit: Option<u32>,
+    /// Exclusive cursor: rows strictly after this id.
+    after_id: Option<String>,
+    /// Exclusive cursor: rows strictly before this id.
+    before_id: Option<String>,
+    /// Page size (Anthropic: default 20, 1..=1000). Claude Code always
+    /// sends 1000, which returns the whole list.
+    limit: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -269,12 +272,88 @@ struct OpenAIModel {
     _owned_by: String,
 }
 
+/// Fold one `model_info` entry (see [`crate::config::ModelInfoEntry`])
+/// onto a model row. Fields the operator did not configure leave the row
+/// alone; `created_at` overrides whatever date the row already carries.
+fn apply_model_info(row: &mut AnthropicModelInfo, info: Option<&crate::config::ModelInfoEntry>) {
+    let Some(info) = info else { return };
+    if let Some(v) = info.max_input_tokens {
+        row.max_input_tokens = Some(v);
+    }
+    if let Some(v) = info.max_tokens {
+        row.max_tokens = Some(v);
+    }
+    if let Some(v) = &info.capabilities {
+        row.capabilities = Some(v.clone());
+    }
+    if let Some(v) = &info.description {
+        row.description = Some(v.clone());
+    }
+    if let Some(v) = &info.created_at {
+        row.created_at = v.clone();
+    }
+}
+
+/// A row for a name the proxy synthesises — an alias key or the fallback
+/// model — where `id` and `display_name` are that name. `inherited` is
+/// the release date of the upstream model it maps to, when the upstream's
+/// list carried one; with none, the date is the epoch, Anthropic's
+/// documented "unknown" value.
+fn alias_model_row(name: &str, inherited: Option<i64>) -> AnthropicModelInfo {
+    let created = inherited.filter(|secs| *secs > 0).unwrap_or(0);
+    AnthropicModelInfo {
+        r#type: "model",
+        id: name.to_owned(),
+        display_name: name.to_owned(),
+        created_at: epoch_to_rfc3339(created as u64),
+        description: None,
+        max_input_tokens: None,
+        max_tokens: None,
+        capabilities: None,
+    }
+}
+
+/// Anthropic's `GET /v1/models` paging (this sorts first): `after_id` /
+/// `before_id` are exclusive cursors over the id order, `limit` caps the
+/// page (default 20, 1..=1000 — anything else is a 400). `first_id` /
+/// `last_id` are the boundaries of the page just returned, ready to feed
+/// back as the opposite cursor, and explicit `null` on an empty page as
+/// Anthropic sends. `has_more` says the cursor window still holds rows
+/// past this page.
+fn page_models(
+    mut data: Vec<AnthropicModelInfo>,
+    after_id: Option<&str>,
+    before_id: Option<&str>,
+    limit: Option<u32>,
+) -> Result<AnthropicModelsList, AppError> {
+    let limit = limit.unwrap_or(20);
+    if !(1..=1000).contains(&limit) {
+        return Err(AppError::BadRequest(format!(
+            "limit must be between 1 and 1000, got {limit}"
+        )));
+    }
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    let start = after_id.map_or(0, |a| data.partition_point(|m| m.id.as_str() <= a));
+    let end = before_id.map_or(data.len(), |b| data.partition_point(|m| m.id.as_str() < b));
+    let end = end.clamp(start, data.len());
+    let stop = (start + limit as usize).min(end);
+    let has_more = stop < end;
+    let page: Vec<AnthropicModelInfo> = data.drain(start..stop).collect();
+    let first_id = page.first().map(|m| m.id.clone());
+    let last_id = page.last().map(|m| m.id.clone());
+    Ok(AnthropicModelsList {
+        data: page,
+        has_more,
+        first_id,
+        last_id,
+    })
+}
+
 async fn handle_models(
     State(state): State<AppState>,
-    Query(_q): Query<ModelsQuery>,
+    Query(q): Query<ModelsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<AnthropicModelsList>, AppError> {
-    use crate::anthropic::{AnthropicModelInfo, AnthropicModelsList};
     let url = format!(
         "{}/v1/models",
         state.config.upstream_base_url.trim_end_matches('/')
@@ -303,7 +382,12 @@ async fn handle_models(
         // Fall back to a list derived solely from configured aliases + default_model
         // when the upstream does not expose /v1/models (common for some gateways).
         if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
-            return Ok(Json(build_models_list_from_aliases(&state)));
+            return Ok(Json(page_models(
+                build_models_list_from_aliases(&state),
+                q.after_id.as_deref(),
+                q.before_id.as_deref(),
+                q.limit,
+            )?));
         }
         return Err(map_upstream_error(status, &body));
     }
@@ -311,13 +395,22 @@ async fn handle_models(
         Ok(u) => u,
         Err(e) => {
             tracing::warn!("upstream /v1/models returned non-JSON body: {e}");
-            return Ok(Json(build_models_list_from_aliases(&state)));
+            return Ok(Json(page_models(
+                build_models_list_from_aliases(&state),
+                q.after_id.as_deref(),
+                q.before_id.as_deref(),
+                q.limit,
+            )?));
         }
     };
 
     let mut data: Vec<AnthropicModelInfo> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The upstream's release dates, so alias rows can inherit them.
+    let mut upstream_created: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
     for m in upstream.data {
+        upstream_created.insert(m.id.clone(), m.created);
         if !seen.insert(m.id.clone()) {
             continue;
         }
@@ -328,12 +421,24 @@ async fn handle_models(
         } else {
             m.id.clone()
         };
-        data.push(AnthropicModelInfo {
+        let mut row = AnthropicModelInfo {
             r#type: "model",
-            id,
+            id: id.clone(),
             display_name: m.id.clone(),
             created_at: epoch_to_rfc3339(m.created as u64),
-        });
+            description: None,
+            max_input_tokens: None,
+            max_tokens: None,
+            capabilities: None,
+        };
+        // Config keys either the id the client sees or the raw one.
+        let info = state
+            .config
+            .model_info
+            .get(&id)
+            .or_else(|| state.config.model_info.get(&m.id));
+        apply_model_info(&mut row, info);
+        data.push(row);
     }
 
     // Merge in configured alias keys (the inbound names like claude-sonnet-5)
@@ -343,72 +448,51 @@ async fn handle_models(
         if !seen.insert(inbound.clone()) {
             continue;
         }
-        data.push(AnthropicModelInfo {
-            r#type: "model",
-            id: inbound.clone(),
-            display_name: inbound.clone(),
-            created_at: epoch_to_rfc3339(0),
-        });
+        // An alias row carries the release date of the upstream model it
+        // maps to, when the upstream's list had one.
+        let inherited = alias_map
+            .get(inbound)
+            .and_then(|target| upstream_created.get(target))
+            .copied();
+        let mut row = alias_model_row(inbound, inherited);
+        apply_model_info(&mut row, state.config.model_info.get(inbound));
+        data.push(row);
     }
     if let Some(fb) = default_model
         && seen.insert(fb.clone())
     {
-        data.push(AnthropicModelInfo {
-            r#type: "model",
-            id: fb.clone(),
-            display_name: fb,
-            created_at: epoch_to_rfc3339(0),
-        });
+        let inherited = upstream_created.get(&fb).copied();
+        let mut row = alias_model_row(&fb, inherited);
+        apply_model_info(&mut row, state.config.model_info.get(&fb));
+        data.push(row);
     }
 
-    // OpenAI items with created==0
-    // rather than faking timestamps. Sort by id for stable output.
-    data.sort_by(|a, b| a.id.cmp(&b.id));
-
-    let first_id = data.first().map(|m| m.id.clone());
-    let last_id = data.last().map(|m| m.id.clone());
-    Ok(Json(AnthropicModelsList {
-        data,
-        has_more: false,
-        first_id,
-        last_id,
-    }))
+    page_models(data, q.after_id.as_deref(), q.before_id.as_deref(), q.limit).map(Json)
 }
 
-fn build_models_list_from_aliases(state: &AppState) -> AnthropicModelsList {
-    use crate::anthropic::{AnthropicModelInfo, AnthropicModelsList};
+/// The rows for a list built only from configured aliases — the upstream
+/// has no `/v1/models` to mirror. With no upstream list there is nothing
+/// to inherit a release date from; `model_info` may still supply one.
+/// [`page_models`] sorts and pages the result at the call site.
+fn build_models_list_from_aliases(state: &AppState) -> Vec<AnthropicModelInfo> {
     let mut data: Vec<AnthropicModelInfo> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (alias_map, default_model) = load_live_mappings(state);
     for inbound in alias_map.keys() {
         if seen.insert(inbound.clone()) {
-            data.push(AnthropicModelInfo {
-                r#type: "model",
-                id: inbound.clone(),
-                display_name: inbound.clone(),
-                created_at: epoch_to_rfc3339(0),
-            });
+            let mut row = alias_model_row(inbound, None);
+            apply_model_info(&mut row, state.config.model_info.get(inbound));
+            data.push(row);
         }
     }
     if let Some(fb) = default_model
         && seen.insert(fb.clone())
     {
-        data.push(AnthropicModelInfo {
-            r#type: "model",
-            id: fb.clone(),
-            display_name: fb,
-            created_at: epoch_to_rfc3339(0),
-        });
+        let mut row = alias_model_row(&fb, None);
+        apply_model_info(&mut row, state.config.model_info.get(&fb));
+        data.push(row);
     }
-    data.sort_by(|a, b| a.id.cmp(&b.id));
-    let first_id = data.first().map(|m| m.id.clone());
-    let last_id = data.last().map(|m| m.id.clone());
-    AnthropicModelsList {
-        data,
-        has_more: false,
-        first_id,
-        last_id,
-    }
+    data
 }
 
 // Map* hold the configured alias keys in their canonical form.

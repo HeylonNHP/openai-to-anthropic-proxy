@@ -182,6 +182,7 @@ fn make_config_with_default_model(
     default_model: Option<&str>,
 ) -> Arc<Config> {
     Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "test-key".into(),
@@ -227,6 +228,7 @@ async fn start_fake_upstream() -> (SocketAddr, FakeUpstream) {
 
 fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
     Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -635,6 +637,7 @@ async fn per_model_reasoning_effort_lookup() {
     );
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -716,6 +719,7 @@ async fn reasoning_summary_is_requested_unless_off_or_reasoning_is_none() {
     );
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -814,6 +818,7 @@ async fn effort_map_and_thinking_disabled_flow_to_upstream() {
     // Configure an effort_map (high→medium) and a thinking_disabled
     // mapping (disabled→none), both under the `default` key.
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -913,6 +918,7 @@ async fn model_alias_rewrites_inbound_model() {
     );
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -999,6 +1005,7 @@ async fn model_not_supported_falls_back_to_default() {
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -1066,6 +1073,7 @@ async fn model_not_supported_without_default_passes_error_through() {
     }]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -1137,6 +1145,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
     }]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -1847,6 +1856,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -1947,6 +1957,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -2030,6 +2041,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -2124,6 +2136,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -2228,6 +2241,7 @@ async fn runtime_alias_edit_takes_effect_on_next_request() {
     // Config has NO aliases for `claude-sonnet-5`. The runtime store
     // is empty too — a freshly-started proxy.
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -2332,6 +2346,7 @@ async fn runtime_alias_deletion_restores_pass_through() {
     );
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -2429,6 +2444,7 @@ async fn in_flight_request_keeps_its_original_mappings_snapshot() {
     );
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "sk-fake".into(),
@@ -3080,6 +3096,7 @@ async fn retry_order_matrix_records_exact_upstream_bodies() {
     ]);
 
     let config = Arc::new(Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: format!("http://{upstream_addr}"),
         upstream_api_key: "test-key".into(),

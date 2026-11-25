@@ -2130,3 +2130,35 @@ fn min_output_tokens_zero_turns_the_floor_off() {
     let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
     assert_eq!(cfg.min_output_tokens, 0);
 }
+
+// ─── model_info: per-model GET /v1/models metadata ──────────────────────
+
+#[test]
+fn model_info_entries_parse() {
+    let parsed: JsonConfig = serde_json::from_str(
+        r#"{
+            "model_info": {
+                "claude-sonnet-5": { "max_input_tokens": 1000000, "max_tokens": 64000 },
+                "gpt-4o-mini": { "description": "small and fast" }
+            }
+        }"#,
+    )
+    .expect("model_info parses");
+    let info = parsed.model_info.expect("model_info present");
+    assert_eq!(info["claude-sonnet-5"].max_input_tokens, Some(1_000_000));
+    assert_eq!(info["claude-sonnet-5"].max_tokens, Some(64_000));
+    assert!(info["claude-sonnet-5"].description.is_none());
+    assert_eq!(
+        info["gpt-4o-mini"].description.as_deref(),
+        Some("small and fast")
+    );
+}
+
+/// `deny_unknown_fields` on the entry: a typo must fail startup, not
+/// silently publish nothing.
+#[test]
+fn a_typo_in_a_model_info_entry_is_rejected() {
+    let parsed: Result<JsonConfig, _> =
+        serde_json::from_str(r#"{ "model_info": { "x": { "max_input_toknes": 1 } } }"#);
+    assert!(parsed.is_err());
+}

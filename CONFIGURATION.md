@@ -44,6 +44,7 @@ The table below spells each one out. A `—` means the option is file-only.
 | --- | --- | --- | --- |
 | `model_aliases.map` | — | empty | Rewrites names like `claude-sonnet-5` to your upstream model names. |
 | `model_aliases.default_model` | — | (none) | Fallback used if the upstream rejects a model. |
+| `model_info` | — | (none) | Per-model metadata for `GET /v1/models`: `max_input_tokens`, `max_tokens`, `capabilities`, `description`, `created_at`, keyed by the id the client sees (an alias key or an upstream id). Unset fields are omitted from the response. Config-file only, like `model_aliases`. |
 
 ## Reasoning (extended thinking)
 

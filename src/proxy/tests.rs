@@ -94,6 +94,7 @@ fn the_upstream_log_line_reports_the_replayed_reasoning_count() {
 
 fn test_config_minimal() -> Config {
     Config {
+        model_info: Default::default(),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream_base_url: "https://example.com".into(),
         upstream_api_key: "test".into(),
@@ -374,4 +375,120 @@ async fn a_terminal_event_missing_model_and_output_still_ends_the_message() {
 
     // And the stream closes cleanly after that.
     assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
+}
+
+// ─── GET /v1/models: metadata and paging ─────────────────────────────────
+
+/// Model rows for paging tests, built through the same constructor the
+/// handler uses for synthesised names.
+fn model_rows(ids: &[&str]) -> Vec<AnthropicModelInfo> {
+    ids.iter().map(|id| alias_model_row(id, None)).collect()
+}
+
+#[test]
+fn the_models_list_pages_twenty_by_default_and_sorts_by_id() {
+    // 25 rows, deliberately reversed: paging sorts first.
+    let mut ids: Vec<String> = (0..25).map(|i| format!("m{i:02}")).collect();
+    ids.reverse();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    let page = page_models(model_rows(&refs), None, None, None).expect("valid default page");
+    assert_eq!(page.data.len(), 20);
+    assert!(page.has_more);
+    assert_eq!(page.first_id.as_deref(), Some("m00"));
+    assert_eq!(page.last_id.as_deref(), Some("m19"));
+    assert_eq!(page.data[0].id, "m00", "sorted, not input order");
+}
+
+#[test]
+fn cursors_and_limit_window_the_page() {
+    let ids: Vec<String> = (0..10).map(|i| format!("m{i:02}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    // `after_id` is exclusive: the page starts at the row after it.
+    let page = page_models(model_rows(&refs), Some("m02"), None, Some(3)).unwrap();
+    let got: Vec<&str> = page.data.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(got, ["m03", "m04", "m05"]);
+    assert!(page.has_more);
+    assert_eq!(page.first_id.as_deref(), Some("m03"));
+    assert_eq!(page.last_id.as_deref(), Some("m05"));
+
+    // `before_id` is exclusive the other way; the window is exhausted,
+    // so there is no next page.
+    let page = page_models(model_rows(&refs), None, Some("m03"), None).unwrap();
+    assert_eq!(page.data.len(), 3);
+    assert!(!page.has_more);
+
+    // Both cursors with limit 1: one row out of the window, more behind it.
+    let page = page_models(model_rows(&refs), Some("m02"), Some("m06"), Some(1)).unwrap();
+    let got: Vec<&str> = page.data.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(got, ["m03"]);
+    assert!(page.has_more);
+}
+
+#[test]
+fn an_out_of_range_limit_is_rejected() {
+    let err = page_models(model_rows(&["a"]), None, None, Some(0)).unwrap_err();
+    assert!(matches!(err, AppError::BadRequest(_)));
+    let err = page_models(model_rows(&["a"]), None, None, Some(1001)).unwrap_err();
+    assert!(matches!(err, AppError::BadRequest(_)));
+}
+
+#[test]
+fn an_empty_page_has_no_boundaries() {
+    let page = page_models(Vec::new(), None, None, None).unwrap();
+    assert!(!page.has_more);
+    assert!(page.first_id.is_none());
+    assert!(page.last_id.is_none());
+}
+
+#[test]
+fn model_info_metadata_lands_on_the_row() {
+    let mut row = alias_model_row("claude-sonnet-5", None);
+    assert_eq!(row.created_at, epoch_to_rfc3339(0), "nothing to inherit");
+
+    let info = crate::config::ModelInfoEntry {
+        max_input_tokens: Some(1_000_000),
+        max_tokens: Some(64_000),
+        capabilities: Some(serde_json::json!({"thinking": {"supported": true}})),
+        description: Some("GPT-5.4-mini behind the alias".to_owned()),
+        created_at: Some("2026-01-02T03:04:05Z".to_owned()),
+    };
+    apply_model_info(&mut row, Some(&info));
+    assert_eq!(row.max_input_tokens, Some(1_000_000));
+    assert_eq!(row.max_tokens, Some(64_000));
+    assert_eq!(
+        row.capabilities,
+        Some(serde_json::json!({"thinking": {"supported": true}}))
+    );
+    assert_eq!(
+        row.description.as_deref(),
+        Some("GPT-5.4-mini behind the alias")
+    );
+    // The configured date wins over the epoch fallback.
+    assert_eq!(row.created_at, "2026-01-02T03:04:05Z");
+}
+
+#[test]
+fn an_alias_row_inherits_a_real_release_date() {
+    // 1_700_000_000 is 2023-11-14: a real date, not the epoch.
+    let row = alias_model_row("claude-sonnet-5", Some(1_700_000_000));
+    assert_ne!(row.created_at, epoch_to_rfc3339(0));
+    assert!(row.created_at.contains("2023"), "{}", row.created_at);
+
+    // An upstream that reported no release date gives nothing to inherit.
+    let row = alias_model_row("claude-sonnet-5", Some(0));
+    assert_eq!(row.created_at, epoch_to_rfc3339(0));
+    let row = alias_model_row("claude-sonnet-5", None);
+    assert_eq!(row.created_at, epoch_to_rfc3339(0));
+}
+
+#[test]
+fn no_config_leaves_the_row_alone() {
+    let mut row = alias_model_row("claude-sonnet-5", Some(1_700_000_000));
+    let before = row.created_at.clone();
+    apply_model_info(&mut row, None);
+    assert!(row.description.is_none());
+    assert!(row.max_input_tokens.is_none());
+    assert_eq!(row.created_at, before);
 }

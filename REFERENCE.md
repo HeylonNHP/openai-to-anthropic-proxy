@@ -161,13 +161,17 @@ to use them.
 
 ## Context-window workaround
 
-Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, not from API responses. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to a hardcoded 200K. That causes premature auto-compaction for 1M-context models.
+Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, never from a gateway's `/v1/models` response — checked against Claude Code 2.1.330: the code that would read `max_input_tokens` off a model list exists in that build but is feature-gated off. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to its assumed default for an unrecognized id — 200K in the code paths recovered from 2.1.330, 1M according to the current docs (since v2.1.323) — which may not match the upstream at all, so auto-compact fires too early or too late.
 
 Tell Claude Code the real window with `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (or the
 `autoCompactWindow` setting) - see
 [CONFIGURATION.md](./CONFIGURATION.md#claude-code-settings-claudesettingsjson).
 Use the value your upstream model actually supports (e.g., `1000000` for
-GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models).
+GPT-5.4-mini / GPT-5.6-luna, `200000` for older 200K models). Publishing the
+same numbers on `GET /v1/models` through
+[`model_info`](./CONFIGURATION.md#model-routing) keeps that endpoint faithful
+to Anthropic's shape, but it does not drive this dial — the window comes from
+the catalog, settings and the environment, not from a model list.
 
 ### Token counting
 

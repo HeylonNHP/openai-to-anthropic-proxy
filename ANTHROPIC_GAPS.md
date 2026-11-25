@@ -244,16 +244,28 @@ so the proxy can only approximate it.
 
 ## E. Models and endpoints
 
-- [ ] **E1. Add `max_input_tokens`, `max_tokens` and `capabilities` to `/v1/models`**
-  - Where: `src/anthropic.rs:814-819` (`AnthropicModelInfo`), `src/proxy.rs:240-247`
-  - Problem: only type, id, display name and `created_at` are returned. Newer
-    Claude Code may read the missing fields to size context (*unverified*, the
-    live docs were not checked). Today the workaround is
-    `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
-  - Fix: add config-driven values per model. OpenAI's own `/v1/models` has no
-    context-window or capability data.
-  - Also: honour `after_id` / `before_id` / `limit`, and give alias entries a
-    real `created_at` instead of epoch 0.
+- [x] **E1. Add `max_input_tokens`, `max_tokens` and `capabilities` to `/v1/models`**
+  - Where: `src/anthropic.rs` (`AnthropicModelInfo`), `src/proxy.rs`
+    (`handle_models`, `page_models`), `src/config.rs` (`model_info`)
+  - Fix: a `model_info` config section (per id: `max_input_tokens`,
+    `max_tokens`, `capabilities`, `description`, `created_at`; config-file
+    only) feeds optional fields that are omitted when unset, as Anthropic's
+    own responder does. Pagination is honoured: `limit` (default 20,
+    1..=1000, else 400), exclusive `after_id` / `before_id`, page-boundary
+    `first_id` / `last_id` with explicit `null` on an empty page. Alias rows
+    inherit the release date of the upstream model they map to.
+  - Note (decompiled Claude Code 2.1.330): the live consumer of this
+    endpoint is gateway discovery, which reads `id`, `display_name` and
+    `description` and strips the rest; the SDK paths that parse
+    `max_input_tokens` / `max_tokens` exist but are hard-gated off in that
+    build, and the context window never comes from `/v1/models` (catalog +
+    settings + environment). So this is Anthropic-shape fidelity plus
+    future-readiness — `description` is the one field the current build
+    reads — not a change to auto-compact timing;
+    `CLAUDE_CODE_MAX_CONTEXT_TOKENS` remains the dial. `capabilities` is not
+    read from `/v1/models` by any client (it lives in the client's model
+    catalog) but is part of Anthropic's documented model object, so it is
+    passed through from config.
   - Severity: medium.
 
 - [ ] **E2. Add `GET /v1/models/{id}`**
@@ -346,4 +358,4 @@ its own design rather than a quick fix.
 
 ## Suggested order
 
-A7 and B6 first, then C1, D1, E1, and the rest as needed.
+A7 and B6 first, then C1, D1, and the rest as needed.

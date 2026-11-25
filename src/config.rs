@@ -231,6 +231,13 @@ pub struct Config {
     /// unchanged — so deployments that don't need aliases (a single
     /// model, or model names that already match) need no config here.
     pub model_aliases: ModelAliases,
+    /// Per-model metadata published on `GET /v1/models`: context and
+    /// output caps, the Anthropic `capabilities` object, a picker
+    /// description and a `created_at` override, keyed by the model id the
+    /// *client* sees (an alias key or an upstream id). Config-file only —
+    /// no environment variable, like `model_aliases`. Fields left unset
+    /// are omitted from the response, as Anthropic's own responder does.
+    pub model_info: BTreeMap<String, ModelInfoEntry>,
     /// Prompt-caching settings. Disabled by default. When a model is listed
     /// in `models`, the proxy translates Anthropic `cache_control: {type: "ephemeral"}`
     /// on user/system text and image blocks into OpenAI `prompt_cache_breakpoint`
@@ -998,6 +1005,7 @@ impl Config {
                 .and_then(|f| f.model_aliases.as_ref())
                 .and_then(|a| a.default_model.clone()),
         };
+        let model_info = file.and_then(|f| f.model_info.clone()).unwrap_or_default();
 
         let prompt_caching_models: Vec<String> = env
             .prompt_caching_models
@@ -1502,6 +1510,7 @@ impl Config {
             reasoning_effort,
             reasoning,
             model_aliases,
+            model_info,
             prompt_caching,
             reasoning_replay,
             tool_result_images,
@@ -2287,6 +2296,8 @@ pub struct JsonConfig {
     pub reasoning: Option<JsonReasoningConfig>,
     /// Inbound → upstream model name aliases. See [`ModelAliases`].
     pub model_aliases: Option<JsonModelAliases>,
+    /// Per-model `/v1/models` metadata. See [`ModelInfoEntry`].
+    pub model_info: Option<BTreeMap<String, ModelInfoEntry>>,
     /// Prompt-caching settings. See [`PromptCachingConfig`].
     pub prompt_caching: Option<JsonPromptCachingConfig>,
     /// How a prior turn's extended thinking is replayed upstream.
@@ -2535,6 +2546,31 @@ impl From<JsonEffortMap> for EffortMap {
 pub struct JsonModelAliases {
     pub map: BTreeMap<String, String>,
     pub default_model: Option<String>,
+}
+
+/// One `model_info` entry: the optional metadata the proxy publishes for
+/// one model id on `GET /v1/models`.
+///
+/// Every field is optional and omitted from the response when unset;
+/// `deny_unknown_fields` keeps a typo from silently doing nothing. Shared
+/// by the JSON file shape and the resolved [`Config`] — there is no
+/// environment variable to merge against.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelInfoEntry {
+    /// Maximum input context window in tokens (`max_input_tokens`).
+    pub max_input_tokens: Option<u64>,
+    /// Largest `max_tokens` the upstream accepts for the model
+    /// (`max_tokens`).
+    pub max_tokens: Option<u64>,
+    /// Anthropic's `capabilities` object, passed through verbatim.
+    pub capabilities: Option<serde_json::Value>,
+    /// Picker subtitle (`description`); Claude Code's gateway discovery
+    /// shows it under the model name.
+    pub description: Option<String>,
+    /// RFC 3339 override for the row's `created_at`. Aliases otherwise
+    /// inherit the upstream model's release date, else the epoch.
+    pub created_at: Option<String>,
 }
 
 /// JSON shape of `prompt_caching`.
