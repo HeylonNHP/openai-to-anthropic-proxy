@@ -46,7 +46,7 @@ use crate::anthropic::{
     ApiErrorBody, ContentBlockKind, ContentDelta, Message, MessageDeltaPayload, ServerToolUseUsage,
     StopReason, StreamEvent, Usage as AnthropicUsage, WebSearchResult, WebSearchToolResultBlock,
 };
-use crate::responses::{IncompleteDetails, OutputItem, ResponsesResponse, ResponsesStreamEvent};
+use crate::responses::{OutputItem, ResponsesResponse, ResponsesStreamEvent};
 
 /// Stateful translator for one streaming request.
 #[derive(Debug)]
@@ -69,6 +69,12 @@ pub struct StreamTranslator {
     stop_reason: Option<StopReason>,
     /// A tool call's arguments were cut short by the output cap.
     truncated_tool_call: bool,
+    /// The upstream refused to answer. Seen as a `refusal` event on the
+    /// wire, which the terminal response does not always repeat.
+    refused: bool,
+    /// The `(output_index, content_index)` of each refusal part whose
+    /// text has already been marked, so the marker is added once.
+    refusal_marked: BTreeSet<(u32, u32)>,
     usage: Option<AnthropicUsage>,
     /// Number of web-search calls represented in the emitted Anthropic blocks.
     web_search_count: u32,
@@ -172,6 +178,8 @@ impl StreamTranslator {
             next_index: 0,
             stop_reason: None,
             truncated_tool_call: false,
+            refused: false,
+            refusal_marked: BTreeSet::new(),
             usage: None,
             web_search_count: 0,
             pending_web_search_ids: Vec::new(),
@@ -319,6 +327,7 @@ impl StreamTranslator {
             }
             ResponsesStreamEvent::RefusalDelta {
                 output_index,
+                content_index,
                 delta,
                 ..
             } => {
@@ -326,10 +335,24 @@ impl StreamTranslator {
                 // open a text block for the parent Message item; if
                 // the model emits both output_text and refusal parts,
                 // refusal deltas land on the same text block.)
+                self.refused = true;
+                // Mark the refusal the way the buffered path marks it,
+                // so the two paths read the same. The marker goes once
+                // per refusal part.
+                if !delta.is_empty() && self.refusal_marked.insert((*output_index, *content_index))
+                {
+                    self.emit_text_delta(
+                        &mut events,
+                        *output_index,
+                        crate::translate::REFUSAL_PREFIX,
+                    );
+                }
                 self.emit_text_delta(&mut events, *output_index, delta);
             }
             ResponsesStreamEvent::RefusalDone { .. } => {
-                // No-op.
+                // The refusal is known from the deltas; this event only
+                // carries the final text.
+                self.refused = true;
             }
             ResponsesStreamEvent::OutputTextAnnotationAdded { annotation, .. } => {
                 // Airia streams the web search's `url_citation` annotations
@@ -934,14 +957,12 @@ impl StreamTranslator {
             .output
             .iter()
             .any(|i| matches!(i, OutputItem::FunctionCall { .. }));
-        let status_stop =
-            map_status_to_stop_reason(&response.status, response.incomplete_details.as_ref());
+        // A refusal seen on the wire counts even when the terminal
+        // response does not repeat it.
+        let refused = self.refused || crate::translate::reply_is_refusal(response);
         self.stop_reason = Some(
-            if status_stop == Some(StopReason::EndTurn) && has_tool_use {
-                StopReason::ToolUse
-            } else {
-                status_stop.unwrap_or(StopReason::EndTurn)
-            },
+            crate::translate::stop_reason_for_reply(response, has_tool_use, refused)
+                .unwrap_or(StopReason::EndTurn),
         );
         // Close open blocks so the client sees a well-formed sequence
         // before the message_delta. Unclosed tool blocks flush their
@@ -1194,24 +1215,6 @@ fn map_usage(u: &crate::responses::ResponsesUsage) -> AnthropicUsage {
             .map_or(0, |d| d.reasoning_tokens),
         server_tool_use: None,
         iterations: None,
-    }
-}
-
-fn map_status_to_stop_reason(
-    status: &str,
-    incomplete: Option<&IncompleteDetails>,
-) -> Option<StopReason> {
-    match status {
-        "completed" | "cancelled" => Some(StopReason::EndTurn),
-        "incomplete" => Some(match incomplete.map(|d| d.reason.as_str()).unwrap_or("") {
-            "max_output_tokens" => StopReason::MaxTokens,
-            _ => StopReason::EndTurn,
-        }),
-        "failed" => Some(StopReason::EndTurn),
-        _ => {
-            tracing::warn!(status = %status, "unknown Responses status; defaulting to EndTurn");
-            Some(StopReason::EndTurn)
-        }
     }
 }
 

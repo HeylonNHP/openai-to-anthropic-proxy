@@ -198,8 +198,14 @@ impl Items {
                 output_index,
                 delta,
                 ..
+            } => {
+                if let Some(OutputItem::Message { content, .. }) =
+                    self.by_index.get_mut(output_index)
+                {
+                    append_text(content, delta);
+                }
             }
-            | ResponsesStreamEvent::RefusalDelta {
+            ResponsesStreamEvent::RefusalDelta {
                 output_index,
                 delta,
                 ..
@@ -207,7 +213,7 @@ impl Items {
                 if let Some(OutputItem::Message { content, .. }) =
                     self.by_index.get_mut(output_index)
                 {
-                    append_text(content, delta);
+                    append_refusal(content, delta);
                 }
             }
             ResponsesStreamEvent::FunctionCallArgumentsDelta {
@@ -267,6 +273,21 @@ fn append_text(content: &mut Vec<OutputContentPart>, delta: &str) {
         content.push(OutputContentPart::OutputText {
             text: delta.to_owned(),
             annotations: Vec::new(),
+        });
+    }
+}
+
+/// Add streamed refusal text to the message's last refusal part (or open
+/// one).
+///
+/// The refusal is kept as a refusal part rather than folded into the text,
+/// so the reply still reads as a refusal after it has been streamed.
+fn append_refusal(content: &mut Vec<OutputContentPart>, delta: &str) {
+    if let Some(OutputContentPart::OutputRefusal { refusal }) = content.last_mut() {
+        refusal.push_str(delta);
+    } else {
+        content.push(OutputContentPart::OutputRefusal {
+            refusal: delta.to_owned(),
         });
     }
 }

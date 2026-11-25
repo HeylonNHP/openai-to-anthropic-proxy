@@ -215,14 +215,16 @@ fn incomplete_response_max_tokens_maps_to_max_tokens() {
 }
 
 #[test]
-fn incomplete_response_content_filter_maps_to_end_turn() {
+fn incomplete_response_content_filter_maps_to_refusal() {
+    // A safety filter stopped the generation: Anthropic reports the same
+    // thing as `refusal`.
     let mut resp = fixture_response();
     resp.status = "incomplete".into();
     resp.incomplete_details = Some(IncompleteDetails {
         reason: "content_filter".into(),
     });
     let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
-    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.stop_reason, Some(StopReason::Refusal));
 }
 
 #[test]
@@ -334,6 +336,65 @@ fn output_refusal_becomes_text_with_prefix() {
         }
         _ => panic!("expected text block"),
     }
+}
+
+#[test]
+fn a_refusal_part_reports_the_refusal_stop_reason() {
+    // Anthropic's `refusal`: the model declined, so the client must not
+    // run the turn's tools.
+    let mut resp = fixture_response();
+    resp.output = vec![OutputItem::Message {
+        id: Some("msg_x".into()),
+        status: Some("completed".into()),
+        role: "assistant".into(),
+        content: vec![OutputContentPart::OutputRefusal {
+            refusal: "I won't do that".into(),
+        }],
+    }];
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    assert_eq!(out.stop_reason, Some(StopReason::Refusal));
+}
+
+#[test]
+fn a_refusal_beats_a_tool_call() {
+    // A refusal can cut a tool call off mid-input, so the refusal wins:
+    // the client must not run the call.
+    let mut resp = fixture_response();
+    resp.output = vec![
+        OutputItem::FunctionCall {
+            id: None,
+            status: None,
+            call_id: "call_1".into(),
+            name: "Bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        },
+        OutputItem::Message {
+            id: Some("msg_x".into()),
+            status: Some("completed".into()),
+            role: "assistant".into(),
+            content: vec![OutputContentPart::OutputRefusal {
+                refusal: "I won't do that".into(),
+            }],
+        },
+    ];
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    assert_eq!(out.stop_reason, Some(StopReason::Refusal));
+}
+
+#[test]
+fn an_empty_refusal_part_is_still_a_refusal() {
+    // Anthropic's own refusal has empty content.
+    let mut resp = fixture_response();
+    resp.output = vec![OutputItem::Message {
+        id: Some("msg_x".into()),
+        status: Some("completed".into()),
+        role: "assistant".into(),
+        content: vec![OutputContentPart::OutputRefusal {
+            refusal: String::new(),
+        }],
+    }];
+    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+    assert_eq!(out.stop_reason, Some(StopReason::Refusal));
 }
 
 #[test]

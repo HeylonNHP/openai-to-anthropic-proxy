@@ -9,7 +9,7 @@ README. Configuration lives in [`CONFIGURATION.md`](./CONFIGURATION.md) and
 - `POST /v1/messages` translation from Anthropic Messages to OpenAI Responses.
 - Streaming via SSE end to end.
 - Tool-use round trips: `tool_use` ↔ `tool_calls`, `tool_result` ↔ `tool` messages.
-- Stop reason mapping: `stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`, `content_filter` → `end_turn`.
+- Stop reason mapping: `stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`, `content_filter` → `refusal`.
 - Error translation from OpenAI `{error: {...}}` envelopes and HTTP statuses into Anthropic-shaped errors.
 - Usage translation from OpenAI `usage` into Anthropic `usage`.
 - Optional prompt-caching translation from Anthropic `cache_control` to OpenAI `prompt_cache_breakpoint`.

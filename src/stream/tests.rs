@@ -161,6 +161,15 @@ fn output_text_delta(output_index: u32, text: &str) -> ResponsesStreamEvent {
     }
 }
 
+fn refusal_delta(output_index: u32, text: &str) -> ResponsesStreamEvent {
+    ResponsesStreamEvent::RefusalDelta {
+        item_id: "msg_x".into(),
+        output_index,
+        content_index: 0,
+        delta: text.into(),
+    }
+}
+
 #[test]
 fn text_stream_emits_message_start_then_text_deltas_then_stop() {
     let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
@@ -484,6 +493,81 @@ fn incomplete_response_max_tokens_maps_to_max_tokens() {
         }
         _ => panic!("expected message_delta"),
     }
+}
+
+#[test]
+fn incomplete_response_content_filter_maps_to_refusal() {
+    // A safety filter stopped the generation: Anthropic reports the same
+    // thing as `refusal`.
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&message_item_added(0));
+    t.feed_event(&output_text_delta(0, "a bit"));
+    t.feed_event(&incomplete_event("content_filter"));
+    let closing = t.finish();
+    match &closing[0] {
+        StreamEvent::MessageDelta { delta, .. } => {
+            assert_eq!(delta.stop_reason, Some(StopReason::Refusal));
+        }
+        _ => panic!("expected message_delta"),
+    }
+}
+
+#[test]
+fn a_refusal_event_reports_the_refusal_stop_reason() {
+    // The upstream declined mid-stream and the terminal response does not
+    // repeat it: the wire event alone must be enough.
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&message_item_added(0));
+    t.feed_event(&refusal_delta(0, "I won't do that"));
+    t.feed_event(&completed_event("completed"));
+    let closing = t.finish();
+    match &closing[0] {
+        StreamEvent::MessageDelta { delta, .. } => {
+            assert_eq!(delta.stop_reason, Some(StopReason::Refusal));
+        }
+        _ => panic!("expected message_delta"),
+    }
+}
+
+#[test]
+fn a_refusal_event_is_marked_the_same_way_the_buffered_path_marks_it() {
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&message_item_added(0));
+    let evs = t.feed_event(&refusal_delta(0, "I won't do that"));
+    let text: String = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentDelta::TextDelta { text },
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "[refusal] I won't do that");
+}
+
+#[test]
+fn a_refusal_is_marked_once_per_part() {
+    let mut t = StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+    t.feed_event(&created_event());
+    t.feed_event(&message_item_added(0));
+    t.feed_event(&refusal_delta(0, "I won't "));
+    let evs = t.feed_event(&refusal_delta(0, "do that"));
+    let text: String = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentDelta::TextDelta { text },
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "do that");
 }
 
 #[test]

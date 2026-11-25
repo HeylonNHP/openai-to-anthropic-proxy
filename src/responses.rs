@@ -463,6 +463,10 @@ pub enum OutputContentPart {
         #[serde(default)]
         annotations: Vec<Value>,
     },
+    /// The upstream's tag is `refusal`, the sibling of `output_text` —
+    /// `rename_all` would spell it `output_refusal`, which the upstream
+    /// never sends.
+    #[serde(rename = "refusal")]
     OutputRefusal {
         refusal: String,
     },

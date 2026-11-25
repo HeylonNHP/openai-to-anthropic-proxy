@@ -2741,7 +2741,10 @@ use crate::responses::{OutputContentPart, OutputItem};
 ///   - `status == "completed"` → `EndTurn` (or `ToolUse` if the response
 ///     contains a tool call).
 ///   - `status == "incomplete"` with `reason: "max_output_tokens"` → `MaxTokens`.
-///   - `status == "incomplete"` with `reason: "content_filter"` → `EndTurn`.
+///   - `status == "incomplete"` with `reason: "content_filter"` → `Refusal`.
+///   - a `refusal` content part in the output → `Refusal`, whatever the
+///     status. A refusal outranks the tool-call upgrade: Anthropic's
+///     clients must not run the tools of a refused turn.
 ///   - `status == "failed"` → `EndTurn`; the inner error message is
 ///     surfaced as a `[error] ` text block so the client sees it. This is a
 ///     fallback only: the proxy turns a failed reply into an error before it
@@ -2779,12 +2782,7 @@ pub fn responses_to_anthropic(
         .iter()
         .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
 
-    let stop_reason = map_status_to_stop_reason(&resp.status, resp.incomplete_details.as_ref());
-    let stop_reason = if stop_reason == Some(StopReason::EndTurn) && has_tool_use {
-        Some(StopReason::ToolUse)
-    } else {
-        stop_reason
-    };
+    let stop_reason = stop_reason_for_reply(resp, has_tool_use, reply_is_refusal(resp));
     let stop_reason =
         stop_reason_for_cut_short_call(stop_reason, &resp.status, truncated_tool_call);
 
@@ -2871,6 +2869,19 @@ pub fn stop_reason_for_cut_short_call(
     }
 }
 
+/// The marker that tells a refusal's text apart from an ordinary answer.
+///
+/// Anthropic has no refusal content block: a refusal is reported by the
+/// stop reason. The text itself still has to reach the client, so both
+/// the buffered and the streaming path mark it with this prefix.
+pub const REFUSAL_PREFIX: &str = "[refusal] ";
+
+/// Map an upstream response's status to Anthropic's stop reason.
+///
+/// `content_filter` is a refusal: the upstream stopped generating because a
+/// safety filter fired. Anthropic reports the same thing as `refusal`, and
+/// a client must not run the tools of a refused turn.
+#[must_use]
 fn map_status_to_stop_reason(
     status: &str,
     incomplete: Option<&crate::responses::IncompleteDetails>,
@@ -2879,7 +2890,7 @@ fn map_status_to_stop_reason(
         "completed" | "cancelled" => Some(StopReason::EndTurn),
         "incomplete" => Some(match incomplete.map(|d| d.reason.as_str()).unwrap_or("") {
             "max_output_tokens" => StopReason::MaxTokens,
-            "content_filter" => StopReason::EndTurn,
+            "content_filter" => StopReason::Refusal,
             _ => StopReason::EndTurn,
         }),
         "failed" => Some(StopReason::EndTurn),
@@ -2888,6 +2899,53 @@ fn map_status_to_stop_reason(
             Some(StopReason::EndTurn)
         }
     }
+}
+
+/// The stop reason for a reply, given what the reply contains.
+///
+/// A refusal outranks everything else: Anthropic reports `refusal` and
+/// tells the client not to run the turn's tools. The upstream says a
+/// refusal two ways, and both are honoured — an `incomplete` reply whose
+/// reason is `content_filter`, and a `refusal` content part in the output.
+#[must_use]
+pub fn stop_reason_for_reply(
+    resp: &ResponsesResponse,
+    has_tool_use: bool,
+    refused: bool,
+) -> Option<StopReason> {
+    if refused {
+        return Some(StopReason::Refusal);
+    }
+    let stop_reason = map_status_to_stop_reason(&resp.status, resp.incomplete_details.as_ref());
+    if stop_reason == Some(StopReason::EndTurn) && has_tool_use {
+        return Some(StopReason::ToolUse);
+    }
+    stop_reason
+}
+
+/// Whether the reply carries a refusal: a `refusal` content part in the
+/// output, or a `content_filter` stop.
+///
+/// An upstream that declines to answer says so in one of two ways: the
+/// reply is `incomplete` with the reason `content_filter`, or it is
+/// `completed` but carries a `refusal` content part instead of text.
+/// Anthropic reports both as `stop_reason: "refusal"`.
+#[must_use]
+pub fn reply_is_refusal(resp: &ResponsesResponse) -> bool {
+    if resp.status == "incomplete"
+        && resp
+            .incomplete_details
+            .as_ref()
+            .is_some_and(|d| d.reason == "content_filter")
+    {
+        return true;
+    }
+    resp.output.iter().any(|item| match item {
+        OutputItem::Message { content, .. } => content
+            .iter()
+            .any(|part| matches!(part, OutputContentPart::OutputRefusal { .. })),
+        _ => false,
+    })
 }
 
 /// Extract web search citations from OpenAI `url_citation` annotations,
@@ -3038,7 +3096,7 @@ fn build_content_blocks(
                             // — surface as a text block with a clear prefix.
                             if !refusal.is_empty() {
                                 blocks.push(ResponseContentBlock::Text {
-                                    text: format!("[refusal] {refusal}"),
+                                    text: format!("{REFUSAL_PREFIX}{refusal}"),
                                 });
                             }
                         }

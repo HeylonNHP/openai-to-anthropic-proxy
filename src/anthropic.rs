@@ -649,7 +649,8 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ToolUse,
-    /// Anthropic occasionally emits a refusal; we propagate as-is.
+    /// The model declined to answer, whether a safety classifier stopped
+    /// it or it declined itself. The client must not run the turn's tools.
     Refusal,
     /// Streaming-only: the model paused mid-turn (rare, round-trip only).
     PauseTurn,

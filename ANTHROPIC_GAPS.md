@@ -97,16 +97,24 @@ so the proxy can only approximate it.
     wire result depend on which SDK partial parser the client uses.
   - Severity: medium.
 
-- [ ] **B3. Produce `refusal` stop reason**
-  - Where: `src/stream.rs:1156-1172`, `src/translate.rs:2830-2833`
+- [x] **B3. Produce `refusal` stop reason**
+  - Where: `src/translate.rs` (`stop_reason_for_reply`, `reply_is_refusal`),
+    `src/stream.rs` (the terminal capture)
   - Problem: `incomplete_details.reason = content_filter` becomes `end_turn`.
     `StopReason::Refusal` exists but is never produced.
   - Fix: map the content-filter reason to `Refusal`.
+  - Also: the upstream's other refusal — a `refusal` content part on a
+    `completed` reply — now produces `Refusal` too. A refusal outranks the
+    tool-call upgrade, because Anthropic's clients must not run the tools
+    of a refused turn.
+  - Note: the `refusal` content part never deserialised before this: its
+    serde tag was `output_refusal` where the upstream sends `refusal`, so
+    every refusal fell into `Unknown` and was dropped.
 
-- [ ] **B4. Make refusal text consistent**
-  - Where: `src/translate.rs:2968-2975` vs `src/stream.rs:317-327`
+- [x] **B4. Make refusal text consistent**
+  - Where: `src/translate.rs` (`REFUSAL_PREFIX`), `src/stream.rs`
   - Problem: non-streaming prefixes `[refusal] `, streaming sends raw text.
-  - Fix: pick one behaviour. Do this together with B3.
+  - Fix: both paths prefix the refusal text with `[refusal] `.
 
 - [ ] **B5. Send `ping` events on the plain streaming path**
   - Where: `src/proxy.rs:1425-1569` (only `server_loop/stream.rs:224` pings)

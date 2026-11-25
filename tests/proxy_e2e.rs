@@ -10617,3 +10617,43 @@ data: {"type":"response.incomplete","response":{"id":"resp_1","object":"response
         "expected stop_reason max_tokens in: {text}"
     );
 }
+
+// ─── a reply the upstream refused to give ───────────────────────────────────
+
+/// A buffered reply the upstream declined: the message carries a `refusal`
+/// content part, as OpenAI sends a model that declines to answer.
+fn refusal_reply(refusal: &str) -> String {
+    format!(
+        r#"{{"id":"resp_r","object":"response","created_at":1,"status":"completed",
+            "model":"any",
+            "output":[{{"type":"message","role":"assistant",
+                "content":[{{"type":"refusal","refusal":"{refusal}"}}]}}],
+            "usage":{{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn a_refused_reply_reports_the_refusal_stop_reason() {
+    let res = post_to_canned_upstream(refusal_reply("I won't do that")).await;
+    assert_eq!(res.status().as_u16(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "refusal");
+    // The refusal text still reaches the client, marked as a refusal.
+    let text = body["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("[refusal] "), "{text}");
+    assert!(text.contains("I won't do that"), "{text}");
+}
+
+#[tokio::test]
+async fn a_content_filtered_reply_reports_the_refusal_stop_reason() {
+    // The other way an upstream declines: generation stopped by a safety
+    // filter, so the reply is `incomplete` with that reason.
+    let body = r#"{"id":"resp_c","object":"response","created_at":1,
+        "status":"incomplete","incomplete_details":{"reason":"content_filter"},
+        "model":"any","output":[],
+        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#;
+    let res = post_to_canned_upstream(body.to_owned()).await;
+    assert_eq!(res.status().as_u16(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "refusal");
+}
