@@ -343,8 +343,10 @@ pub struct WebSearchToolResultBlockParam {
 /// recognised, such a block fell into `Unknown` and was merely dropped.
 ///
 /// A number or an object is rendered as its JSON text so no information is
-/// lost; `null` becomes the empty string.
-fn tolerant_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// lost; `null` becomes the empty string. `pub(crate)` so the upstream
+/// response type (`crate::responses`) can use it for `model` — a field
+/// whose absence or `null` must not drop a terminal stream event.
+pub(crate) fn tolerant_text<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

@@ -351,3 +351,27 @@ async fn the_plain_stream_does_not_ping_after_the_terminal_event() {
     // And the stream ends there: no ping follows the message.
     assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
 }
+
+/// A terminal event whose `response` omits `model` and `output`: serde
+/// used to reject it, so the translator never saw the turn end and the
+/// client got a spurious `api_error` for a successful response.
+const COMPLETED_MINIMAL: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed"}}"#;
+
+#[tokio::test(start_paused = true)]
+async fn a_terminal_event_missing_model_and_output_still_ends_the_message() {
+    let mut stream = translator_stream(upstream(&[CREATED, COMPLETED_MINIMAL]));
+
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: message_start"), "{first}");
+
+    // The turn ends normally instead of being dropped: no `error`
+    // event, stop reason `end_turn`.
+    let last = chunk(poll_once(&mut stream));
+    assert!(last.contains("event: message_delta"), "{last}");
+    assert!(last.contains("end_turn"), "{last}");
+    assert!(last.contains("event: message_stop"), "{last}");
+    assert!(!last.contains("event: error"), "{last}");
+
+    // And the stream closes cleanly after that.
+    assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
+}

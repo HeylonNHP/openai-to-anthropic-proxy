@@ -394,8 +394,22 @@ pub struct ResponsesResponse {
     pub object: String,
     pub created_at: i64,
     /// `"completed" | "incomplete" | "failed" | "in_progress" | "queued" | "cancelled"`.
+    ///
+    /// Deliberately **not** defaulted: `status` decides the stop reason
+    /// (`incomplete` → `max_tokens` / `refusal`), and an empty default
+    /// would silently turn a truncated turn into `end_turn`. An upstream
+    /// that omits it should fail visibly, not be guessed at.
     pub status: String,
+    /// An upstream that omits or nulls these fields must not take the
+    /// whole event down with it: a terminal event (`response.completed`,
+    /// `response.created`, ...) dropped by serde leaves the stream looking
+    /// like it never ended, and Claude Code sees a spurious `api_error`
+    /// for a turn that actually succeeded. `tolerant_text` /
+    /// `tolerant_output` cover both an absent key and an explicit
+    /// `null` — `#[serde(default)]` alone would only cover absence.
+    #[serde(default, deserialize_with = "crate::anthropic::tolerant_text")]
     pub model: String,
+    #[serde(default, deserialize_with = "tolerant_output")]
     pub output: Vec<OutputItem>,
     #[serde(default)]
     pub usage: Option<ResponsesUsage>,
@@ -403,6 +417,18 @@ pub struct ResponsesResponse {
     pub error: Option<ResponsesError>,
     #[serde(default)]
     pub incomplete_details: Option<IncompleteDetails>,
+}
+
+/// Accept an `output` array, an explicit `null` (→ empty), or an absent
+/// key (→ `#[serde(default)]` supplies `Vec::new()`). Mirrors
+/// `tolerant_text`, for the same reason: a malformed-but-recoverable
+/// upstream field must not drop the event that carries it.
+fn tolerant_output<'de, D>(deserializer: D) -> Result<Vec<OutputItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items = Option::<Vec<OutputItem>>::deserialize(deserializer)?;
+    Ok(items.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]

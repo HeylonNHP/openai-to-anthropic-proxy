@@ -102,3 +102,70 @@ fn net_input_saturates_when_cache_counts_exceed_the_total() {
     assert_eq!(usage_with(10, 8, 8).net_input_tokens(), 0);
     assert_eq!(net_input_tokens(5, u32::MAX, u32::MAX), 0);
 }
+
+// ─── B7: a terminal event whose response omits model/output ──────────────
+
+/// A terminal `response.completed` with `model` and `output` absent.
+#[test]
+fn a_terminal_event_without_model_or_output_deserializes() {
+    let json = r#"{
+        "type": "response.completed",
+        "response": {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed"
+        }
+    }"#;
+    let event: ResponsesStreamEvent = serde_json::from_str(json).expect("must not be dropped");
+    let ResponsesStreamEvent::Completed { response } = event else {
+        panic!("expected a completed event");
+    };
+    assert_eq!(response.model, "");
+    assert!(response.output.is_empty());
+}
+
+/// The same event with explicit nulls: `#[serde(default)]` alone does
+/// not cover this — serde rejects `null` for `String`/`Vec` outright.
+#[test]
+fn a_terminal_event_with_null_model_or_output_deserializes() {
+    let json = r#"{
+        "type": "response.completed",
+        "response": {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": null,
+            "output": null
+        }
+    }"#;
+    let event: ResponsesStreamEvent = serde_json::from_str(json).expect("must not be dropped");
+    let ResponsesStreamEvent::Completed { response } = event else {
+        panic!("expected a completed event");
+    };
+    assert_eq!(response.model, "");
+    assert!(response.output.is_empty());
+}
+
+/// A well-formed terminal event still round-trips its real fields.
+#[test]
+fn a_normal_terminal_event_is_unaffected_by_the_defaults() {
+    let json = r#"{
+        "type": "response.completed",
+        "response": {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": []
+        }
+    }"#;
+    let event: ResponsesStreamEvent = serde_json::from_str(json).expect("must deserialize");
+    let ResponsesStreamEvent::Completed { response } = event else {
+        panic!("expected a completed event");
+    };
+    assert_eq!(response.model, "gpt-4o");
+    assert!(response.output.is_empty());
+}

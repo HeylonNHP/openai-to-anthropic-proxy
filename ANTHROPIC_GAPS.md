@@ -141,12 +141,24 @@ so the proxy can only approximate it.
   - Note: existing tests may assume the current behaviour.
   - Severity: low.
 
-- [ ] **B7. Terminal events can be dropped on a deserialise failure**
-  - Where: `src/responses.rs:395-405`, `src/proxy.rs:1464-1475`
-  - Problem: `model: String` and `output: Vec` have no `#[serde(default)]`. A
-    terminal `response.created` / `completed` that lacks them is dropped with a
-    warning, so the stream can look like it ended without a terminal event.
-  - Fix: add defaults. Unverified against real upstreams.
+- [x] **B7. Terminal events can be dropped on a deserialise failure**
+  - Where: `src/responses.rs` (`ResponsesResponse`), drop sites
+    `src/proxy.rs` ("dropping malformed upstream SSE event") and
+    `src/tools/server_loop/live.rs`
+  - Problem: `model: String` and `output: Vec` had no `#[serde(default)]`.
+    A terminal `response.created` / `completed` that lacks them was dropped
+    with a warning, so the stream looked like it ended without a terminal
+    event: the client got a spurious `api_error` for a turn that actually
+    succeeded, and the response's stats line was suppressed.
+  - Fix: default both fields, tolerating an absent key **and** an explicit
+    `null` (plain `#[serde(default)]` only covers absence — serde rejects
+    `null` for `String`/`Vec`). `status` is deliberately left required: it
+    decides the stop reason (`incomplete` → `max_tokens` / `refusal`), so
+    an empty default would silently mislabel a truncated turn.
+  - Note: verified against the code and serde semantics, not against a live
+    upstream that actually omits these fields (none was found in the wild).
+    Both drop sites (plain stream and server-tool loop) are covered by the
+    shared struct fix.
 
 ---
 
@@ -334,4 +346,4 @@ its own design rather than a quick fix.
 
 ## Suggested order
 
-A7 and B6 to B7 first, then C1, D1, E1, and the rest as needed.
+A7 and B6 first, then C1, D1, E1, and the rest as needed.
