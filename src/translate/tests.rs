@@ -2452,6 +2452,79 @@ fn over_budget_request_keeps_all_tools_and_demotes_the_heaviest() {
     assert!(registry.get("enormous").is_some());
 }
 
+// ── The client's `strict` flag ──
+
+fn function_tool(strict: Option<bool>, name: &str, props: usize) -> Tool {
+    let properties: serde_json::Map<String, Value> = (0..props)
+        .map(|i| (format!("p{i}"), json!({"type": "string"})))
+        .collect();
+    Tool {
+        name: name.into(),
+        input_schema: Some(json!({"type": "object", "properties": properties})),
+        strict,
+        ..Tool::default()
+    }
+}
+
+fn translate_tools(tools: Vec<Tool>) -> (Vec<ToolDefinition>, crate::repair::ToolSchemaRegistry) {
+    let mut req = fixture_request();
+    req.tools = Some(tools);
+    let (out, registry) = translate_plain(&req).unwrap();
+    (out.tools.unwrap(), registry)
+}
+
+#[test]
+fn a_tool_with_no_strict_flag_is_sent_strict() {
+    // Claude Code sends no `strict`; the upstream needs strict tools.
+    let (tools, _) = translate_tools(vec![function_tool(None, "plain", 1)]);
+    assert!(is_strict(&tools[0]));
+}
+
+#[test]
+fn an_explicit_strict_true_is_sent_strict() {
+    let (tools, _) = translate_tools(vec![function_tool(Some(true), "t", 1)]);
+    assert!(is_strict(&tools[0]));
+}
+
+#[test]
+fn an_explicit_strict_false_is_sent_non_strict_with_its_schema_intact() {
+    let (tools, registry) = translate_tools(vec![function_tool(Some(false), "loose", 2)]);
+    assert!(!is_strict(&tools[0]));
+    let ToolDefinition::Function(f) = &tools[0] else {
+        panic!("function tool");
+    };
+    // Same sanitized schema a budget-demoted tool carries.
+    assert_eq!(f.parameters["additionalProperties"], json!(false));
+    assert_eq!(f.parameters["properties"].as_object().unwrap().len(), 2);
+    assert!(
+        registry.get("loose").is_some(),
+        "repair still has its schema"
+    );
+}
+
+#[test]
+fn a_client_non_strict_tool_does_not_use_up_the_strict_budget() {
+    // `loose` alone is over budget but is not strict, so it counts for
+    // nothing and `tiny` is not demoted on its account.
+    let (tools, _) = translate_tools(vec![
+        function_tool(Some(false), "loose", STRICT_PROPERTY_BUDGET + 10),
+        function_tool(None, "tiny", 1),
+    ]);
+    assert!(!is_strict(&tools[0]));
+    assert!(is_strict(&tools[1]));
+}
+
+#[test]
+fn strict_tools_are_still_demoted_when_over_budget() {
+    // Neither tool asked for non-strict, so the heaviest is demoted as before.
+    let (tools, _) = translate_tools(vec![
+        function_tool(Some(true), "heavy", STRICT_PROPERTY_BUDGET + 10),
+        function_tool(None, "tiny", 1),
+    ]);
+    assert!(!is_strict(&tools[0]));
+    assert!(is_strict(&tools[1]));
+}
+
 /// Live 400: `Invalid schema for function 'mcp__rea__compare_web_captures':
 /// In context=(), 'minProperties' is not permitted.` Rule 10 drops the
 /// object-size and array-uniqueness keywords the validator does not

@@ -119,7 +119,9 @@ fn truncate_user_id(s: String) -> String {
 ///   **The big behavior change:** every tool now carries
 ///   `strict: true` + `additionalProperties: false` on the parameters
 ///   schema, which is what the airia gateway requires for function tools
-///   on `/v1/responses`.
+///   on `/v1/responses`. A tool the client explicitly marks `strict: false`
+///   is sent `strict: false` (with the same sanitized schema), and so does
+///   not count against the strict property budget.
 /// - `tool_choice`: `Auto`→`"auto"`, `Any`→`"required"`, `None`→`"none"`,
 ///   `Tool{name}`→`{ type: "function", name: "..." }`.
 /// - `max_tokens` → `max_output_tokens`.
@@ -288,7 +290,12 @@ pub fn anthropic_to_responses_with(
                     kind: "function".to_string(),
                     name: t.name.clone(),
                     description: t.description.clone(),
-                    strict: true,
+                    // Strict unless the client explicitly asked for non-strict.
+                    // Anthropic's own default is non-strict, so an absent flag
+                    // (Claude Code sends none) must stay strict: that is what
+                    // the upstream needs. The schema is sanitized either way,
+                    // as it is when the budget below demotes a tool.
+                    strict: t.strict != Some(false),
                     parameters: sanitize_tool_schema(input_schema, original),
                 }))
             })

@@ -332,8 +332,9 @@ pub struct ResponsesTool {
     pub description: Option<String>,
     /// Strict mode is required for the airia gateway — without it,
     /// `gpt-5.6-luna` returns 400 `invalid_function_parameters`. The
-    /// translator sets this to `true` for every tool, then clears it only
-    /// for the heaviest tools when a request's strict schemas exceed the
+    /// translator sets this to `true` for every tool unless the client
+    /// explicitly sent `strict: false`, then clears it for the heaviest
+    /// tools when a request's strict schemas exceed the
     /// upstream's compile budget (`STRICT_PROPERTY_BUDGET` in `translate`):
     /// beyond that budget the upstream answers with an empty `incomplete`
     /// response instead of an error. Live probing showed the gateway accepts

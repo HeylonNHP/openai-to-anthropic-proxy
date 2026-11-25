@@ -439,6 +439,11 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<Value>,
+    /// The client's `strict` flag on a function tool. Only an explicit
+    /// `false` is acted on: the proxy sends every other tool strict (see
+    /// `translate`), because that is what the upstream needs.
+    #[serde(default)]
+    pub strict: Option<bool>,
     /// Options a client sets on a server tool. Always default for a client
     /// function tool.
     #[serde(flatten)]

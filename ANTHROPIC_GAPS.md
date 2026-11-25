@@ -50,7 +50,7 @@ so the proxy can only approximate it.
   - Fix: use `Tool::is_server_tool` (`src/anthropic.rs:480`), which checks the
     schema.
 
-- [ ] **A5. Honour the client's `strict` flag**
+- [x] **A5. Honour the client's `strict` flag**
   - Where: `src/translate.rs:289`, strict budget at `:295-297` and `:454`
   - Problem: every function tool is forced to `strict: true`, even when the
     client sent `strict: false`.
