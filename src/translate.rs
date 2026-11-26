@@ -3053,7 +3053,11 @@ fn build_content_blocks(
 
     // Inject one server-tool/result pair per search with a distinct ID.
     for search_index in 0..web_search_count {
-        let tool_use_id = format!("stoolu_web_search_{:02}", search_index + 1);
+        // Anthropic's API validates a `server_tool_use` id on INBOUND
+        // history, so it must be `srvtoolu_` plus `[A-Za-z0-9_]`. It is
+        // minted per call rather than derived from the index, so it
+        // stays unique across the whole conversation.
+        let tool_use_id = crate::server_tool_id::new_server_tool_id();
         let result_content = if search_index == 0 {
             citations
                 .iter()

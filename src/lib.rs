@@ -8,6 +8,7 @@ mod context_overflow;
 mod count_tokens;
 mod error;
 pub mod responses;
+pub mod server_tool_id;
 pub mod stream;
 
 pub mod anthropic;

@@ -341,7 +341,12 @@ so the proxy can only approximate it.
   - Where: `src/stream.rs:515-517`, `src/translate.rs:2809`
   - Problem: `message.model` is the upstream's name, not the requested one. Ids
     are `msg_resp_…` and tool ids are `call_…`, not `toolu_…`.
-  - Unverified: whether any client logic keys on these.
+  - Verified against the Messages API request schema: a `tool_use` id and a
+    `tool_result.tool_use_id` only have to match `^[a-zA-Z0-9_-]+$` — no
+    prefix and no fixed length — so the `call_…` and `msg_resp_…` ids are
+    **accepted**. The `toolu_` prefix is what Anthropic mints, not what it
+    requires. The `message.model` echo is still unaddressed.
+  - Unverified: whether any client logic keys on `message.model`.
 
 - [ ] **G4. Parallel tool-call blocks overlap**
   - Where: `src/stream.rs:642-683`, `:943-960`
@@ -361,6 +366,50 @@ so the proxy can only approximate it.
   - Where: `REFERENCE.md:143-146`
   - Problem: with server tools active, a plain answer arrives in one burst.
     Non-trivial to fix.
+
+- [x] **G7. `server_tool_use` ids must match Anthropic's `srvtoolu_` pattern**
+  - Where: `src/server_tool_id.rs` (the shared generator),
+    `src/stream.rs` (`emit_server_tool_use`), `src/translate.rs`
+    (`build_content_blocks`)
+  - Problem: the upstream-signalled web-search path minted
+    `server_tool_use` ids of the form `stoolu_web_search_01`. Anthropic's
+    Messages API constrains a `server_tool_use` id to
+    `^srvtoolu_[a-zA-Z0-9_]+$` and validates it on **inbound** history, so
+    a conversation recorded through the proxy could not be resumed against
+    a real Anthropic subscription: the replayed history was rejected with
+    `messages.N.content.M.server_tool_use.id: String should match pattern
+    ^srvtoolu_[a-zA-Z0-9_-]+$`. The counter was also per-response, so the
+    same id recurred across many turns of one conversation.
+  - Fix: every server-tool id now comes from one shared generator
+    (`src/server_tool_id.rs`) that mints `srvtoolu_<hex>_<counter>` from a
+    process-wide counter, so the shape is right by construction and no id
+    repeats inside a conversation. The `web_fetch` and `advisor`
+    generators delegate to it, so all server-tool ids share one counter.
+  - Note: an id already written into a client's transcript stays wrong —
+    the API has no leniency for ids it did not mint. Existing transcripts
+    need a new session, a `/compact` past the affected turns, or a
+    hand-edit of the JSONL.
+  - Severity: high (the conversation became unresumable against Anthropic).
+
+- [ ] **G8. Server-tool blocks in replayed history need the tool declared**
+  - Where: `src/translate.rs` (the echoed `server_tool_use` /
+    `*_tool_result` blocks are folded into the upstream request)
+  - Problem: a `server_tool_use` / `web_search_tool_result` pair recorded
+    through the proxy is replayed to Anthropic by the client on a later
+    turn. Anthropic pairs server-tool blocks to their results by id and
+    checks the pairing against the request's `tools` array; a client that
+    never declared the `web_search` **server** tool (Claude Code's own
+    WebSearch is a client-side tool) may still be rejected, even with the
+    ids fixed.
+  - Unverified: the docs are explicit only about a *still-waiting* server
+    tool (which must stay declared); whether a *completed* pair replayed
+    without the tool declared is accepted is not documented. Assume it is
+    rejected until proven otherwise.
+  - Fix (larger): record the upstream's search as an ordinary
+    `tool_use` / `tool_result` pair with a `toolu_`-shaped id, rather than
+    dressing it up as a server tool — that is what Claude Code's own
+    WebSearch does.
+  - Severity: high, if confirmed.
 
 ---
 

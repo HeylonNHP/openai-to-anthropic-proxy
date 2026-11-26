@@ -1062,7 +1062,12 @@ impl StreamTranslator {
     /// renders inline rather than from this block).
     fn emit_server_tool_use(&mut self, events: &mut Vec<StreamEvent>) {
         self.web_search_count = self.web_search_count.saturating_add(1);
-        let tool_use_id = format!("stoolu_web_search_{:02}", self.web_search_count);
+        // The id must be one Anthropic's API accepts on INBOUND history:
+        // `srvtoolu_` plus `[A-Za-z0-9_]`. It is minted per call, not
+        // derived from `web_search_count`, so it stays unique across the
+        // whole conversation — the count is per-response and would
+        // repeat the same id in every turn.
+        let tool_use_id = crate::server_tool_id::new_server_tool_id();
         self.pending_web_search_ids.push(tool_use_id.clone());
 
         let index = self.allocate_index();

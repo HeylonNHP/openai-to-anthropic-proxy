@@ -532,17 +532,22 @@ fn web_search_call_output_item_injects_blocks_and_usage() {
 
     // server_tool_use + web_search_tool_result + text = 3 blocks.
     assert_eq!(out.content.len(), 3, "expected 3 content blocks");
-    match &out.content[0] {
+    let use_id = match &out.content[0] {
         ResponseContentBlock::ServerToolUse { id, name, input } => {
-            assert_eq!(id, "stoolu_web_search_01");
+            assert!(
+                crate::server_tool_id::is_server_tool_id(id),
+                "server_tool_use id must match Anthropic's pattern: {id}"
+            );
             assert_eq!(name, "web_search");
             assert_eq!(input["query"], "Web search");
+            id.clone()
         }
         other => panic!("expected ServerToolUse, got {other:?}"),
-    }
+    };
     match &out.content[1] {
         ResponseContentBlock::WebSearchToolResult { block } => {
-            assert_eq!(block.tool_use_id, "stoolu_web_search_01");
+            // The result block must pair with the use block by id.
+            assert_eq!(block.tool_use_id, use_id);
             // No url_citation annotations were present, so the result
             // list is empty. Claude Code renders this as "No links
             // found." and the search counter still registers via the
@@ -591,7 +596,14 @@ fn multiple_web_searches_get_unique_ids_and_accurate_usage() {
             _ => None,
         })
         .collect();
-    assert_eq!(ids, vec!["stoolu_web_search_01", "stoolu_web_search_02"]);
+    assert_eq!(ids.len(), 2, "expected one server_tool_use per search");
+    assert_ne!(ids[0], ids[1], "ids must be unique");
+    for id in &ids {
+        assert!(
+            crate::server_tool_id::is_server_tool_id(id),
+            "server_tool_use id must match Anthropic's pattern: {id}"
+        );
+    }
     let result_ids: Vec<&str> = out
         .content
         .iter()

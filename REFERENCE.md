@@ -401,8 +401,9 @@ This is a planning note for future changes. It is separate from the current
   arrive and stopping early, rather than reading the body and then deciding.
 
 Everything else is either a user-facing feature (see the "out of scope" list
-above) or deployment work on the Pi, tracked in
-[`ADVISOR_FAULTS.md`](./ADVISOR_FAULTS.md#still-open).
+above), deployment work on the Pi (tracked in
+[`ADVISOR_FAULTS.md`](./ADVISOR_FAULTS.md#still-open)), or an Anthropic-API
+fidelity gap (tracked in [`ANTHROPIC_GAPS.md`](./ANTHROPIC_GAPS.md)).
 
 ### De-prioritise for now
 - TLS termination: better handled by a reverse proxy (Caddy/nginx/Traefik).

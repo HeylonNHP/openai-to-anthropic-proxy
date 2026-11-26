@@ -5,9 +5,6 @@
 //! as [`crate::anthropic::ResponseContentBlock::Raw`], so no per-feature enum
 //! variant is needed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde_json::{Value, json};
 
 use crate::responses::ResponsesUsage;
@@ -116,22 +113,17 @@ pub fn max_uses_exceeded(id: &str) -> Value {
 
 /// Collision-resistant id for one consultation.
 ///
-/// `srvtoolu_` is the real prefix; Claude Code does no format validation
-/// beyond non-empty + equal `tool_use_id`, but matching the real shape keeps
-/// logs honest.
+/// `srvtoolu_` is the real prefix; the id must match
+/// `^srvtoolu_[a-zA-Z0-9_]+$`, because the API validates a
+/// `server_tool_use` id on INBOUND history — one that does not match is
+/// rejected when the client replays the conversation against Anthropic
+/// itself. Matching the real shape also keeps logs honest.
 ///
-/// Uses `SystemTime` nanoseconds plus a process-local atomic counter — no
-/// new dependency, no `rand` crate. The counter makes ids unique even when
-/// two calls land in the same nanosecond (or the clock is coarse).
+/// Delegates to the shared generator, so every server-tool id in the
+/// process comes from one counter and cannot collide.
 #[must_use]
 pub fn new_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("srvtoolu_{nanos:x}_{n:x}")
+    crate::server_tool_id::new_server_tool_id()
 }
 
 /// Token counts shared by both iteration shapes. Kept as a private helper

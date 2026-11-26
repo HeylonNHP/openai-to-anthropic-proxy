@@ -601,7 +601,14 @@ fn multiple_streaming_web_searches_get_unique_ids_and_accurate_usage() {
             _ => None,
         })
         .collect();
-    assert_eq!(ids, vec!["stoolu_web_search_01", "stoolu_web_search_02"]);
+    assert_eq!(ids.len(), 2, "expected one server_tool_use per search");
+    assert_ne!(ids[0], ids[1], "ids must be unique");
+    for id in &ids {
+        assert!(
+            crate::server_tool_id::is_server_tool_id(id),
+            "server_tool_use id must match Anthropic's pattern: {id}"
+        );
+    }
 
     t.feed_event(&completed_event("completed"));
     let closing = t.finish();
@@ -1019,13 +1026,20 @@ fn web_search_call_emits_server_tool_use_and_result_blocks() {
     // annotations completes (Airia streams those after the call item).
     let evs = t.feed_event(&web_search_call_added(0));
     assert_eq!(evs.len(), 2, "expected server_tool_use start+stop");
-    assert!(matches!(
-        &evs[0],
+    let use_id = match &evs[0] {
         StreamEvent::ContentBlockStart {
-            content_block: ContentBlockKind::ServerToolUse { name, .. },
+            content_block: ContentBlockKind::ServerToolUse { name, id, .. },
             ..
-        } if name == "web_search"
-    ));
+        } => {
+            assert_eq!(name, "web_search");
+            id.clone()
+        }
+        other => panic!("expected a server_tool_use block, got {other:?}"),
+    };
+    assert!(
+        crate::server_tool_id::is_server_tool_id(&use_id),
+        "server_tool_use id must match Anthropic's pattern: {use_id}"
+    );
     assert!(matches!(&evs[1], StreamEvent::ContentBlockStop { .. }));
 
     // Message completes carrying a url_citation annotation; the
@@ -1046,7 +1060,7 @@ fn web_search_call_emits_server_tool_use_and_result_blocks() {
             StreamEvent::ContentBlockStart {
                 content_block: ContentBlockKind::WebSearchToolResult { block },
                 ..
-            } if block.tool_use_id == "stoolu_web_search_01"
+            } if block.tool_use_id == use_id
               && block.content.len() == 1
               && block.content[0].url == "https://example.com/weather"
               && block.content[0].title == "Example Weather"
@@ -1082,7 +1096,21 @@ fn web_search_citations_from_annotation_events_populate_result_block() {
     t.feed_event(&created_event());
 
     // 1. web_search_call item -> server_tool_use block.
-    let _ = t.feed_event(&web_search_call_added(0));
+    let use_events = t.feed_event(&web_search_call_added(0));
+    let use_id = use_events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ServerToolUse { id, .. },
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("expected a server_tool_use block");
+    assert!(
+        crate::server_tool_id::is_server_tool_id(&use_id),
+        "server_tool_use id must match Anthropic's pattern: {use_id}"
+    );
 
     // 2. Message text streams, then url_citation annotations arrive.
     let _ = t.feed_event(&message_item_added(1));
@@ -1112,7 +1140,7 @@ fn web_search_citations_from_annotation_events_populate_result_block() {
             StreamEvent::ContentBlockStart {
                 content_block: ContentBlockKind::WebSearchToolResult { block },
                 ..
-            } if block.tool_use_id == "stoolu_web_search_01"
+            } if block.tool_use_id == use_id
               && block.content.len() == 1
               && block.content[0].url == "https://www.stat.go.jp/"
               && block.content[0].title == "Statistics Bureau of Japan"

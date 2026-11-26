@@ -60,7 +60,6 @@
 //! | `url_not_accessible` | DNS failure, connection failure, timeout, or a non-2xx response |
 //! | `unavailable` | the fetch could not be performed for another reason |
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -135,20 +134,16 @@ pub fn error_result(id: &str, error_code: &str) -> Value {
 /// Collision-resistant id for one fetch.
 ///
 /// `srvtoolu_` is the real prefix Anthropic uses for server tools, and
-/// the id must match `^srvtoolu_[a-zA-Z0-9_]+$`.
+/// the id must match `^srvtoolu_[a-zA-Z0-9_]+$` — the API validates a
+/// `server_tool_use` id on INBOUND history, so one that does not match
+/// would be rejected when the client replays the conversation against
+/// Anthropic itself.
 ///
-/// Uses `SystemTime` nanoseconds plus a process-local atomic counter — no
-/// new dependency, no `rand` crate. The counter makes ids unique even
-/// when two calls land in the same nanosecond (or the clock is coarse).
+/// Delegates to the shared generator, so every server-tool id in the
+/// process comes from one counter and cannot collide.
 #[must_use]
 pub fn new_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("srvtoolu_{nanos:x}_{n:x}")
+    crate::server_tool_id::new_server_tool_id()
 }
 
 /// The current time as an ISO-8601 timestamp.

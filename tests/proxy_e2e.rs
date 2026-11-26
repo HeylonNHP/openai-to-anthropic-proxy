@@ -10829,3 +10829,94 @@ async fn no_configured_limit_lets_requests_overlap() {
         "requests were serialised although no limit is set: {elapsed:?}"
     );
 }
+
+/// Regression: the proxy used to mint `server_tool_use` ids of the form
+/// `stoolu_web_search_01` when the upstream ran its own built-in web
+/// search. Anthropic's API constrains a `server_tool_use` id to
+/// `^srvtoolu_[a-zA-Z0-9_]+$` and validates it on INBOUND history, so a
+/// conversation recorded through the proxy could not be resumed against
+/// a real Anthropic subscription: the replayed history was rejected with
+/// `messages.N.content.M.server_tool_use.id: String should match
+/// pattern ^srvtoolu_[a-zA-Z0-9_-]+$`.
+///
+/// This drives the real path: an upstream that reports a `web_search_call`
+/// output item, through the proxy, to a client. The `server_tool_use`
+/// block the client receives must carry an id Anthropic will accept.
+#[tokio::test]
+async fn upstream_web_search_yields_a_server_tool_use_id_anthropic_accepts() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{
+            "id": "resp_abc",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_01",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Found it.", "annotations": []}
+                    ]
+                }
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+        }"#
+        .into(),
+    );
+
+    let config = make_proxy_config(upstream_addr);
+    let proxy_addr = start_proxy(config).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(ReqBody::from(
+            r#"{
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "search for something"}]
+            }"#,
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+
+    // The upstream's search is dressed up as a `server_tool_use` block so
+    // Claude Code's search counter registers it.
+    let use_block = body["content"]
+        .as_array()
+        .expect("content is an array")
+        .iter()
+        .find(|b| b["type"] == "server_tool_use")
+        .expect("expected a server_tool_use block")
+        .clone();
+
+    let id = use_block["id"].as_str().expect("server_tool_use has an id");
+    assert!(
+        openai_to_anthropic_proxy::server_tool_id::is_server_tool_id(id),
+        "server_tool_use id must match Anthropic's pattern \
+         ^srvtoolu_[a-zA-Z0-9_]+$: {id}"
+    );
+
+    // The paired result block must reference the same id, or Anthropic
+    // cannot pair the two.
+    let result = body["content"]
+        .as_array()
+        .expect("content is an array")
+        .iter()
+        .find(|b| b["type"] == "web_search_tool_result")
+        .expect("expected a web_search_tool_result block")
+        .clone();
+    assert_eq!(result["tool_use_id"], id);
+}
