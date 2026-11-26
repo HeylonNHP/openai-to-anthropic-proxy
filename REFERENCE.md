@@ -270,8 +270,10 @@ mod tests;
 - The test module is still a **child** module, so `use super::*;` works and
   private items stay testable. That is why unit tests do **not** go in
   `tests/` (those are separate crates and can only see the public API).
-- `tests/` holds integration tests only — separate crates, public API only
-  (`tests/proxy_e2e.rs`). `tests/project_layout.rs` is a repo-hygiene test
+- `tests/` holds integration tests only — separate crates, public API only.
+  `tests/proxy_e2e/` is one directory test target: `main.rs` declares only
+  `mod`s, shared scaffolding lives in `harness.rs`, and each other module holds
+  one topic's tests. `tests/project_layout.rs` is a repo-hygiene test
   that checks this convention.
 
 There is no "is the file big enough to split?" judgement: the rule is uniform,

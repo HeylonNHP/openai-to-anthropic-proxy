@@ -67,9 +67,12 @@ mod tests;
 - A crate root (`src/lib.rs`, `src/main.rs`) → module `NAME` lives in `src/NAME.rs`.
 - The test module is a **child** module, so `use super::*;` works and private
   items stay testable.
-- `tests/` is for **integration tests only** — separate crates, public API only
-  (`tests/proxy_e2e.rs`). `tests/project_layout.rs` is a repo-hygiene test that
-  enforces the rule above: an inline `#[cfg(test)] mod X { … }` fails the run.
+- `tests/` is for **integration tests only** — separate crates, public API only.
+  `tests/proxy_e2e/` is one directory test target: `main.rs` declares only
+  `mod`s, shared scaffolding lives in `tests/proxy_e2e/harness.rs`, and each
+  other module holds one topic's tests. `tests/project_layout.rs` is a
+  repo-hygiene test that enforces the rule above: an inline
+  `#[cfg(test)] mod X { … }` fails the run.
 
 There is no "is it big enough to split?" judgement. The rule is uniform.
 

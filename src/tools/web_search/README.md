@@ -325,10 +325,11 @@ of small, clearly marked hooks. `web_fetch` and the advisor never import from
    independent of this module (it maps the *upstream's* built-in search) — keep it.
    `src/tools/domains.rs` is shared with `web_fetch` — keep it.
 6. **Tests** — remove the `web_search` tests in `src/config/tests.rs`, the
-   `// ─── Proxy-native web_search` section at the end of
-   `tests/proxy_e2e.rs`, the `web_search:` lines in the `Config` literals
-   (`tests/proxy_e2e.rs`, `src/proxy/tests.rs`), and the `WebSearchConfig`
-   import in `tests/proxy_e2e.rs`.
+   `tests/proxy_e2e/web_search.rs` module (and its `mod web_search;` line in
+   `tests/proxy_e2e/main.rs`), the `// ─── Proxy-native web_search` helpers in
+   `tests/proxy_e2e/harness.rs`, the `web_search:` lines in the `Config`
+   literals across `tests/proxy_e2e/*.rs` and in `src/proxy/tests.rs`, and the
+   `WebSearchConfig` imports in `tests/proxy_e2e/*.rs`.
 7. **Docs** — remove the `web_search` rows/sections from `REFERENCE.md`,
    `README.md`, `proxy.json.example` and `proxy.json-guide.md`.
 8. **Verify:** `cargo build && cargo clippy --all-targets && cargo test`.
