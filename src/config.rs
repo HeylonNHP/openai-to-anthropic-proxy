@@ -43,6 +43,11 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// while Anthropic accepts `max_tokens` of 0 (a cache pre-warm) and Claude Code
 /// reportedly probes with 1. `min_output_tokens = 0` turns the floor off.
 pub const DEFAULT_MIN_OUTPUT_TOKENS: u32 = 16;
+
+/// How many times the proxy re-sends a request the upstream refused with a
+/// `429` before it gives up and reports the rate limit to the client.
+/// `rate_limit_retries = 0` turns the retry off.
+pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 3;
 /// Prompt caching is opt-in and off by default. When disabled, the
 /// proxy does not emit any OpenAI prompt-cache fields, so the feature
 /// has zero impact on upstreams that don't understand it.
@@ -213,6 +218,14 @@ pub struct Config {
     /// below it is sent as this value instead (`0` turns the floor off). See
     /// [`DEFAULT_MIN_OUTPUT_TOKENS`].
     pub min_output_tokens: u32,
+    /// Most upstream requests the proxy keeps in flight at once; further
+    /// requests wait their turn without the client being told. `0` (the
+    /// default) is no limit. See [`crate::upstream_gate`].
+    pub max_concurrent_requests: u32,
+    /// How many times a request the upstream refused with `429` is re-sent,
+    /// with exponential backoff, before the `429` is passed to the client.
+    /// `0` turns the retry off. See [`DEFAULT_RATE_LIMIT_RETRIES`].
+    pub rate_limit_retries: u32,
     /// Outbound `reasoning_effort` for Responses requests. See
     /// [`DEFAULT_REASONING_EFFORT`] for why this exists. Forwarded to
     /// the upstream as `reasoning: { effort: "..." }` (the Responses
@@ -1180,6 +1193,22 @@ impl Config {
             u32::try_from(v).unwrap_or(u32::MAX)
         });
 
+        // `max_concurrent_requests`: env wins over file, default `0` = no limit.
+        let max_concurrent_requests = pick_u64(
+            file.and_then(|f| f.max_concurrent_requests),
+            env.max_concurrent_requests,
+        )
+        .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX));
+
+        // `rate_limit_retries`: env wins over file, default 3, `0` = no retry.
+        let rate_limit_retries = pick_u64(
+            file.and_then(|f| f.rate_limit_retries),
+            env.rate_limit_retries,
+        )
+        .map_or(DEFAULT_RATE_LIMIT_RETRIES, |v| {
+            u32::try_from(v).unwrap_or(u32::MAX)
+        });
+
         // `forward_documents`: env wins over file, default `false`.
         let forward_documents = env
             .forward_documents
@@ -1507,6 +1536,8 @@ impl Config {
             request_timeout: Duration::from_secs(request_timeout_secs),
             max_request_body_bytes,
             min_output_tokens,
+            max_concurrent_requests,
+            rate_limit_retries,
             reasoning_effort,
             reasoning,
             model_aliases,
@@ -1725,6 +1756,12 @@ pub struct EnvInputs {
     /// `MIN_OUTPUT_TOKENS`: a whole number; `0` turns the floor off. An
     /// unparseable value is ignored, like `REQUEST_TIMEOUT_SECS`.
     pub min_output_tokens: Option<u64>,
+    /// `MAX_CONCURRENT_REQUESTS`: a whole number; `0` or unset is no limit.
+    /// An unparseable value is ignored.
+    pub max_concurrent_requests: Option<u64>,
+    /// `RATE_LIMIT_RETRIES`: a whole number; `0` turns the retry off.
+    /// An unparseable value is ignored.
+    pub rate_limit_retries: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// `REASONING_SUMMARY`: `auto` (default), `concise`, `detailed` or `off`.
     pub reasoning_summary: Option<String>,
@@ -1816,6 +1853,12 @@ impl EnvInputs {
             forward_documents: env::var("FORWARD_DOCUMENTS").ok().map(|s| parse_truthy(&s)),
             system_message_placement: env::var("SYSTEM_MESSAGE_PLACEMENT").ok(),
             min_output_tokens: env::var("MIN_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            max_concurrent_requests: env::var("MAX_CONCURRENT_REQUESTS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            rate_limit_retries: env::var("RATE_LIMIT_RETRIES")
                 .ok()
                 .and_then(|s| s.trim().parse().ok()),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
@@ -2289,6 +2332,13 @@ pub struct JsonConfig {
     /// TUI rewrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_output_tokens: Option<u64>,
+    /// Most upstream requests in flight at once; `0` or unset is no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u64>,
+    /// Retries, with backoff, of an upstream `429` before it is reported to
+    /// the client; unset is 3, `0` turns the retry off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_retries: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared

@@ -33,6 +33,7 @@ use crate::responses;
 use crate::stream::StreamTranslator;
 use crate::translate;
 use crate::tui::MappingsStore;
+use crate::upstream_gate::GatedResponse;
 
 use eventsource_stream::Event as SseEvent;
 use eventsource_stream::EventStreamError;
@@ -71,6 +72,10 @@ pub struct AppState {
     /// (see [`crate::count_tokens`]), so later counts go straight to the
     /// local estimate instead of costing a wasted request each.
     pub count_endpoint_unsupported: Arc<std::sync::atomic::AtomicBool>,
+    /// Every upstream request goes through this: it queues requests past
+    /// `max_concurrent_requests` and retries a `429` (see
+    /// [`crate::upstream_gate`]).
+    pub gate: crate::upstream_gate::UpstreamGate,
 }
 
 /// Make a client-controlled string safe to put in a log line.
@@ -147,7 +152,12 @@ pub fn router_with_stores(
 ) -> Router {
     // Save the route-local body limit before moving `config` into state.
     let max_request_body_bytes = config.max_request_body_bytes;
+    let gate = crate::upstream_gate::UpstreamGate::new(
+        config.max_concurrent_requests,
+        config.rate_limit_retries,
+    );
     let state = AppState {
+        gate,
         config,
         mappings,
         client,
@@ -778,7 +788,7 @@ pub(crate) async fn send_upstream_once<B: serde::Serialize + Sync + ?Sized>(
     headers: &HeaderMap,
     outbound: &B,
     timeout: Option<Duration>,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<GatedResponse, AppError> {
     let mut upstream_req = state
         .client
         .post(url)
@@ -798,13 +808,13 @@ pub(crate) async fn send_upstream_once<B: serde::Serialize + Sync + ?Sized>(
         }
     }
 
-    upstream_req.send().await.map_err(AppError::from)
+    state.gate.send(upstream_req).await.map_err(AppError::from)
 }
 
 /// Read and parse a non-streaming upstream body. Extracted so the
 /// hidden validation-retry loop can re-read a fresh response.
 pub(crate) async fn parse_upstream_body(
-    resp: reqwest::Response,
+    resp: GatedResponse,
 ) -> Result<responses::ResponsesResponse, AppError> {
     let bytes = resp.bytes().await?;
     tracing::debug!(
@@ -856,10 +866,10 @@ pub(crate) struct Attempt {
 }
 
 /// The successful upstream response, split on `outbound.stream`.
-/// `Streaming` owns the RAW `reqwest::Response` so the caller can still
+/// `Streaming` owns the RAW upstream response so the caller can still
 /// consume `.bytes_stream()`; `Buffered` carries the parsed JSON body.
 pub(crate) enum Outcome {
-    Streaming(reqwest::Response),
+    Streaming(GatedResponse),
     Buffered(responses::ResponsesResponse),
 }
 
@@ -1003,7 +1013,7 @@ impl Attempt {
     /// `RequestParam::ALL.len()`), the one-shot `attempt == 1`
     /// `default_model` fallback and `map_upstream_error`. Returns the raw
     /// response so the streaming branch can still take `.bytes_stream()`.
-    async fn send_success(&mut self, url: &str) -> Result<reqwest::Response, AppError> {
+    async fn send_success(&mut self, url: &str) -> Result<GatedResponse, AppError> {
         // Apply anything already learned about this model before the first
         // send, so a fact cached on an earlier request (or by a concurrent
         // one) is honoured immediately instead of re-triggering the 400.
@@ -1320,10 +1330,7 @@ impl Attempt {
 /// Render the raw upstream SSE response into an Anthropic-shaped stream.
 /// `TranslatorStream` takes ownership of the registry and clones the sink /
 /// stats; its `Drop` hook prints the response line and records usage.
-fn render_streaming(
-    attempt: Attempt,
-    upstream_resp: reqwest::Response,
-) -> Result<Response, AppError> {
+fn render_streaming(attempt: Attempt, upstream_resp: GatedResponse) -> Result<Response, AppError> {
     let content_type = upstream_resp
         .headers()
         .get(header::CONTENT_TYPE)

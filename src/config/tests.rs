@@ -2131,6 +2131,75 @@ fn min_output_tokens_zero_turns_the_floor_off() {
     assert_eq!(cfg.min_output_tokens, 0);
 }
 
+// ─── max_concurrent_requests / rate_limit_retries ───────────────────────────
+
+#[test]
+fn the_concurrency_limit_is_off_by_default() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.max_concurrent_requests, 0);
+}
+
+#[test]
+fn the_concurrency_limit_comes_from_the_file_and_env_overrides_it() {
+    let file = JsonConfig {
+        max_concurrent_requests: Some(4),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.max_concurrent_requests, 4);
+
+    let env = EnvInputs {
+        max_concurrent_requests: Some(2),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.max_concurrent_requests, 2);
+}
+
+#[test]
+fn rate_limit_retries_default_to_three() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(cfg.rate_limit_retries, DEFAULT_RATE_LIMIT_RETRIES);
+    assert_eq!(cfg.rate_limit_retries, 3);
+}
+
+#[test]
+fn rate_limit_retries_come_from_the_file_and_env_overrides_them() {
+    let file = JsonConfig {
+        rate_limit_retries: Some(5),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.rate_limit_retries, 5);
+
+    let env = EnvInputs {
+        rate_limit_retries: Some(1),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.rate_limit_retries, 1);
+}
+
+#[test]
+fn rate_limit_retries_zero_turns_the_retry_off() {
+    let file = JsonConfig {
+        rate_limit_retries: Some(0),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.rate_limit_retries, 0);
+}
+
+#[test]
+fn the_new_options_parse_from_json_and_unknown_keys_still_fail() {
+    let parsed: JsonConfig =
+        serde_json::from_str(r#"{ "max_concurrent_requests": 3, "rate_limit_retries": 2 }"#)
+            .expect("both options parse");
+    assert_eq!(parsed.max_concurrent_requests, Some(3));
+    assert_eq!(parsed.rate_limit_retries, Some(2));
+    assert!(serde_json::from_str::<JsonConfig>(r#"{ "max_concurrent_request": 3 }"#).is_err());
+}
+
 // ─── model_info: per-model GET /v1/models metadata ──────────────────────
 
 #[test]

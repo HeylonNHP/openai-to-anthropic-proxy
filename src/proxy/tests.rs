@@ -116,6 +116,8 @@ fn test_config_minimal() -> Config {
         tool_result_images: crate::config::ToolResultImages::default(),
         forward_documents: false,
         min_output_tokens: crate::config::DEFAULT_MIN_OUTPUT_TOKENS,
+        max_concurrent_requests: 0,
+        rate_limit_retries: 0,
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     }

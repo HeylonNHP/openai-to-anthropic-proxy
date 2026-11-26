@@ -36,6 +36,8 @@ The table below spells each one out. A `—` means the option is file-only.
 | `listen_addr` | `LISTEN_ADDR` | `0.0.0.0:8085` | Where the proxy listens locally. |
 | `max_request_body_bytes` | `MAX_REQUEST_BODY_BYTES` | 33554432 | Biggest request Claude Code can send (32 MB). Leave alone. |
 | `min_output_tokens` | `MIN_OUTPUT_TOKENS` | 16 | Smallest output cap sent upstream. A client `max_tokens` below it (Claude Code probes with 1) is raised to this, because OpenAI-style servers reportedly refuse less than 16. `0` turns the floor off. |
+| `max_concurrent_requests` | `MAX_CONCURRENT_REQUESTS` | (no limit) | Most requests the proxy keeps in flight to the upstream at once. Extra requests wait their turn; Claude Code just sees a slower reply. For an upstream that answers `429 too many concurrent requests`. Unset or `0` means no limit. |
+| `rate_limit_retries` | `RATE_LIMIT_RETRIES` | 3 | How many times a request the upstream refuses with `429` is re-sent, with exponential backoff, before the `429` is passed to Claude Code. `0` turns the retry off. |
 | `proxy_key` | `PROXY_KEY` | (none) | A shared secret clients must send with `X-Proxy-Key`. Recommended if anyone else can reach the proxy. |
 
 ## Model routing

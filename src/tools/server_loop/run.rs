@@ -53,7 +53,7 @@ pub(crate) enum LoopEvent {
     Failed(AppError),
     /// The upstream streamed although the request was buffered: hand the
     /// request back to be rendered as an ordinary stream.
-    Fallback(Box<Attempt>, reqwest::Response),
+    Fallback(Box<Attempt>, crate::upstream_gate::GatedResponse),
 }
 
 /// Sends a streaming client's view of the loop to its response, and counts
@@ -152,7 +152,7 @@ pub(crate) enum SessionOutcome {
     /// `prepare` forces `stream: false`, but if an upstream answers with a
     /// stream anyway, degrade to the ordinary streaming path rather than
     /// erroring the client.
-    UnexpectedStreaming(reqwest::Response),
+    UnexpectedStreaming(crate::upstream_gate::GatedResponse),
 }
 
 /// Text injected for calls made after the round limit: the model must answer.
@@ -527,7 +527,7 @@ fn complete(
 /// upstream ignored `stream: true` and answered with JSON).
 async fn run_streamed(
     attempt: &Attempt,
-    raw: reqwest::Response,
+    raw: crate::upstream_gate::GatedResponse,
     out: &mut Emitter<'_>,
     names: &[&'static str],
 ) -> Result<(ResponsesResponse, bool), AppError> {

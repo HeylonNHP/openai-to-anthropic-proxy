@@ -69,7 +69,7 @@ pub(crate) enum Streamed {
     Response(Response),
     /// The upstream streamed although the request was buffered, before any
     /// work was done: render its stream the ordinary way.
-    Fallback(Box<Attempt>, reqwest::Response),
+    Fallback(Box<Attempt>, crate::upstream_gate::GatedResponse),
 }
 
 /// Run the turn for a streaming client.

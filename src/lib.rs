@@ -17,6 +17,7 @@ pub mod repair;
 mod schema_refs;
 mod translate;
 pub mod tui;
+mod upstream_gate;
 
 pub use capabilities::{CapabilityRegistry, CapabilityStore, RequestParam};
 pub use config::{Config, UNBOUNDED_ADVISOR_LOOP_WARNING};

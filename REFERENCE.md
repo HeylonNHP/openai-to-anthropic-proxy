@@ -225,8 +225,11 @@ The proxy's own connect failures (502) and timeouts (504) are `api_error`, not
 overloaded. On a 429 or a 5xx the upstream's `Retry-After` (seconds or an HTTP
 date) or `retry-after-ms` is passed on as both `retry-after` and
 `retry-after-ms`, rounded up and capped at 60 s, the longest the Anthropic SDK
-honours. The proxy never retries a 429 or 5xx itself; Claude Code does, and a
-second layer of retries would stack the delays.
+honours. The proxy retries a 429 itself, up to `rate_limit_retries` times (3 by
+default) with exponential backoff, and passes it on only when those are spent;
+it never retries a 5xx, which Claude Code does. With `max_concurrent_requests`
+set, requests past the limit wait in the proxy instead of reaching the
+upstream. Both live in `src/upstream_gate.rs`.
 
 An error inside a stream cannot carry a status or header, only a type, taken
 from the upstream's error code: `rate_limit_*` / `insufficient_quota` →
