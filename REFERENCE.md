@@ -16,6 +16,7 @@ README. Configuration lives in [`CONFIGURATION.md`](./CONFIGURATION.md) and
 - The server-side `web_fetch` tool, implemented by the proxy: it fetches the URL itself, extracts the readable text, and returns it as an Anthropic `web_fetch_tool_result` (see "Server-side `web_fetch`" below).
 - Optional proxy-native `web_search` (DuckDuckGo scraping + page fetching + compaction) as a swap-in for the upstream's built-in search — see "Proxy-native `web_search`" below.
 - `POST /v1/messages/count_tokens`, answered from the upstream's own token-counting endpoint when it has one, else a local estimate (see "Token counting" below).
+- `GET /v1/models` for gateway model discovery, and `GET /v1/models/{id}` for one model (see "Gateway model discovery" below).
 - `GET /healthz` for liveness checks.
 
 ## Configuration
@@ -161,7 +162,7 @@ to use them.
 
 ## Context-window workaround
 
-Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, never from a gateway's `/v1/models` response — checked against Claude Code 2.1.330: the code that would read `max_input_tokens` off a model list exists in that build but is feature-gated off. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to its assumed default for an unrecognized id — 200K in the code paths recovered from 2.1.330, 1M according to the current docs (since v2.1.323) — which may not match the upstream at all, so auto-compact fires too early or too late.
+Claude Code decides when to auto-compact based on the model's perceived context window. It derives that window from Anthropic model names and the first-party Anthropic API, never from a gateway's `/v1/models` response — checked against Claude Code 2.1.330: the code that would read `max_input_tokens` off a model list exists in that build but is feature-gated off. When the proxy rewrites `claude-sonnet-5` → `gpt-5.4-mini` (or any other alias), Claude Code does not know the upstream model's real context window and falls back to its assumed default for an unrecognized id — 200K, the fallback constant in the installed 2.1.332 client (which caps the modelled window at 1M) — which may not match the upstream at all, so auto-compact fires too early or too late.
 
 Tell Claude Code the real window with `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (or the
 `autoCompactWindow` setting) - see
@@ -371,7 +372,14 @@ See also [`README.md`](./README.md#features) for the shorter visitor-facing list
 
 ### Beta / protocol features
 - Anthropic beta headers are dropped, so beta-gated features cannot rely on them
-- Anthropic-specific server-side tool envelopes and iteration billing beyond what the proxy synthesises
+- Anthropic's own server-tool envelopes are not reproduced. The proxy
+  synthesises `server_tool_use` / `*_tool_result` blocks for the tools it
+  serves (`web_search`, `web_fetch`, `advisor`), but a conversation
+  recorded through the proxy cannot be replayed against Anthropic itself
+  and stay intact — the blocks are paired by id against the request's
+  `tools` array, and the search result blobs are the proxy's own, not
+  Anthropic's. See G8–G10 in
+  [`ANTHROPIC_GAPS.md`](./ANTHROPIC_GAPS.md).
 
 > Extended thinking blocks **are** supported on the response side (the proxy
 > generates them from the upstream's `reasoning` output item) and are replayed

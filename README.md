@@ -130,9 +130,10 @@ autocomplete from the proxy instead of typing alias names by hand:
 ```
 
 The proxy forwards to the upstream's `/v1/models` and translates each entry
-(id, display name, creation time) into Anthropic's shape. With an upstream
-that has no such endpoint, it returns your `model_aliases.map` keys plus
-`default_model`.
+into Anthropic's model shape (id, display name, created_at, and — when
+`model_info` configures them — max_input_tokens, max_tokens, capabilities
+and description). With an upstream that has no such endpoint, it returns
+your `model_aliases.map` keys plus `default_model`.
 
 ## Features
 
@@ -147,7 +148,8 @@ that has no such endpoint, it returns your `model_aliases.map` keys plus
   a model outright.
 - **Prompt caching** on allowlisted models.
 - **`POST /v1/messages/count_tokens`** (the upstream's count, or a local
-  estimate), **`GET /v1/models`** for gateway model discovery, **`GET /healthz`**
+  estimate), **`GET /v1/models`** for gateway model discovery,
+  **`GET /v1/models/{id}`** for one model, and **`GET /healthz`**
   for liveness checks.
 - An optional shared-secret `proxy_key` for a bind-all listener.
 

@@ -192,8 +192,9 @@ To **remove** one: delete its module and those two lines.
   tool call still violates the client's schema after repair gets one corrective
   re-send. A streamed run's bytes are already with the client, so it cannot.
   (Arguments are still repaired.)
-* **Usage is the last executor run's**, not the sum of the rounds (the advisor's
-  tokens are in `iterations[]`; compaction tokens are not recorded).
+* **Usage is the sum over every executor run**, not the last run's (the
+  advisor's tokens are also broken out in `iterations[]`; compaction tokens
+  are not recorded).
 * **Internal calls use the model's own function-calling**, not Anthropic's
   server tools, so the model's behaviour (when it chooses to search, how it
   writes queries) is the upstream model's, not Claude's.

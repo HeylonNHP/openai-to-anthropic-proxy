@@ -1,15 +1,23 @@
 # Anthropic API gaps: fixes to work through
 
-Source: three read-only research passes over `src/` (request side, response
-side, endpoints and tools). Nothing was run against a live upstream.
+Source: read-only research passes over `src/` (request side, response side,
+endpoints and tools). A later pass re-checked the current code and the live
+Anthropic schema for the entries added since, and checked a few of them
+against the installed Claude Code client. Nothing was run against a live
+upstream.
 
 **Before you start any item:**
 
 - Line references come from the research and may have drifted. Re-check each
   one in the code first.
 - Anything marked *unverified* is a hypothesis. Confirm it before changing code.
-- The Anthropic-side facts in the endpoint pass were not checked against the
-  live docs.
+- The Anthropic-side facts in the original three passes were not checked
+  against the live docs. Entries added later (A8, A9, B8, B9, E5, E6, F4,
+  G9, G10 and section H) were checked against the live schema; the ones
+  that name a client impact were checked against the installed Claude Code
+  CLI (v2.1.332), by reading its embedded JavaScript. That is a static
+  reading of one client version, not a behavioural test — treat it as
+  strong evidence, not proof.
 - Run the gate for each fix: `cargo fmt --all -- --check`,
   `cargo clippy --all-targets`, `cargo test`.
 - Unit tests go in the sibling `tests.rs` file for the module (see `CLAUDE.md`).
@@ -67,6 +75,44 @@ so the proxy can only approximate it.
   - Where: `src/translate.rs:299-308`, `:2657-2700`
   - Problem: it is only sent when `tool_choice` is present. `disable_parallel_tool_use`
     is ignored when the choice is `none`.
+  - Severity: low.
+
+- [ ] **A8. The `min_output_tokens` floor can exceed the client's `max_tokens`**
+  - Where: `src/proxy.rs:921-931` (the floor is applied to the outbound
+    request); `src/proxy.rs:1391-1397` (only `max_tokens == 0` is pre-warmed)
+  - Problem: a client `max_tokens` of 1..15 is silently sent as 16 upstream,
+    and the reply comes back unmodified — so `usage.output_tokens` can
+    exceed the client's `max_tokens`, with `stop_reason: end_turn` when the
+    model finishes naturally inside 16. Anthropic treats `max_tokens` as
+    "the absolute maximum number of tokens to generate" and never returns
+    more than it.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): Claude Code does
+    send `max_tokens: 1` probes in at least five places (a `count_tokens`
+    fallback, a `model_validation` probe, a quota probe), but every probe
+    found reads only `usage.input_tokens` or the HTTP status — never the
+    output. So this is an API-contract divergence and wasted generation
+    (up to 15 extra tokens per probe), not a Claude Code break.
+  - Note: `proxy.json-guide.md` already documents that "a probe may carry up
+    to 16 tokens instead of 1", so the behaviour is visible to the operator.
+  - Fix: inherent to an OpenAI-style upstream's floor. Optionally log the
+    raise at `warn` when the client cap is 0 or 1 — the values Claude Code
+    actually sends.
+  - Severity: low-medium.
+
+- [ ] **A9. `max_tokens: 0` + `stream: true` is rejected on an unverified rule**
+  - Where: `src/proxy.rs:666-672`
+  - Problem: the proxy answers 400 "max_tokens: 0 (a cache pre-warm) cannot
+    be combined with stream: true", on the stated grounds that "Anthropic
+    refuses it together with `stream: true`". The Messages API schema
+    documents `max_tokens` with `minimum: 0` and "set to 0 to populate the
+    prompt cache without generating a response", and states no
+    incompatibility with `stream: true`. If live Anthropic accepts the
+    combination, the proxy 400s a documented-valid request.
+  - Unverified: needs a live subscription to settle. Claude Code sends
+    `max_tokens: 0` only non-streamed in the snippets found.
+  - Fix: if Anthropic allows it, stream the pre-warm (message_start → an
+    immediate message_delta with `stop_reason: max_tokens`, no server
+    tools); if it refuses, cite the observed response in the comment.
   - Severity: low.
 
 ---
@@ -159,6 +205,39 @@ so the proxy can only approximate it.
     upstream that actually omits these fields (none was found in the wild).
     Both drop sites (plain stream and server-tool loop) are covered by the
     shared struct fix.
+
+- [ ] **B8. The upstream gate's queue wait and 429 backoff sit outside every timeout**
+  - Where: `src/upstream_gate.rs:80` (`acquire().await`), `:109`
+    (`tokio::time::sleep(wait)`), `:88` (`request.send()`); the client-level
+    timeout is at `src/main.rs:173`
+  - Problem: both the semaphore wait and the exponential backoff sleep run
+    BEFORE `request.send()` is invoked, so neither the client-level
+    `request_timeout` nor any per-request `.timeout()` covers them. Queue
+    wait is unbounded, and backoff can total minutes when the upstream sends
+    a `Retry-After` (honoured up to the 60 s cap, per attempt, with
+    `rate_limit_retries` defaulting to 3). During all of it the proxy has
+    sent the client zero bytes: response headers are written only once the
+    upstream's arrive — the window B5's ping cannot cover — so a queued or
+    backing-off request can outlast Claude Code's byte watchdog and abort
+    the turn, reintroducing pre-first-byte the failure B5 fixed mid-stream.
+  - Note: `proxy.json-guide.md` already says "no queue time counts against
+    `request_timeout_secs`", so the timeout gap is documented; what is not
+    documented is that the wait is unbounded and that it happens before any
+    byte reaches the client.
+  - Fix: wrap `acquire` in a `tokio::time::timeout` (bound = `request_timeout`
+    or a new `queue_timeout`) and map expiry to a 429/529; cap cumulative
+    backoff across retries; or write the response headers and a
+    `message_start` placeholder early, as the server-tool path's
+    `start_after` timer does.
+  - Severity: medium.
+
+- [ ] **B9. A streamed server-tool run gets no corrective schema retry**
+  - Where: `src/tools/server_loop/README.md:191-193`
+  - Problem: a buffered server-tool run that violates the tool's schema gets
+    one corrective re-send after the arguments are repaired. A streamed run
+    cannot: its bytes are already with the client.
+  - Fix: inherent with streaming. Declare it and move on.
+  - Severity: low.
 
 ---
 
@@ -299,6 +378,47 @@ so the proxy can only approximate it.
   - Claude Code does not use them. Batches and Files could map to OpenAI's
     equivalents. Skills and Admin are inherent. Likely leave out of scope.
 
+- [ ] **E5. `GET /v1/models/{model_id}` can answer with a different `id` than requested**
+  - Where: `src/proxy.rs:403-410` (`find_model_row` falls back to
+    `display_name`), used by `handle_model`
+  - Problem: the second pass matches on `display_name` (for an upstream row
+    `display_name` is the raw upstream name, while `id` may be a
+    `prefix_models_for_discovery` `claude-` rewrite), so
+    `GET /v1/models/<display-name>` returns a bare Model object whose `id` is
+    not the requested path — a shape Anthropic never produces, and a case
+    where Anthropic would 404. The docs do allow "Model identifier or
+    alias", but alias keys are already rows of their own, so the exact-match
+    pass covers the legitimate case.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): the retrieve path
+    is hard-gated off, and clients normally look up ids obtained from the
+    list — so display-name lookup is unlikely to be exercised.
+  - Fix: match `id` only, or rewrite the returned `id` to the requested name.
+  - Severity: low.
+
+- [ ] **E6. `/v1/models` rows omit four documented fields and add an undocumented one**
+  - Where: `src/anthropic.rs:833-846` (`AnthropicModelInfo`),
+    `src/proxy.rs:260-266` (`ModelsQuery` — only `after_id`/`before_id`/`limit`)
+  - Problem: the live ModelInfo schema is `type`, `id`, `capabilities`,
+    `created_at`, `deprecated_at`, `display_name`, `lifecycle`, `line`,
+    `max_input_tokens`, `max_tokens`, `retires_at` — with `lifecycle` always
+    present and `line` nullable, and the list endpoint additionally
+    accepting a `lifecycle` query filter. The proxy never emits
+    `lifecycle`, `line`, `deprecated_at` or `retires_at`, silently ignores
+    the `lifecycle` filter (a client asking for `lifecycle=["retired"]` gets
+    active models), and serves a `description` field that the public schema
+    does not have at all.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): gateway discovery
+    GETs `/v1/models?limit=1000` and `safeParse`s the response, so a
+    missing REQUIRED field would fail discovery outright — but the element
+    schema could not be extracted from the binary, so whether the four
+    omitted fields are optional there is unverified. Discovery is also
+    hard-gated off by default.
+  - Fix: emit `lifecycle: "active"`, `line: null`, `deprecated_at: null`,
+    `retires_at: null` by default; either apply the `lifecycle` filter or
+    document that it is ignored; keep `description` but note it is not in
+    the public schema (E1's note says the current build reads it).
+  - Severity: low.
+
 ---
 
 ## F. Errors and headers
@@ -316,6 +436,21 @@ so the proxy can only approximate it.
   - Where: `src/error.rs:249-262`
   - Problem: no `anthropic-ratelimit-*` headers. Only worth doing if the
     upstream sends `x-ratelimit-*`. The SDK works without them.
+
+- [ ] **F4. The upstream `/v1/models` GET bypasses the upstream gate**
+  - Where: `src/proxy.rs:425` (`state.client.get(&url)` inside
+    `collect_model_rows`), against the contract stated at
+    `src/proxy.rs:75-76` and `src/upstream_gate.rs:1`
+  - Problem: every POST goes through the gate — messages
+    (`src/proxy.rs:811`), `count_tokens` and the advisor via
+    `send_upstream_once` — but the models-list mirror does a bare
+    `state.client.get`. With `max_concurrent_requests` set it is neither
+    queued nor concurrency-limited, and with `rate_limit_retries` (default
+    3) a 429 on model listing is reported immediately while message traffic
+    is retried: a silent inconsistency between two client-visible paths.
+  - Fix: route the GET through `state.gate.send(req)`, or weaken the two
+    "every request" doc comments to name the exception.
+  - Severity: low.
 
 ---
 
@@ -405,11 +540,160 @@ so the proxy can only approximate it.
     tool (which must stay declared); whether a *completed* pair replayed
     without the tool declared is accepted is not documented. Assume it is
     rejected until proven otherwise.
+  - Why the client replays them at all (read from Claude Code 2.1.332's
+    embedded JS): its recognised content-block types include
+    `server_tool_use`, `web_search_tool_result`, `web_fetch_tool_result`,
+    `advisor_tool_result`, `mcp_tool_use` and `mcp_tool_result`, so those
+    blocks are preserved and sent back verbatim — the mechanism behind G7
+    as well.
   - Fix (larger): record the upstream's search as an ordinary
     `tool_use` / `tool_result` pair with a `toolu_`-shaped id, rather than
     dressing it up as a server tool — that is what Claude Code's own
     WebSearch does.
   - Severity: high, if confirmed.
+
+- [ ] **G9. Upstream-signalled `web_search_result` entries have no `encrypted_content`**
+  - Where: `src/translate.rs:3067`, `src/stream.rs:1095`
+    (`encrypted_content: String::new()`); `src/anthropic.rs:630-634` skips the
+    field when empty
+  - Problem: Anthropic's schema marks `encrypted_content` as **required** on
+    every `web_search_result` entry (only `page_age` is optional). The
+    upstream-signalled path leaves it empty, so the field is omitted from
+    the wire entirely — a result block that does not match the documented
+    shape. The proxy-native search sets it (its own `oap1:` format, see
+    G10), so this is specific to the upstream-signalled path.
+  - Note: this is the same code path that minted the malformed
+    `server_tool_use` id in G7.
+  - Fix: fill it with something (the proxy-native path's own encoding
+    would do), or drop the entries and keep only the citations.
+  - Severity: low-medium.
+
+- [ ] **G10. The proxy-native search's `encrypted_content` is not an Anthropic blob**
+  - Where: `src/tools/web_search/protocol.rs:46`, `src/tools/web_search/history.rs`
+  - Problem: the proxy writes `oap1:` + base64 of the page text, which is
+    opaque rather than encrypted — documented as such in
+    `src/tools/web_search/README.md`. Anthropic's own blob is opaque to the
+    client and meaningful to the server, so a conversation moved to the real
+    Anthropic API loses the page content.
+  - Unverified: whether Anthropic rejects a non-Anthropic blob on replay.
+  - Fix: strip the field on the way out to Anthropic, or record the search
+    as an ordinary tool pair (the G8 sketch) so no server-tool block needs
+    to survive the move.
+  - Severity: low.
+
+---
+
+## H. Response and error shape (checked against the live schema and the client)
+
+These were found by a later research pass that checked the current code
+against the live Anthropic schema, and the client impact against the
+installed Claude Code CLI (v2.1.332) by reading its embedded JavaScript.
+That is a static reading of one client version, not a behavioural test —
+strong evidence, not proof.
+
+### H.a. Affects what the client shows
+
+- [ ] **H1. `usage.output_tokens_details.thinking_tokens` is not emitted**
+  - Where: `src/anthropic.rs:684-685` (`Usage.thinking_tokens`), populated at
+    `src/stream.rs:1217` and `src/translate.rs:2803`
+  - Problem: Anthropic nests the thinking-token count under
+    `output_tokens_details: { thinking_tokens }`. The proxy emits a flat
+    `thinking_tokens` instead, and never emits `output_tokens_details`.
+    The upstream's `output_tokens_details.reasoning_tokens` is flattened
+    into it.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): the CLI reads ONLY
+    the nested form — `o.output_tokens_details?.thinking_tokens` — and there
+    is no unprefixed `.thinking_tokens` read in the binary. The flat field is
+    stripped on parse, so the client's thinking-token accounting always
+    rolls up **0**. A wrong displayed metric, not a failure.
+  - Fix: emit `output_tokens_details: { thinking_tokens }` (keep or drop the
+    flat alias deliberately).
+  - Severity: low-medium.
+
+- [ ] **H2. The response `Message` omits `stop_details`**
+  - Where: `src/anthropic.rs:565-576` (the `Message` struct)
+  - Problem: Anthropic's response `Message` carries `stop_details`
+    (`type: "refusal"`, `category`, `explanation`), plus `container` and
+    `diagnostics`. The proxy declares none of them. Since B3 is fixed the
+    proxy does emit `stop_reason: "refusal"`, but with no `stop_details`
+    companion.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): every read is
+    null-tolerant (`qo.stop_details?.category ?? null`), so the refusal
+    itself — driven purely by `stop_reason` — still works. What degrades is
+    the category/explanation display, the category-gated refusal-fallback
+    lane, and delta-borne `resumption` tokens (an Anthropic-lane feature
+    that cannot exist through the proxy anyway).
+  - Fix: declare the fields so a refusal can carry its details.
+  - Severity: low.
+
+### H.b. Cosmetic for Claude Code (shape fidelity only)
+
+- [ ] **H3. `message_delta` omits `stop_sequence` (always) and `stop_reason` (abnormal paths)**
+  - Where: `src/anthropic.rs:817-822` (`MessageDeltaPayload`), `src/stream.rs:477-483`
+  - Problem: Anthropic's `message_delta.delta` declares four non-optional
+    fields — `container`, `stop_details`, `stop_reason`, `stop_sequence` —
+    and its examples show `"stop_sequence": null` present in every
+    `message_delta`. The proxy's payload omits `stop_sequence` entirely
+    (both fields are `skip_serializing_if = "Option::is_none"`, and
+    `stop_sequence` is hard-wired `None` on both the streaming and the
+    advisor path).
+  - Client impact (read from Claude Code 2.1.332's embedded JS): `stop_sequence` and
+    `stop_details` are `.optional()` and every read is `??`-guarded, so
+    absent keys yield `undefined` and are tolerated — the proxy already
+    streams to this client with `stop_sequence` absent every turn.
+  - Fix: drop `skip_serializing_if` from `stop_sequence` (emit null when
+    unset); consider always emitting `stop_reason` too.
+  - Severity: low (cosmetic for Claude Code).
+
+- [ ] **H4. Tool-call arguments are buffered into one `input_json_delta`**
+  - Where: `src/stream.rs:835-850` (`emit_tool_args_delta` accumulates and
+    discards its events), `src/stream.rs:888-912` (`emit_repaired_args`
+    emits the whole blob at block close); same shape in
+    `src/tools/advisor/sse.rs:134-152`
+  - Problem: Anthropic streams `input_json_delta` incrementally as each
+    key/value completes. The proxy sends nothing until the tool block
+    closes, then one delta.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): the client parses
+    partial JSON per delta with a try/catch fallback and accumulates
+    per event, so one blob at block close parses fine. The loss is
+    progressive rendering and spinner-byte granularity during long argument
+    generation — the tool cannot execute before `content_block_stop`
+    regardless.
+  - Note: the buffering is deliberate — it is what enables argument repair
+    (B2). This is a fidelity cost, not a bug.
+  - Fix: stream syntactically-committed JSON prefixes incrementally and
+    keep the repair pass authoritative; or accept and document it.
+  - Severity: low (cosmetic for Claude Code).
+
+- [ ] **H5. Unknown routes and methods answer with axum's default 404/405**
+  - Where: `src/proxy.rs:193-215` (the router has no `.fallback()`)
+  - Problem: a request to any other Anthropic endpoint (`/v1/batches`,
+    `/v1/files`, `/v1/complete`, …) or a wrong method on `/v1/messages`
+    gets axum's stock 404/405 rather than Anthropic's
+    `{"type":"error","error":{"type":"not_found_error"}}` envelope.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): the error path is
+    parse-safe — a non-JSON body yields the right status with
+    `error.type === undefined` instead of throwing — and Claude Code never
+    calls the routes that would miss (per E4). An SDK user that JSON-parses
+    every error body would see a parse failure instead of a typed error.
+  - Fix: add a `fallback` handler returning an Anthropic-shaped envelope.
+  - Severity: low.
+
+- [ ] **H6. Upstream error bodies are re-wrapped verbatim into `error.message`**
+  - Where: `src/error.rs:266-269` (`AppError::Upstream`)
+  - Problem: the client-visible `error.message` is
+    `"upstream returned {status}: {entire raw upstream body}"` — raw
+    OpenAI-shaped JSON embedded inside an Anthropic envelope. Anthropic's
+    own messages are human-readable sentences, and the embedded body can
+    leak upstream-internal detail.
+  - Client impact (read from Claude Code 2.1.332's embedded JS): behaviour keys on
+    `status` and `error.type`, never on free text; the text matchers that
+    do exist are `$`-anchored, so the embedded body cannot false-match
+    them. Context-overflow errors never take this path (they keep
+    Anthropic's wording).
+  - Fix: map common upstream error codes to Anthropic-worded messages and
+    keep the raw body in a log field, not the client's `message`.
+  - Severity: low.
 
 ---
 
@@ -421,6 +705,30 @@ programmatic tool calling, the MCP connector (`mcp_servers`),
 `pause_turn` outside the opt-in. If one of these becomes a requirement, it needs
 its own design rather than a quick fix.
 
+Also inherent, and listed in `REFERENCE.md`'s "Out of scope" section:
+
+- **Model-generated images** — the proxy is text-only in both directions.
+- **Assistant-turn `image` blocks** — dropped with a warning, because the
+  Responses API has no assistant-image content part to map them to. (User
+  and `tool_result` images ARE supported.)
+- **Native reasoning replay mints a synthetic `rs_` id** — the upstream's
+  own reasoning-item id is lost at the Anthropic wire boundary.
+- **Claude Code's standby advisor path** — only an explicitly configured
+  `advisorModel` works behind a proxy.
+- **Proxy-driven resumption of a paused server-tool turn** — the proxy can
+  end a turn with `stop_reason: "pause_turn"` (opt-in) and accepts the
+  client's resend, but it never re-sends the conversation itself, and
+  Claude Code does not resume it.
+
 ## Suggested order
 
 A7 and B6 first, then C1, D1, and the rest as needed.
+
+The server-tool id work (G7, G8, G9, G10) belongs together: G7 fixed the
+`server_tool_use` id shape, and the other three are what remains of the same
+"a conversation recorded through the proxy must survive being replayed
+against Anthropic" problem. G8's fix — recording the upstream's search as an
+ordinary `tool_use` / `tool_result` pair — would also settle G9 and G10.
+
+B8 is the only newly-added entry that can end a turn: a queued or
+backing-off request sits in front of the first byte, outside every timeout.
