@@ -12,7 +12,8 @@
 //!   is no limit and no waiting.
 //! * **`429` retry** (`rate_limit_retries`). A request the upstream refuses
 //!   with `429` is sent again after an exponential backoff, up to the
-//!   configured number of times. Only when the retries are spent is the `429`
+//!   configured number of times, with no single wait longer than
+//!   `max_retry_wait_secs`. Only when the retries are spent is the `429`
 //!   handed on, and the usual error mapping then reports it to the client as a
 //!   `rate_limit_error`.
 //!
@@ -53,20 +54,28 @@ pub struct UpstreamGate {
     /// `None` is no limit.
     slots: Option<Arc<Semaphore>>,
     retries: u32,
+    /// The longest any single sleep between two attempts may last: the
+    /// configured `max_retry_wait_secs`.
+    max_wait: Duration,
 }
 
 impl UpstreamGate {
-    /// A gate allowing `max_concurrent` requests in flight (`0` is no limit)
-    /// and re-sending a `429`ed request up to `retries` times.
+    /// A gate allowing `max_concurrent` requests in flight (`0` is no limit),
+    /// re-sending a `429`ed request up to `retries` times, and never waiting
+    /// longer than `max_wait` between two attempts.
     #[must_use]
-    pub fn new(max_concurrent: u32, retries: u32) -> Self {
+    pub fn new(max_concurrent: u32, retries: u32, max_wait: Duration) -> Self {
         let slots = (max_concurrent > 0).then(|| {
             let permits = usize::try_from(max_concurrent)
                 .unwrap_or(Semaphore::MAX_PERMITS)
                 .min(Semaphore::MAX_PERMITS);
             Arc::new(Semaphore::new(permits))
         });
-        Self { slots, retries }
+        Self {
+            slots,
+            retries,
+            max_wait,
+        }
     }
 
     /// Send `request`, waiting for a free slot first and retrying a `429`.
@@ -97,6 +106,7 @@ impl UpstreamGate {
                 attempt,
                 crate::error::parse_retry_after(response.headers()),
                 jitter_unit(),
+                self.max_wait,
             );
             tracing::warn!(
                 attempt = attempt + 1,
@@ -171,13 +181,22 @@ impl GatedResponse {
 /// The wait doubles each time from [`BACKOFF_BASE`] up to [`BACKOFF_CAP`], then
 /// is scaled by `jitter` (a value in `0.0..=1.0`) to between half and all of
 /// it, so requests refused together do not come back together. When the
-/// upstream sent a `Retry-After`, the wait is never shorter than that.
-fn backoff(attempt: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
+/// upstream sent a `Retry-After`, the wait is never shorter than that. However
+/// it comes out, the wait never exceeds `max_wait` — the configured
+/// `max_retry_wait_secs`, the operator's dial for failing fast.
+fn backoff(
+    attempt: u32,
+    retry_after: Option<Duration>,
+    jitter: f64,
+    max_wait: Duration,
+) -> Duration {
     let doubled = BACKOFF_BASE.saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX));
     let wait = doubled
         .min(BACKOFF_CAP)
         .mul_f64(0.5f64.mul_add(jitter.clamp(0.0, 1.0), 0.5));
-    retry_after.map_or(wait, |asked| asked.max(wait))
+    retry_after
+        .map_or(wait, |asked| asked.max(wait))
+        .min(max_wait)
 }
 
 /// A cheap `0.0..1.0` value for jitter, from the clock's sub-second part.

@@ -79,6 +79,7 @@ async fn model_not_supported_falls_back_to_default() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -147,6 +148,7 @@ async fn model_not_supported_without_default_passes_error_through() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -223,6 +225,7 @@ async fn unrelated_upstream_400_is_not_a_fallback_trigger() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -670,6 +673,7 @@ data: {"type":"response.completed","response":{"id":"resp_fb","object":"response
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -777,6 +781,7 @@ async fn fallback_recomputes_reasoning_for_default_model() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -863,6 +868,7 @@ async fn fallback_recomputes_prompt_caching_for_default_model() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });
@@ -961,6 +967,7 @@ async fn fallback_recomputes_reasoning_replay_for_default_model() {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     });

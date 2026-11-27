@@ -6,6 +6,7 @@
   "min_output_tokens": 16,
   "max_concurrent_requests": 4,
   "rate_limit_retries": 3,
+  "max_retry_wait_secs": 60,
 
   "system_message_placement": "inline",
 

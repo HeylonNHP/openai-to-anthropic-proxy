@@ -38,6 +38,7 @@ The table below spells each one out. A `—` means the option is file-only.
 | `min_output_tokens` | `MIN_OUTPUT_TOKENS` | 16 | Smallest output cap sent upstream. A client `max_tokens` below it (Claude Code probes with 1) is raised to this, because OpenAI-style servers reportedly refuse less than 16. `0` turns the floor off. |
 | `max_concurrent_requests` | `MAX_CONCURRENT_REQUESTS` | (no limit) | Most requests the proxy keeps in flight to the upstream at once. Extra requests wait their turn; Claude Code just sees a slower reply. For an upstream that answers `429 too many concurrent requests`. Unset or `0` means no limit. |
 | `rate_limit_retries` | `RATE_LIMIT_RETRIES` | 3 | How many times a request the upstream refuses with `429` is re-sent, with exponential backoff, before the `429` is passed to Claude Code. `0` turns the retry off. |
+| `max_retry_wait_secs` | `MAX_RETRY_WAIT_SECS` | 60 | Longest the proxy waits between two attempts of one request — the `429` backoff, including a `Retry-After` the upstream sent. Lower it to reach a non-streaming client faster when the upstream keeps refusing. `0` warns and falls back to 60; values above 60 do nothing, since no wait is ever longer. |
 | `proxy_key` | `PROXY_KEY` | (none) | A shared secret clients must send with `X-Proxy-Key`. Recommended if anyone else can reach the proxy. |
 
 ## Model routing

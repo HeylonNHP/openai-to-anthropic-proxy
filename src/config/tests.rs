@@ -2198,6 +2198,60 @@ fn the_new_options_parse_from_json_and_unknown_keys_still_fail() {
     assert_eq!(parsed.max_concurrent_requests, Some(3));
     assert_eq!(parsed.rate_limit_retries, Some(2));
     assert!(serde_json::from_str::<JsonConfig>(r#"{ "max_concurrent_request": 3 }"#).is_err());
+    // The cap parses as its own key, and a typo still fails.
+    let parsed: JsonConfig =
+        serde_json::from_str(r#"{ "max_retry_wait_secs": 5 }"#).expect("the cap parses");
+    assert_eq!(parsed.max_retry_wait_secs, Some(5));
+    assert!(serde_json::from_str::<JsonConfig>(r#"{ "max_retry_wait_sec": 5 }"#).is_err());
+}
+
+// ─── max_retry_wait_secs ────────────────────────────────────────────────────
+
+#[test]
+fn max_retry_wait_defaults_to_sixty_seconds() {
+    let cfg = Config::resolve(None, &env_with_required()).unwrap();
+    assert_eq!(
+        cfg.max_retry_wait,
+        Duration::from_secs(DEFAULT_MAX_RETRY_WAIT_SECS)
+    );
+    assert_eq!(cfg.max_retry_wait, Duration::from_secs(60));
+}
+
+#[test]
+fn max_retry_wait_comes_from_the_file_and_env_overrides_it() {
+    let file = JsonConfig {
+        max_retry_wait_secs: Some(5),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(cfg.max_retry_wait, Duration::from_secs(5));
+
+    let env = EnvInputs {
+        max_retry_wait_secs: Some(2),
+        ..env_with_required()
+    };
+    let cfg = Config::resolve(Some(&file), &env).unwrap();
+    assert_eq!(cfg.max_retry_wait, Duration::from_secs(2));
+}
+
+#[test]
+fn max_retry_wait_zero_warns_and_falls_back_to_the_default() {
+    let file = JsonConfig {
+        max_retry_wait_secs: Some(0),
+        ..JsonConfig::default()
+    };
+    let cfg = Config::resolve(Some(&file), &env_with_required()).unwrap();
+    assert_eq!(
+        cfg.max_retry_wait,
+        Duration::from_secs(DEFAULT_MAX_RETRY_WAIT_SECS)
+    );
+    assert!(
+        cfg.warnings
+            .iter()
+            .any(|w| w.message.contains("max_retry_wait_secs")),
+        "the unusable value must be called out: {:?}",
+        cfg.warnings
+    );
 }
 
 // ─── model_info: per-model GET /v1/models metadata ──────────────────────

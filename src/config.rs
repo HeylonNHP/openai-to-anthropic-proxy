@@ -48,6 +48,15 @@ pub const DEFAULT_MIN_OUTPUT_TOKENS: u32 = 16;
 /// `429` before it gives up and reports the rate limit to the client.
 /// `rate_limit_retries = 0` turns the retry off.
 pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 3;
+/// The longest the proxy waits between two attempts of one request, in
+/// seconds.
+///
+/// It caps the `429` backoff including any `Retry-After` the upstream
+/// sent. `60` is what the proxy already does (the exponential part never
+/// exceeds 8 s and `Retry-After` was already capped at a minute), so the
+/// default changes nothing; set it lower to reach a client faster when
+/// the upstream keeps refusing.
+pub const DEFAULT_MAX_RETRY_WAIT_SECS: u64 = 60;
 /// Prompt caching is opt-in and off by default. When disabled, the
 /// proxy does not emit any OpenAI prompt-cache fields, so the feature
 /// has zero impact on upstreams that don't understand it.
@@ -226,6 +235,10 @@ pub struct Config {
     /// with exponential backoff, before the `429` is passed to the client.
     /// `0` turns the retry off. See [`DEFAULT_RATE_LIMIT_RETRIES`].
     pub rate_limit_retries: u32,
+    /// The longest any single wait between two attempts of one request may
+    /// last: it caps the backoff above, including an upstream `Retry-After`.
+    /// See [`DEFAULT_MAX_RETRY_WAIT_SECS`].
+    pub max_retry_wait: Duration,
     /// Outbound `reasoning_effort` for Responses requests. See
     /// [`DEFAULT_REASONING_EFFORT`] for why this exists. Forwarded to
     /// the upstream as `reasoning: { effort: "..." }` (the Responses
@@ -1209,6 +1222,30 @@ impl Config {
             u32::try_from(v).unwrap_or(u32::MAX)
         });
 
+        // `max_retry_wait_secs`: env wins over file, default 60. It caps
+        // every wait between two attempts of one request. `0` would mean
+        // "never wait", which only hammers a rate-limited upstream back to
+        // back, so it falls back to the default with a warning instead —
+        // `rate_limit_retries = 0` is the knob for no waiting at all.
+        let max_retry_wait = match pick_u64(
+            file.and_then(|f| f.max_retry_wait_secs),
+            env.max_retry_wait_secs,
+        ) {
+            Some(0) => {
+                warnings.push(
+                    ConfigWarning::new(
+                        "max_retry_wait_secs = 0 would mean never waiting between retries; \
+                         using the default (60)"
+                            .to_owned(),
+                    )
+                    .with_field("max_retry_wait_secs", "0".to_owned()),
+                );
+                Duration::from_secs(DEFAULT_MAX_RETRY_WAIT_SECS)
+            }
+            Some(secs) => Duration::from_secs(secs),
+            None => Duration::from_secs(DEFAULT_MAX_RETRY_WAIT_SECS),
+        };
+
         // `forward_documents`: env wins over file, default `false`.
         let forward_documents = env
             .forward_documents
@@ -1538,6 +1575,7 @@ impl Config {
             min_output_tokens,
             max_concurrent_requests,
             rate_limit_retries,
+            max_retry_wait,
             reasoning_effort,
             reasoning,
             model_aliases,
@@ -1762,6 +1800,9 @@ pub struct EnvInputs {
     /// `RATE_LIMIT_RETRIES`: a whole number; `0` turns the retry off.
     /// An unparseable value is ignored.
     pub rate_limit_retries: Option<u64>,
+    /// `MAX_RETRY_WAIT_SECS`: a whole number of seconds; `0` warns and
+    /// falls back to the default. An unparseable value is ignored.
+    pub max_retry_wait_secs: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// `REASONING_SUMMARY`: `auto` (default), `concise`, `detailed` or `off`.
     pub reasoning_summary: Option<String>,
@@ -1859,6 +1900,9 @@ impl EnvInputs {
                 .ok()
                 .and_then(|s| s.trim().parse().ok()),
             rate_limit_retries: env::var("RATE_LIMIT_RETRIES")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            max_retry_wait_secs: env::var("MAX_RETRY_WAIT_SECS")
                 .ok()
                 .and_then(|s| s.trim().parse().ok()),
             reasoning_effort: env::var("REASONING_EFFORT").ok(),
@@ -2339,6 +2383,10 @@ pub struct JsonConfig {
     /// the client; unset is 3, `0` turns the retry off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_retries: Option<u64>,
+    /// Cap, in seconds, on any single wait between two attempts of one
+    /// request; unset is 60, `0` warns and falls back to 60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retry_wait_secs: Option<u64>,
     pub reasoning_effort: Option<String>,
     /// Per-model `reasoning_effort` overrides. Sub-object because
     /// `deny_unknown_fields` rejects any keys we haven't declared

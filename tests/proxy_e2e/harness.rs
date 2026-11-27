@@ -208,6 +208,7 @@ pub fn make_config_with_default_model(
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     })
@@ -253,6 +254,7 @@ pub fn make_proxy_config(addr: SocketAddr) -> Arc<Config> {
         min_output_tokens: openai_to_anthropic_proxy::config::DEFAULT_MIN_OUTPUT_TOKENS,
         max_concurrent_requests: 0,
         rate_limit_retries: 0,
+        max_retry_wait: Duration::from_secs(60),
         system_message_placement: Default::default(),
         warnings: Vec::new(),
     })

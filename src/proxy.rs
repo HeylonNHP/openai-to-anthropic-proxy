@@ -155,6 +155,7 @@ pub fn router_with_stores(
     let gate = crate::upstream_gate::UpstreamGate::new(
         config.max_concurrent_requests,
         config.rate_limit_retries,
+        config.max_retry_wait,
     );
     let state = AppState {
         gate,
