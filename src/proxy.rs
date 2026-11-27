@@ -1301,14 +1301,14 @@ impl Attempt {
             return match crate::tools::server_loop::stream::respond(self, tools).await? {
                 crate::tools::server_loop::stream::Streamed::Response(response) => Ok(response),
                 crate::tools::server_loop::stream::Streamed::Fallback(attempt, raw) => {
-                    render_streaming(*attempt, raw)
+                    render_streaming(*attempt, raw, false)
                 }
             };
         }
         if !tools.is_empty() {
             return match crate::tools::server_loop::run::run(&mut self, tools).await {
                 Ok(crate::tools::server_loop::run::SessionOutcome::UnexpectedStreaming(resp)) => {
-                    render_streaming(self, resp)
+                    render_streaming(self, resp, false)
                 }
                 Ok(crate::tools::server_loop::run::SessionOutcome::Complete(result)) => {
                     crate::tools::server_loop::render::render(&self, *result)
@@ -1316,13 +1316,67 @@ impl Attempt {
                 Err(err) => Err(err),
             };
         }
-        // Retries are issued here -- before any response bytes are written,
-        // so the streaming path is safe too: once per sampling parameter the
-        // upstream says it does not support, and once with the configured
-        // `default_model` if the upstream rejects the requested model entirely.
+        // A streaming request goes through the early start: the upstream
+        // work runs in its own task, and a reply that takes longer than
+        // `early_start::START_AFTER` no longer holds the client's
+        // connection in silence.
+        if self.outbound.stream {
+            return self.run_streaming().await;
+        }
+        // Retries are issued here -- before any response bytes are
+        // written: once per sampling parameter the upstream says it does
+        // not support, and once with the configured `default_model` if the
+        // upstream rejects the requested model entirely. (For streaming,
+        // the same retries run inside `run_streaming`'s upstream task.)
         match self.execute(&url).await? {
-            Outcome::Streaming(resp) => render_streaming(self, resp),
+            Outcome::Streaming(resp) => render_streaming(self, resp, false),
             Outcome::Buffered(body) => render_json(&self, body),
+        }
+    }
+
+    /// Send a streaming request under the early-start rule: the upstream
+    /// work (gate queue, 429 backoff, retries — all of it) runs in its
+    /// own task; if it finishes within [`crate::early_start::START_AFTER`]
+    /// the response is built exactly as the ordinary path builds it — a
+    /// failure still carries its HTTP status, which clients retry with
+    /// backoff. If it does not, the response starts anyway with the
+    /// placeholder `message_start` and `ping`s until the real reply splices
+    /// in behind it.
+    async fn run_streaming(mut self) -> Result<Response, AppError> {
+        let url = self.url();
+        let placeholder = crate::early_start::placeholder_message(&self.outbound.model);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamTaskResult>();
+        tokio::spawn(async move {
+            let result = match self.execute(&url).await {
+                Ok(outcome) => Ok((self, outcome)),
+                Err(err) => Err(err),
+            };
+            // The receiver is gone when the client disconnected: nothing
+            // to tell.
+            let _ = tx.send(result);
+        });
+
+        match tokio::time::timeout(crate::early_start::START_AFTER, rx.recv()).await {
+            // The upstream answered inside the deadline: the ordinary
+            // paths, statuses and all.
+            Ok(Some(Ok((attempt, Outcome::Streaming(resp))))) => {
+                render_streaming(attempt, resp, false)
+            }
+            Ok(Some(Ok((attempt, Outcome::Buffered(body))))) => render_json(&attempt, body),
+            Ok(Some(Err(err))) => Err(err),
+            Ok(None) => Err(AppError::Internal(
+                "the upstream task ended without a result".to_owned(),
+            )),
+            // Past the deadline the status line goes out as the
+            // placeholder; from here a failure can only be an in-stream
+            // `error` event.
+            Err(_elapsed) => {
+                let first = crate::early_start::placeholder_frame(&placeholder);
+                Ok(crate::early_start::keep_alive_response(
+                    first,
+                    splice_source(rx),
+                ))
+            }
         }
     }
 }
@@ -1330,18 +1384,44 @@ impl Attempt {
 /// Render the raw upstream SSE response into an Anthropic-shaped stream.
 /// `TranslatorStream` takes ownership of the registry and clones the sink /
 /// stats; its `Drop` hook prints the response line and records usage.
-fn render_streaming(attempt: Attempt, upstream_resp: GatedResponse) -> Result<Response, AppError> {
+/// `placeholder_sent` marks a splice behind an early-start placeholder:
+/// the translator then suppresses its own `message_start` and leaves the
+/// keep-alive to the wrapping body.
+fn render_streaming(
+    attempt: Attempt,
+    upstream_resp: GatedResponse,
+    placeholder_sent: bool,
+) -> Result<Response, AppError> {
     let content_type = upstream_resp
         .headers()
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("text/event-stream"));
+    let translator_stream = build_translator(attempt, upstream_resp, placeholder_sent);
+
+    let body = Body::from_stream(translator_stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("build streaming response: {e}")))
+}
+
+/// The translator over the raw upstream SSE stream. Extracted from
+/// `render_streaming` so the early-start splice can consume the stream
+/// directly instead of round-tripping through a `Response`.
+fn build_translator(
+    attempt: Attempt,
+    upstream_resp: GatedResponse,
+    placeholder_sent: bool,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     let byte_stream = upstream_resp.bytes_stream();
     let sse: EventStream<_> = byte_stream.eventsource();
 
     let msg_id = synthetic_message_id(&attempt.req);
     let model = attempt.outbound.model.clone();
-    let translator_stream = TranslatorStream::new(
+    TranslatorStream::new(
         sse,
         TranslatorStreamConfig {
             msg_id,
@@ -1356,16 +1436,65 @@ fn render_streaming(attempt: Attempt, upstream_resp: GatedResponse) -> Result<Re
                 attempt.fallback_used,
             ),
             fallback_used: attempt.fallback_used,
+            placeholder_sent,
         },
-    );
+    )
+}
 
-    let body = Body::from_stream(translator_stream);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .map_err(|e| AppError::Internal(format!("build streaming response: {e}")))
+/// What the early-start upstream task hands back: the attempt (still
+/// needed to build the response) plus the outcome, or the failure.
+type StreamTaskResult = Result<(Attempt, Outcome), AppError>;
+
+/// The remainder of a committed stream: the upstream task's answer,
+/// spliced in behind the placeholder. A success becomes the translator's
+/// bytes with its own `message_start` suppressed — the placeholder was
+/// it; a failure (only reachable once the status line is gone) becomes an
+/// in-stream `error` frame: the shape the wire still allows.
+fn splice_source(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<StreamTaskResult>,
+) -> impl Stream<Item = Bytes> + Send {
+    futures_util::stream::once(async move {
+        match rx.recv().await {
+            Some(Ok((attempt, Outcome::Streaming(resp)))) => {
+                let translator = build_translator(attempt, resp, true);
+                // A body error ends the stream rather than shipping an
+                // empty chunk mid-message.
+                Box::pin(
+                    translator
+                        .take_while(|chunk| std::future::ready(chunk.is_ok()))
+                        .map(|chunk| chunk.unwrap_or_default()),
+                ) as Pin<Box<dyn Stream<Item = Bytes> + Send>>
+            }
+            Some(Ok((_, Outcome::Buffered(body)))) => {
+                // `execute` answers `Buffered` only when `outbound.stream`
+                // is off, and `run_streaming` only runs when it is on.
+                tracing::warn!(
+                    model = %body.model,
+                    "the upstream answered a streaming request with a whole body"
+                );
+                error_frame_stream(&AppError::Internal(
+                    "upstream answered a streaming request with a whole body".to_owned(),
+                ))
+            }
+            Some(Err(err)) => error_frame_stream(&err),
+            None => error_frame_stream(&AppError::Internal(
+                "the upstream task ended without a result".to_owned(),
+            )),
+        }
+    })
+    .flatten()
+}
+
+/// An in-stream failure frame: `event: error`, then the terminal
+/// `message_stop` — the order the transport's error paths pin.
+fn error_frame_stream(err: &AppError) -> Pin<Box<dyn Stream<Item = Bytes> + Send>> {
+    let frame = encode_sse_events(&[
+        StreamEvent::Error {
+            error: err.to_api_error_body(),
+        },
+        StreamEvent::MessageStop {},
+    ]);
+    Box::pin(futures_util::stream::iter(vec![frame]))
 }
 
 /// Translate a buffered upstream response, record stats once, emit the
@@ -1577,6 +1706,11 @@ where
     /// Whether `message_start` has gone out. A `ping` before it would
     /// break the event order, so the keep-alive waits for it.
     message_started: bool,
+    /// True when the early-start placeholder already went out: the
+    /// response body is then wrapped in `early_start::keep_alive_stream`,
+    /// which owns the pings, so this translator must never start its own
+    /// timer — exactly one pinger per response.
+    external_keepalive: bool,
 }
 
 /// Configuration for creating a `TranslatorStream`.
@@ -1589,6 +1723,9 @@ struct TranslatorStreamConfig {
     session_stats: Arc<crate::tui::SessionStatsStore>,
     stats_model: String,
     fallback_used: bool,
+    /// The early-start placeholder `message_start` has already been sent:
+    /// the translator suppresses its own and the body pings externally.
+    placeholder_sent: bool,
 }
 
 impl<S> TranslatorStream<S>
@@ -1596,13 +1733,13 @@ where
     S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
 {
     fn new(inner: S, config: TranslatorStreamConfig) -> Self {
+        let mut translator = StreamTranslator::new(config.msg_id, config.model, config.registry);
+        if config.placeholder_sent {
+            translator.mark_message_start_sent();
+        }
         Self {
             inner,
-            translator: Some(StreamTranslator::new(
-                config.msg_id,
-                config.model,
-                config.registry,
-            )),
+            translator: Some(translator),
             start: config.start,
             stats: None,
             session_stats: config.session_stats,
@@ -1611,6 +1748,7 @@ where
             sink: config.sink,
             ping_timer: None,
             message_started: false,
+            external_keepalive: config.placeholder_sent,
         }
     }
 
@@ -1655,7 +1793,9 @@ where
     /// Record that `events` went to the client.
     ///
     /// The keep-alive restarts on every byte the client hears, and it
-    /// starts for good once `message_start` has been sent.
+    /// starts for good once `message_start` has been sent. When the body
+    /// already pings externally (early-start placeholder), no timer is
+    /// ever created here.
     fn note_sent(&mut self, events: &[StreamEvent]) {
         if events
             .iter()
@@ -1665,7 +1805,7 @@ where
         }
         // The message is over once the translator is gone: there is
         // nothing left to keep alive.
-        if self.translator.is_some() {
+        if self.translator.is_some() && !self.external_keepalive {
             self.restart_ping();
         }
     }

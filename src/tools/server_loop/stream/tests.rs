@@ -1,5 +1,6 @@
 use super::*;
 use crate::anthropic::{StopReason, Usage};
+use futures_util::StreamExt;
 use serde_json::json;
 
 fn raw(kind: &str) -> ResponseContentBlock {
@@ -33,17 +34,13 @@ fn shape(events: &[StreamEvent]) -> Vec<(String, Option<u32>)> {
         .collect()
 }
 
-fn state(rx: UnboundedReceiver<LoopEvent>, ping_after: Duration) -> BodyState {
-    BodyState {
-        rx,
-        next_index: 0,
-        done: false,
-        ping_after,
-    }
-}
-
 fn chunk_text(chunk: &Bytes) -> String {
     String::from_utf8_lossy(chunk).into_owned()
+}
+
+/// The next encoded chunk of a `loop_events` stream.
+async fn next_bytes(stream: &mut (impl Stream<Item = Bytes> + Unpin)) -> Option<String> {
+    stream.next().await.map(|chunk| chunk_text(&chunk))
 }
 
 #[test]
@@ -116,43 +113,54 @@ async fn the_body_forwards_blocks_then_finishes_and_ends() {
     let (tx, rx) = mpsc::unbounded_channel();
     tx.send(LoopEvent::Blocks(vec![raw("server_tool_use")]))
         .unwrap();
+    tx.send(LoopEvent::Blocks(vec![text("answer")])).unwrap();
     tx.send(LoopEvent::Finished(tail(
         vec![text("done")],
         Some(StopReason::EndTurn),
     )))
     .unwrap();
 
-    let (first, st) = next_chunk(state(rx, Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert!(chunk_text(&first).contains("event: content_block_start"));
-    assert_eq!(st.next_index, 1);
+    let mut stream = Box::pin(loop_events(rx));
 
-    let (last, st) = next_chunk(st).await.unwrap();
-    let last = chunk_text(&last);
+    let first = next_bytes(&mut stream).await.unwrap();
+    assert!(first.contains("event: content_block_start"), "{first}");
+
+    // Numbering carries across chunks: the second block is index 1, the
+    // tail's block index 2.
+    let second = next_bytes(&mut stream).await.unwrap();
+    assert!(second.contains(r#""index":1"#), "{second}");
+
+    let last = next_bytes(&mut stream).await.unwrap();
     assert!(
         last.contains("done") && last.contains("event: message_stop"),
         "{last}"
     );
-    assert!(st.done);
     assert!(
-        next_chunk(st).await.is_none(),
+        last.contains(r#""index":2"#),
+        "the tail's block continues the numbering: {last}"
+    );
+    assert!(
+        next_bytes(&mut stream).await.is_none(),
         "nothing follows message_stop"
     );
 }
 
-#[tokio::test]
+/// The keep-alive now lives in the shared early-start body; here it wraps
+/// the loop exactly as `response` does: a silent loop keeps the client
+/// supplied with `ping`s rather than silence.
+#[tokio::test(start_paused = true)]
 async fn a_quiet_stream_is_kept_alive_with_pings() {
     let (_tx, rx) = mpsc::unbounded_channel::<LoopEvent>();
-    let (chunk, st) = next_chunk(state(rx, Duration::from_millis(20)))
-        .await
-        .unwrap();
-    assert!(
-        chunk_text(&chunk).starts_with("event: ping"),
-        "{}",
-        chunk_text(&chunk)
+    let body = crate::early_start::keep_alive_response(
+        crate::early_start::placeholder_frame(&placeholder_message("m")),
+        loop_events(rx),
     );
-    assert!(!st.done, "a ping does not end the stream");
+    let mut chunks = body.into_body().into_data_stream();
+
+    let first = chunk_text(&chunks.next().await.unwrap().unwrap());
+    assert!(first.contains("event: message_start"), "{first}");
+    let second = chunk_text(&chunks.next().await.unwrap().unwrap());
+    assert!(second.starts_with("event: ping"), "{second}");
 }
 
 #[tokio::test]
@@ -160,22 +168,20 @@ async fn a_failure_event_ends_the_stream_with_an_error() {
     let (tx, rx) = mpsc::unbounded_channel();
     tx.send(LoopEvent::Failed(AppError::Internal("late failure".into())))
         .unwrap();
-    let (chunk, st) = next_chunk(state(rx, Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert!(chunk_text(&chunk).contains("event: error"));
-    assert!(next_chunk(st).await.is_none());
+    let mut stream = Box::pin(loop_events(rx));
+    let chunk = next_bytes(&mut stream).await.unwrap();
+    assert!(chunk.contains("event: error"));
+    assert!(next_bytes(&mut stream).await.is_none());
 }
 
 #[tokio::test]
 async fn a_loop_that_vanishes_ends_the_stream_with_an_error_not_a_hang() {
     let (tx, rx) = mpsc::unbounded_channel::<LoopEvent>();
     drop(tx);
-    let (chunk, st) = next_chunk(state(rx, Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert!(chunk_text(&chunk).contains("event: error"));
-    assert!(next_chunk(st).await.is_none());
+    let mut stream = Box::pin(loop_events(rx));
+    let chunk = next_bytes(&mut stream).await.unwrap();
+    assert!(chunk.contains("event: error"));
+    assert!(next_bytes(&mut stream).await.is_none());
 }
 
 #[tokio::test]
@@ -193,10 +199,9 @@ async fn events_that_do_not_belong_after_the_start_are_ignored() {
     }))
     .unwrap();
     tx.send(LoopEvent::Blocks(vec![text("x")])).unwrap();
-    let (chunk, _) = next_chunk(state(rx, Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert!(chunk_text(&chunk).contains("event: content_block_start"));
+    let mut stream = Box::pin(loop_events(rx));
+    let chunk = next_bytes(&mut stream).await.unwrap();
+    assert!(chunk.contains("event: content_block_start"));
 }
 
 fn started(id: &str) -> LoopEvent {
@@ -306,7 +311,6 @@ async fn a_slow_first_run_that_then_fails_ends_the_early_stream_with_an_error() 
 #[tokio::test]
 async fn live_events_are_sent_as_they_are_and_numbering_follows_them() {
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut st = state(rx, Duration::from_secs(60));
     // A run streamed live used blocks 0 and 1; the next block the response
     // numbers itself must be 2.
     tx.send(LoopEvent::Live(
@@ -319,27 +323,14 @@ async fn live_events_are_sent_as_they_are_and_numbering_follows_them() {
     .unwrap();
     tx.send(LoopEvent::Blocks(vec![text("after")])).unwrap();
 
-    let (live, st1) = next_chunk(std::mem::replace(&mut st, state_empty()))
-        .await
-        .unwrap();
-    assert_eq!(st1.next_index, 2);
-    assert_eq!(
-        chunk_text(&live)
-            .matches("event: content_block_stop")
-            .count(),
-        2
-    );
+    let mut stream = Box::pin(loop_events(rx));
 
-    let (blocks, st2) = next_chunk(st1).await.unwrap();
+    let live = next_bytes(&mut stream).await.unwrap();
+    assert_eq!(live.matches("event: content_block_stop").count(), 2);
+
+    let blocks = next_bytes(&mut stream).await.unwrap();
     assert!(
-        chunk_text(&blocks).contains(r#""index":2"#),
-        "{}",
-        chunk_text(&blocks)
+        blocks.contains(r#""index":2"#),
+        "numbering followed the live run: {blocks}"
     );
-    assert_eq!(st2.next_index, 3);
-}
-
-fn state_empty() -> BodyState {
-    let (_tx, rx) = mpsc::unbounded_channel();
-    state(rx, Duration::from_secs(60))
 }

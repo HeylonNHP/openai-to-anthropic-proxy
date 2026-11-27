@@ -325,9 +325,22 @@ quiet for five minutes trips Claude Code's stream-idle watchdog, which aborts
 the turn and retries the whole request. The keep-alive starts once
 `message_start` has been sent (a `ping` before it would break the event
 order), restarts whenever the client hears something else, and stops with the
-message. It does not cover an upstream that has not sent its response headers
-yet: the proxy's own headers go out only once the upstream's do, so that
-window is a first-byte problem, not a keep-alive one.
+message.
+
+The same protection covers the wait *before* the upstream's first byte. A
+streaming request whose upstream has not answered within ten seconds
+(`early_start::START_AFTER`, `src/early_start.rs`) starts anyway: HTTP 200,
+an empty placeholder `message_start`, then `ping`s until the real reply
+splices in behind it — the spliced translator suppresses its own
+`message_start`, so the client sees exactly one, and the turn's real usage
+arrives in the closing `message_delta`. The deadline doubles as the error
+channel: a failure the upstream reports *within* it is still a real HTTP
+status, which clients retry with backoff; past it the status line is already
+on the wire and a failure surfaces as an in-stream `error` event instead.
+The server-tool streaming path has always used this placeholder-and-ping
+shell; both paths now share the one implementation. Buffered (non-streaming)
+requests have no channel for mid-wait bytes and are unchanged: their queue
+and backoff time is still silent.
 
 ## Architecture
 

@@ -230,6 +230,13 @@ impl StreamTranslator {
         self.next_index
     }
 
+    /// The `message_start` has already gone out (the early-start placeholder
+    /// sent it): suppress this translator's own so the client sees exactly
+    /// one per message, and so the closing events reuse the placeholder's.
+    pub fn mark_message_start_sent(&mut self) {
+        self.started = true;
+    }
+
     /// Close every open content block and stop, without the closing
     /// `message_delta` / `message_stop`. Idempotent. The loop calls this when
     /// a run ends, however it ended, so the client never sees a

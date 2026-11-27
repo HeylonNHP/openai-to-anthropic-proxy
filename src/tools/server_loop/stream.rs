@@ -16,13 +16,15 @@
 //! The response starts once the first executor run has been ANSWERED with a
 //! success status (not finished), so a quick failure there is still an ordinary
 //! HTTP error with its proper status, which clients retry on. If the upstream
-//! has not answered within [`EARLY_START_AFTER`] the stream starts anyway with
-//! the same placeholder `message_start` and `ping`s, so the client is never
-//! silent for longer than the ping interval:
+//! has not answered within [`crate::early_start::START_AFTER`] the stream
+//! starts anyway with the same placeholder `message_start` and `ping`s — the
+//! shared early-start body ([`crate::early_start`]) keeps the client supplied
+//! with bytes — so the client is never silent for longer than the ping
+//! interval:
 //!
 //! ```text
-//! first run answered within EARLY_START_AFTER ─▶ message_start (placeholder)
-//! still waiting at EARLY_START_AFTER          ─▶ message_start (placeholder), ping …
+//! first run answered within START_AFTER ─▶ message_start (placeholder)
+//! still waiting at START_AFTER          ─▶ message_start (placeholder), ping …
 //! ```
 //!
 //! Once the stream has started a failure cannot change the status any more
@@ -39,29 +41,24 @@
 // clippy; they must be `pub(crate)` because they name `proxy::Attempt`.
 #![allow(clippy::redundant_pub_crate)]
 
-use std::io;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::Stream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::anthropic::{Message, ResponseContentBlock, StreamEvent};
 use crate::error::AppError;
-use crate::proxy::{Attempt, PING_INTERVAL, encode_sse_events};
-use crate::tools::advisor::sse::{block_events, end_events, start_event};
+use crate::proxy::{Attempt, encode_sse_events};
+use crate::tools::advisor::sse::{block_events, end_events};
 use crate::tools::server_loop::handler::ServerTool;
 use crate::tools::server_loop::render::{Tail, finish_streaming};
 use crate::tools::server_loop::run::{LoopEvent, SessionOutcome, drive};
 
-/// How long the first executor run may take before the stream is started
-/// without it, so the client is never left without a byte for longer than
-/// the ping interval. A first run that fails sooner is still a plain HTTP
-/// error.
-const EARLY_START_AFTER: Duration = PING_INTERVAL;
+// The placeholder message comes from the shared early-start module, under
+// the path `run.rs` already names.
+pub(crate) use crate::early_start::placeholder_message;
 
 /// What [`respond`] made of the request.
 pub(crate) enum Streamed {
@@ -85,7 +82,7 @@ pub(crate) async fn respond(
     let placeholder = placeholder_message(&attempt.req.model);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(run_turn(attempt, tools, tx));
-    start(rx, placeholder, EARLY_START_AFTER).await
+    start(rx, placeholder, crate::early_start::START_AFTER).await
 }
 
 /// Wait for the first executor run, but no longer than `start_after`: past
@@ -109,24 +106,6 @@ pub(crate) async fn start(
     }
 }
 
-/// The `message_start` sent when the stream starts before the first
-/// executor run has answered: an empty assistant message for the model the
-/// client asked for. Its usage is zero; the closing `message_delta` carries
-/// the turn's real usage.
-pub(crate) fn placeholder_message(model: &str) -> Message {
-    let id = crate::tools::web_fetch::protocol::new_id();
-    Message {
-        id: format!("msg_{}", id.trim_start_matches("srvtoolu_")),
-        r#type: "message",
-        role: "assistant",
-        content: Vec::new(),
-        model: model.to_owned(),
-        stop_reason: None,
-        stop_sequence: None,
-        usage: crate::anthropic::Usage::default(),
-    }
-}
-
 /// The task that owns the request for the whole turn.
 async fn run_turn(
     mut attempt: Attempt,
@@ -144,84 +123,77 @@ async fn run_turn(
     let _ = tx.send(event);
 }
 
-/// The SSE response: `message_start`, then whatever the loop sends.
+/// The SSE response: `message_start`, then whatever the loop sends — over
+/// the shared keep-alive body, which interleaves `ping`s while the loop is
+/// quiet.
 fn response(message: Message, rx: UnboundedReceiver<LoopEvent>) -> Response {
-    let first = encode_sse_events(&[start_event(&message)]);
-    let state = BodyState {
+    let first = crate::early_start::placeholder_frame(&message);
+    crate::early_start::keep_alive_response(first, loop_events(rx))
+}
+
+/// The loop's events as SSE bytes for the keep-alive body: blocks and live
+/// runs as they arrive, the closing tail, failures as an in-stream `error`
+/// — and a `Started` discarded, because the placeholder already opened the
+/// message. Block numbering lives here (`Live` carries its own index, as it
+/// did when the body polled the channel itself).
+fn loop_events(rx: UnboundedReceiver<LoopEvent>) -> impl Stream<Item = Bytes> + Send {
+    let state = LoopSource {
         rx,
         next_index: 0,
         done: false,
-        ping_after: PING_INTERVAL,
     };
-    let rest = futures_util::stream::unfold(state, next_chunk);
-    let body = futures_util::stream::once(std::future::ready(Ok::<Bytes, io::Error>(first)))
-        .chain(rest.map(Ok::<Bytes, io::Error>));
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(body))
-        .expect("static headers are valid")
-}
-
-struct BodyState {
-    rx: UnboundedReceiver<LoopEvent>,
-    /// The index of the next content block.
-    next_index: u32,
-    done: bool,
-    /// How long the stream may be silent before a `ping`.
-    ping_after: Duration,
-}
-
-/// The next chunk of the body: the loop's next event as SSE, or a `ping` if it
-/// stays quiet. `None` ends the stream.
-async fn next_chunk(mut state: BodyState) -> Option<(Bytes, BodyState)> {
-    if state.done {
-        return None;
-    }
-    let events = loop {
-        tokio::select! {
-            event = state.rx.recv() => match event {
-                Some(LoopEvent::Blocks(blocks)) => {
+    futures_util::stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+        let events = loop {
+            let Some(event) = state.rx.recv().await else {
+                state.done = true;
+                break vec![error_event(&AppError::Internal(
+                    "the server-tool turn ended unexpectedly".to_owned(),
+                ))];
+            };
+            match event {
+                LoopEvent::Blocks(blocks) => {
                     break block_stream_events(&mut state.next_index, blocks);
                 }
-                Some(LoopEvent::Live(events, next_index)) => {
-                    // The loop numbered these itself (a run streamed live);
-                    // carry on from where it left off.
+                LoopEvent::Live(events, next_index) => {
                     state.next_index = next_index;
                     break events;
                 }
-                Some(LoopEvent::Finished(tail)) => {
+                LoopEvent::Finished(tail) => {
                     state.done = true;
                     break tail_stream_events(&mut state.next_index, tail);
                 }
-                Some(LoopEvent::Failed(err)) => {
+                LoopEvent::Failed(err) => {
                     state.done = true;
                     break vec![error_event(&err)];
                 }
                 // The stream was started early with a placeholder: the real
                 // `message_start` is not sent a second time.
-                Some(LoopEvent::Started(_)) => {}
+                LoopEvent::Started(_) => {}
                 // The stream was started early, and the upstream then
                 // answered with a stream although a whole response was
                 // asked for. It cannot be spliced into this stream.
-                Some(LoopEvent::Fallback(..)) => {
+                LoopEvent::Fallback(..) => {
                     state.done = true;
                     break vec![error_event(&AppError::Internal(
                         "the upstream streamed a response that was requested whole".to_owned(),
                     ))];
                 }
-                None => {
-                    state.done = true;
-                    break vec![error_event(&AppError::Internal(
-                        "the server-tool turn ended unexpectedly".to_owned(),
-                    ))];
-                }
-            },
-            () = tokio::time::sleep(state.ping_after) => break vec![StreamEvent::Ping {}],
-        }
-    };
-    Some((encode_sse_events(&events), state))
+            }
+        };
+        Some((encode_sse_events(&events), state))
+    })
+}
+
+/// What the [`loop_events`] unfold carries between chunks.
+struct LoopSource {
+    rx: UnboundedReceiver<LoopEvent>,
+    /// The index the next content block gets.
+    next_index: u32,
+    /// Set once a terminal event has been yielded: nothing follows it.
+    done: bool,
 }
 
 /// The events for `blocks`, numbering them from `*next_index`.
@@ -237,7 +209,7 @@ pub(crate) fn block_stream_events(
     events
 }
 
-/// The events that close the stream: the blocks not yet sent, then the
+/// The events that close the stream: the blocks not sent, then the
 /// `message_delta` and `message_stop`.
 pub(crate) fn tail_stream_events(next_index: &mut u32, tail: Tail) -> Vec<StreamEvent> {
     let Tail {

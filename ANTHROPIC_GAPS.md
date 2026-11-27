@@ -206,7 +206,7 @@ so the proxy can only approximate it.
     Both drop sites (plain stream and server-tool loop) are covered by the
     shared struct fix.
 
-- [ ] **B8. The upstream gate's queue wait and 429 backoff sit outside every timeout**
+- [x] **B8. The upstream gate's queue wait and 429 backoff sit outside every timeout**
   - Where: `src/upstream_gate.rs:80` (`acquire().await`), `:109`
     (`tokio::time::sleep(wait)`), `:88` (`request.send()`); the client-level
     timeout is at `src/main.rs:173`
@@ -214,22 +214,34 @@ so the proxy can only approximate it.
     BEFORE `request.send()` is invoked, so neither the client-level
     `request_timeout` nor any per-request `.timeout()` covers them. Queue
     wait is unbounded, and backoff can total minutes when the upstream sends
-    a `Retry-After` (honoured up to the 60 s cap, per attempt, with
-    `rate_limit_retries` defaulting to 3). During all of it the proxy has
-    sent the client zero bytes: response headers are written only once the
-    upstream's arrive — the window B5's ping cannot cover — so a queued or
-    backing-off request can outlast Claude Code's byte watchdog and abort
-    the turn, reintroducing pre-first-byte the failure B5 fixed mid-stream.
-  - Note: `proxy.json-guide.md` already says "no queue time counts against
-    `request_timeout_secs`", so the timeout gap is documented; what is not
-    documented is that the wait is unbounded and that it happens before any
-    byte reaches the client.
-  - Fix: wrap `acquire` in a `tokio::time::timeout` (bound = `request_timeout`
-    or a new `queue_timeout`) and map expiry to a 429/529; cap cumulative
-    backoff across retries; or write the response headers and a
-    `message_start` placeholder early, as the server-tool path's
-    `start_after` timer does.
-  - Severity: medium.
+    a `Retry-After`. During all of it the proxy has sent the client zero
+    bytes, so a queued or backing-off request could outlast Claude Code's
+    byte watchdog and abort the turn — the pre-first-byte version of the
+    failure B5 fixed mid-stream.
+  - Fix: streaming requests now take the **early start** (shared module
+    `src/early_start.rs`): the upstream work (queue, backoff, retries — all
+    of it) runs in a spawned task, and a reply that takes longer than
+    `START_AFTER` (10 s = one ping interval) gets HTTP 200 + a placeholder
+    `message_start` + `ping`s every 10 s until the real reply splices in
+    behind it (the spliced translator suppresses its own `message_start`;
+    the real usage lands in the closing `message_delta`). The server-tool
+    streaming path's existing placeholder shell was hoisted into the same
+    module, so both paths share one keep-alive body.
+  - The deadline doubles as the error channel, and that is load-bearing:
+    a static reading of Claude Code 2.1.332 (decompiled, not
+    behaviourally tested) shows an in-stream `error` event does **not**
+    get the HTTP status' backoff treatment — `rate_limit_error` in-stream
+    classifies as `badRequest` → one non-streaming fallback then fail,
+    versus ~10 backoff retries for an HTTP 429. So a failure the upstream
+    reports *within* the deadline stays a real HTTP status; only the
+    long-wait tail (the B8 case, where the old behaviour was a turn abort
+    and a full re-send) degrades to an in-stream error, after the gate has
+    already retry-with-backoff'd internally.
+  - Non-streaming requests are unchanged (no channel for mid-wait bytes);
+    their queue/backoff silence remains, with `rate_limit_retries` as the
+    operator's dial. Queue time still does not count against
+    `request_timeout_secs` (documented in `proxy.json-guide.md`).
+  - Severity: medium. Was the only unchecked entry that could end a turn.
 
 - [ ] **B9. A streamed server-tool run gets no corrective schema retry**
   - Where: `src/tools/server_loop/README.md:191-193`
@@ -730,5 +742,6 @@ The server-tool id work (G7, G8, G9, G10) belongs together: G7 fixed the
 against Anthropic" problem. G8's fix — recording the upstream's search as an
 ordinary `tool_use` / `tool_result` pair — would also settle G9 and G10.
 
-B8 is the only newly-added entry that can end a turn: a queued or
-backing-off request sits in front of the first byte, outside every timeout.
+B8 is fixed: a queued or backing-off streaming request now gets the early
+start (placeholder `message_start` + pings) instead of silence before the
+first byte.

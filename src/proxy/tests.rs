@@ -232,6 +232,16 @@ fn translator_stream<S>(inner: S) -> TranslatorStream<S>
 where
     S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
 {
+    translator_stream_with(inner, false)
+}
+
+/// The same, with the early-start placeholder already sent: the
+/// translator suppresses its own `message_start` and never pings — the
+/// wrapping body owns both.
+fn translator_stream_with<S>(inner: S, placeholder_sent: bool) -> TranslatorStream<S>
+where
+    S: Stream<Item = Result<SseEvent, EventStreamError<reqwest::Error>>> + Unpin,
+{
     let (sink, _rx) = crate::tui::OutputSink::tui();
     TranslatorStream::new(
         inner,
@@ -244,6 +254,7 @@ where
             session_stats: Arc::new(crate::tui::SessionStatsStore::new()),
             stats_model: "test-model".to_owned(),
             fallback_used: false,
+            placeholder_sent,
         },
     )
 }
@@ -336,6 +347,36 @@ async fn the_plain_stream_does_not_ping_before_the_message_starts() {
     assert!(!first.contains("event: message_start"), "{first}");
     tokio::time::advance(PING_INTERVAL).await;
     assert!(poll_once(&mut stream).is_pending());
+}
+
+/// Behind an early-start placeholder the translator must keep quiet about
+/// `message_start` (the placeholder was it) and never start its own
+/// keep-alive (the wrapping body pings): content flows, nothing else.
+#[tokio::test(start_paused = true)]
+async fn a_spliced_translator_neither_reopens_the_message_nor_pings() {
+    let mut stream = translator_stream_with(upstream(&[CREATED, DELTA]), true);
+
+    // The `response.created` that would normally open the message is
+    // swallowed; the content that follows goes straight out.
+    let first = chunk(poll_once(&mut stream));
+    assert!(first.contains("event: content_block_delta"), "{first}");
+    assert!(!first.contains("event: message_start"), "{first}");
+
+    // A long quiet spell never produces a ping from the translator — no
+    // timer was ever created.
+    tokio::time::advance(PING_INTERVAL * 3).await;
+    assert!(poll_once(&mut stream).is_pending());
+    assert!(
+        stream.ping_timer.is_none(),
+        "the external body owns the keep-alive"
+    );
+
+    // The closing events still arrive, and still without a second
+    // `message_start`.
+    let mut stream = translator_stream_with(upstream(&[CREATED, COMPLETED]), true);
+    let last = chunk(poll_once(&mut stream));
+    assert!(last.contains("event: message_stop"), "{last}");
+    assert!(!last.contains("event: message_start"), "{last}");
 }
 
 #[tokio::test(start_paused = true)]

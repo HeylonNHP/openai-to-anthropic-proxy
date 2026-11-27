@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod config;
 mod context_overflow;
 mod count_tokens;
+mod early_start;
 mod error;
 pub mod responses;
 pub mod server_tool_id;
