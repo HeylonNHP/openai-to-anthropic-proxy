@@ -665,7 +665,9 @@ async fn handle_messages(
         .map_err(|e| AppError::BadRequest(format!("invalid request body: {e}")))?;
 
     // `max_tokens: 0` is Anthropic's cache pre-warm, and it is a buffered
-    // call: Anthropic refuses it together with `stream: true`, so do we.
+    // call: Anthropic refuses it together with `stream: true` — the live
+    // prompt-caching docs say a `max_tokens: 0` request "is rejected with
+    // an `invalid_request_error`" when `stream: true` is set — so do we.
     if req.max_tokens == 0 && req.stream == Some(true) {
         return Err(AppError::BadRequest(
             "max_tokens: 0 (a cache pre-warm) cannot be combined with stream: true".to_owned(),

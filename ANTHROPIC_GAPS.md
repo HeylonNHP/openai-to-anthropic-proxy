@@ -99,21 +99,20 @@ so the proxy can only approximate it.
     actually sends.
   - Severity: low-medium.
 
-- [ ] **A9. `max_tokens: 0` + `stream: true` is rejected on an unverified rule**
-  - Where: `src/proxy.rs:666-672`
-  - Problem: the proxy answers 400 "max_tokens: 0 (a cache pre-warm) cannot
-    be combined with stream: true", on the stated grounds that "Anthropic
-    refuses it together with `stream: true`". The Messages API schema
-    documents `max_tokens` with `minimum: 0` and "set to 0 to populate the
-    prompt cache without generating a response", and states no
-    incompatibility with `stream: true`. If live Anthropic accepts the
-    combination, the proxy 400s a documented-valid request.
-  - Unverified: needs a live subscription to settle. Claude Code sends
-    `max_tokens: 0` only non-streamed in the snippets found.
-  - Fix: if Anthropic allows it, stream the pre-warm (message_start → an
-    immediate message_delta with `stop_reason: max_tokens`, no server
-    tools); if it refuses, cite the observed response in the comment.
-  - Severity: low.
+- [x] **A9. `max_tokens: 0` + `stream: true` is rejected — the rule is real**
+  - Where: `src/proxy.rs` (the 400 in `handle_messages`)
+  - The entry suspected the proxy 400s a documented-valid request, because
+    the Messages parameter reference says `max_tokens` has `minimum: 0` and
+    states no `stream` incompatibility. Settled 2026-11-27 against the live
+    prompt-caching docs (two independent fetches, identical wording): "A
+    `max_tokens: 0` request is rejected with an `invalid_request_error` if
+    any of the following are set … `stream: true`". The rule lives on the
+    prompt-caching page, not the parameter reference — which is why it
+    looked missing.
+  - Fix: none needed; the proxy's 400 is correct. The comment at the check
+    now cites the doc instead of asserting it bare. (Doc reading, not a
+    live API call; the docs are explicit enough to stand on.)
+  - Severity: low (closed).
 
 ---
 
