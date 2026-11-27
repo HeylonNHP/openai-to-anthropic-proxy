@@ -1349,7 +1349,10 @@ impl Attempt {
         let url = self.url();
         let placeholder = crate::early_start::placeholder_message(&self.outbound.model);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamTaskResult>();
-        tokio::spawn(async move {
+        // The guard cancels the upstream call if the client goes away while
+        // it is in flight: before the deadline this future is dropped (and
+        // the guard with it); after it, `splice_source` holds the guard.
+        let guard = crate::early_start::AbortOnDrop::spawn(async move {
             let result = match self.execute(&url).await {
                 Ok(outcome) => Ok((self, outcome)),
                 Err(err) => Err(err),
@@ -1377,7 +1380,7 @@ impl Attempt {
                 let first = crate::early_start::placeholder_frame(&placeholder);
                 Ok(crate::early_start::keep_alive_response(
                     first,
-                    splice_source(rx),
+                    splice_source(rx, guard),
                 ))
             }
         }
@@ -1455,8 +1458,13 @@ type StreamTaskResult = Result<(Attempt, Outcome), AppError>;
 /// in-stream `error` frame: the shape the wire still allows.
 fn splice_source(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<StreamTaskResult>,
+    guard: crate::early_start::AbortOnDrop,
 ) -> impl Stream<Item = Bytes> + Send {
     futures_util::stream::once(async move {
+        // Held while waiting: a client that leaves drops this future, and
+        // the guard cancels the upstream call. Once a result has arrived the
+        // task is done, so the guard has nothing left to cancel.
+        let _guard = guard;
         match rx.recv().await {
             Some(Ok((attempt, Outcome::Streaming(resp)))) => {
                 let translator = build_translator(attempt, resp, true);

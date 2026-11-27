@@ -583,3 +583,38 @@ fn an_unknown_model_id_finds_nothing() {
     assert!(find_model_row(&rows, "claude-opus-9000").is_none());
     assert!(find_model_row(&[], "claude-sonnet-5").is_none());
 }
+
+/// A client that leaves while the upstream call is still in flight must
+/// cancel that call, not leave it running detached (holding a concurrency
+/// slot for a reply nobody will read).
+#[tokio::test(start_paused = true)]
+async fn dropping_the_spliced_stream_cancels_the_upstream_task() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamTaskResult>();
+    let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+    let guard = crate::early_start::AbortOnDrop::spawn(async move {
+        // Stands in for `execute`: holds `tx` and never answers.
+        let _tx = tx;
+        let _alive = alive_tx;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+
+    let mut stream = Box::pin(splice_source(rx, guard));
+    // Start waiting on the result, as the response body would.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .is_err(),
+        "no answer yet"
+    );
+
+    // The client disconnects: the body, and with it the stream, is dropped.
+    drop(stream);
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), alive_rx)
+            .await
+            .expect("the upstream task was cancelled")
+            .is_err(),
+        "the task was aborted, not completed"
+    );
+}

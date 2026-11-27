@@ -61,6 +61,33 @@ pub fn placeholder_frame(message: &Message) -> Bytes {
     crate::proxy::encode_sse_events(&[start_event(message)])
 }
 
+/// Cancels a spawned task when dropped.
+///
+/// The upstream call runs in its own task so the response can start while it
+/// is still waiting. A plain `tokio::spawn` detaches that task: if the client
+/// disconnects meanwhile, it would finish an upstream request nobody will
+/// read, holding a concurrency slot and spending upstream capacity. Holding
+/// this guard for exactly as long as someone is waiting on the task restores
+/// the old behaviour, where dropping the handler cancelled the request.
+/// Aborting a task that has already finished is a no-op.
+pub struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl AbortOnDrop {
+    /// Spawn `future` and tie its lifetime to the returned guard.
+    pub fn spawn<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self(tokio::spawn(future).abort_handle())
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A committed streaming response: `first` (the placeholder frame) goes
 /// out immediately — with the headers, since axum writes them with the
 /// first chunk — then every chunk `source` yields, with a `ping` whenever

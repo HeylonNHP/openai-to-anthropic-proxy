@@ -72,3 +72,37 @@ fn the_placeholder_message_is_empty() {
     assert!(message.id.starts_with("msg_"));
     assert_eq!(message.model, "claude-test");
 }
+
+/// Dropping the guard cancels a task that is still working.
+#[tokio::test(start_paused = true)]
+async fn dropping_the_guard_cancels_a_running_task() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let guard = AbortOnDrop::spawn(async move {
+        let _flag = tx;
+        // Far longer than the test runs: only cancellation ends it early.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+    tokio::task::yield_now().await;
+
+    drop(guard);
+
+    // The task's future was dropped, which drops the sender it held.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("the task was cancelled promptly")
+            .is_err(),
+        "the sender is dropped, not sent"
+    );
+}
+
+/// A task that has already finished is unaffected by the guard going away.
+#[tokio::test]
+async fn dropping_the_guard_after_the_task_finished_is_harmless() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let guard = AbortOnDrop::spawn(async move {
+        let _ = tx.send(7);
+    });
+    assert_eq!(rx.await.unwrap(), 7);
+    drop(guard);
+}
