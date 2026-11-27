@@ -637,3 +637,35 @@ fn an_empty_models_page_reports_null_boundaries() {
     assert_eq!(value["last_id"], serde_json::Value::Null);
     assert_eq!(value["has_more"], false);
 }
+
+/// Anthropic nests the thinking-token count under `output_tokens_details`.
+/// A static reading of Claude Code 2.1.332 shows it reads only that nested
+/// form, so the old flat `thinking_tokens` was dropped by the client and its
+/// thinking accounting always came to zero.
+#[test]
+fn thinking_tokens_are_sent_nested_not_flat() {
+    let usage = Usage {
+        thinking_tokens: 14,
+        ..plain_usage()
+    };
+    let value = serde_json::to_value(usage).unwrap();
+    assert_eq!(
+        value["output_tokens_details"],
+        serde_json::json!({"thinking_tokens": 14})
+    );
+    assert!(
+        !value.as_object().unwrap().contains_key("thinking_tokens"),
+        "the flat alias is gone: {value}"
+    );
+}
+
+#[test]
+fn zero_thinking_tokens_leave_the_usage_unchanged() {
+    let value = serde_json::to_value(plain_usage()).unwrap();
+    assert!(
+        !value
+            .as_object()
+            .unwrap()
+            .contains_key("output_tokens_details")
+    );
+}

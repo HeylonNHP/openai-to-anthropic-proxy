@@ -604,7 +604,7 @@ strong evidence, not proof.
 
 ### H.a. Affects what the client shows
 
-- [ ] **H1. `usage.output_tokens_details.thinking_tokens` is not emitted**
+- [x] **H1. `usage.output_tokens_details.thinking_tokens` is not emitted**
   - Where: `src/anthropic.rs:684-685` (`Usage.thinking_tokens`), populated at
     `src/stream.rs:1217` and `src/translate.rs:2803`
   - Problem: Anthropic nests the thinking-token count under
@@ -617,8 +617,11 @@ strong evidence, not proof.
     is no unprefixed `.thinking_tokens` read in the binary. The flat field is
     stripped on parse, so the client's thinking-token accounting always
     rolls up **0**. A wrong displayed metric, not a failure.
-  - Fix: emit `output_tokens_details: { thinking_tokens }` (keep or drop the
-    flat alias deliberately).
+  - Fix: `Usage` now serialises through a wire struct (`src/anthropic.rs`)
+    that nests the count as `output_tokens_details: { thinking_tokens }`,
+    only when non-zero. The flat `thinking_tokens` alias is dropped: the
+    client strips it and Anthropic never sent it. The internal field is
+    unchanged, so the TUI and stats still read it.
   - Severity: low-medium.
 
 - [ ] **H2. The response `Message` omits `stop_details`**

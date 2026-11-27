@@ -669,19 +669,28 @@ pub struct ServerToolUseUsage {
     pub web_fetch_requests: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Token usage, in the proxy's internal shape.
+///
+/// [`Serialize`] writes Anthropic's wire shape, which differs in one place:
+/// the thinking-token count is nested as
+/// `output_tokens_details: { thinking_tokens }` rather than carried as a flat
+/// `thinking_tokens`.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub cache_creation_input_tokens: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub cache_read_input_tokens: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub cache_creation_input_tokens_5m: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub cache_creation_input_tokens_1h: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    /// Reasoning tokens (the upstream's `reasoning_tokens`). Sent to the
+    /// client as `output_tokens_details.thinking_tokens`, and only when
+    /// non-zero.
+    #[serde(default)]
     pub thinking_tokens: u32,
     /// Server tool usage (e.g. web search request count).
     /// Only present when a server tool was used.
@@ -694,6 +703,53 @@ pub struct Usage {
     /// every existing response is byte-for-byte unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iterations: Option<Vec<Value>>,
+}
+
+/// Anthropic's `usage.output_tokens_details`.
+#[derive(Serialize)]
+struct OutputTokensDetailsWire {
+    thinking_tokens: u32,
+}
+
+/// What [`Usage`] looks like on the wire. Zero counts and absent parts are
+/// omitted, so a response without thinking or caching is unchanged.
+#[derive(Serialize)]
+struct UsageWire<'a> {
+    input_tokens: u32,
+    output_tokens: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    cache_creation_input_tokens: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    cache_read_input_tokens: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    cache_creation_input_tokens_5m: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    cache_creation_input_tokens_1h: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens_details: Option<OutputTokensDetailsWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_tool_use: Option<&'a ServerToolUseUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iterations: Option<&'a Vec<Value>>,
+}
+
+impl Serialize for Usage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        UsageWire {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation_input_tokens_5m: self.cache_creation_input_tokens_5m,
+            cache_creation_input_tokens_1h: self.cache_creation_input_tokens_1h,
+            output_tokens_details: (self.thinking_tokens > 0).then_some(OutputTokensDetailsWire {
+                thinking_tokens: self.thinking_tokens,
+            }),
+            server_tool_use: self.server_tool_use.as_ref(),
+            iterations: self.iterations.as_ref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 const fn is_zero_u32(n: &u32) -> bool {
