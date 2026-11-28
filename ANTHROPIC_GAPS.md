@@ -1055,23 +1055,32 @@ written. Nothing was run against a live upstream.
   - Fix: each run's refused / cut-short flags are read as it happens (from
     the response, and from the live translator) and carried into the session
     result.
-  - Not covered: (a) a streamed paused round whose terminal `output` omits a
-    client call the client was already sent still ends `pause_turn`, because
-    "a tool is pending" is judged from the rendered content; (b) a re-run
-    that fails part way through its stream keeps the previous round's flags,
-    and a client `tool_use` the failed run streamed, even a complete one, is
-    not counted, so the turn can end `end_turn` after it.
+  - Since fixed (with I17): a streamed paused round whose terminal `output`
+    omits a client call ends `tool_use`.
+  - Not covered: a re-run that fails part way through its stream keeps the
+    previous round's flags, and a client `tool_use` the failed run streamed,
+    even a complete one, is not counted, so the turn can end `end_turn` after
+    it.
   - Severity: medium.
 
-- [ ] **I17. A plain streamed tool call missing from the terminal `output` ends `end_turn`**
-  - Where: `src/stream.rs`, the terminal-event handler (`has_tool_use` is read
-    from `response.output` only).
+- [x] **I17. A plain streamed tool call missing from the terminal `output` ends `end_turn`**
+  - Where: `src/stream.rs`, the terminal-event handler (`has_tool_use` was read
+    from `response.output` only); `src/tools/server_loop/live.rs` (`consume`,
+    `Items::add_missing_calls`).
   - Problem: when `response.completed` carries `output: []`, a call that was
     streamed to the client is followed by `stop_reason: "end_turn"` instead of
     `tool_use`. The server-tool path gets the empty case right; when the
     terminal `output` has other items but omits the call, both paths say
     `end_turn`.
-  - Fix: also count the tool blocks the translator has emitted.
+  - Fix: the plain path remembers that it sent a client `tool_use` block. The
+    server-tool path adds each call announced by `output_item.added` and
+    missing from the terminal `output` back into the run's response, so it
+    also counts toward the stop reason, and the loop's own calls are served.
+  - Not covered: calls are matched by `call_id`, so an upstream that renamed
+    one in its terminal `output` would have it counted twice (a loop tool
+    would run twice). None is known to. Recovered calls are appended, not put
+    back at their stream position, so the next run's replay can separate a
+    reasoning item from its call.
   - Severity: medium if an upstream sends that shape; which do is
     *unverified*.
 
@@ -1137,6 +1146,5 @@ Section I came from the 2026-11-28 pass (decompiled client + source
 re-read). Its medium entries are B-class response-correctness work and
 deserve the next look alongside A7 and B6: I2 (the stream body bound), I3
 (an upstream that does not actually stream), I4 (post-200 first-event
-silence), I11 (required usage keys) and I17 (streamed call ending
-`end_turn`). I6–I9 are catalogue-and-warn work in the
+silence) and I11 (required usage keys). I6–I9 are catalogue-and-warn work in the
 D2/D4/D5 vein.

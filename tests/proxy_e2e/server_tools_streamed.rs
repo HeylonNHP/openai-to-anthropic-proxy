@@ -768,3 +768,108 @@ async fn stop_signals_seen_only_in_the_events_reach_the_stop_reason() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// One run whose terminal `output` lists its text but not the call it streamed.
+fn sse_run_omitting_the_call(name: &str, args: &serde_json::Value) -> String {
+    use serde_json::json;
+    let mut events = sse_text(0, "ok");
+    events.extend(sse_call(1, name, "call_o", args));
+    events.push((
+        "response.completed",
+        json!({"response": {"id": "r1", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4o-mini", "output": [
+                {"type": "message", "id": "msg_0", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ok", "annotations": []}]}]}}),
+    ));
+    sse_run("r1", &events, "none")
+}
+
+fn final_stop_reason(events: &[(String, serde_json::Value)]) -> serde_json::Value {
+    events
+        .iter()
+        .rev()
+        .find(|(kind, _)| kind == "message_delta")
+        .map(|(_, v)| v["delta"]["stop_reason"].clone())
+        .expect("message_delta")
+}
+
+/// A client call the client was sent ends the turn `tool_use`, although the
+/// terminal `output` leaves it out. With `pause_turn` at its limit too.
+#[tokio::test]
+async fn a_client_call_missing_from_the_terminal_output_still_ends_tool_use() {
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"}}}}"#;
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![ok_response(sse_run_omitting_the_call(
+            "Bash",
+            &serde_json::json!({"command": "ls"}),
+        ))],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let request = server_tools_request(true, &[client_decl, SEARCH_DECL]);
+    let res = post_messages(proxy_addr, request).await;
+    let events = anthropic_events(&res.text().await.unwrap());
+    assert_eq!(assert_well_formed_blocks(&events), 2, "{events:?}");
+    assert_eq!(final_stop_reason(&events), "tool_use", "{events:?}");
+}
+
+/// A call to one of the loop's own tools is served although the terminal
+/// `output` leaves it out.
+#[tokio::test]
+async fn a_server_tool_call_missing_from_the_terminal_output_is_served() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(
+        &upstream,
+        vec![
+            ok_response(sse_run_omitting_the_call(
+                "proxy_web_search",
+                &serde_json::json!({"queries": ["rust"]}),
+            )),
+            ok_response(sse_run("r2", &sse_text(0, "Final answer."), "completed")),
+        ],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let res = post_messages(proxy_addr, server_tools_request(true, &[SEARCH_DECL])).await;
+    let text = res.text().await.unwrap();
+    assert!(text.contains("web_search_tool_result"), "{text}");
+    assert!(text.contains("Final answer."), "{text}");
+}
+
+/// The paused round: a search to serve and a client call the terminal `output`
+/// leaves out. The client has a tool to run, so the turn is not `pause_turn`.
+#[tokio::test]
+async fn a_paused_round_with_an_omitted_client_call_ends_tool_use() {
+    use serde_json::json;
+    let search = json!({"queries": ["rust"]});
+    let mut events = sse_call(0, "proxy_web_search", "call_s", &search);
+    events.extend(sse_call(1, "Bash", "call_b", &json!({"command": "ls"})));
+    events.push((
+        "response.completed",
+        json!({"response": {"id": "r1", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4o-mini", "output": [
+                {"type": "function_call", "id": "fc_0", "call_id": "call_s",
+                 "name": "proxy_web_search", "arguments": search.to_string()}]}}),
+    ));
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    script(&upstream, vec![ok_response(sse_run("r1", &events, "none"))]);
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let mut config = (*all_server_tools_config(upstream_addr, engine)).clone();
+    config.server_tools = openai_to_anthropic_proxy::config::ServerToolsConfig {
+        max_rounds: Some(1),
+        pause_turn: true,
+    };
+    let proxy_addr = start_proxy(std::sync::Arc::new(config)).await;
+
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"}}}}"#;
+    let request = server_tools_request(true, &[client_decl, SEARCH_DECL]);
+    let res = post_messages(proxy_addr, request).await;
+    let reply = anthropic_events(&res.text().await.unwrap());
+    assert_eq!(final_stop_reason(&reply), "tool_use", "{reply:?}");
+}

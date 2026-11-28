@@ -16,12 +16,12 @@
 //!
 //! ## What the collected response holds
 //!
-//! The terminal event's own `output` is used when it has one. Many upstreams
-//! send it empty, and the loop needs more than the text: a reasoning item's
-//! `encrypted_content` and a call's arguments are what the next run is
-//! replayed from. So the items are also built up from `output_item.added`,
-//! the deltas, and `output_item.done` (the authoritative copy when it has
-//! content).
+//! The terminal event's own `output` is used when it has one, plus any call it
+//! leaves out. Many upstreams send it empty, and the loop needs more than the
+//! text: a reasoning item's `encrypted_content` and a call's arguments are
+//! what the next run is replayed from. So the items are also built up from
+//! `output_item.added`, the deltas, and `output_item.done` (the authoritative
+//! copy when it has content).
 //!
 //! ## However the run ends, its blocks are closed
 //!
@@ -30,7 +30,7 @@
 //! the error is returned, because a `content_block_start` with no
 //! `content_block_stop` breaks a client. What was already streamed stays.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 
 use eventsource_stream::Event as SseEvent;
@@ -92,6 +92,8 @@ where
     result.map(|mut resp| {
         if resp.output.is_empty() {
             resp.output = items.into_output();
+        } else {
+            items.add_missing_calls(&mut resp.output);
         }
         (resp, signals)
     })
@@ -183,6 +185,9 @@ where
 #[derive(Default)]
 struct Items {
     by_index: BTreeMap<u32, OutputItem>,
+    /// The indices announced by `output_item.added`, which is what opens a
+    /// call's block on the client.
+    added: BTreeSet<u32>,
 }
 
 impl Items {
@@ -190,6 +195,7 @@ impl Items {
         match event {
             ResponsesStreamEvent::OutputItemAdded { output_index, item } => {
                 self.by_index.insert(*output_index, item.clone());
+                self.added.insert(*output_index);
             }
             ResponsesStreamEvent::OutputItemDone { output_index, item } => {
                 match self.by_index.get_mut(output_index) {
@@ -262,6 +268,25 @@ impl Items {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Add the announced calls `output` leaves out. The client has been sent
+    /// them, or the loop has to serve them.
+    fn add_missing_calls(self, output: &mut Vec<OutputItem>) {
+        for (index, item) in self.by_index {
+            if !self.added.contains(&index) {
+                continue;
+            }
+            let OutputItem::FunctionCall { call_id, .. } = &item else {
+                continue;
+            };
+            let listed = output.iter().any(|have| {
+                matches!(have, OutputItem::FunctionCall { call_id: id, .. } if id == call_id)
+            });
+            if !listed {
+                output.push(item);
+            }
         }
     }
 

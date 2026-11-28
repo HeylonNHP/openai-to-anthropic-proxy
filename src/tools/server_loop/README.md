@@ -61,8 +61,7 @@ intermediate text, each tool's `server_tool_use` / result pair, any client
   the client must not run it. Both are read from the run as it happens, so a
   refusal or cut-short call counts even when the rendered output no longer
   shows it: a round served before a pause or a failed re-run, or one a
-  streamed run's events showed and its terminal `output` omits (one pause
-  case excepted, see I16 in `ANTHROPIC_GAPS.md`). `pause_turn` is only sent
+  streamed run's events showed and its terminal `output` omits. `pause_turn` is only sent
   when [enabled](#the-round-limit).
 * `usage` is the SUM of every executor run in the turn (each run is billed
   upstream), plus what each tool adds:
@@ -139,8 +138,9 @@ last run done    ─▶ message_delta (the turn's usage), message_stop
   dropped, so the client never sees `proxy_web_search` and friends as `tool_use`.
   The same events are collected into the run's response, which the loop
   inspects for calls to serve and replays into the next run. The terminal
-  event's `output` is used when it has one; otherwise the items are rebuilt
-  from `output_item.added` / deltas / `output_item.done`.
+  event's `output` is used when it has one, plus any call announced by
+  `output_item.added` that it leaves out; otherwise the items are rebuilt from
+  `output_item.added` / deltas / `output_item.done`.
 * The loop is the single owner of the content numbering. The response mirrors
   it: every [`LoopEvent::Live`](run.rs) carries the index that follows its
   events.

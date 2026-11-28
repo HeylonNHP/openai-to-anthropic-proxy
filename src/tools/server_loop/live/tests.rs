@@ -352,3 +352,34 @@ async fn a_vanished_client_stops_the_run() {
     let err = consume(stream, &mut out, context()).await.unwrap_err();
     assert!(err.to_string().contains("disconnected"), "{err}");
 }
+
+/// A call the terminal output leaves out is added back only if it opened a
+/// block: one seen only as `output_item.done` was never sent to the client.
+#[tokio::test]
+async fn only_an_opened_call_is_added_to_a_terminal_output_that_omits_it() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut out = Emitter::new(Some(&tx));
+    let stream = futures_util::stream::iter(sse(vec![
+        created(),
+        call_added(0, "Read", "call_r"),
+        args_delta(0, r#"{"path":"a"}"#),
+        (
+            "response.output_item.done",
+            json!({"output_index": 1, "item": {
+                "type": "function_call", "id": "fc", "call_id": "call_done_only",
+                "name": "Read", "arguments": "{}"}}),
+        ),
+        completed(json!([{"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "ok", "annotations": []}]}])),
+    ]));
+    let (resp, _) = consume(stream, &mut out, context()).await.unwrap();
+    let ids: Vec<&str> = resp
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["call_r"]);
+}

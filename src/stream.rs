@@ -69,6 +69,9 @@ pub struct StreamTranslator {
     stop_reason: Option<StopReason>,
     /// A tool call's arguments were cut short by the output cap.
     truncated_tool_call: bool,
+    /// A client tool_use block was opened. The terminal `output` may leave the
+    /// call out, and `tool_blocks` is emptied as blocks close.
+    sent_tool_use: bool,
     /// The upstream refused to answer. Seen as a `refusal` event on the
     /// wire, which the terminal response does not always repeat.
     refused: bool,
@@ -178,6 +181,7 @@ impl StreamTranslator {
             next_index: 0,
             stop_reason: None,
             truncated_tool_call: false,
+            sent_tool_use: false,
             refused: false,
             refusal_marked: BTreeSet::new(),
             usage: None,
@@ -710,6 +714,7 @@ impl StreamTranslator {
                 self.close_open_thinking_blocks(events);
                 // Allocate a fresh Anthropic index for this tool.
                 let index = self.allocate_index();
+                self.sent_tool_use = true;
                 events.push(StreamEvent::ContentBlockStart {
                     index,
                     content_block: ContentBlockKind::ToolUse {
@@ -974,10 +979,11 @@ impl StreamTranslator {
             self.usage = Some(u);
         }
         // Map the response's status to a stop reason.
-        let has_tool_use = response
-            .output
-            .iter()
-            .any(|i| matches!(i, OutputItem::FunctionCall { .. }));
+        let has_tool_use = self.sent_tool_use
+            || response
+                .output
+                .iter()
+                .any(|i| matches!(i, OutputItem::FunctionCall { .. }));
         // A refusal seen on the wire counts even when the terminal
         // response does not repeat it.
         let refused = self.refused || crate::translate::reply_is_refusal(response);

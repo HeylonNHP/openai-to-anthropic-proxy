@@ -1490,3 +1490,38 @@ fn a_truncated_call_from_a_completed_stream_still_reports_max_tokens() {
     }
     assert!(saw_max_tokens, "expected stop_reason max_tokens");
 }
+
+/// A call the client was sent counts even when the terminal `output` leaves it
+/// out. An `incomplete` reply still keeps its own reason.
+#[test]
+fn a_streamed_call_missing_from_the_terminal_output_still_ends_tool_use() {
+    let text = OutputItem::Message {
+        id: Some("msg_0".into()),
+        status: Some("completed".into()),
+        role: "assistant".into(),
+        content: vec![OutputContentPart::OutputText {
+            text: "ok".into(),
+            annotations: Vec::new(),
+        }],
+    };
+    for (terminal, expected) in [
+        (completed_event("completed"), StopReason::ToolUse),
+        (
+            completed_event_with_output("completed", vec![text]),
+            StopReason::ToolUse,
+        ),
+        (incomplete_event("max_output_tokens"), StopReason::MaxTokens),
+    ] {
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+        t.feed_event(&created_event());
+        t.feed_event(&function_call_added(0, "call_1", "get_weather"));
+        t.feed_event(&function_call_args_done(0, "{}"));
+        t.feed_event(&terminal);
+        let closing = t.finish();
+        let StreamEvent::MessageDelta { delta, .. } = &closing[0] else {
+            panic!("expected message_delta");
+        };
+        assert_eq!(delta.stop_reason, Some(expected), "{terminal:?}");
+    }
+}
