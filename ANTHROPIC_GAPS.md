@@ -6,6 +6,14 @@ Anthropic schema for the entries added since, and checked a few of them
 against the installed Claude Code client. Nothing was run against a live
 upstream.
 
+A 2026-11-28 pass used four parallel research agents — two re-reading
+`src/`, two reading the installed Claude Code CLI's (v2.1.332) embedded
+JavaScript out of the native binary — and added section I, plus the
+client-impact evidence that settled G3's unverified clause. Section I's
+medium entries (I1–I4, I11) were spot-checked against the current source
+when written; client-impact claims there are static readings of that one
+build, same evidence class as section H.
+
 **Before you start any item:**
 
 - Line references come from the research and may have drifted. Re-check each
@@ -492,7 +500,11 @@ so the proxy can only approximate it.
     prefix and no fixed length — so the `call_…` and `msg_resp_…` ids are
     **accepted**. The `toolu_` prefix is what Anthropic mints, not what it
     requires. The `message.model` echo is still unaddressed.
-  - Unverified: whether any client logic keys on `message.model`.
+  - Was unverified; settled by the 2026-11-28 decompilation pass: the CLI
+    DOES key on `message.model` — a read of it warms
+    `servedModelsByRequestedModel`, later consumed by served-model
+    mismatch checks — so the echo feeds model-tracking lane logic, not
+    rendering. The echo itself is still unaddressed in the proxy.
 
 - [ ] **G4. Parallel tool-call blocks overlap**
   - Where: `src/stream.rs:642-683`, `:943-960`
@@ -711,6 +723,356 @@ strong evidence, not proof.
 
 ---
 
+## I. From the 2026-11-28 pass: decompiled client + source re-read
+
+Source: four parallel research agents — two re-read `src/`, two read the
+CLI's embedded JavaScript (v2.1.332, strings dump of the native binary).
+Client-impact claims are static readings of that one build; anything
+neither confirmed in the JS nor in the code is marked *unverified*.
+The medium entries were spot-checked against the current source when
+written. Nothing was run against a live upstream.
+
+### I.a. Response and streaming correctness
+
+- [ ] **I1. The server-tool `assemble` lets `tool_use` outrank `max_tokens` and `refusal`**
+  - Where: `src/tools/server_loop/render.rs:101-118` (in `assemble`, used by
+    `render` and `finish_streaming`): `if has_client_tool_use { … ToolUse }`
+    runs before the terminal-reason check.
+  - Problem: the plain path orders it the other way — refusal wins first
+    (`src/translate.rs:2914-2916`, B3) and a call cut short at `max_tokens`
+    is forced to `max_tokens` last (B2's "signal the client keys on to retry
+    with a bigger budget"). On the server-tool path, a final run whose
+    client tool call is truncated ships `tool_use` with the truncated input
+    instead of `max_tokens`, and a refusal plus any pending client tool
+    ships `tool_use` — the client executes the tools of a refused turn,
+    exactly what B3 says must not happen. (`pause_turn` losing to `tool_use`
+    is pinned as intended in `render/tests.rs:173-178`; the conflicting
+    combination is untested.)
+  - Client impact: Claude Code's loop branches on `stop_reason` (run tools
+    vs retry with a bigger budget); how often upstreams produce the
+    conflicting final shape is *unverified*.
+  - Fix: let `Refusal` outrank `tool_use` (match `stop_reason_for_reply`),
+    and decide explicitly whether a truncated call keeps `MaxTokens` or
+    yields only to a *sibling* pending tool, as the plain path effectively
+    does.
+  - Severity: medium (the most concrete two-path disagreement found).
+
+- [ ] **I2. The client-level `request_timeout` bounds the whole streamed body**
+  - Where: `src/main.rs:171-176` (`ClientBuilder::timeout(config.request_timeout)`
+    on the shared client); message sends pass `timeout: None`, so the client
+    total applies; failure surfaces as an upstream error around
+    `src/proxy.rs:1975-1980`.
+  - Problem: reqwest's client-level timeout runs from when the request
+    starts connecting until the response body has finished — so connect +
+    first byte + the **entire SSE body** must complete inside
+    `request_timeout_secs` (default 600 s) or reqwest aborts the read. A
+    healthy streamed turn generating for >10 minutes dies mid-stream with
+    `upstream SSE error: … timeout` → in-stream `api_error`, minutes of
+    tokens spent, no HTTP status for Claude Code to back off on. No
+    `read_timeout` (per-read stall) is configured, so bytes flowing at 10 Hz
+    do not hold the deadline off. Queue/backoff sit outside every timeout by
+    design (B8), and the early-start/ping machinery exists to keep long
+    waits alive — this is the mid-stream mirror of B8's pre-first-byte
+    problem.
+  - Client impact: Claude Code's watchdogs are idle/byte-based (B5: pings
+    every 10 s hold them off indefinitely), so the client would happily
+    wait — the proxy is what kills the turn; the CLI's reaction to the
+    in-stream `api_error` is *unverified*, at best a full re-send.
+  - Fix: stop using the total deadline as a body bound for streams — a
+    per-read `read_timeout` (stall detection) instead, or override
+    `.timeout()` on streaming sends; keep a total cap only for buffered
+    sends. Operator workaround today: raise `request_timeout_secs` (which
+    also lengthens buffered 504s).
+  - Severity: medium.
+
+- [ ] **I3. The plain path never checks that the upstream actually streamed**
+  - Where: `src/proxy.rs:1215-1224` (`execute` picks the streaming path
+    purely from `outbound.stream`, before any body/content-type check);
+    `src/proxy.rs:1396-1414` (`render_streaming` clones the upstream's
+    `Content-Type`, defaulting to `text/event-stream` only when the header
+    is *absent*); `parse_upstream_body` then assumes JSON.
+  - Problem: two upstream mismatches are unhandled on the ordinary
+    (non-server-tool) path: (a) `stream: true` answered with
+    `200 application/json` — the client gets an SSE-typed response whose
+    body is a JSON document the event parser never turns into events
+    (in-stream `error`, "stream ended before a terminal response event"),
+    with the wrong `Content-Type` on the wire; (b) buffered client +
+    streaming upstream — the SSE text hits `serde_json::from_slice` and
+    becomes a 502 "upstream returned non-JSON body". The server-tool loop
+    already handles both directions (`src/tools/server_loop/run.rs:534-546`
+    JSON sniffing, `:320-325` `UnexpectedStreaming`), and its README
+    documents that an upstream ignoring `stream: true` is still served — so
+    the upstream behaviour is known-real.
+  - Client impact: a failed turn on the weak in-stream error lane (B8's
+    note) instead of the reply the proxy held in hand. Claude Code branches
+    on the response `Content-Type` (JS evidence: usage metering checks the
+    header for `text/event-stream` to choose SSE vs JSON reading; a relay
+    path cancels a 200 whose type lacks it — `relay_not_sse`). Which
+    configured upstreams ignore `stream` is *unverified*.
+  - Fix: always emit `text/event-stream` from `render_streaming`, and sniff
+    content-type/shape in `execute` before choosing the path, routing each
+    body through the matching renderer — as `run_streamed` already does.
+  - Severity: medium.
+
+- [ ] **I4. Silence between the committed HTTP 200 and the first SSE event**
+  - Where: `src/proxy.rs:1810-1822` (`note_sent` sets `message_started` only
+    when a `message_start` frame was produced); `src/proxy.rs:2000-2010`
+    (the `ping` fires only when `message_started`); `src/stream.rs:266-286`
+    (`message_start` is emitted only when the first upstream event arrives).
+  - Problem: the early-start deadline covers only `execute()` (queue,
+    backoff, headers). When the upstream's headers arrive inside
+    `START_AFTER` but its first event (`response.created`) comes later,
+    `render_streaming` has already committed 200 with no placeholder, and
+    the ping gate stays shut until that first event — unbounded body
+    silence. B5 scoped its "cannot cover" remark to the pre-headers case
+    (which B8's early start then covered), and both keep-alive bodies
+    (`early_start::keep_alive_stream`, the server-loop's
+    `keep_alive_response`) ping from the moment `message_start` goes out —
+    this post-headers window on the plain path is the one left open.
+  - Client impact: *unverified* frequency — but axum commits headers with
+    the response while Claude Code's watchdog counts body bytes, so an
+    upstream buffering its first event past ~300 s trips the byte watchdog
+    (B5's documented abort + full re-send, tokens paid twice); shorter
+    stalls just sit silent against the design goal in `early_start.rs`'s
+    module doc.
+  - Fix: after `render_streaming` commits, if no first event arrives within
+    one ping interval, send the placeholder `message_start` (as the
+    early-start body does) or lift the `message_started` gate with a
+    synthetic start.
+  - Severity: medium.
+
+- [ ] **I5. An upstream web-search FunctionCall is presented twice — completed server tool *and* pending client tool**
+  - Where: `src/stream.rs:683-716` (emits `server_tool_use`, then falls
+    through to open a client `tool_use` block); buffered path:
+    `src/translate.rs:3054-3084` (injected pair) + `:3114-3173`
+    (unconditional `ToolUse` push); terminal upgrade via `has_tool_use`
+    (`src/stream.rs:963-966`, `src/translate.rs:2779-2783`). Pinned by
+    `stream/tests.rs::web_search_function_call_emits_blocks_then_tool_use`.
+  - Problem: for a search the upstream reports as a FunctionCall named
+    `WebSearch`/`web_search`, the client gets the server-tool pair (search
+    shown as already done, results filled from citations) *and* a client
+    `tool_use` for the same call, and the stop reason becomes `tool_use`.
+    Anthropic never presents one search as both completed and pending. The
+    `web_search_call`-item path (`src/stream.rs:657-667`) correctly produces
+    only the server blocks with `end_turn` — the two upstream signals
+    diverge.
+  - Client impact: *unverified* — but from the CLI JS, `WebSearch` is in
+    `BUILTIN_TOOL_NAMES` and an assistant `tool_use` named `WebSearch`
+    increments its web-search usage counter, so Claude Code plausibly
+    re-executes the search client-side; the lowercase `web_search` name
+    matches no builtin ("unknown tool"-class failure).
+  - Fix: pick one presentation — when the turn shows the search as a server
+    tool, drop the client `tool_use` for the same call and exclude
+    web-search function calls from `has_tool_use` (or present only the
+    client tool).
+  - Severity: medium-low.
+
+### I.b. Request features silently dropped (not in D2/D4/D5)
+
+- [ ] **I6. `safeguards` and `restore_if_safeguards_refused` are dropped without a warning**
+  - Where: no `safeguards` anywhere in `src/`; not declared in
+    `CreateMessageRequest` (`src/anthropic.rs:45-93`); JS marker
+    `extraBodyParams:{safeguards:` — `safeguards:[{type,classifier_context}]`
+    plus betas `dangerous-tool-use-2026-09-03`,
+    `auto-mode-classifier-2026-07-16`, `subagent-review-2026-11-17`.
+  - Problem: the top-level `safeguards` field rides along on auto-mode
+    requests (auto_mode is a common permission mode) and is silently
+    ignored — not in D2's drop list. The CLI also reads back
+    `restore_if_safeguards_refused === true` to drive a
+    "safeguards refused → switch model" lane that can never engage through
+    the proxy, with no log either way.
+  - Client impact: running an upstream safety classifier is inherent to an
+    OpenAI upstream; the *silence* is the gap (security-adjacent feature
+    dropped invisibly). Suppression via beta policy does not apply — the
+    fields arrive via `extraBodyParams`, not the org-gated
+    `CLAUDE_CODE_EXTRA_BODY`.
+  - Fix: add `safeguards` and `restore_if_safeguards_refused` to D2's
+    warn-once list.
+  - Severity: low-medium (inherent but uncatalogued, security-adjacent).
+
+- [ ] **I7. `context_hint` and its beta are dropped without a warning**
+  - Where: no `context_hint` in `src/`; JS marker
+    `body:u?{context_hint:{enabled:!0,…target_tokens_saved:i}}` with beta
+    `context-hint-2026-04-09`.
+  - Problem: `context_hint:{enabled, target_tokens_saved}` asks the API to
+    emit compaction hints; the proxy drops field and beta with no log.
+  - Client impact: gated client-side; consumed via a `context_hint_sse`
+    error-origin tag and a `compact_micro_keep_recent` action with
+    `trigger:"context_hint"` — dropping it disables that compaction
+    trigger. Emitting hints against an OpenAI upstream is inherent.
+  - Fix: add `context_hint` to D2's warning list and note hints cannot be
+    produced.
+  - Severity: low-medium, conditional.
+
+- [ ] **I8. `tool_reference` content blocks are dropped**
+  - Where: `ContentBlockParam` (`src/anthropic.rs:161-206`) has no
+    `tool_reference`; it falls to `#[serde(other)] Unknown` and is dropped
+    at forward (with a generic tracing warning). CLI JS: `tool_reference` is
+    in the preserved-block switch, written as `tool_result` content
+    `({type:"tool_reference", tool_name})`, and the build carries
+    `defer_loading:true` / tool-search shapes.
+  - Problem: Claude Code writes `tool_reference` blocks into outgoing
+    messages (the in-context record of deferred/loaded tools, inside
+    `tool_result` content); the proxy parses them as Unknown and drops
+    them, losing the record upstream. D5 names `search_result` /
+    `container_upload` only.
+  - Client impact: normal-path activation depends on deferred tool loading
+    being on in this build — *partially unverified*.
+  - Fix: parse `tool_reference` (`{tool_name}`) and fold the name into
+    context, or at least warn specifically; extend D5.
+  - Severity: low-medium.
+
+- [ ] **I9. Tool `annotations` and `hints` are silently ignored**
+  - Where: `Tool` (`src/anthropic.rs:433-454`) declares
+    name/kind/description/input_schema/strict/options only; CLI JS builds
+    tools with `annotations:{title,readOnlyHint,destructiveHint,openWorld}`
+    and `hints:{search_hint,…,always_load}`.
+  - Problem: inbound `annotations` and `hints` are dropped without a log.
+    D4 lists `input_examples`, `defer_loading`, `allowed_callers` and
+    `eager_input_streaming` but not these.
+  - Client impact: Claude Code attaches them notably to MCP tools (where
+    `readOnlyHint` etc. are standard); advisory for Anthropic tooling and
+    near-neutral OpenAI-side, but the drop is silent.
+  - Fix: extend D4 — fold `title`/hints into the upstream tool description
+    or declare-and-warn.
+  - Severity: low.
+
+### I.c. Retry and error handling
+
+- [ ] **I10. The learned parameter-strip retry covers only `temperature` and `top_p`**
+  - Where: `src/capabilities.rs:53-62` (`RequestParam::ALL = [Temperature,
+    TopP]`), `:136-148` (`unsupported_parameter` gated on `ALL`); the
+    strip-retry loop is `src/proxy.rs:1067-1099`.
+  - Problem: proxy-injected fields with no strip path: forced
+    `strict: true` (`src/translate.rs:298`), `reasoning` incl. `summary`
+    (`src/translate.rs:355-360`, `src/proxy.rs:941-943` — A3 already warned
+    some servers reject it), `user` (`src/translate.rs:327-331`),
+    `prompt_cache_key` (`src/proxy.rs:972-974`), `parallel_tool_calls`
+    (`src/translate.rs:316-325`). A 400 naming any of them unsupported is
+    passed straight to the client, while `temperature`/`top_p` self-heal
+    process-wide.
+  - Client impact: *unverified* — needs an upstream that rejects one of
+    these keys; when it happens the proxy is unusable for that model with
+    no self-heal.
+  - Fix: add variants, or a generic "strip the named outbound key" fallback,
+    for the proxy-injected optional fields (the store's own docstring says
+    adding a variant is the only change needed).
+  - Severity: low-medium.
+
+### I.d. Response shape fidelity
+
+- [ ] **I11. Usage keys the CLI's schema marks required-nullable are omitted when zero**
+  - Where: `UsageWire` (`src/anthropic.rs:716-734`) —
+    `skip_serializing_if = "is_zero_u32"` on `cache_creation_input_tokens`
+    and `cache_read_input_tokens` (and the flat `_5m`/`_1h` fields);
+    `cache_creation`, `service_tier`, `speed`, `inference_geo`,
+    `fallback_credit` never modelled.
+  - Problem: the CLI's zod usage schema marks `cache_creation_input_tokens`,
+    `cache_read_input_tokens`, `cache_creation` and `service_tier`
+    **nullable but not optional** — `.nullable()` ≠ `.optional()`, so a
+    missing key fails `safeParse` where an explicit `null` passes. The proxy
+    omits them whenever zero, i.e. on every uncached turn. At least one CLI
+    site also reads unguarded (`h.cache_creation.ephemeral_1h_input_tokens`,
+    no `?.`), which on a missing `cache_creation` object is a TypeError.
+  - Client impact: *unverified* whether any `safeParse`/unguarded read ever
+    sees a raw proxy usage object — mitigating evidence: the CLI normalises
+    its own usage through defaults and merge paths that tolerate
+    `undefined`, so most runtime readers degrade rather than break; the
+    exposed lane is a record/resume path that parses a persisted
+    `message.usage` taken straight from the proxy's `message_start` —
+    missing required keys → record rejected — plus the unguarded
+    `cache_creation` read.
+  - Fix: always emit `cache_creation_input_tokens: 0` and
+    `cache_read_input_tokens: 0`, plus `cache_creation: null` and
+    `service_tier: "standard"` — matches Anthropic's own wire, costs
+    nothing. Distinct from G1 (which is about the `cache_creation` TTL
+    object's contents and the non-standard flat `_5m`/`_1h` fields).
+  - Severity: medium, *unverified* on parse/crash reachability.
+
+- [ ] **I12. On the streaming path the `server_tool_use` input arrives as `""` → `{}`**
+  - Where: `src/stream.rs:1070-1090` — the start event carries
+    `input: {"query": "Web search"}` then an immediate `content_block_stop`,
+    with no `input_json_delta`; the buffered path keeps the object
+    (`build_content_blocks`).
+  - Problem: the client discards any object input at `content_block_start`
+    (it stores `input: ""`) and only accumulates `input_json_delta` — which
+    the proxy never sends for this block — so the recorded block ends as
+    `input: ""`, and the stop-time JSON parse turns it into `{}`. Every
+    streamed search turn therefore records/replays
+    `server_tool_use.input = {}` while the same turn non-streaming delivers
+    `{"query":"Web search"}`: a cross-path inconsistency in transcript,
+    replay, and input-hash telemetry.
+  - Client impact: verified mechanism (the start handler overwrites input,
+    the validator never checks it — silent); visible in transcript/history,
+    no crash. Extends G2: G2's fix alone (the fake query's content) would
+    not restore the value on the streaming path.
+  - Fix: follow `content_block_start` with one `input_json_delta` carrying
+    the JSON (the same buffered single-delta pattern as H4), or accept `{}`
+    and fold the observation into G2.
+  - Severity: medium-low.
+
+- [ ] **I13. `message_start.usage.input_tokens` is 0 on virtually every streamed turn**
+  - Where: `src/stream.rs:565-595` — `build_message_start` takes the
+    legacy-placeholder branch (`input_tokens: 0, output_tokens: 1`) unless
+    `input_usage_seen`, which is set only at the terminal event (after
+    `message_start` has gone out); only upstreams that put usage in
+    `response.created`/`in_progress` get the real branch. The early-start
+    placeholder is all-zero too.
+  - Problem: Anthropic's `message_start` carries the real input count
+    (input is known before generation); the proxy's almost never does. The
+    closing `message_delta` carries real usage and the client's merge folds
+    it in, so displayed/final usage is correct — but every read keyed to
+    `message_start` sees 0: the CLI's `first_request_input_tokens` ("lets a
+    consumer tell a cold prompt cache from a large prompt") and its
+    prompt-size latency bucket both sum `message_start` usage, so proxied
+    turns all bucket as 0-token prompts. B8 documents the *early-start*
+    placeholder, not the always-placeholder on the normal path.
+  - Client impact: telemetry/`@internal` fields; *unverified* whether any
+    non-telemetry logic keys on them (the `output_tokens` read is healed by
+    `Math.max`).
+  - Fix: buffering `message_start` until usage arrives is impractical with
+    streaming — forward `response.created`/`in_progress` usage when the
+    upstream provides it (already implemented) and document the remainder as
+    inherent; or accept as telemetry-only.
+  - Severity: low.
+
+- [ ] **I14. Adjacent text blocks are re-joined with inserted separators Anthropic never sent**
+  - Where: `src/translate.rs:1587-1588` (consecutive user text blocks merged
+    with a pushed `'\n'`), `:2282-2287` (assistant text blocks joined with
+    `'\n'`), `:381-388` (system blocks joined with `"\n\n"`), `:2643-2647`
+    (system-message blocks joined with `"\n"`).
+  - Problem: Anthropic delivers each text block as-is; the proxy injects
+    separators when merging — notably when prompt caching is unconfigured,
+    so every block's `cache_control` fails the `ephemeral` gate and all
+    blocks merge.
+  - Client impact: *unverified* — depends on Claude Code sending 2+ text
+    blocks in one message; the alteration is deterministic when it does.
+  - Fix: concatenate without inserting separators (or join only where the
+    client itself had separated), and note the choice in the translation
+    overview.
+  - Severity: low.
+
+- [ ] **I15. With N upstream searches, only the first result block carries results, and pairs are emitted out of position**
+  - Where: `src/stream.rs:1092-1120`, `src/translate.rs:3061-3072` (all
+    collected citations go to search #0; searches 2..N get `content: []`);
+    `src/translate.rs:3054-3084` (every pair hoisted to the FRONT of
+    `content`); `src/stream.rs:657-690` (`server_tool_use` start/stop
+    emitted while the preceding text block is still open — overlapping
+    blocks; G4 covers only parallel tool/tool overlap).
+  - Problem: later result blocks claim zero results; buffered ordering
+    doesn't reflect when the search happened; streaming overlaps open
+    blocks where Anthropic has one at a time.
+  - Client impact: Claude Code's renderer maps result entries directly, so
+    later searches show 0 results; its per-index block accumulator
+    tolerates the overlap (read from JS), so ordering is shape fidelity —
+    *unverified* for stricter SDKs.
+  - Fix: attribute each result block its results, emit pairs at their
+    chronological position, and close the text block before opening
+    `server_tool_use`.
+  - Severity: low.
+
+---
+
 ## Not planned (inherent or out of scope)
 
 `top_k`, real thinking-budget enforcement, `code_execution`, `tool_search`,
@@ -747,3 +1109,11 @@ ordinary `tool_use` / `tool_result` pair — would also settle G9 and G10.
 B8 is fixed: a queued or backing-off streaming request now gets the early
 start (placeholder `message_start` + pings) instead of silence before the
 first byte.
+
+Section I came from the 2026-11-28 pass (decompiled client + source
+re-read). Its medium entries are B-class response-correctness work and
+deserve the next look alongside A7 and B6: I1 (stop-reason conflict on
+the server-tool path), I2 (the stream body bound), I3 (an upstream that
+does not actually stream), I4 (post-200 first-event silence) and I11
+(required usage keys). I6–I9 are catalogue-and-warn work in the
+D2/D4/D5 vein.
