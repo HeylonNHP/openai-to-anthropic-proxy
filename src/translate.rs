@@ -2013,6 +2013,16 @@ fn tool_result_output(
                     }
                     continue;
                 }
+                // A tool search (Claude Code's ToolSearch) answers with the
+                // names of the tools it loaded and nothing else. The schemas
+                // arrive in `tools`; the names are the result, so say them
+                // rather than hand the model an empty output.
+                if block.get("type").and_then(Value::as_str) == Some("tool_reference")
+                    && let Some(name) = block.get("tool_name").and_then(Value::as_str)
+                {
+                    push_text(format!("Loaded tool: {name}"), &mut ordered);
+                    continue;
+                }
                 // Any other block with a string `text` contributes it,
                 // matching the previous behaviour (which kept text from
                 // blocks of any type).

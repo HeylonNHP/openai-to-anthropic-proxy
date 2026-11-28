@@ -293,6 +293,8 @@ fails the test run.
   forwarded as an array of `input_text`/`input_image` parts by default
   (see `tool_result_images` in
   [proxy.json-guide.md](./proxy.json-guide.md#tool-result-images-tool_result_images)).
+- A `tool_reference` block inside a `tool_result` (what a tool search returns)
+  is sent as the text `Loaded tool: <name>`.
 - Assistant text becomes `output_text`, and `tool_use` blocks become
   `function_call` items emitted after the assistant message.
 - `tool_use.input` is serialized to JSON for OpenAI `arguments`.

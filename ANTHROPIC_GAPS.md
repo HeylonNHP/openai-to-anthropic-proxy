@@ -891,23 +891,17 @@ written. Nothing was run against a live upstream.
     produced.
   - Severity: low-medium, conditional.
 
-- [ ] **I8. `tool_reference` content blocks are dropped**
-  - Where: `ContentBlockParam` (`src/anthropic.rs:161-206`) has no
-    `tool_reference`; it falls to `#[serde(other)] Unknown` and is dropped
-    at forward (with a generic tracing warning). CLI JS: `tool_reference` is
-    in the preserved-block switch, written as `tool_result` content
-    `({type:"tool_reference", tool_name})`, and the build carries
-    `defer_loading:true` / tool-search shapes.
-  - Problem: Claude Code writes `tool_reference` blocks into outgoing
-    messages (the in-context record of deferred/loaded tools, inside
-    `tool_result` content); the proxy parses them as Unknown and drops
-    them, losing the record upstream. D5 names `search_result` /
-    `container_upload` only.
-  - Client impact: normal-path activation depends on deferred tool loading
-    being on in this build — *partially unverified*.
-  - Fix: parse `tool_reference` (`{tool_name}`) and fold the name into
-    context, or at least warn specifically; extend D5.
-  - Severity: low-medium.
+- [x] **I8. `tool_reference` content blocks are dropped**
+  - Where: `src/translate.rs` (`tool_result_output`)
+  - Problem: a tool search (Claude Code's ToolSearch) returns a
+    `tool_result` holding only `tool_reference` blocks (`{tool_name}`).
+    They have no `text`, so they were dropped and the model saw an empty
+    result. (Not `ContentBlockParam::Unknown`, as first written: tool
+    result content is raw JSON.)
+  - Fix: each one becomes the text `Loaded tool: <name>`. The loaded tools'
+    schemas still arrive in the request's `tools`.
+  - Confirmed in a 2026-11-28 proxy log and session transcript before the fix.
+  - Severity: medium (every deferred tool load).
 
 - [ ] **I9. Tool `annotations` and `hints` are silently ignored**
   - Where: `Tool` (`src/anthropic.rs:433-454`) declares

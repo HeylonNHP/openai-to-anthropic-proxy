@@ -1499,6 +1499,32 @@ fn tool_result_is_error_none_passes_output_through() {
     );
 }
 
+#[test]
+fn tool_result_tool_references_name_the_loaded_tools() {
+    // Claude Code's ToolSearch result holds only `tool_reference` blocks.
+    // Dropping them left the model an empty output.
+    let tr = ToolResultBlockParam {
+        tool_use_id: "call_1".into(),
+        content: Some(ToolResultContent::Blocks(vec![
+            json!({"type": "tool_reference", "tool_name": "WebSearch"}),
+            json!({"type": "tool_reference", "tool_name": "WebFetch"}),
+            // No name, nothing to say: still dropped.
+            json!({"type": "tool_reference"}),
+        ])),
+        is_error: None,
+    };
+    let out = tool_result_output(
+        &tr,
+        &ToolResultImages::default(),
+        &PromptCachingConfig::default(),
+        false,
+    );
+    assert_eq!(
+        out.output,
+        FunctionCallOutputBody::Text("Loaded tool: WebSearch\nLoaded tool: WebFetch".to_string())
+    );
+}
+
 fn tool_result_image_json(media: &str, data: &str) -> serde_json::Value {
     json!({
         "type": "image",
