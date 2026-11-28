@@ -675,7 +675,8 @@ impl StreamTranslator {
             OutputItem::FunctionCall { call_id, name, .. } => {
                 // The model may invoke web search as a function tool
                 // (name == "WebSearch" or "web_search") instead of via
-                // a `web_search_call` output item. Detect that here and
+                // a `web_search_call` output item. (A tool of that name
+                // the client declared itself is not one.) Detect that here and
                 // emit the `server_tool_use` block FIRST, then fall
                 // through to the normal tool_use handling. The matching
                 // `web_search_tool_result` block is emitted later when

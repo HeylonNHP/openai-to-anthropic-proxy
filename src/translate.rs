@@ -2960,21 +2960,24 @@ pub fn reply_is_refusal(resp: &ResponsesResponse) -> bool {
 /// API emits when the model uses its built-in web search. A secondary
 /// signal is a `FunctionCall` whose name is `WebSearch` or `web_search`
 /// (the model sometimes invokes web search as a function tool instead
-/// of via the built-in). The tertiary signal — kept as a fallback — is
+/// of via the built-in; never when the client declared that tool itself).
+/// The tertiary signal — kept as a fallback — is
 /// `url_citation` annotations on `OutputText` parts, which is what the
 /// non-streaming response path populates once content is fully
 /// materialized.
 /// Whether a function call from the model is a web search made as a function
 /// (`WebSearch` or `web_search`) rather than through the built-in tool.
 ///
-/// A `web_search` the client declared as its own function tool is in the
-/// registry (only function tools with a schema are), and a call to it is an
-/// ordinary tool call, not a search the proxy should dress up as a server tool.
+/// A function tool the client declared itself is in the registry (only
+/// function tools with a schema are, never server tools), and a call to it is
+/// an ordinary tool call, not a search the proxy should dress up as a server
+/// tool. Claude Code's own `WebSearch` is one: the client runs it, and the
+/// search happens in a later request.
 pub fn is_web_search_function_call(
     name: &str,
     registry: &crate::repair::ToolSchemaRegistry,
 ) -> bool {
-    name == "WebSearch" || (name == "web_search" && registry.get(name).is_none())
+    matches!(name, "WebSearch" | "web_search") && registry.get(name).is_none()
 }
 
 fn extract_web_search_citations(

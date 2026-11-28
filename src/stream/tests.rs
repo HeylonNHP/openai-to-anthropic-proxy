@@ -1255,25 +1255,39 @@ fn web_search_function_call_emits_blocks_then_tool_use() {
     }
 }
 
-/// A `web_search` the client declared as its own function tool is in the
-/// registry, and a call to it is an ordinary `tool_use`: no `server_tool_use`
-/// block, no search count.
+/// A `WebSearch` or `web_search` the client declared as its own function tool is
+/// in the registry, and a call to it is an ordinary `tool_use`: no
+/// `server_tool_use` block, no search count. Claude Code's `WebSearch` is one.
 #[test]
 fn a_client_web_search_function_call_does_not_emit_search_blocks() {
-    let mut registry = crate::repair::ToolSchemaRegistry::new();
-    registry.insert("web_search".into(), serde_json::json!({"type": "object"}));
-    let mut t = StreamTranslator::new(msg_id(), model(), registry);
-    t.feed_event(&created_event());
+    for name in ["WebSearch", "web_search"] {
+        let mut registry = crate::repair::ToolSchemaRegistry::new();
+        registry.insert(name.into(), serde_json::json!({"type": "object"}));
+        let mut t = StreamTranslator::new(msg_id(), model(), registry);
+        t.feed_event(&created_event());
 
-    let evs = t.feed_event(&function_call_added(0, "call_1", "web_search"));
-    assert_eq!(evs.len(), 1, "only the tool_use start: {evs:?}");
-    assert!(matches!(
-        &evs[0],
-        StreamEvent::ContentBlockStart {
-            content_block: ContentBlockKind::ToolUse { name, .. },
-            ..
-        } if name == "web_search"
-    ));
+        let evs = t.feed_event(&function_call_added(0, "call_1", name));
+        assert_eq!(evs.len(), 1, "only the tool_use start: {evs:?}");
+        assert!(matches!(
+            &evs[0],
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockKind::ToolUse { name: sent, .. },
+                ..
+            } if sent == name
+        ));
+
+        let _ = t.feed_event(&completed_event("completed"));
+        match &t.finish()[0] {
+            StreamEvent::MessageDelta { usage, .. } => assert!(
+                usage
+                    .as_ref()
+                    .and_then(|u| u.server_tool_use.as_ref())
+                    .is_none(),
+                "no search is counted for {name}"
+            ),
+            other => panic!("expected message_delta, got {other:?}"),
+        }
+    }
 }
 
 /// A non-web-search function call (e.g. `get_weather`) must NOT emit

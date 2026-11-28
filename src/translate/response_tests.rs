@@ -477,29 +477,32 @@ fn a_client_web_search_function_tool_can_be_forced() {
 
 #[test]
 fn a_call_to_a_client_web_search_function_is_a_plain_tool_use() {
-    let mut registry = crate::repair::ToolSchemaRegistry::new();
-    registry.insert("web_search".into(), json!({"type": "object"}));
-    let mut resp = fixture_response();
-    resp.output = vec![OutputItem::FunctionCall {
-        id: Some("fc_x".into()),
-        status: Some("completed".into()),
-        call_id: "call_1".into(),
-        name: "web_search".into(),
-        arguments: "{}".into(),
-    }];
-    let out = responses_to_anthropic(&resp, &registry);
-    assert_eq!(out.content.len(), 1, "no synthetic search blocks");
-    assert!(matches!(
-        out.content[0],
-        ResponseContentBlock::ToolUse { .. }
-    ));
+    for name in ["WebSearch", "web_search"] {
+        let mut registry = crate::repair::ToolSchemaRegistry::new();
+        registry.insert(name.into(), json!({"type": "object"}));
+        let mut resp = fixture_response();
+        resp.output = vec![OutputItem::FunctionCall {
+            id: Some("fc_x".into()),
+            status: Some("completed".into()),
+            call_id: "call_1".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }];
+        let out = responses_to_anthropic(&resp, &registry);
+        assert_eq!(out.content.len(), 1, "no synthetic search blocks: {name}");
+        assert!(matches!(
+            out.content[0],
+            ResponseContentBlock::ToolUse { .. }
+        ));
+        assert!(out.usage.server_tool_use.is_none(), "no search: {name}");
 
-    // With no such tool declared, the same call is still read as a search.
-    let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
-    assert!(matches!(
-        out.content[0],
-        ResponseContentBlock::ServerToolUse { .. }
-    ));
+        // With no such tool declared, the same call is still read as a search.
+        let out = responses_to_anthropic(&resp, &crate::repair::ToolSchemaRegistry::new());
+        assert!(matches!(
+            out.content[0],
+            ResponseContentBlock::ServerToolUse { .. }
+        ));
+    }
 }
 
 /// Regression: when the upstream emits a `web_search_call` output

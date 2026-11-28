@@ -462,3 +462,42 @@ async fn a_failed_later_server_tool_run_keeps_the_work_already_done() {
         "the last good answer survives: {body}"
     );
 }
+
+// ── The client's own `WebSearch` beside the proxy's server tools ──
+
+/// Claude Code's `WebSearch` is a function tool the client runs itself. A call
+/// to it in a server-tool turn is a plain `tool_use`: no search block is
+/// invented and none is counted, and the proxy's tools are still offered.
+#[tokio::test]
+async fn a_client_websearch_call_is_not_dressed_up_as_a_server_search() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(function_calls_response(
+        "resp_ws",
+        &[("WebSearch", "call_ws", serde_json::json!({"query": "rust"}))],
+    ));
+    let (engine, searched) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let client_decl = r#"{"name":"WebSearch","input_schema":{"type":"object",
+        "properties":{"query":{"type":"string"}},"required":["query"]}}"#;
+    let search_decl = r#"{"type":"web_search_20250305","name":"web_search"}"#;
+    let request =
+        server_tools_request(false, &[client_decl, search_decl, FETCH_DECL, ADVISOR_DECL]);
+    let res = post_messages(proxy_addr, request).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+
+    let content = content_of(&body);
+    assert_eq!(content.len(), 1, "only the client's call: {content:?}");
+    assert_eq!(content[0]["type"], "tool_use");
+    assert_eq!(content[0]["name"], "WebSearch");
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert!(body["usage"]["server_tool_use"].is_null(), "{body}");
+    assert!(searched.lock().await.is_empty());
+
+    let sent = upstream.received_all.lock().await.clone();
+    let offered = offered_tool_names(&sent[0]);
+    for name in ["WebSearch", "proxy_web_search", "web_fetch", "advisor"] {
+        assert!(offered.iter().any(|n| n == name), "{name}: {offered:?}");
+    }
+}

@@ -841,31 +841,18 @@ written. Nothing was run against a live upstream.
     synthetic start.
   - Severity: medium.
 
-- [ ] **I5. An upstream web-search FunctionCall is presented twice — completed server tool *and* pending client tool**
-  - Where: `src/stream.rs:683-716` (emits `server_tool_use`, then falls
-    through to open a client `tool_use` block); buffered path:
-    `src/translate.rs:3054-3084` (injected pair) + `:3114-3173`
-    (unconditional `ToolUse` push); terminal upgrade via `has_tool_use`
-    (`src/stream.rs:963-966`, `src/translate.rs:2779-2783`). Pinned by
-    `stream/tests.rs::web_search_function_call_emits_blocks_then_tool_use`.
-  - Problem: for a search the upstream reports as a FunctionCall named
-    `WebSearch`/`web_search`, the client gets the server-tool pair (search
-    shown as already done, results filled from citations) *and* a client
-    `tool_use` for the same call, and the stop reason becomes `tool_use`.
-    Anthropic never presents one search as both completed and pending. The
-    `web_search_call`-item path (`src/stream.rs:657-667`) correctly produces
-    only the server blocks with `end_turn` — the two upstream signals
-    diverge.
-  - Client impact: *unverified* — but from the CLI JS, `WebSearch` is in
-    `BUILTIN_TOOL_NAMES` and an assistant `tool_use` named `WebSearch`
-    increments its web-search usage counter, so Claude Code plausibly
-    re-executes the search client-side; the lowercase `web_search` name
-    matches no builtin ("unknown tool"-class failure).
-  - Fix: pick one presentation — when the turn shows the search as a server
-    tool, drop the client `tool_use` for the same call and exclude
-    web-search function calls from `has_tool_use` (or present only the
-    client tool).
-  - Severity: medium-low.
+- [x] **I5. A client `WebSearch` call is also presented as a completed server search**
+  - Where: `src/translate.rs` (`is_web_search_function_call`), shared by the
+    plain, buffered and server-tool paths
+  - Problem: the lowercase `web_search` name was exempt when the client
+    declared it as its own function tool, but `WebSearch` always matched. So
+    every call to Claude Code's `WebSearch` also produced an invented
+    `server_tool_use` / `web_search_tool_result` pair and counted a search
+    that had not run. The `tool_use` itself was right, and ran once.
+  - Fix: the declared-tool exemption now covers both names. A call to an
+    *undeclared* `WebSearch` / `web_search` is still read as a search.
+  - Confirmed in a 2026-11-28 proxy log and session transcript before the fix.
+  - Severity: medium (every main-loop web search).
 
 ### I.b. Request features silently dropped (not in D2/D4/D5)
 

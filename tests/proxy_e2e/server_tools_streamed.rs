@@ -575,3 +575,46 @@ async fn a_client_that_disconnects_stops_the_turn() {
         "no third run for a client that left"
     );
 }
+
+/// The streaming mirror of the client's own `WebSearch` in a server-tool turn:
+/// one `tool_use` block, no invented search.
+#[tokio::test]
+async fn a_streamed_client_websearch_call_is_a_plain_tool_use() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let run = sse_call(
+        0,
+        "WebSearch",
+        "call_ws",
+        &serde_json::json!({"query": "rust"}),
+    );
+    script(
+        &upstream,
+        vec![ok_response(sse_run("r1", &run, "completed"))],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let client_decl = r#"{"name":"WebSearch","input_schema":{"type":"object",
+        "properties":{"query":{"type":"string"}},"required":["query"]}}"#;
+    let search_decl = r#"{"type":"web_search_20250305","name":"web_search"}"#;
+    let request = server_tools_request(true, &[client_decl, search_decl]);
+    let res = post_messages(proxy_addr, request).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let events = anthropic_events(&res.text().await.unwrap());
+
+    assert_eq!(assert_well_formed_blocks(&events), 1, "{events:?}");
+    let block = events
+        .iter()
+        .find(|(kind, _)| kind == "content_block_start")
+        .map(|(_, v)| &v["content_block"])
+        .expect("a content block");
+    assert_eq!(block["type"], "tool_use");
+    assert_eq!(block["name"], "WebSearch");
+    let delta = events
+        .iter()
+        .find(|(kind, _)| kind == "message_delta")
+        .map(|(_, v)| v)
+        .expect("message_delta");
+    assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    assert!(delta["usage"]["server_tool_use"].is_null(), "{delta}");
+}
