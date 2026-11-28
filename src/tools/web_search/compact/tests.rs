@@ -148,5 +148,6 @@ fn the_request_is_tool_free_and_buffered() {
     assert_eq!(r.model, "cheap-model");
     assert!(r.tools.is_none());
     assert!(!r.stream);
-    assert_eq!(r.max_output_tokens, Some(2500));
+    // 2500 for the summary, plus the reasoning allowance.
+    assert_eq!(r.max_output_tokens, Some(2500 + 16_384));
 }

@@ -110,11 +110,16 @@ A page longer than `compaction_threshold_chars` is shortened:
 
 - With a `compaction_model`: up to 3 summarisation passes (a side call to the
   upstream, like the advisor's), each asking for a shorter result. The prompt
-  preserves code, tables, URLs and quotations.
+  preserves code, tables, URLs and quotations. The output budget is half a
+  token per character of the limit (at least 512) plus 16384 for reasoning;
+  each pass times out after 300 s (or
+  `request_timeout_secs`, if shorter), so a slow reasoning model can hold a
+  search for minutes.
 - Without one, or if the call fails, or the model cannot get under the limit:
   the text is **truncated** at a paragraph boundary and the page carries a note
   saying it was *not* summarised, so the model never mistakes the first N
-  characters for the whole page.
+  characters for the whole page. A failure with a model configured is logged
+  at `warn`.
 
 ### Failure handling
 

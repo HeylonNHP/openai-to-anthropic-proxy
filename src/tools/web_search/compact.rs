@@ -21,7 +21,15 @@ use crate::responses::{
 pub const MAX_PASSES: u8 = 3;
 
 /// Wall-clock cap on one compaction request (clamped to the global timeout).
-const COMPACTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Long enough to generate the whole output budget, reasoning included, on a
+/// model managing about 70 tokens a second.
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Output tokens allowed for a reasoning model's thinking, on top of the
+/// summary itself: upstreams count both against `max_output_tokens`, and a
+/// model that spends the whole budget thinking returns no text. The same size
+/// as the advisor's default `reasoning_max_tokens`.
+const REASONING_ALLOWANCE: u32 = 16_384;
 
 /// The reason reported when `compaction_model` is unset.
 pub const NO_MODEL: &str = "no web_search.compaction_model is configured";
@@ -140,12 +148,23 @@ pub async fn fit<C: Compactor + Sync>(text: String, limit: usize, compactor: &C)
         }
     }
 
+    let reason = failure
+        .unwrap_or_else(|| "the model could not bring the summary under the limit".to_owned());
+    // Truncating without a model is the configured behaviour; failing to
+    // summarise with one is something the operator needs to hear about.
+    if !reason.contains(NO_MODEL) {
+        tracing::warn!(
+            reason = %reason,
+            original_chars,
+            limit,
+            "web_search compaction failed; truncating the page instead"
+        );
+    }
     Fitted::Truncated {
         text: truncate_chars(&current, limit),
         original_chars,
         limit,
-        reason: failure
-            .unwrap_or_else(|| "the model could not bring the summary under the limit".to_owned()),
+        reason,
     }
 }
 
@@ -256,11 +275,12 @@ impl Compactor for UpstreamCompactor {
 
 /// The tool-free request for one pass.
 fn compaction_request(model: &str, request: CompactRequest<'_>) -> ResponsesRequest {
-    // Roughly 2 characters of budget per allowed output character is
-    // generous for any tokenizer and leaves room for a reasoning model.
+    // Half a token per allowed output character is generous for any
+    // tokenizer; thinking gets its own allowance.
     let max_output_tokens = u32::try_from(request.limit / 2)
         .unwrap_or(u32::MAX)
-        .max(512);
+        .max(512)
+        .saturating_add(REASONING_ALLOWANCE);
     ResponsesRequest {
         model: model.to_owned(),
         input: Input::Items(vec![InputItem::Message {

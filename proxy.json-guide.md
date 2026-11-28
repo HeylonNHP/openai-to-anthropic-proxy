@@ -455,7 +455,7 @@ Optional proxy-native replacement for the upstream's built-in web search. **Opt-
 }
 ```
 
-- `compaction_model` is an **explicit upstream model name** (no alias resolution, like `advisor.model`). Pages longer than `compaction_threshold_chars` are summarised by it (up to 3 passes). **Unset / `null` means no model call:** long pages are truncated at a paragraph boundary and carry a note saying so.
+- `compaction_model` is an **explicit upstream model name** (no alias resolution, like `advisor.model`). Pages longer than `compaction_threshold_chars` are summarised by it (up to 3 passes). **Unset / `null` means no model call:** long pages are truncated at a paragraph boundary and carry a note saying so. A failed summary logs a `warn` (`web_search compaction failed`) and the page is truncated. A slow reasoning model can hold a search for minutes; the output budget and timeout are in the web search README's "Compaction".
 - `max_queries` (default 3, max 10) is how many queries the model may run per call; `max_results_per_query` (default 5, max 10) is how many result pages are fetched per query.
 - **Nothing is unlimited.** Unlike `web_fetch`, `0`, negative and fractional values are invalid: the default is used with a startup warning. Values above the maximum are clamped, with a warning.
 - Result pages are fetched through the same SSRF-hardened fetcher as `web_fetch`.
