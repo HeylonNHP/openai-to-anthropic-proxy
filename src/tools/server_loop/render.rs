@@ -11,8 +11,9 @@ use axum::response::{IntoResponse, Response};
 use crate::anthropic::{Message, ResponseContentBlock, StopReason};
 use crate::error::AppError;
 use crate::proxy::{Attempt, record_json_stats};
+use crate::responses::ResponsesResponse;
 use crate::tools::server_loop::handler::ServerTool;
-use crate::tools::server_loop::run::SessionResult;
+use crate::tools::server_loop::run::{SessionResult, StopSignals};
 use crate::translate;
 
 /// Render the assembled turn.
@@ -22,11 +23,12 @@ pub(crate) fn render(attempt: &Attempt, result: SessionResult) -> Result<Respons
         prefix_blocks,
         tools,
         paused,
+        signals,
         emitted: _,
         live_final: _,
     } = result;
 
-    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
+    let mut anth = translate_final(attempt, &final_resp, signals);
     assemble(&mut anth, prefix_blocks, &tools, paused);
 
     // Records the turn's usage exactly once: `run` has already replaced the
@@ -53,12 +55,13 @@ pub(crate) fn finish_streaming(attempt: &Attempt, result: SessionResult) -> Tail
         prefix_blocks,
         tools,
         paused,
+        signals,
         emitted,
         live_final,
     } = result;
 
     let prefix_len = prefix_blocks.len();
-    let mut anth: Message = translate::responses_to_anthropic(&final_resp, &attempt.registry);
+    let mut anth = translate_final(attempt, &final_resp, signals);
     assemble(&mut anth, prefix_blocks, &tools, paused);
     record_json_stats(attempt, &final_resp);
 
@@ -77,6 +80,26 @@ pub(crate) fn finish_streaming(attempt: &Attempt, result: SessionResult) -> Tail
         stop_sequence: anth.stop_sequence,
         usage: anth.usage,
     }
+}
+
+/// Translate the final response, ranking in the stop signals its output may
+/// not show.
+fn translate_final(
+    attempt: &Attempt,
+    final_resp: &ResponsesResponse,
+    signals: StopSignals,
+) -> Message {
+    let mut anth = translate::responses_to_anthropic(final_resp, &attempt.registry);
+    anth.stop_reason = if signals.refused {
+        Some(StopReason::Refusal)
+    } else {
+        translate::stop_reason_for_cut_short_call(
+            anth.stop_reason,
+            &final_resp.status,
+            signals.cut_short,
+        )
+    };
+    anth
 }
 
 /// Turn the translated final response into what the client must see.
@@ -98,24 +121,25 @@ pub(crate) fn assemble(
         tool.contribute_usage(&mut anth.usage);
     }
 
-    // Preserve a TERMINAL stop reason from the translator. A pending client
-    // tool_use always wins (the client must run it). Otherwise a loop that
-    // stopped at its round limit is `pause_turn`, and anything else that is
-    // not terminal is `end_turn`.
+    // The translator's reason is the last run's, ranked as on the plain path:
+    // the client must not run the tools of a refused turn, and a turn cut off
+    // at `max_tokens` is retried with a bigger budget, not acted on. After
+    // those, a pending client tool_use wins (the client must run it), then a
+    // loop stopped at its round limit is `pause_turn`.
     let has_client_tool_use = anth
         .content
         .iter()
         .any(|b| matches!(b, ResponseContentBlock::ToolUse { .. }));
-    if has_client_tool_use {
-        anth.stop_reason = Some(StopReason::ToolUse);
-    } else if paused {
-        anth.stop_reason = Some(StopReason::PauseTurn);
-    } else if !matches!(
-        anth.stop_reason,
-        Some(StopReason::MaxTokens | StopReason::Refusal | StopReason::StopSequence)
-    ) {
-        anth.stop_reason = Some(StopReason::EndTurn);
-    }
+    anth.stop_reason = Some(match anth.stop_reason {
+        Some(StopReason::Refusal) => StopReason::Refusal,
+        // A paused turn's reason comes from a round already served, so with
+        // nothing for the client to run it can still resume.
+        Some(StopReason::MaxTokens) if has_client_tool_use || !paused => StopReason::MaxTokens,
+        _ if has_client_tool_use => StopReason::ToolUse,
+        _ if paused => StopReason::PauseTurn,
+        Some(StopReason::StopSequence) => StopReason::StopSequence,
+        _ => StopReason::EndTurn,
+    });
 }
 
 #[cfg(test)]

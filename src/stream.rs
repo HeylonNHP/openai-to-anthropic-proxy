@@ -237,6 +237,19 @@ impl StreamTranslator {
         self.started = true;
     }
 
+    /// Whether a refusal has been seen on the wire.
+    #[must_use]
+    pub const fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// Whether a client tool call's arguments were cut short. Known once the
+    /// call's block is closed.
+    #[must_use]
+    pub const fn cut_short(&self) -> bool {
+        self.truncated_tool_call
+    }
+
     /// Close every open content block and stop, without the closing
     /// `message_delta` / `message_stop`. Idempotent. The loop calls this when
     /// a run ends, however it ended, so the client never sees a

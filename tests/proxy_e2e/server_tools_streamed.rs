@@ -618,3 +618,153 @@ async fn a_streamed_client_websearch_call_is_a_plain_tool_use() {
     assert_eq!(delta["delta"]["stop_reason"], "tool_use");
     assert!(delta["usage"]["server_tool_use"].is_null(), "{delta}");
 }
+
+/// The streamed twin of the cut-short client call: the arguments stop part way.
+#[tokio::test]
+async fn a_streamed_cut_short_client_call_is_max_tokens() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let partial = r#"{"command":"ls","path":"/ho"#;
+    let mut run = sse_call(0, "Bash", "call_b", &serde_json::json!({}));
+    run[1].1["delta"] = serde_json::json!(partial);
+    run[2].1["arguments"] = serde_json::json!(partial);
+    run[3].1["item"]["arguments"] = serde_json::json!(partial);
+    script(
+        &upstream,
+        vec![ok_response(sse_run("r1", &run, "completed"))],
+    );
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"},"path":{"type":"string"}}}}"#;
+    let request = server_tools_request(true, &[client_decl, SEARCH_DECL]);
+    let res = post_messages(proxy_addr, request).await;
+    let events = anthropic_events(&res.text().await.unwrap());
+    let delta = events
+        .iter()
+        .find(|(kind, _)| kind == "message_delta")
+        .map(|(_, v)| v)
+        .expect("message_delta");
+    assert_eq!(delta["delta"]["stop_reason"], "max_tokens", "{events:?}");
+}
+
+/// A run's refusal or cut-short call can be visible only in its events: the
+/// terminal `output` omits it, or the rebuilt run drops it.
+#[tokio::test]
+async fn stop_signals_seen_only_in_the_events_reach_the_stop_reason() {
+    use serde_json::json;
+    type Events = Vec<(&'static str, serde_json::Value)>;
+
+    let full = json!({"command": "ls", "path": "/home"});
+    let call = || sse_call(1, "Bash", "call_b", &full);
+    let call_item = json!({"type": "function_call", "id": "fc_1", "call_id": "call_b",
+        "name": "Bash", "arguments": full.to_string()});
+    let text_item = json!({"type": "message", "id": "msg_0", "role": "assistant",
+        "content": [{"type": "output_text", "text": "ok", "annotations": []}]});
+    let message = |kind: &'static str, content: serde_json::Value| {
+        (
+            kind,
+            json!({"output_index": 0, "item": {"type": "message", "id": "msg_0",
+                "role": "assistant", "content": content}}),
+        )
+    };
+    let added = || message("response.output_item.added", json!([]));
+    let delta = || {
+        (
+            "response.refusal.delta",
+            json!({"item_id": "msg_0", "output_index": 0, "content_index": 0, "delta": "No."}),
+        )
+    };
+    let refusal_done = (
+        "response.refusal.done",
+        json!({"item_id": "msg_0", "output_index": 0, "content_index": 0, "refusal": "No."}),
+    );
+    // The arguments stop part way and no `done` event follows.
+    let cut = || -> Events {
+        let mut run = call();
+        run.truncate(2);
+        run[1].1["delta"] = json!(r#"{"command":"ls","path":"/ho"#);
+        run
+    };
+
+    let cases: Vec<(&str, Events, serde_json::Value, &str)> = vec![
+        (
+            "terminal output omits the refusal",
+            [vec![added(), delta()], call()].concat(),
+            json!([call_item]),
+            "refusal",
+        ),
+        (
+            "refusal delta with no message item",
+            [vec![delta()], call()].concat(),
+            json!([]),
+            "refusal",
+        ),
+        (
+            "only refusal.done",
+            [vec![refusal_done], call()].concat(),
+            json!([]),
+            "refusal",
+        ),
+        (
+            "item.done drops the refusal",
+            [
+                vec![
+                    added(),
+                    delta(),
+                    message("response.output_item.done", text_item["content"].clone()),
+                ],
+                call(),
+            ]
+            .concat(),
+            json!([]),
+            "refusal",
+        ),
+        (
+            "a refusal with no client call",
+            vec![delta()],
+            json!([]),
+            "refusal",
+        ),
+        (
+            "terminal output has the whole call",
+            cut(),
+            json!([call_item]),
+            "max_tokens",
+        ),
+        (
+            "terminal output omits the cut call",
+            cut(),
+            json!([text_item]),
+            "max_tokens",
+        ),
+    ];
+
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"},"path":{"type":"string"}}}}"#;
+    let mut wrong = Vec::new();
+    for (name, mut events, output, expected) in cases {
+        events.push((
+            "response.completed",
+            json!({"response": {"id": "r1", "object": "response", "created_at": 1,
+                "status": "completed", "model": "gpt-4o-mini", "output": output}}),
+        ));
+        let (upstream_addr, upstream) = start_fake_upstream().await;
+        script(&upstream, vec![ok_response(sse_run("r1", &events, "none"))]);
+        let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+        let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+        let request = server_tools_request(true, &[client_decl, SEARCH_DECL]);
+        let res = post_messages(proxy_addr, request).await;
+        let reply = anthropic_events(&res.text().await.unwrap());
+        let stop = reply
+            .iter()
+            .find(|(kind, _)| kind == "message_delta")
+            .map(|(_, v)| v["delta"]["stop_reason"].clone())
+            .expect("message_delta");
+        if stop != expected {
+            wrong.push(format!("{name}: {stop}, expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

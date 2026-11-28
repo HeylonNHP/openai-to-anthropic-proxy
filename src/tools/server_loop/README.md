@@ -57,8 +57,13 @@ intermediate text, each tool's `server_tool_use` / result pair, any client
 `tool_use` the model asked for, and the final answer.
 
 * `stop_reason` is `end_turn`, or `tool_use` if a *client* tool is pending.
-  A terminal reason from the model (`max_tokens`, `refusal`, `stop_sequence`)
-  is kept. `pause_turn` is only sent when [enabled](#the-round-limit).
+  A `refusal` or `max_tokens` from the last run outranks a pending tool, since
+  the client must not run it. Both are read from the run as it happens, so a
+  refusal or cut-short call counts even when the rendered output no longer
+  shows it: a round served before a pause or a failed re-run, or one a
+  streamed run's events showed and its terminal `output` omits (one pause
+  case excepted, see I16 in `ANTHROPIC_GAPS.md`). `pause_turn` is only sent
+  when [enabled](#the-round-limit).
 * `usage` is the SUM of every executor run in the turn (each run is billed
   upstream), plus what each tool adds:
   `server_tool_use.web_search_requests` / `web_fetch_requests` (a zero count is
@@ -105,10 +110,15 @@ turn; **Claude Code does not**. (Checked by searching its binary: nothing in
 its own turn loop reacts to `pause_turn`, so a paused turn would simply end,
 with no answer.) Turn it on for clients that resume.
 
-A client tool pending in the paused round still wins: the stop reason is
-`tool_use`, since the client must run the tool, and sending its result resumes
-the turn. A resumed conversation (the paused assistant message as the last
-message) is accepted; the earlier results are put back in front of the model.
+A pending client tool wins over the pause: the stop reason is `tool_use`,
+since the client must run the tool, and sending its result resumes the turn.
+The exceptions: a refused paused round gives `refusal`, and when a tool is
+pending, a round cut off at `max_tokens` (or `completed` with a cut-short
+client call) gives `max_tokens`. With none pending, a cut-off round still
+pauses.
+
+A resumed conversation (the paused assistant message as the last message) is
+accepted; the earlier results are put back in front of the model.
 
 ## Streaming
 

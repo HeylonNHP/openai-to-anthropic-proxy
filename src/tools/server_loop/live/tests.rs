@@ -122,7 +122,7 @@ async fn text_is_forwarded_and_the_hidden_call_is_not() {
         completed(json!([])),
     ]));
 
-    let resp = consume(stream, &mut out, context()).await.unwrap();
+    let (resp, _) = consume(stream, &mut out, context()).await.unwrap();
 
     let (events, next) = drain(&mut rx);
     assert_eq!(
@@ -235,7 +235,7 @@ async fn done_items_supply_what_the_stream_did_not() {
         ),
         completed(json!([])),
     ]));
-    let resp = consume(stream, &mut out, context()).await.unwrap();
+    let (resp, _) = consume(stream, &mut out, context()).await.unwrap();
 
     match &resp.output[0] {
         OutputItem::Reasoning {
@@ -263,7 +263,7 @@ async fn the_terminal_output_is_used_when_it_has_content() {
         completed(json!([{"type": "message", "role": "assistant", "content": [
             {"type": "output_text", "text": "whole", "annotations": []}]}])),
     ]));
-    let resp = consume(stream, &mut out, context()).await.unwrap();
+    let (resp, _) = consume(stream, &mut out, context()).await.unwrap();
     assert_eq!(resp.output.len(), 1);
 }
 

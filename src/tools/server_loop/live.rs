@@ -42,7 +42,7 @@ use crate::responses::{
     OutputContentPart, OutputItem, ReasoningSummaryText, ResponsesResponse, ResponsesStreamEvent,
 };
 use crate::stream::StreamTranslator;
-use crate::tools::server_loop::run::Emitter;
+use crate::tools::server_loop::run::{Emitter, StopSignals};
 
 /// What a run needs besides its events.
 pub(crate) struct RunContext<'a> {
@@ -57,7 +57,8 @@ pub(crate) struct RunContext<'a> {
 }
 
 /// Read one run's events, sending the client what they translate to as they
-/// arrive, and return the run as a response.
+/// arrive, and return the run as a response, with the stop signals its events
+/// carried.
 ///
 /// # Errors
 ///
@@ -67,7 +68,7 @@ pub(crate) async fn consume<S, E>(
     mut events: S,
     out: &mut Emitter<'_>,
     ctx: RunContext<'_>,
-) -> Result<ResponsesResponse, AppError>
+) -> Result<(ResponsesResponse, StopSignals), AppError>
 where
     S: Stream<Item = Result<SseEvent, E>> + Unpin,
     E: Display,
@@ -84,11 +85,15 @@ where
     // Close whatever is open, on success and failure alike.
     let closing = translator.close_blocks();
     out.send_live(closing, translator.next_index());
+    let signals = StopSignals {
+        refused: translator.refused(),
+        cut_short: translator.cut_short(),
+    };
     result.map(|mut resp| {
         if resp.output.is_empty() {
             resp.output = items.into_output();
         }
-        resp
+        (resp, signals)
     })
 }
 

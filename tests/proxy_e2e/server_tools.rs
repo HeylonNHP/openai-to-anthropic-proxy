@@ -501,3 +501,61 @@ async fn a_client_websearch_call_is_not_dressed_up_as_a_server_search() {
         assert!(offered.iter().any(|n| n == name), "{name}: {offered:?}");
     }
 }
+
+/// The final run's client call was cut short: the client is told to retry with
+/// a bigger budget, not to run the call.
+#[tokio::test]
+async fn a_cut_short_client_call_on_the_server_tool_path_is_max_tokens() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let mut run: serde_json::Value = serde_json::from_str(&function_calls_response(
+        "r1",
+        &[("Bash", "call_b", serde_json::json!({}))],
+    ))
+    .unwrap();
+    run["output"][0]["arguments"] = serde_json::json!(r#"{"command":"ls","path":"/ho"#);
+    *upstream.canned.lock().await = Some(run.to_string());
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"},"path":{"type":"string"}}}}"#;
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[client_decl, SEARCH_DECL]),
+    )
+    .await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(content_of(&body)[0]["type"], "tool_use", "{body}");
+    assert_eq!(body["stop_reason"], "max_tokens", "{body}");
+}
+
+/// A refused final run that also calls a client tool stays a refusal.
+#[tokio::test]
+async fn a_refused_client_call_on_the_server_tool_path_is_a_refusal() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    let mut run: serde_json::Value = serde_json::from_str(&function_calls_response(
+        "r1",
+        &[("Bash", "call_b", serde_json::json!({"command": "ls"}))],
+    ))
+    .unwrap();
+    run["output"].as_array_mut().unwrap().insert(
+        0,
+        serde_json::json!({
+            "type": "message", "id": "msg_0", "role": "assistant", "status": "completed",
+            "content": [{"type": "refusal", "refusal": "I will not."}],
+        }),
+    );
+    *upstream.canned.lock().await = Some(run.to_string());
+    let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+    let proxy_addr = start_proxy(all_server_tools_config(upstream_addr, engine)).await;
+
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"}}}}"#;
+    let res = post_messages(
+        proxy_addr,
+        server_tools_request(false, &[client_decl, SEARCH_DECL]),
+    )
+    .await;
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "refusal", "{body}");
+}

@@ -183,3 +183,41 @@ fn a_turn_that_is_not_paused_never_says_pause_turn() {
     assemble(&mut anth, Vec::new(), &tools(vec![Tool("t", 0)]), false);
     assert_eq!(anth.stop_reason, Some(StopReason::EndTurn));
 }
+
+#[test]
+fn a_refused_turn_never_asks_the_client_to_run_its_tools() {
+    for paused in [false, true] {
+        let mut anth = message(vec![tool_use("Bash")], Some(StopReason::Refusal));
+        assemble(&mut anth, Vec::new(), &tools(vec![Tool("t", 0)]), paused);
+        assert_eq!(anth.stop_reason, Some(StopReason::Refusal), "{paused}");
+    }
+    let mut anth = message(vec![text("no")], Some(StopReason::Refusal));
+    assemble(&mut anth, Vec::new(), &tools(vec![Tool("t", 0)]), true);
+    assert_eq!(anth.stop_reason, Some(StopReason::Refusal));
+}
+
+#[test]
+fn a_turn_cut_off_at_max_tokens_wins_over_a_pending_client_tool() {
+    for paused in [false, true] {
+        let mut anth = message(vec![tool_use("Bash")], Some(StopReason::MaxTokens));
+        assemble(&mut anth, Vec::new(), &tools(vec![Tool("t", 0)]), paused);
+        assert_eq!(anth.stop_reason, Some(StopReason::MaxTokens), "{paused}");
+    }
+    // A client call from an earlier round sits in the prefix.
+    let mut anth = message(vec![text("x")], Some(StopReason::MaxTokens));
+    assemble(
+        &mut anth,
+        vec![tool_use("Bash")],
+        &tools(vec![Tool("t", 0)]),
+        false,
+    );
+    assert_eq!(anth.stop_reason, Some(StopReason::MaxTokens));
+}
+
+#[test]
+fn a_paused_turn_with_nothing_pending_stays_paused_after_a_cut_off_round() {
+    // The reason is that of a round already served; the client can resume.
+    let mut anth = message(vec![text("x")], Some(StopReason::MaxTokens));
+    assemble(&mut anth, Vec::new(), &tools(vec![Tool("t", 0)]), true);
+    assert_eq!(anth.stop_reason, Some(StopReason::PauseTurn));
+}

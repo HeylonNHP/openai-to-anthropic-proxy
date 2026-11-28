@@ -210,6 +210,44 @@ pub(crate) enum AfterRound {
     AnswerNext,
 }
 
+/// Why a run's client tools must not be run.
+///
+/// Both are read from the run as it happens: a served round is later rendered
+/// without its output, and a streamed run's rebuilt output can omit what its
+/// events said.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StopSignals {
+    pub refused: bool,
+    /// A client tool call's arguments were cut short.
+    pub cut_short: bool,
+}
+
+impl StopSignals {
+    /// The signals `resp` shows. The loop's own calls (`names`) are left out:
+    /// the client never runs them.
+    pub(crate) fn of(resp: &ResponsesResponse, names: &[&'static str]) -> Self {
+        let cut_short = resp.output.iter().any(|item| {
+            matches!(item, OutputItem::FunctionCall { name, arguments, .. }
+            if !names.contains(&name.as_str())
+                && matches!(
+                    crate::repair::read_arguments(arguments),
+                    crate::repair::Arguments::Truncated(_)
+                ))
+        });
+        Self {
+            refused: crate::translate::reply_is_refusal(resp),
+            cut_short,
+        }
+    }
+
+    const fn or(self, other: Self) -> Self {
+        Self {
+            refused: self.refused || other.refused,
+            cut_short: self.cut_short || other.cut_short,
+        }
+    }
+}
+
 /// The buffered result of the whole turn.
 pub(crate) struct SessionResult {
     /// The LAST executor response, the one that answered the user. Its
@@ -224,6 +262,9 @@ pub(crate) struct SessionResult {
     /// response ends with `stop_reason: "pause_turn"` (unless a client tool
     /// call is pending).
     pub paused: bool,
+    /// The stop signals of the run `final_resp` stands for, which its output
+    /// may no longer show.
+    pub signals: StopSignals,
     /// How many `prefix_blocks` a streaming client already has (0 when the
     /// client is buffered).
     pub emitted: usize,
@@ -266,7 +307,7 @@ pub(crate) async fn drive(
     // The last executor response whose content is already in
     // `prefix_blocks`. Once present, a failed re-run renders THIS (minus its
     // output, which is not repeated) instead of failing the client.
-    let mut last_good: Option<ResponsesResponse> = None;
+    let mut last_good: Option<(ResponsesResponse, StopSignals)> = None;
     // Rounds served so far. `limit_hit`: the round limit was reached, so any
     // further call is refused. `terminal`: such a refusal was just sent, so
     // the next response is final whatever it contains.
@@ -327,11 +368,11 @@ pub(crate) async fn drive(
             Ok(Outcome::Streaming(_)) => Err(AppError::Internal(
                 "the upstream streamed a response that was requested whole".to_owned(),
             )),
-            Ok(Outcome::Buffered(body)) => Ok((body, false)),
+            Ok(Outcome::Buffered(body)) => Ok((body, false, StopSignals::default())),
             Err(err) => Err(err),
         };
-        let (resp, live_run) = match outcome {
-            Ok((body, live_run)) => {
+        let (resp, live_run, wire) = match outcome {
+            Ok((body, live_run, wire)) => {
                 tracing::info!(
                     round = rounds + 1,
                     streamed = live_run,
@@ -342,10 +383,10 @@ pub(crate) async fn drive(
                     "← executor run (server-tool turn)"
                 );
                 add_usage(&mut total_usage, body.usage.as_ref());
-                (body, live_run)
+                (body, live_run, wire)
             }
             Err(err) => {
-                let Some(last) = last_good.take() else {
+                let Some((last, signals)) = last_good.take() else {
                     return Err(scrub(&tools, err));
                 };
                 warn_rerun_failed(attempt, &err);
@@ -355,7 +396,7 @@ pub(crate) async fn drive(
                     }
                 }
                 return Ok(complete(
-                    last,
+                    (last, signals),
                     total_usage,
                     prefix_blocks,
                     tools,
@@ -365,6 +406,8 @@ pub(crate) async fn drive(
                 ));
             }
         };
+        // Read before any call is stripped from the response.
+        let signals = StopSignals::of(&resp, &names).or(wire);
         // A buffered run (an upstream that ignored `stream`, or a client that
         // is not streaming) starts the response from its own skeleton.
         out.start(|| {
@@ -392,7 +435,7 @@ pub(crate) async fn drive(
                 strip_exhausted(&mut resp, &tools);
             }
             return Ok(complete(
-                resp,
+                (resp, signals),
                 total_usage,
                 prefix_blocks,
                 tools,
@@ -425,7 +468,7 @@ pub(crate) async fn drive(
                 .collect();
             continue_with(&mut attempt.outbound.input, &resp, &answered, &replay_mode);
             terminal = true;
-            last_good = Some(without_output(&resp));
+            last_good = Some((without_output(&resp), signals));
             continue;
         }
 
@@ -469,7 +512,7 @@ pub(crate) async fn drive(
                     "server-tool round limit reached; returning pause_turn for the client to resume"
                 );
                 return Ok(complete(
-                    without_output(&resp),
+                    (without_output(&resp), signals),
                     total_usage,
                     prefix_blocks,
                     tools,
@@ -492,12 +535,12 @@ pub(crate) async fn drive(
                 limit_hit = true;
             }
         }
-        last_good = Some(without_output(&resp));
+        last_good = Some((without_output(&resp), signals));
     }
 }
 
 fn complete(
-    mut final_resp: ResponsesResponse,
+    (mut final_resp, signals): (ResponsesResponse, StopSignals),
     total_usage: Option<ResponsesUsage>,
     prefix_blocks: Vec<ResponseContentBlock>,
     tools: Vec<Box<dyn ServerTool>>,
@@ -515,6 +558,7 @@ fn complete(
         prefix_blocks,
         tools,
         paused,
+        signals,
         emitted: out.emitted,
         live_final,
     }))
@@ -525,12 +569,14 @@ fn complete(
 /// a [`ResponsesResponse`] for the loop to inspect. The flag says whether the
 /// run's content has been streamed to the client (it has not when the
 /// upstream ignored `stream: true` and answered with JSON).
+///
+/// The signals are what the run's events showed, which the response may not.
 async fn run_streamed(
     attempt: &Attempt,
     raw: crate::upstream_gate::GatedResponse,
     out: &mut Emitter<'_>,
     names: &[&'static str],
-) -> Result<(ResponsesResponse, bool), AppError> {
+) -> Result<(ResponsesResponse, bool, StopSignals), AppError> {
     let is_json = raw
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -542,7 +588,7 @@ async fn run_streamed(
         if let Some(err) = AppError::from_failed_response(&body) {
             return Err(err);
         }
-        return Ok((body, false));
+        return Ok((body, false, StopSignals::default()));
     }
     let msg_id = crate::tools::server_loop::stream::placeholder_message(&attempt.req.model).id;
     let events = eventsource_stream::Eventsource::eventsource(raw.bytes_stream());
@@ -557,7 +603,7 @@ async fn run_streamed(
         },
     )
     .await
-    .map(|resp| (resp, true))
+    .map(|(resp, wire)| (resp, true, wire))
 }
 
 /// Add one executor run's usage to the turn's running total.

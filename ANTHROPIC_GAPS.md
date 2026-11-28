@@ -734,28 +734,19 @@ written. Nothing was run against a live upstream.
 
 ### I.a. Response and streaming correctness
 
-- [ ] **I1. The server-tool `assemble` lets `tool_use` outrank `max_tokens` and `refusal`**
-  - Where: `src/tools/server_loop/render.rs:101-118` (in `assemble`, used by
-    `render` and `finish_streaming`): `if has_client_tool_use { … ToolUse }`
-    runs before the terminal-reason check.
-  - Problem: the plain path orders it the other way — refusal wins first
-    (`src/translate.rs:2914-2916`, B3) and a call cut short at `max_tokens`
-    is forced to `max_tokens` last (B2's "signal the client keys on to retry
-    with a bigger budget"). On the server-tool path, a final run whose
-    client tool call is truncated ships `tool_use` with the truncated input
-    instead of `max_tokens`, and a refusal plus any pending client tool
-    ships `tool_use` — the client executes the tools of a refused turn,
-    exactly what B3 says must not happen. (`pause_turn` losing to `tool_use`
-    is pinned as intended in `render/tests.rs:173-178`; the conflicting
-    combination is untested.)
-  - Client impact: Claude Code's loop branches on `stop_reason` (run tools
-    vs retry with a bigger budget); how often upstreams produce the
-    conflicting final shape is *unverified*.
-  - Fix: let `Refusal` outrank `tool_use` (match `stop_reason_for_reply`),
-    and decide explicitly whether a truncated call keeps `MaxTokens` or
-    yields only to a *sibling* pending tool, as the plain path effectively
-    does.
-  - Severity: medium (the most concrete two-path disagreement found).
+- [x] **I1. The server-tool `assemble` lets `tool_use` outrank `max_tokens` and `refusal`**
+  - Where: `src/tools/server_loop/render.rs` (`assemble`, used by `render`
+    and `finish_streaming`).
+  - Problem: a pending client `tool_use` overrode every other stop reason, so
+    a refused final run still had its tools executed, and a cut-short call
+    was run with truncated input instead of retried with a bigger budget. The
+    plain path ranks both the other way.
+  - Fix: the last run's `refusal`, then `max_tokens`, outrank a pending tool.
+    A pause with nothing pending still outranks `max_tokens`.
+  - Not covered: only the LAST run's reason is read. A middle round that is
+    refused or cut off, and also calls a server tool, is still served, and
+    its reason is lost.
+  - Severity: medium.
 
 - [ ] **I2. The client-level `request_timeout` bounds the whole streamed body**
   - Where: `src/main.rs:171-176` (`ClientBuilder::timeout(config.request_timeout)`
@@ -1052,6 +1043,57 @@ written. Nothing was run against a live upstream.
     `server_tool_use`.
   - Severity: low.
 
+### I.e. Found while verifying I1 (probe tests against a fake upstream)
+
+- [x] **I16. The server-tool path loses some refusal and truncation signals**
+  - Where: `src/tools/server_loop/run.rs` (`StopSignals`), `live.rs`
+    (`consume`), `render.rs` (`translate_final`).
+  - Problem: a pending client tool was reported as `tool_use` although the
+    turn was refused or its call cut short, when (a) the round ending the turn
+    was already served (a pause or a failed re-run), so its output was
+    dropped; or (b) a streamed run showed it only in its events.
+  - Fix: each run's refused / cut-short flags are read as it happens (from
+    the response, and from the live translator) and carried into the session
+    result.
+  - Not covered: (a) a streamed paused round whose terminal `output` omits a
+    client call the client was already sent still ends `pause_turn`, because
+    "a tool is pending" is judged from the rendered content; (b) a re-run
+    that fails part way through its stream keeps the previous round's flags,
+    and a client `tool_use` the failed run streamed, even a complete one, is
+    not counted, so the turn can end `end_turn` after it.
+  - Severity: medium.
+
+- [ ] **I17. A plain streamed tool call missing from the terminal `output` ends `end_turn`**
+  - Where: `src/stream.rs`, the terminal-event handler (`has_tool_use` is read
+    from `response.output` only).
+  - Problem: when `response.completed` carries `output: []`, a call that was
+    streamed to the client is followed by `stop_reason: "end_turn"` instead of
+    `tool_use`. The server-tool path gets the empty case right; when the
+    terminal `output` has other items but omits the call, both paths say
+    `end_turn`.
+  - Fix: also count the tool blocks the translator has emitted.
+  - Severity: medium if an upstream sends that shape; which do is
+    *unverified*.
+
+- [ ] **I18. An empty `response.refusal.done` or `refusal.delta` marks the turn refused**
+  - Where: `src/stream.rs`, the `RefusalDelta` and `RefusalDone` arms set
+    `refused` without checking that the text is non-empty.
+  - Problem: an ordinary answer followed by an empty refusal event ends
+    `refusal`. The plain path always did this; the I16 fix brought the
+    `refusal.done` case to the server-tool path, which said `end_turn` before.
+  - Fix: set the flag only for non-empty text.
+  - Severity: low. No upstream is known to send it.
+
+- [ ] **I19. Whitespace `function_call_arguments.done` overwrites the streamed arguments**
+  - Where: `src/stream.rs` (`maybe_finalize_tool_args`),
+    `src/tools/server_loop/live.rs` (the `FunctionCallArgumentsDone` arm):
+    both guard on `is_empty`, not on blank.
+  - Problem: full argument deltas followed by a `done` carrying `"   "` give
+    the client `{}`, on both paths.
+  - Fix: treat blank like empty.
+  - Severity: low. No upstream is known to send it.
+
+
 ---
 
 ## Not planned (inherent or out of scope)
@@ -1093,8 +1135,8 @@ first byte.
 
 Section I came from the 2026-11-28 pass (decompiled client + source
 re-read). Its medium entries are B-class response-correctness work and
-deserve the next look alongside A7 and B6: I1 (stop-reason conflict on
-the server-tool path), I2 (the stream body bound), I3 (an upstream that
-does not actually stream), I4 (post-200 first-event silence) and I11
-(required usage keys). I6–I9 are catalogue-and-warn work in the
+deserve the next look alongside A7 and B6: I2 (the stream body bound), I3
+(an upstream that does not actually stream), I4 (post-200 first-event
+silence), I11 (required usage keys) and I17 (streamed call ending
+`end_turn`). I6–I9 are catalogue-and-warn work in the
 D2/D4/D5 vein.

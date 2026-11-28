@@ -489,3 +489,75 @@ async fn a_paused_turn_can_be_resumed() {
         "the model must still see what the search found"
     );
 }
+
+// ── Stop signals of a round that has already been served ──
+
+/// A completed run that searches and calls the client's `Bash`, led by
+/// `lead` (a message content part) and with `args` as `Bash`'s raw arguments.
+fn search_and_bash_round(lead: serde_json::Value, args: &str) -> FakeResponse {
+    let mut run: serde_json::Value = serde_json::from_str(&function_calls_response(
+        "r1",
+        &[
+            (
+                "proxy_web_search",
+                "call_s",
+                serde_json::json!({"queries": ["rust"]}),
+            ),
+            ("Bash", "call_b", serde_json::json!({})),
+        ],
+    ))
+    .unwrap();
+    run["output"][1]["arguments"] = serde_json::json!(args);
+    run["output"].as_array_mut().unwrap().insert(
+        0,
+        serde_json::json!({"type": "message", "id": "msg_0", "role": "assistant",
+            "status": "completed", "content": [lead]}),
+    );
+    ok_response(run.to_string())
+}
+
+/// The pause and the failed re-run both end the turn on a served round, whose
+/// output is not rendered again: its refusal or cut-short call still counts.
+#[tokio::test]
+async fn a_served_rounds_stop_signals_survive_the_end_of_the_turn() {
+    let refusal = serde_json::json!({"type": "refusal", "refusal": "No."});
+    let text = serde_json::json!({"type": "output_text", "text": "ok", "annotations": []});
+    let whole = r#"{"command":"ls"}"#;
+    let cut = r#"{"command":"ls"#;
+    let client_decl = r#"{"name":"Bash","input_schema":{"type":"object",
+        "properties":{"command":{"type":"string"}}}}"#;
+
+    let mut wrong = Vec::new();
+    for paused in [true, false] {
+        for (lead, args, expected) in [
+            (&refusal, whole, "refusal"),
+            (&text, cut, "max_tokens"),
+            (&text, whole, "tool_use"),
+        ] {
+            let (upstream_addr, upstream) = start_fake_upstream().await;
+            let rerun = FakeResponse {
+                status: StatusCode::BAD_REQUEST,
+                body: Some(r#"{"error":{"message":"re-run failed"}}"#.to_owned()),
+            };
+            script(
+                &upstream,
+                vec![search_and_bash_round(lead.clone(), args), rerun],
+            );
+            let (engine, _) = start_fake_search_engine(FAKE_RESULTS_HTML).await;
+            let max_rounds = if paused { 1 } else { 5 };
+            let config = rounds_config(upstream_addr, engine, max_rounds, paused);
+            let proxy_addr = start_proxy(config).await;
+
+            let request = server_tools_request(false, &[client_decl, SEARCH_DECL]);
+            let res = post_messages(proxy_addr, request).await;
+            let body: serde_json::Value = res.json().await.unwrap();
+            if body["stop_reason"] != expected {
+                wrong.push(format!(
+                    "paused={paused} expected {expected}: {}",
+                    body["stop_reason"]
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
