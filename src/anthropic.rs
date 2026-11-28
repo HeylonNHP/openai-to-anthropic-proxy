@@ -659,22 +659,22 @@ pub enum StopReason {
 }
 
 /// Server tool usage tracking: how many searches and fetches were made.
-/// A count of zero is omitted from the wire, so a request that used only one
-/// of the tools reports only that one.
+/// Both counts are always sent: Claude Code's schema requires each of them
+/// once the object is there.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerToolUseUsage {
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub web_search_requests: u32,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    #[serde(default)]
     pub web_fetch_requests: u32,
 }
 
 /// Token usage, in the proxy's internal shape.
 ///
-/// [`Serialize`] writes Anthropic's wire shape, which differs in one place:
+/// [`Serialize`] writes Anthropic's wire shape, which differs in two places:
 /// the thinking-token count is nested as
 /// `output_tokens_details: { thinking_tokens }` rather than carried as a flat
-/// `thinking_tokens`.
+/// `thinking_tokens`, and `cache_creation` and `service_tier` are added.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
@@ -711,16 +711,20 @@ struct OutputTokensDetailsWire {
     thinking_tokens: u32,
 }
 
-/// What [`Usage`] looks like on the wire. Zero counts and absent parts are
-/// omitted, so a response without thinking or caching is unchanged.
+/// What [`Usage`] looks like on the wire.
+///
+/// Claude Code's schema marks the two cache counts, `cache_creation` and
+/// `service_tier` nullable but not optional, so those are always sent. Other
+/// absent parts and zero counts are omitted.
 #[derive(Serialize)]
 struct UsageWire<'a> {
     input_tokens: u32,
     output_tokens: u32,
-    #[serde(skip_serializing_if = "is_zero_u32")]
     cache_creation_input_tokens: u32,
-    #[serde(skip_serializing_if = "is_zero_u32")]
     cache_read_input_tokens: u32,
+    /// The per-TTL breakdown, which the upstream does not report.
+    cache_creation: Option<()>,
+    service_tier: &'static str,
     #[serde(skip_serializing_if = "is_zero_u32")]
     cache_creation_input_tokens_5m: u32,
     #[serde(skip_serializing_if = "is_zero_u32")]
@@ -740,6 +744,8 @@ impl Serialize for Usage {
             output_tokens: self.output_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation: None,
+            service_tier: "standard",
             cache_creation_input_tokens_5m: self.cache_creation_input_tokens_5m,
             cache_creation_input_tokens_1h: self.cache_creation_input_tokens_1h,
             output_tokens_details: (self.thinking_tokens > 0).then_some(OutputTokensDetailsWire {

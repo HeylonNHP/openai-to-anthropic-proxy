@@ -53,7 +53,7 @@ async fn advisor_disabled_is_byte_for_byte_identical() {
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": 7,
-                    "output_tokens": 3
+                    "output_tokens": 3, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation": null, "service_tier": "standard"
                 }
             }),
             "{label}: the client response must be byte-identical to the pre-advisor path"
@@ -3001,7 +3001,7 @@ async fn b9_disabled_without_declaration_is_still_byte_identical() {
             "model": "gpt-4o-mini",
             "stop_reason": "end_turn",
             "stop_sequence": null,
-            "usage": {"input_tokens": 7, "output_tokens": 3}
+            "usage": {"input_tokens": 7, "output_tokens": 3, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation": null, "service_tier": "standard"}
         })
     );
     let sent = upstream.received_all.lock().await.clone();
@@ -3116,7 +3116,7 @@ async fn two_sections_disabled_no_declaration_preserves_second_section() {
                     "model": "gpt-4o-mini",
                     "stop_reason": "end_turn",
                     "stop_sequence": null,
-                    "usage": {"input_tokens": 7, "output_tokens": 3}
+                    "usage": {"input_tokens": 7, "output_tokens": 3, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation": null, "service_tier": "standard"}
                 })
             );
         }

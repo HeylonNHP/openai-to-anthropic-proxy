@@ -1525,3 +1525,45 @@ fn a_streamed_call_missing_from_the_terminal_output_still_ends_tool_use() {
         assert_eq!(delta.stop_reason, Some(expected), "{terminal:?}");
     }
 }
+
+/// An explicit zero in `message_delta` can overwrite a client's count, so a
+/// terminal event that says nothing about the cache keeps what was reported
+/// earlier.
+#[test]
+fn cache_counts_reported_early_survive_a_silent_terminal_event() {
+    let mut created = base_response("in_progress");
+    created.usage = Some(ResponsesUsage {
+        input_tokens: 10,
+        output_tokens: 0,
+        total_tokens: 10,
+        input_tokens_details: Some(InputTokensDetails {
+            cached_tokens: 6,
+            cache_write_tokens: 1,
+        }),
+        output_tokens_details: None,
+    });
+    let mut no_usage = base_response("completed");
+    no_usage.usage = None;
+    // `base_response` has usage but no `input_tokens_details`.
+    let no_details = base_response("completed");
+
+    for terminal in [Some(no_usage), Some(no_details), None] {
+        let mut t =
+            StreamTranslator::new(msg_id(), model(), crate::repair::ToolSchemaRegistry::new());
+        t.feed_event(&ResponsesStreamEvent::Created {
+            response: created.clone(),
+        });
+        let label = format!("{terminal:?}");
+        if let Some(response) = terminal {
+            t.feed_event(&ResponsesStreamEvent::Completed { response });
+        }
+        let closing = t.finish();
+        let StreamEvent::MessageDelta { usage, .. } = &closing[0] else {
+            panic!("expected message_delta");
+        };
+        let usage = usage.as_ref().expect("usage");
+        assert_eq!(usage.cache_read_input_tokens, 6, "{label}");
+        assert_eq!(usage.cache_creation_input_tokens, 1, "{label}");
+        assert!(usage.input_tokens <= 3, "{label}: {}", usage.input_tokens);
+    }
+}

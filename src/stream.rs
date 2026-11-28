@@ -482,8 +482,8 @@ impl StreamTranslator {
             Some(AnthropicUsage {
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                cache_read_input_tokens: self.cache_read_input_tokens,
                 cache_creation_input_tokens_5m: 0,
                 cache_creation_input_tokens_1h: 0,
                 thinking_tokens: 0,
@@ -566,17 +566,20 @@ impl StreamTranslator {
             self.model = response.model.clone();
         }
         if let Some(u) = &response.usage {
-            self.input_tokens = u.input_tokens;
-            self.cache_read_input_tokens = u
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens);
-            self.cache_creation_input_tokens = u
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cache_write_tokens);
-            self.input_usage_seen = true;
+            self.capture_input_usage(u);
         }
+    }
+
+    /// Record a snapshot's input counts. A snapshot with no cache details says
+    /// nothing about the cache, so earlier counts stand: the closing delta
+    /// sends them explicitly, and a zero there can overwrite the client's.
+    fn capture_input_usage(&mut self, usage: &crate::responses::ResponsesUsage) {
+        self.input_tokens = usage.input_tokens;
+        if let Some(details) = &usage.input_tokens_details {
+            self.cache_read_input_tokens = details.cached_tokens;
+            self.cache_creation_input_tokens = details.cache_write_tokens;
+        }
+        self.input_usage_seen = true;
     }
 
     fn build_message_start(&self) -> StreamEvent {
@@ -957,19 +960,19 @@ impl StreamTranslator {
     fn capture_terminal(&mut self, events: &mut Vec<StreamEvent>, response: &ResponsesResponse) {
         // Capture usage first so `finish()` includes it in message_delta.
         // The terminal snapshot is authoritative: created/in-progress
-        // snapshots may omit usage or contain only provisional counts.
+        // snapshots may omit usage or contain only provisional counts. Cache
+        // counts it does not report stand (`capture_input_usage`).
         if let Some(usage) = &response.usage {
-            self.input_tokens = usage.input_tokens;
-            self.cache_read_input_tokens = usage
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens);
-            self.cache_creation_input_tokens = usage
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cache_write_tokens);
-            self.input_usage_seen = true;
+            self.capture_input_usage(usage);
             let mut u = map_usage(usage);
+            // The counts as last reported, which this snapshot may not repeat.
+            u.cache_read_input_tokens = self.cache_read_input_tokens;
+            u.cache_creation_input_tokens = self.cache_creation_input_tokens;
+            u.input_tokens = crate::responses::net_input_tokens(
+                usage.input_tokens,
+                self.cache_read_input_tokens,
+                self.cache_creation_input_tokens,
+            );
             if self.web_search_count > 0 {
                 u.server_tool_use = Some(ServerToolUseUsage {
                     web_search_requests: self.web_search_count,

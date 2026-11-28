@@ -147,7 +147,7 @@ can use all of them in one turn, in any order. Details are in
   `ping` events while a later run is in flight. A plain answer with no tool call
   is still delivered in one burst (each executor run is fetched whole).
 - **Usage.** `usage.server_tool_use` reports `web_search_requests` and
-  `web_fetch_requests` (a zero count is left out); the advisor's tokens are in
+  `web_fetch_requests`; the advisor's tokens are in
   `iterations[]`.
 - **Failure.** A tool never fails the request. If the *first* executor run
   fails, the error is returned with its HTTP status; if a later run fails, the

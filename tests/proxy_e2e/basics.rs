@@ -399,3 +399,59 @@ async fn proxy_key_is_checked_before_the_body_is_read() {
         .unwrap();
     assert_eq!(authed.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+/// An uncached turn still carries every usage key Claude Code requires, in a
+/// buffered body and in a streamed `message_start`.
+#[tokio::test]
+async fn usage_carries_the_required_keys_when_nothing_was_cached() {
+    let (upstream_addr, upstream) = start_fake_upstream().await;
+    *upstream.canned.lock().await = Some(
+        r#"{"id":"resp_u","object":"response","created_at":1,"status":"completed","model":"gpt-4o",
+            "output":[],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}"#
+            .into(),
+    );
+    let proxy_addr = start_proxy(make_proxy_config(upstream_addr)).await;
+
+    for stream in [false, true] {
+        // The fake serves a canned stream to every request, so set it late.
+        if stream {
+            *upstream.canned_stream.lock().await = Some(
+                r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_u","object":"response","created_at":0,"status":"completed","model":"gpt-4o","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}
+
+"#
+                .into(),
+            );
+        }
+        let res = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(ReqBody::from(format!(
+                r#"{{"model":"gpt-4o","max_tokens":16,"stream":{stream},"messages":[{{"role":"user","content":"x"}}]}}"#
+            )))
+            .send()
+            .await
+            .unwrap();
+        let text = res.text().await.unwrap();
+        let usage = if stream {
+            let start = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                .find(|v| v["type"] == "message_start")
+                .expect("message_start");
+            start["message"]["usage"].clone()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["usage"].clone()
+        };
+        let keys = usage.as_object().expect("usage object");
+        for key in [
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation",
+            "service_tier",
+        ] {
+            assert!(keys.contains_key(key), "stream={stream} {key}: {usage}");
+        }
+    }
+}

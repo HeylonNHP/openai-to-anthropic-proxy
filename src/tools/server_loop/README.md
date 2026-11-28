@@ -65,8 +65,8 @@ intermediate text, each tool's `server_tool_use` / result pair, any client
   when [enabled](#the-round-limit).
 * `usage` is the SUM of every executor run in the turn (each run is billed
   upstream), plus what each tool adds:
-  `server_tool_use.web_search_requests` / `web_fetch_requests` (a zero count is
-  left out) and, for the advisor, `iterations[]`.
+  `server_tool_use.web_search_requests` / `web_fetch_requests` and, for the
+  advisor, `iterations[]`.
 
 ## What the operator sees
 

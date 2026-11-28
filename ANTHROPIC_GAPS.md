@@ -10,7 +10,7 @@ A 2026-11-28 pass used four parallel research agents — two re-reading
 `src/`, two reading the installed Claude Code CLI's (v2.1.332) embedded
 JavaScript out of the native binary — and added section I, plus the
 client-impact evidence that settled G3's unverified clause. Section I's
-medium entries (I1–I4, I11) were spot-checked against the current source
+medium entries (I1–I4, I11 as first rated) were spot-checked against the current source
 when written; client-impact claims there are static readings of that one
 build, same evidence class as section H.
 
@@ -481,7 +481,7 @@ so the proxy can only approximate it.
   - Problem: markers apply only to user text, image and document blocks (and
     `tool_result` images), and only for allowlisted models. System, tool and
     assistant markers and `ttl` are ignored. The usage `cache_creation` object
-    is not emitted; non-standard flat `cache_creation_input_tokens_5m/_1h`
+    is always `null` (no TTL breakdown); non-standard flat `cache_creation_input_tokens_5m/_1h`
     fields are sent instead, and `cache_creation_input_tokens_1h` is hard-coded
     to 0.
   - Mostly inherent, since OpenAI caches the prefix automatically.
@@ -933,33 +933,29 @@ written. Nothing was run against a live upstream.
 
 ### I.d. Response shape fidelity
 
-- [ ] **I11. Usage keys the CLI's schema marks required-nullable are omitted when zero**
-  - Where: `UsageWire` (`src/anthropic.rs:716-734`) —
-    `skip_serializing_if = "is_zero_u32"` on `cache_creation_input_tokens`
-    and `cache_read_input_tokens` (and the flat `_5m`/`_1h` fields);
-    `cache_creation`, `service_tier`, `speed`, `inference_geo`,
-    `fallback_credit` never modelled.
-  - Problem: the CLI's zod usage schema marks `cache_creation_input_tokens`,
-    `cache_read_input_tokens`, `cache_creation` and `service_tier`
-    **nullable but not optional** — `.nullable()` ≠ `.optional()`, so a
-    missing key fails `safeParse` where an explicit `null` passes. The proxy
-    omits them whenever zero, i.e. on every uncached turn. At least one CLI
-    site also reads unguarded (`h.cache_creation.ephemeral_1h_input_tokens`,
-    no `?.`), which on a missing `cache_creation` object is a TypeError.
-  - Client impact: *unverified* whether any `safeParse`/unguarded read ever
-    sees a raw proxy usage object — mitigating evidence: the CLI normalises
-    its own usage through defaults and merge paths that tolerate
-    `undefined`, so most runtime readers degrade rather than break; the
-    exposed lane is a record/resume path that parses a persisted
-    `message.usage` taken straight from the proxy's `message_start` —
-    missing required keys → record rejected — plus the unguarded
-    `cache_creation` read.
-  - Fix: always emit `cache_creation_input_tokens: 0` and
-    `cache_read_input_tokens: 0`, plus `cache_creation: null` and
-    `service_tier: "standard"` — matches Anthropic's own wire, costs
-    nothing. Distinct from G1 (which is about the `cache_creation` TTL
-    object's contents and the non-standard flat `_5m`/`_1h` fields).
-  - Severity: medium, *unverified* on parse/crash reachability.
+- [x] **I11. Usage keys the CLI's schema marks required-nullable are omitted when zero**
+  - Where: `UsageWire` and `ServerToolUseUsage` (`src/anthropic.rs`);
+    `src/stream.rs` (`capture_input_usage`, `capture_terminal`, `finish`).
+  - Problem: the CLI's (v2.1.332) assistant-message usage schema marks
+    `cache_creation_input_tokens`, `cache_read_input_tokens`, `cache_creation`
+    and `service_tier` nullable but not optional, and the proxy omitted them.
+    It also requires both counts inside a `server_tool_use` object, where the
+    proxy omitted a zero one.
+  - Impact, from a second static reading (2026-11-29), narrower than first
+    written: transcript resume uses a lenient schema; the unguarded
+    `cache_creation.ephemeral_1h_input_tokens` read is not reachable from
+    proxy data. Raw usage can reach the strict schema in a sampled,
+    telemetry-only SDK output check and in the internal `turn_handoff`
+    request. A partial `server_tool_use` can override the Agent tool's
+    defaults before its output is validated; no refusal was reproduced.
+  - Fix: always send the four keys (`cache_creation: null`,
+    `service_tier: "standard"`) and both server-tool counts. Because zero
+    cache counts are now explicit in `message_delta`, and can overwrite in
+    some client merges, counts reported early in a stream are no longer lost
+    to a later snapshot that says nothing about them.
+  - Not determined: Anthropic's real wire values, other CLI versions, and
+    whether the client serialises a message before `message_delta` updates it.
+  - Severity: low.
 
 - [ ] **I12. On the streaming path the `server_tool_use` input arrives as `""` → `{}`**
   - Where: `src/stream.rs:1070-1090` — the start event carries
@@ -1145,6 +1141,5 @@ first byte.
 Section I came from the 2026-11-28 pass (decompiled client + source
 re-read). Its medium entries are B-class response-correctness work and
 deserve the next look alongside A7 and B6: I2 (the stream body bound), I3
-(an upstream that does not actually stream), I4 (post-200 first-event
-silence) and I11 (required usage keys). I6–I9 are catalogue-and-warn work in the
-D2/D4/D5 vein.
+(an upstream that does not actually stream) and I4 (post-200 first-event
+silence). I6–I9 are catalogue-and-warn work in the D2/D4/D5 vein.

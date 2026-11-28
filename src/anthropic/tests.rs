@@ -241,13 +241,26 @@ fn plain_usage() -> Usage {
 
 #[test]
 fn usage_iterations_none_is_omitted() {
-    // Zero wire change for every existing response.
+    let value = serde_json::to_value(plain_usage()).unwrap();
+    assert!(!value.as_object().unwrap().contains_key("iterations"));
+}
+
+/// Claude Code's usage schema marks these nullable but not optional, so they
+/// are sent even when there is nothing to report.
+#[test]
+fn usage_always_carries_the_keys_the_client_requires() {
     let value = serde_json::to_value(plain_usage()).unwrap();
     assert_eq!(
         value,
-        serde_json::json!({"input_tokens": 7, "output_tokens": 3})
+        serde_json::json!({
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": null,
+            "service_tier": "standard",
+        })
     );
-    assert!(!value.as_object().unwrap().contains_key("iterations"));
 }
 
 #[test]
@@ -554,14 +567,14 @@ fn a_function_tool_with_both_fields_is_not_validated_as_a_server_tool() {
 }
 
 #[test]
-fn server_tool_usage_omits_a_zero_count() {
+fn server_tool_usage_carries_both_counts() {
     let only_search = ServerToolUseUsage {
         web_search_requests: 2,
         ..ServerToolUseUsage::default()
     };
     assert_eq!(
         serde_json::to_value(only_search).unwrap(),
-        serde_json::json!({"web_search_requests": 2})
+        serde_json::json!({"web_search_requests": 2, "web_fetch_requests": 0})
     );
     let both = ServerToolUseUsage {
         web_search_requests: 1,

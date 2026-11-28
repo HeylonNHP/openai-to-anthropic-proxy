@@ -35,7 +35,7 @@ async fn web_fetch_disabled_is_byte_for_byte_identical() {
             "stop_sequence": null,
             "usage": {
                 "input_tokens": 7,
-                "output_tokens": 3
+                "output_tokens": 3, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation": null, "service_tier": "standard"
             }
         }),
         "the client response must be unchanged when web_fetch is disabled"
